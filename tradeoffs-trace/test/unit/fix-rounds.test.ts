@@ -8,15 +8,15 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { fixTasks, FIXER_DUTY, otherTaskIndexLines, type FixFinding } from "../../src/core/fix-rounds.ts";
+import { decisionFixPoint, fixTasks, FIXER_DUTY, otherTaskIndexLines, type DecisionFixPoint, type FixFinding } from "../../src/core/fix-rounds.ts";
 import { fixRoundCandidate } from "../../src/core/lanes.ts";
 import { lintPlan } from "../../src/core/plan-lint.ts";
 import { reduce } from "../../src/core/reduce.ts";
 import { validate } from "../../src/core/schema.ts";
 import type { Domain } from "../../src/core/domains.ts";
-import type { Disposition } from "../../src/core/triage.ts";
+import { disposition, evidenceForFinding, recordImpact, type Disposition } from "../../src/core/triage.ts";
 import type { Finding } from "../../src/core/types.ts";
-import { baseState } from "./helpers.ts";
+import { basePhase, baseState, makeBallot, makeDecision } from "./helpers.ts";
 
 const DOMAINS: Domain[] = [
   { name: "booking", globs: ["booking/**"] },
@@ -192,4 +192,169 @@ test("tt lint refuses TT_FIX_ROUNDS without TT_DOMAINS", () => {
   const badFixers = lintPlan({ fixers: 0, phases: [] }).filter((f) => f.rule === "fix-rounds");
   assert.equal(badFixers.length, 1);
   assert.match(badFixers[0].problem, /whole number of 1 or more/);
+});
+
+// ---------------------------------------------------------------------------
+// Fix packet Z: voted-down and vetoed decisions are fix points
+// ---------------------------------------------------------------------------
+
+const SEATS = ["M", "A", "B"];
+
+/** A decision point as `decisionFixPoint` builds it, for `fixTasks` tests. */
+function decisionPoint(id: string, domain: string | undefined, cls: DecisionFixPoint["class"] = "delegated"): DecisionFixPoint {
+  return {
+    source: "decision",
+    id,
+    class: cls,
+    choice: `${id} choice`,
+    outcome: "vetoed",
+    ...(domain !== undefined ? { domain } : {}),
+    reasons: [`M: ${id} is wrong`],
+    alternative: `${id} alternative`,
+    expected: `${id} expected`,
+  };
+}
+
+test("fixTasks groups mixed finding and decision points by domain in declaration order", () => {
+  const points = [
+    decisionPoint("D-1", "gates"),
+    finding("F-1", "matching"),
+    finding("F-2", "gates"),
+    decisionPoint("D-2", "booking"),
+    decisionPoint("D-3", undefined),
+    finding("F-3", "booking"),
+  ];
+  const tasks = fixTasks(points, DOMAINS, 4);
+  assert.deepEqual(
+    tasks.map((t) => ({ domain: t.domain, ids: t.findingIds, findings: t.findings.map((f) => f.id), decisions: t.decisions.map((d) => d.id) })),
+    [
+      { domain: "booking", ids: ["D-2", "F-3"], findings: ["F-3"], decisions: ["D-2"] },
+      { domain: "gates", ids: ["D-1", "F-2"], findings: ["F-2"], decisions: ["D-1"] },
+      { domain: "matching", ids: ["F-1"], findings: ["F-1"], decisions: [] },
+    ],
+    "domains in declaration order, points in input order within a domain; a domainless decision is in no task",
+  );
+  // The cap still counts tasks, decisions included.
+  assert.deepEqual(fixTasks(points, DOMAINS, 1).map((t) => t.findingIds), [["D-2", "F-3"]]);
+});
+
+test("a reserved (owner) decision is never a fixer task", () => {
+  // fixTasks refuses a reserved decision point even when handed one ...
+  assert.deepEqual(fixTasks([decisionPoint("D-R", "booking", "reserved")], DOMAINS, 4), []);
+  // ... and decisionFixPoint never builds one: the owner rules on it.
+  const reserved = makeDecision({ id: "D-R", class: "reserved" });
+  const facts = {
+    ballots: [makeBallot({ decisionId: "D-R", reviewer: "M", vote: "reject", evidence: ["booking/a.ts:3"] })],
+    seats: SEATS,
+    leader: "M",
+    settled: false,
+    domains: DOMAINS,
+  };
+  assert.equal(decisionFixPoint(reserved, facts), undefined);
+  // A delegated decision with the same ballots is a point.
+  assert.ok(decisionFixPoint(makeDecision({ id: "D-R" }), facts));
+});
+
+test("decisionFixPoint: a vetoed or failed delegated decision carries the dissent reasons, the alternative and a domain", () => {
+  const decision = makeDecision({
+    id: "D1",
+    choice: "skip the overlay gate",
+    alternatives: [{ option: "keep the overlay gate", consequence: "one more check per batch" }],
+  });
+  const veto = makeBallot({ reviewer: "M", vote: "reject", rationale: "VETO: the gate is required", evidence: ["the plan", "gates/g.ts:10 check"] });
+  const approve = makeBallot({ reviewer: "A", vote: "approve", evidence: ["booking/b.ts:1"] });
+  const point = decisionFixPoint(decision, { ballots: [approve, veto], seats: SEATS, leader: "M", settled: false, domains: DOMAINS });
+  assert.ok(point);
+  assert.equal(point!.outcome, "vetoed");
+  assert.equal(point!.domain, "gates", "the first dissent evidence path a domain owns names the domain");
+  assert.equal(point!.where, "gates/g.ts:10 check");
+  assert.deepEqual(point!.reasons, ["M: VETO: the gate is required (evidence: the plan, gates/g.ts:10 check)"]);
+  assert.match(point!.alternative, /keep the overlay gate/);
+  assert.match(point!.expected, /VETO: the gate is required/);
+  assert.match(point!.expected, /keep the overlay gate/);
+  // The item's :DOMAIN: wins over the evidence path.
+  const itemPoint = decisionFixPoint(makeDecision({ itemId: "R1" }), { ballots: [veto], seats: SEATS, leader: "M", settled: false, itemDomain: "booking", domains: DOMAINS });
+  assert.equal(itemPoint!.domain, "booking");
+  assert.equal(itemPoint!.item, "R1");
+  // The evaluator's alternative, when it gave one, is the one the fixer applies.
+  const evalPoint = decisionFixPoint(decision, { ballots: [veto], seats: SEATS, leader: "M", settled: false, domains: DOMAINS, evaluatorAlternative: "EVAL_ALT" });
+  assert.equal(evalPoint!.alternative, "EVAL_ALT");
+  // M approved, A and B rejected: a failed vote, not a veto.
+  const failed = decisionFixPoint(decision, {
+    ballots: [
+      makeBallot({ reviewer: "M", vote: "approve" }),
+      makeBallot({ reviewer: "A", vote: "reject", rationale: "A dissents", evidence: ["matching/m.ts:2"] }),
+      makeBallot({ reviewer: "B", vote: "reject", rationale: "B dissents", evidence: ["booking/b.ts:2"] }),
+    ],
+    seats: SEATS,
+    leader: "M",
+    settled: false,
+    domains: DOMAINS,
+  });
+  assert.equal(failed!.outcome, "failed");
+  assert.equal(failed!.domain, "matching", "the first dissenting seat's path, in seat order");
+  // Without a domain-owned path it is returned domainless and no task takes it.
+  const noDomain = decisionFixPoint(decision, {
+    ballots: [makeBallot({ reviewer: "M", vote: "reject", evidence: ["the plan says so"] })],
+    seats: SEATS,
+    leader: "M",
+    settled: false,
+    domains: DOMAINS,
+  });
+  assert.equal(noDomain!.domain, undefined);
+  assert.deepEqual(fixTasks([noDomain!], DOMAINS, 4), []);
+  // A settled, unballoted, detail or superseded decision is no point; a
+  // ballot bound to another candidate does not count.
+  assert.equal(decisionFixPoint(decision, { ballots: [veto], seats: SEATS, leader: "M", settled: true, domains: DOMAINS }), undefined);
+  assert.equal(decisionFixPoint(decision, { ballots: [], seats: SEATS, leader: "M", settled: false, domains: DOMAINS }), undefined);
+  assert.equal(decisionFixPoint(makeDecision({ class: "detail" }), { ballots: [veto], seats: SEATS, leader: "M", settled: false, domains: DOMAINS }), undefined);
+  assert.equal(decisionFixPoint(makeDecision({ supersededBy: "x" }), { ballots: [veto], seats: SEATS, leader: "M", settled: false, domains: DOMAINS }), undefined);
+  assert.equal(
+    decisionFixPoint(decision, { ballots: [{ ...veto, boundCandidateSha: "OLD" }], seats: SEATS, leader: "M", settled: false, domains: DOMAINS }),
+    undefined,
+  );
+});
+
+test("the fixer duty tells a fixer to apply the seats' alternative and never to take an owner decision", () => {
+  assert.match(FIXER_DUTY, /apply the alternative the seats chose/i);
+  assert.match(FIXER_DUTY, /remove the vetoed change/i);
+  assert.match(FIXER_DUTY, /reserved\) decision is never your task/i);
+});
+
+test("an unclassified domain-mode point with a doneWhen is triaged fix (contract), not escalated", () => {
+  const point: Finding = {
+    id: "F-P",
+    version: 1,
+    phaseId: "p1",
+    kind: "defect",
+    severity: "blocking",
+    evidence: "the booking path is wrong",
+    raisedBy: "M",
+    status: "open",
+    boundCandidateSha: "C1",
+    domain: "booking",
+    item: "R1",
+    where: "booking/a.ts:1 fn",
+    doneWhen: "test -f booking-fixed.txt",
+  };
+  const contract = { ...basePhase().contract, domains: DOMAINS };
+  const decide = (phase: ReturnType<typeof basePhase>) =>
+    disposition({ itemId: point.id, source: "finding", impact: recordImpact(phase, point.id) }, evidenceForFinding(point, phase));
+  const phase = basePhase({ contract, findings: [point] });
+  assert.equal(recordImpact(phase, point.id), "contract");
+  assert.equal(decide(phase).kind, "fix", "the unclassified point is a fix");
+  // Classified judgement by the evaluator: the ordinary path (a trade-off with all three fields).
+  const judged = basePhase({
+    contract,
+    findings: [point],
+    itemChecks: [{ itemId: point.id, verdict: "confirmed", evidence: "booking/a.ts:1", impact: "judgement", chosen: "keep", alternative: "change", why: "style" }],
+  });
+  assert.equal(decide(judged).kind, "tradeoff");
+  // Outside domain mode, or without a doneWhen, it escalates as before.
+  assert.equal(decide(basePhase({ findings: [point] })).kind, "escalate");
+  const noDone = { ...point, doneWhen: undefined };
+  assert.equal(
+    disposition({ itemId: point.id, source: "finding", impact: recordImpact(basePhase({ contract, findings: [noDone] }), point.id) }, evidenceForFinding(noDone, basePhase({ contract, findings: [noDone] }))).kind,
+    "escalate",
+  );
 });

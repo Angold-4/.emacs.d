@@ -165,7 +165,17 @@ import type {
 import { computeBoundaryTriggerPaths, computeUnreferencedHunks } from "./core/boundaries.ts";
 import { whereKey, type Domain } from "./core/domains.ts";
 // Plan 07c (D4): the fix-round task rule and the fixer's fixed duty text.
-import { DEFAULT_FIXERS, FIXER_DUTY, fixTasks, otherTaskIndexLines, type FixFinding, type FixTask } from "./core/fix-rounds.ts";
+import {
+  decisionFixPoint,
+  DEFAULT_FIXERS,
+  FIXER_DUTY,
+  fixTasks,
+  otherTaskIndexLines,
+  type DecisionFixPoint,
+  type FixFinding,
+  type FixPoint,
+  type FixTask,
+} from "./core/fix-rounds.ts";
 import {
   assertToolSet,
   launchArgs,
@@ -9165,6 +9175,7 @@ export class Conductor {
         // a trade-off it met; its submission is kept with the note.
         return {
           lane: opts.lane,
+          unchanged: true,
           note: opts.changedNothingNote ?? `the ${opts.roleWord} changed nothing on the base`,
           ...(handle.consolidationAdded && handle.consolidationAdded.length > 0 ? { added: handle.consolidationAdded } : {}),
           ...(disclosures.length > 0 ? { disclosures } : {}),
@@ -9219,8 +9230,11 @@ export class Conductor {
       ...f,
       disposition: triageRecordFor(this.#state.phase.triage, f.id)?.disposition,
     }));
+    // Fix packet Z: a decision of the pick the seats voted down or vetoed is
+    // fixer work too (the seats decided; the fixer applies their alternative).
+    const points: FixPoint[] = [...findings, ...this.#decisionFixPoints(record.picked.sha, domains)];
     const cap = this.#state.phase.contract.fixers ?? DEFAULT_FIXERS;
-    const tasks = fixTasks(findings, domains, cap);
+    const tasks = fixTasks(points, domains, cap);
     if (tasks.length === 0) return undefined;
     const base = consolidatedBase(this.#state.phase.rounds, roundNo + 1) ?? record.picked.sha;
     const stopped = (): boolean => this.#stopRequested || this.#recheckCancelledLaneRound;
@@ -9234,11 +9248,6 @@ export class Conductor {
         })),
       ),
     );
-    // Plan 07c (C3): the fixers' own decision disclosures, unioned, so the
-    // merged candidate's hand-off records them (a fixer decides no trade-off
-    // but may report one; that report must reach the reviewers).
-    const disclosures = results.flatMap((r) => r.disclosures ?? []);
-    const added = results.flatMap((r) => r.added ?? []);
     if (stopped()) {
       this.#log.append("fix_round_stopped", { round: roundNo, reason: this.#stopRequested ? "the owner stopped the run" : "a recheck stopped it" });
       return "stopped";
@@ -9278,6 +9287,16 @@ export class Conductor {
       merges.push({ sha: result.sha });
     }
     if (mergeWorktreeReady && merges.length > 0) candidate = headOf(mergeWorktree);
+    // Plan 07c (C3): the fixers' own decision disclosures and notes, unioned in
+    // task order, so the merged candidate's hand-off records them (a fixer
+    // decides no trade-off but may report one; that report must reach the
+    // reviewers). Only a fixer whose commit is IN the candidate, or one that
+    // changed nothing and only reported, speaks for it: a red or conflicting
+    // fixer's decisions describe code the candidate does not contain.
+    const merged = new Set(merges.map((m) => m.sha));
+    const speaking = results.filter((r) => r.unchanged === true || (typeof r.sha === "string" && merged.has(r.sha)));
+    const disclosures = speaking.flatMap((r) => r.disclosures ?? []);
+    const added = speaking.flatMap((r) => r.added ?? []);
     // The merged candidate is the next round's candidate: materialize its
     // read-only checkout now, before the next round's lane reviews (which run
     // in it) start.
@@ -9305,6 +9324,34 @@ export class Conductor {
       ...(added.length > 0 ? { added } : {}),
     });
     return undefined;
+  }
+
+  /** Fix packet Z: the fixer points of the decisions bound to `sha` (the
+   * round's pick) — `decisionFixPoint` decides which (a non-reserved decision
+   * whose vote failed or that the leader vetoed) and their domain; this only
+   * gathers the facts it reads: the vote outcome, the item's `:DOMAIN:` and
+   * the evaluator's alternative. */
+  #decisionFixPoints(sha: string, domains: readonly Domain[]): DecisionFixPoint[] {
+    const phase = this.#state.phase;
+    const K = phase.contract.contractVersion;
+    const items = this.#planItems();
+    const itemDomain = (id: string | undefined): string | undefined =>
+      id ? [...items.requirements, ...items.architecture, ...items.constraints].find((i) => i.id === id)?.domain : undefined;
+    const points: DecisionFixPoint[] = [];
+    for (const decision of phase.decisions) {
+      if (decision.boundCandidateSha !== sha || !isLiveDecision(decision)) continue;
+      const point = decisionFixPoint(decision, {
+        ballots: phase.ballots ?? [],
+        seats: this.#laneSeats(),
+        leader: this.#laneLeader(),
+        settled: decisionSettled(decision, phase, sha, K),
+        itemDomain: itemDomain(decision.itemId),
+        domains,
+        evaluatorAlternative: (phase.itemChecks ?? []).find((c) => c.itemId === decision.id)?.alternative,
+      });
+      if (point) points.push(point);
+    }
+    return points;
   }
 
   /** Plan 07c (D4.3): one fixer — its own worktree at B, its own session, and
@@ -9425,7 +9472,7 @@ export class Conductor {
     if (refs.length > 0) {
       lines.push("", "The design references are:", ...refs.map((r) => `- ${r}`));
     }
-    lines.push("", `Your findings (domain ${task.domain}):`);
+    if (task.findings.length > 0) lines.push("", `Your findings (domain ${task.domain}):`);
     for (const finding of task.findings) {
       lines.push(
         `- ${finding.id} [${finding.severity}/${finding.kind}] item ${finding.item ?? "?"} where ${finding.where ?? "?"}`,
@@ -9437,6 +9484,22 @@ export class Conductor {
         lines.push(`  from: ${finding.from.sha} (${finding.from.paths.join(", ")})`);
         const show = this.#gitShow(finding.from.sha, finding.from.paths);
         if (show) lines.push("  ```", ...show.split("\n").map((l) => `  ${l}`), "  ```");
+      }
+    }
+    // Fix packet Z: the decisions the seats voted down or vetoed. The seats
+    // decided; the fixer applies their alternative or removes the change.
+    if (task.decisions.length > 0) {
+      lines.push(
+        "",
+        `Your decision points (domain ${task.domain}) — the seats did not approve these choices; apply the alternative they recommend, or remove the vetoed change:`,
+      );
+      for (const point of task.decisions) {
+        lines.push(
+          `- ${point.id} [decision/${point.outcome}] item ${point.item ?? "?"} where ${point.where ?? "?"}`,
+          `  choice: ${point.choice}`,
+          `  expected: ${point.expected}`,
+          "  doneWhen: (none — the seats re-vote on the next candidate)",
+        );
       }
     }
     const others = otherTaskIndexLines(allTasks, task);

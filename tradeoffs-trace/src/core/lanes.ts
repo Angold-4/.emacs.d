@@ -60,6 +60,9 @@ export interface LaneBuild {
   /** tt 09 (change 3): a consolidator's own report of what it changed beyond
    * the work it took (its submit_phase `deviations`). */
   added?: string[];
+  /** Plan 07c (C3): a consolidator/fixer commit with the base's own tree — it
+   * changed nothing, but its submission (disclosures) still counts. */
+  unchanged?: boolean;
 }
 
 /** One candidate's check result. `ok` false carries the note the status and
@@ -700,6 +703,10 @@ export interface ConsolidationOutcome {
   /** Plan 07c (C3): the consolidator's/fixer's own decision disclosures, so a
    * fix round can carry them onto the merged candidate. */
   disclosures?: DecisionDisclosure[];
+  /** Plan 07c (C3): the build changed nothing on the base (no commit), yet its
+   * submission is kept — the one failed outcome whose disclosures still
+   * reach the merged candidate. */
+  unchanged?: boolean;
   /** The owner stopped the run mid-way: nothing is recorded. */
   stopped?: boolean;
 }
@@ -719,7 +726,13 @@ export async function runConsolidation(host: ConsolidationHost): Promise<Consoli
   }
   if (host.stopRequested?.()) return { ok: false, fixes: 0, stopped: true };
   if (typeof build.sha !== "string" || build.sha.length === 0) {
-    return { ok: false, fixes: 0, note: build.note ?? "the consolidator produced no commit", ...submitted(build) };
+    return {
+      ok: false,
+      fixes: 0,
+      note: build.note ?? "the consolidator produced no commit",
+      ...submitted(build),
+      ...(build.unchanged === true ? { unchanged: true } : {}),
+    };
   }
   const check = async (sha: string): Promise<LaneCheck> => {
     try {
