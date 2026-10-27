@@ -384,10 +384,11 @@ function spawnLockHelper(helperScript: string, lockPath: string): Promise<Lock> 
       reject(new LockError(lockPath, undefined, String(err)));
     });
 
-    // 'close' (not 'exit'): it fires after the helper's stdio has closed, so
-    // `stderr` is complete. On 'exit' a busy helper could be read with empty
-    // stderr, so a held check slot was reported as a fatal "helper exited
-    // with code 1" instead of a busy slot to retry.
+    // 'close' (not 'exit'): it fires after the helper's stdio streams have
+    // closed, so `stderr` is fully flushed. Listening on 'exit' raced the
+    // stderr pipe: a busy helper that printed "busy" and exited could be
+    // seen with empty stderr, so a held check slot was reported as a fatal
+    // "helper exited with code 1" instead of a retryable busy slot.
     child.once("close", (code) => {
       if (settled) return;
       settled = true;

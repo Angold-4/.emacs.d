@@ -175,6 +175,41 @@ test("plan-lint: a test verify without a name is an error with its line", () => 
   assert.match(finding!.problem, /no name/);
 });
 
+test("plan-lint: a test final verify in a phase with no final checks is an error with its line", () => {
+  const requirements = [{ id: "R1", title: "r", text: "r", arch: [], verify: ['test final "corpus gate"'], line: 15, verifyLine: 16 }];
+  const without: LintPlanInput = { sourceFile: "/x/PLAN.org", phases: [{ id: "p1", architecture: [], requirements, constraints: [] }] };
+  const finding = lintPlan(without).find((f) => f.rule === "item-verify");
+  assert.ok(finding);
+  assert.equal(finding!.severity, "error");
+  assert.equal(finding!.line, 16);
+  assert.match(finding!.problem, /test final verify needs final checks/);
+  const withFinal: LintPlanInput = {
+    sourceFile: "/x/PLAN.org",
+    phases: [{ id: "p1", architecture: [], requirements, constraints: [], finalChecks: ["make corpus"] }],
+  };
+  assert.equal(lintPlan(withFinal).some((f) => f.rule === "item-verify"), false);
+});
+
+test("org-plan: a test final verify is carried as finalTests, and #+TT_FINAL_CHECKS keeps it lint-clean", () => {
+  const org = STRUCTURED.replace('#+TT_CHECKS: make check\n', '#+TT_CHECKS: make check\n#+TT_FINAL_CHECKS: make corpus\n').replace(
+    ':VERIFY:   test "lanes: tally"',
+    ':VERIFY:   test final "lanes: tally" test final src/x.test.ts::gate',
+  );
+  const plan = parseOrgPlan(org, "/x/PLAN.org");
+  const r4 = plan.phases![0].requirements!.find((r) => r.id === "R4")!;
+  assert.deepEqual(r4.verify, ['test final "lanes: tally" test final src/x.test.ts::gate']);
+  assert.deepEqual(r4.finalTests, [
+    { name: "lanes: tally", final: true },
+    { name: "gate", file: "src/x.test.ts", final: true },
+  ]);
+  // An item with no final-only test carries no field.
+  assert.equal("finalTests" in plan.phases![0].requirements!.find((r) => r.id === "R1")!, false);
+  assert.deepEqual(lintPlan(plan).filter((f) => f.severity === "error"), []);
+  // Without #+TT_FINAL_CHECKS the same plan is refused.
+  const bare = parseOrgPlan(org.replace("#+TT_FINAL_CHECKS: make corpus\n", ""), "/x/PLAN.org");
+  assert.ok(lintPlan(bare).some((f) => f.rule === "item-verify" && /final checks/.test(f.problem)));
+});
+
 test("plan-lint: a truncated item text is an error with file and line", () => {
   const plan: LintPlanInput = {
     sourceFile: "/x/PLAN.org",

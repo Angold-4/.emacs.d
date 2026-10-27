@@ -195,15 +195,17 @@ test("plan-items: a requirement whose test verify is missing from the check outp
   }
 });
 
-test("TT_FINAL_ONLY_MISSING: a test verify missing from a round's output is left to the final checks", async () => {
-  // exex 01b2 (2026-10-27): the corpus gates run only in #+TT_FINAL_CHECKS,
-  // so a round's output cannot show them; with the switch on, a merely
-  // missing test raises no blocking finding (the final checks fail the phase
-  // if the gate fails).
-  const previous = process.env.TT_FINAL_ONLY_MISSING;
-  process.env.TT_FINAL_ONLY_MISSING = "1";
-  const setup = await setupConductor({
-    items: { ...ITEMS, finalChecks: ["true"] },
+/** R1's test runs only in the final checks (`:VERIFY: test final`). */
+const FINAL_ONLY_ITEMS = {
+  ...ITEMS,
+  requirements: [{ ...ITEMS.requirements[0], verify: ['test final "R1 proves it"'] }, ITEMS.requirements[1]],
+};
+
+/** One fake-pi run of the single-candidate loop with `items`, the round
+ * checks `true` (so they print no test name) and `finalChecks`. */
+function finalOnlySetup(items: typeof ITEMS, finalChecks: string[]): Promise<Setup> {
+  return setupConductor({
+    items: { ...items, finalChecks },
     checks: ["true"],
     phaseChecks: ["true"],
     stubReviews: false,
@@ -218,23 +220,74 @@ test("TT_FINAL_ONLY_MISSING: a test verify missing from a round's output is left
     }),
     reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({})),
   });
+}
+
+test("test final: a final-only test missing from a round's output holds nothing; the final checks resolve it as passed", async () => {
+  // exex 01b2: the corpus gates run only in #+TT_FINAL_CHECKS, so a round's
+  // output cannot show them. A `test final` verify missing there raises no
+  // finding and does not hold acceptance; the final checks print it.
+  const setup = await finalOnlySetup(FINAL_ONLY_ITEMS, [CHECK_OUTPUT]);
   try {
     await setup.conductor.start();
-    await waitFor(() => setup.conductor.state.phase.checks?.passed === true, 90_000, 50, setup.runDir);
-    assert.equal(
-      (setup.conductor.state.phase.checkResolution ?? []).some((r) => r.id === "R1"),
-      false,
-      "a missing test is not a round's verify outcome, so it cannot hold acceptance",
-    );
+    await waitFor(() => ["DONE", "BLOCKED", "AWAITING_OWNER"].includes(setup.conductor.state.phase.phase), 90_000, 50, setup.runDir);
+    assert.equal(setup.conductor.state.phase.phase, "DONE");
+    const types = readEvents(setup.runDir).filter((r) => r.kind === "event").map((r) => (r.event as { type: string }).type);
+    assert.ok(types.includes("FINAL_CHECKS_PASSED"), "the final checks ran and passed");
+    assert.ok(!types.includes("FINAL_CHECKS_FAILED"));
     assert.equal(
       setup.conductor.state.phase.findings.some((f) => f.itemId === "R1" && f.raisedBy === "conductor"),
       false,
-      "a missing test is left to the final checks",
+      "a final-only test missing from the round raises no finding",
+    );
+    assert.deepEqual(
+      (setup.conductor.state.phase.checkResolution ?? []).filter((r) => r.id === "R1"),
+      [{ id: "R1", name: "R1 proves it", final: true, outcome: "passed" }],
+      "the final checks resolved the final-only test as passed",
     );
   } finally {
     await teardown(setup);
-    if (previous === undefined) delete process.env.TT_FINAL_ONLY_MISSING;
-    else process.env.TT_FINAL_ONLY_MISSING = previous;
+  }
+});
+
+test("test final: a final-only test missing from the final checks' output fails them, naming the test", async () => {
+  // The final command exits 0 but never prints R1's test.
+  const setup = await finalOnlySetup(FINAL_ONLY_ITEMS, ["true"]);
+  try {
+    await setup.conductor.start();
+    const failedEvent = () =>
+      readEvents(setup.runDir).find((r) => r.kind === "event" && (r.event as { type: string }).type === "FINAL_CHECKS_FAILED");
+    await waitFor(() => failedEvent() !== undefined, 90_000, 50, setup.runDir);
+    const failed = failedEvent()!.event as { evidence: string; failures?: Array<{ name: string }> };
+    assert.match(failed.evidence, /R1 test final "R1 proves it" is missing from the final check output/);
+    assert.deepEqual(failed.failures?.map((f) => f.name), ["R1 proves it"], "the repair prompt names the test");
+    assert.ok(!readEvents(setup.runDir).some((r) => r.kind === "event" && (r.event as { type: string }).type === "FINAL_CHECKS_PASSED"));
+    assert.equal(
+      setup.conductor.state.phase.findings.some((f) => f.itemId === "R1" && f.raisedBy === "conductor"),
+      false,
+      "the round raised no finding for it",
+    );
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("test final: a test verify that is not final-only and is missing from a round's output is still a blocking finding", async () => {
+  // Final checks declared do not excuse an ordinary test the worker never
+  // wrote: it holds acceptance and raises a blocking finding, as before.
+  const setup = await finalOnlySetup(ITEMS, [CHECK_OUTPUT]);
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.findings.some((f) => f.itemId === "R1"), 90_000, 50, setup.runDir);
+    const finding = setup.conductor.state.phase.findings.find((f) => f.itemId === "R1")!;
+    assert.equal(finding.severity, "blocking");
+    assert.equal(finding.raisedBy, "conductor");
+    assert.match(finding.evidence, /test "R1 proves it" missing/);
+    assert.ok(
+      (setup.conductor.state.phase.checkResolution ?? []).some((r) => r.id === "R1" && r.outcome === "missing"),
+      "the missing test holds acceptance",
+    );
+  } finally {
+    await teardown(setup);
   }
 });
 

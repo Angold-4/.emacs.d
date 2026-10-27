@@ -530,6 +530,41 @@ Org line the owner will edit rather than at a temporary JSON copy."
             (when (re-search-forward (concat "^[ \t]*:" (regexp-quote name) ":[ \t]*") drawer-end t)
               (line-number-at-pos))))))))
 
+(defun +tt--final-tests (verify)
+  "The `test final' verifies of the :VERIFY: string VERIFY, as plan JSON.
+Each is an alist (name file final) for `test final \"name\"' or
+`test final file::name'.  The scan reads VERIFY left to right as
+`parseVerify' in `src/core/items.ts' does: `test', an optional bare `final'
+keyword followed by whitespace or the end, then an optional quoted or bare
+name, so a quoted name is consumed whole.  The `file::' prefix is split off
+only when it is a path (it has a `/' or a file extension).  The final checks
+resolve these tests; a round's output may lack them.  Nil when VERIFY names
+none."
+  (let ((out nil) (pos 0) (case-fold-search t))
+    (while (and verify (string-match "\\btest\\b" verify pos))
+      (let* ((p (match-end 0))
+             (final (let ((rest (substring verify p)))
+                      (when (string-match "\\`\\([ \t]+final\\)\\(?:[ \t]\\|\\'\\)" rest)
+                        (setq p (+ p (match-end 1)))
+                        t)))
+             (name (let ((rest (substring verify p)))
+                     (when (string-match "\\`[ \t]+\\(?:\"\\([^\"]*\\)\"\\|\\([^ \t\n]+\\)\\)" rest)
+                       (setq p (+ p (match-end 0)))
+                       (or (match-string 1 rest) (match-string 2 rest))))))
+        (setq pos p)
+        (when final
+          (let* ((name (string-trim (or name "")))
+                 (sep (string-search "::" name))
+                 (left (and sep (> sep 0) (substring name 0 sep)))
+                 (file (and left (or (string-search "/" left)
+                                     (string-match-p "\\.[A-Za-z0-9]+\\'" left))
+                            left)))
+            (push `((name . ,(if file (substring name (+ sep 2)) name))
+                    ,@(when file `((file . ,file)))
+                    (final . t))
+                  out)))))
+    (nreverse out)))
+
 (defun +tt--parse-item (hl kind)
   "Parse one structured item headline HL of KIND into a plan-JSON alist.
 KIND is `architecture', `requirement' or `constraint'.  The item's text is
@@ -549,6 +584,8 @@ keeps the same text so `tt lint' can prove nothing was lost in parsing."
          (verify (org-element-property :VERIFY hl))
          (arch (org-element-property :ARCH hl))
          (where (org-element-property :WHERE hl))
+         ;; Plan 07a (D1): the declared domain this item serves.
+         (domain (org-element-property :DOMAIN hl))
          (title (string-trim (+tt--headline-title hl)))
          (item-id (org-element-property :ID hl))
          (where-line (+tt--property-line hl "WHERE"))
@@ -563,6 +600,9 @@ keeps the same text so `tt lint' can prove nothing was lost in parsing."
       (title . ,title)
       (text . ,text)
       (rawText . ,raw)
+      ;; Plan 07a (D1): a `:DOMAIN:` property on any R/A/C item reaches the
+      ;; plan JSON (and so the contract) verbatim.
+      ,@(when domain `((domain . ,domain)))
       ;; Tags are an architecture property only (OD-1 R8: the requirement and
       ;; constraint schemas forbid extra fields).
       ,@(when (eq kind 'architecture)
@@ -574,6 +614,10 @@ keeps the same text so `tt lint' can prove nothing was lost in parsing."
             ,@(when arch-line `((archLine . ,arch-line)))))
       ,@(when (memq kind '(requirement constraint))
           `((verify . ,(vconcat (and verify (list verify))))
+            ;; `:VERIFY: test final "name"': the final-only tests, flagged so
+            ;; the plan JSON says which tests the final checks resolve.
+            ,@(let ((finals (+tt--final-tests verify)))
+                (when finals `((finalTests . ,(vconcat finals)))))
             ,@(when verify-line `((verifyLine . ,verify-line)))))
       (line . ,line))))
 
@@ -631,6 +675,22 @@ so an old plan reaches the loop as items without changing meaning."
           (list `((id . "C1") (title . ,text) (text . ,text) (rawText . ,text)
                   (verify . ,(vector "review"))))))))))
 
+(defun +tt--parse-domains (value)
+  "Parse a #+TT_DOMAINS VALUE into a vector of (name . globs) alists.
+Whitespace separates `name=glob[,glob…]' tokens; a token without `=' keeps
+the whole token as its name and owns no globs.  Declaration order is kept,
+because `domainOf' takes the first match."
+  (vconcat
+   (mapcar
+    (lambda (token)
+      (let* ((eq (string-match "=" token))
+             (name (string-trim (if eq (substring token 0 eq) token)))
+             (globs (if eq
+                        (split-string (substring token (1+ eq)) "[ \t,]+" t)
+                      nil)))
+        `((name . ,name) (globs . ,(vconcat globs)))))
+    (split-string value "[ \t]+" t))))
+
 (defun +tt--parse-phase (hl)
   "Parse phase headline HL into (PHASE-ALIST . ERRORS)."
   (let* ((line (line-number-at-pos (org-element-property :begin hl)))
@@ -679,6 +739,17 @@ so an old plan reaches the loop as items without changing meaning."
          ;; whenever the phase runs two or more workers.
          (consolidate (or (org-element-property :CONSOLIDATE hl)
                           (+tt--keyword "TT_CONSOLIDATE")))
+         ;; Plan 07a (D1): the plan's declared domains. A per-plan keyword
+         ;; like #+TT_CONSOLIDATE; domain mode is on exactly when the plan
+         ;; declares one (there is no phase override).
+         (domains (+tt--keyword "TT_DOMAINS"))
+         ;; Plan 07c (D4): fix rounds. Per-plan keywords like
+         ;; #+TT_DOMAINS: #+TT_FIX_ROUNDS: domains switches them on,
+         ;; #+TT_FIXERS: n caps the tasks and #+TT_FIX_CHECKS: <cmd> is the
+         ;; fast check every fixer's own commit must pass.
+         (fix-rounds (+tt--keyword "TT_FIX_ROUNDS"))
+         (fixers (+tt--keyword "TT_FIXERS"))
+         (fix-checks (+tt--keyword "TT_FIX_CHECKS"))
          ;; Plan 01f: the conductor's own expensive, live proof. `:GATE:` is
          ;; the command it runs once per candidate the reviewers accepted,
          ;; before acceptance; `:GATE_CLEANUP:` releases what the gate took,
@@ -748,6 +819,14 @@ so an old plan reaches the loop as items without changing meaning."
                 `((leader . ,(string-trim leader))))
             ,@(when consolidate
                 `((consolidate . ,(string-trim consolidate))))
+            ,@(when domains
+                `((domains . ,(+tt--parse-domains domains))))
+            ,@(when fix-rounds
+                `((fixRounds . ,(string-trim fix-rounds))))
+            ,@(when fixers
+                `((fixers . ,(+tt--count-value fixers))))
+            ,@(when fix-checks
+                `((fixChecks . ,(string-trim fix-checks))))
             (boundaries . ,(vconcat (and boundaries (split-string boundaries))))
             (reserved . ,(vconcat reserved-list))
             (provisional . ,(if provisional t :false))
@@ -1047,6 +1126,24 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                   ,@(let ((c (+tt--keyword-at "TT_CONSOLIDATE")))
                       (and c (list (cons 'consolidate (string-trim (car c)))
                                    (cons 'consolidateLine (cdr c)))))
+                  ;; Plan 07a (D1): #+TT_DOMAINS, as written, so `tt lint' can
+                  ;; read the declared domains (and a phase's items against
+                  ;; them).
+                  ,@(let ((d (+tt--keyword-at "TT_DOMAINS")))
+                      (and d (list (cons 'domains (+tt--parse-domains (car d)))
+                                   (cons 'domainsLine (cdr d)))))
+                  ;; Plan 07c (D4): #+TT_FIX_ROUNDS, #+TT_FIXERS and
+                  ;; #+TT_FIX_CHECKS, as written, so `tt lint' can read them
+                  ;; (and refuse TT_FIX_ROUNDS without TT_DOMAINS).
+                  ,@(let ((f (+tt--keyword-at "TT_FIX_ROUNDS")))
+                      (and f (list (cons 'fixRounds (string-trim (car f)))
+                                   (cons 'fixRoundsLine (cdr f)))))
+                  ,@(let ((f (+tt--keyword-at "TT_FIXERS")))
+                      (and f (list (cons 'fixers (+tt--count-value (car f)))
+                                   (cons 'fixersLine (cdr f)))))
+                  ,@(let ((f (+tt--keyword-at "TT_FIX_CHECKS")))
+                      (and f (list (cons 'fixChecks (string-trim (car f)))
+                                   (cons 'fixChecksLine (cdr f)))))
                   ,@(let ((d (+tt--plan-deadlines)))
                       (and d `((deadlines . ,d))))
                   ,@(let ((r (+tt--plan-references dir)))

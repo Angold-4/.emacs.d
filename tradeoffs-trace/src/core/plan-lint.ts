@@ -25,6 +25,7 @@ import * as fs from "node:fs";
 
 import { expandPromptPath, isLaneId } from "./worker-prompt.ts";
 import { matchesGlob } from "./boundaries.ts";
+import { domainDeclarationIssues, type Domain } from "./domains.ts";
 import { parseVerify, verifyKindIssue } from "./items.ts";
 import { rerunTemplateIssue } from "./test-failures.ts";
 
@@ -51,6 +52,11 @@ export type LintRule =
   | "item-arch"
   | "item-verify"
   | "item-text-loss"
+  // Plan 07a (D1): in domain mode an item must name a declared domain.
+  | "item-domain"
+  // Plan 07a (D1): a declared domain name must match [a-z0-9-]+, be unique,
+  // and own at least one glob.
+  | "domain"
   // A `test` verify defined only where the phase's checks never run: tt
   // reports it missing on every candidate, a gate no owner command waives.
   | "verify-reach"
@@ -59,7 +65,10 @@ export type LintRule =
   // tt 09-1: a cheap command that only the final (acceptance) check runs.
   | "cheap-final-check"
   // tt 09 (change 3): `#+TT_CONSOLIDATE` is `on` or `off`.
-  | "consolidate";
+  | "consolidate"
+  // Plan 07c (D4): `#+TT_FIX_ROUNDS` needs `#+TT_DOMAINS`; the value is
+  // `domains`, and `#+TT_FIXERS` is a positive whole number.
+  | "fix-rounds";
 
 /** The roles #+TT_MODELS may assign a model to. */
 // tt 09 (change 3): `consolidator` — the model that combines the lanes.
@@ -142,8 +151,12 @@ export interface LintItemInput {
   tags?: string[];
   /** Requirements only: the architecture ids the item is realised by. */
   arch?: string[];
+  /** Plan 07a (D1): the declared domain the item names (`:DOMAIN:`). */
+  domain?: string;
   /** Requirements and constraints: the raw `:VERIFY:` strings. */
   verify?: string[];
+  /** Requirements and constraints: the `test final` verifies of `verify`. */
+  finalTests?: Array<{ name: string; file?: string; final: true }>;
   line?: number;
   archLine?: number;
   verifyLine?: number;
@@ -201,6 +214,18 @@ export interface LintPhaseInput {
   /** tt 09 (change 3): the phase's own `:CONSOLIDATE:` (`on`/`off`),
    * overriding the plan's `#+TT_CONSOLIDATE:`. */
   consolidate?: unknown;
+  /** Plan 07a (D1): the plan's declared domains (`#+TT_DOMAINS:`), carried
+   * onto every phase. Absent means domain mode is off. */
+  domains?: Domain[];
+  /** Plan 07c (D4): `#+TT_FIX_ROUNDS:` (`domains` switches fix rounds on),
+   * carried onto every phase. Kept open so lint can name a bad value. */
+  fixRounds?: unknown;
+  /** Plan 07c (D4): `#+TT_FIXERS:` — the most fixer tasks one fix round
+   * runs. Kept open so lint can name a bad value. */
+  fixers?: unknown;
+  /** Plan 07c (D4): `#+TT_FIX_CHECKS:` — the fast command a fixer's own
+   * commit must pass. */
+  fixChecks?: unknown;
 }
 
 export interface LintPlanInput {
@@ -279,6 +304,24 @@ export interface LintPlanInput {
   consolidate?: unknown;
   /** Lint-only: the 1-based line of `#+TT_CONSOLIDATE:`. */
   consolidateLine?: number;
+  /** Plan 07a (D1): the plan's `#+TT_DOMAINS:` — the declared domains, in
+   * declaration order. Absent means domain mode is off. */
+  domains?: Domain[];
+  /** Lint-only: the 1-based line of `#+TT_DOMAINS:`. */
+  domainsLine?: number;
+  /** Plan 07c (D4): the plan's `#+TT_FIX_ROUNDS:` — `domains` or a bad
+   * value. Kept as written so lint can name it. */
+  fixRounds?: unknown;
+  /** Lint-only: the 1-based line of `#+TT_FIX_ROUNDS:`. */
+  fixRoundsLine?: number;
+  /** Plan 07c (D4): the plan's `#+TT_FIXERS:`. */
+  fixers?: unknown;
+  /** Lint-only: the 1-based line of `#+TT_FIXERS:`. */
+  fixersLine?: number;
+  /** Plan 07c (D4): the plan's `#+TT_FIX_CHECKS:`. */
+  fixChecks?: unknown;
+  /** Lint-only: the 1-based line of `#+TT_FIX_CHECKS:`. */
+  fixChecksLine?: number;
   /** `#+TT_WORKER_PROMPT`: lane to the files appended to its worker. Kept
    * open (`unknown`) so a malformed value still reaches the linter. */
   workerPrompt?: Record<string, unknown>;
@@ -631,6 +674,32 @@ export function lintItems(phase: LintPhaseInput): LintFinding[] {
     } else {
       seen.set(id, item.line ?? 0);
     }
+    // Plan 07a (D1): in domain mode every R/A/C item names a declared domain.
+    if (phase.domains && phase.domains.length > 0) {
+      const names = phase.domains.map((d) => d.name);
+      const declared = new Set(names);
+      if (typeof item.domain !== "string" || item.domain.trim().length === 0) {
+        out.push(
+          finding(
+            "item-domain",
+            item,
+            item.line,
+            `the item ${id ?? "(no id)"} has no :DOMAIN:`,
+            `add :DOMAIN: <one of ${names.join(", ")}> (this plan declares #+TT_DOMAINS, so domain mode is on)`,
+          ),
+        );
+      } else if (!declared.has(item.domain)) {
+        out.push(
+          finding(
+            "item-domain",
+            item,
+            item.line,
+            `the item ${id ?? "(no id)"} names the undeclared domain ${item.domain}`,
+            `use one of the declared domains (${names.join(", ")}), or declare ${item.domain} in #+TT_DOMAINS`,
+          ),
+        );
+      }
+    }
     for (const raw of item.verify ?? []) {
       // Plan 06k2 (A5): a `:VERIFY:` kind the runtime cannot use (e.g.
       // `grep "x"`) is an error with the file and line, never silently read
@@ -651,6 +720,19 @@ export function lintItems(phase: LintPhaseInput): LintFinding[] {
       for (const v of parseVerify(raw)) {
         if (v.kind === "test" && v.name.trim().length === 0) {
           out.push(finding("item-verify", item, item.verifyLine ?? item.line, `a test verify has no name: ${JSON.stringify(raw)}`, 'write test "<the test name>" (the name as the test runner prints it), or drop the test kind'));
+        }
+        // A final-only test is resolved by the final checks, so a phase
+        // without any has nothing that would ever run it.
+        if (v.kind === "test" && v.final && !(phase.finalChecks ?? []).some((c) => c.trim().length > 0)) {
+          out.push(
+            finding(
+              "item-verify",
+              item,
+              item.verifyLine ?? item.line,
+              `a test final verify needs final checks, and this phase has none: ${JSON.stringify(raw)}`,
+              "declare #+TT_FINAL_CHECKS (or the phase's :FINAL_CHECKS:) that runs the test, or drop final",
+            ),
+          );
         }
       }
     }
@@ -752,6 +834,8 @@ export function lintPlan(plan: LintPlanInput): LintFinding[] {
     ...lintWorkerPrompt(plan),
     ...lintCheapFinalChecks(plan),
     ...lintConsolidate(plan),
+    ...lintDomains(plan),
+    ...lintFixRounds(plan),
   ];
   for (const phase of plan.phases ?? []) {
     const phaseId = phase.id ?? "?";
@@ -777,7 +861,11 @@ export function lintPlan(plan: LintPlanInput): LintFinding[] {
       }
     }
     for (const finding of lintPhaseSeats(phase, plan)) out.push(finding);
-    for (const finding of lintItems(phase)) out.push({ ...finding, sourceFile: plan.sourceFile });
+    // Plan 07a (D1): a hand-written JSON plan may declare the domains only at
+    // the plan level; the item rule reads the phase's effective list.
+    const phaseForDomains =
+      phase.domains === undefined && plan.domains && plan.domains.length > 0 ? { ...phase, domains: plan.domains } : phase;
+    for (const finding of lintItems(phaseForDomains)) out.push({ ...finding, sourceFile: plan.sourceFile });
     const acceptance = phase.acceptance ?? [];
     acceptance.forEach((item, i) => {
       const line = phase.acceptanceLines?.[i];
@@ -1074,6 +1162,97 @@ function consolidateFinding(keyword: string, value: unknown, phaseId: string, li
 export function lintConsolidate(plan: LintPlanInput): LintFinding[] {
   if (plan.consolidate === undefined || isConsolidateValue(plan.consolidate)) return [];
   return [consolidateFinding("#+TT_CONSOLIDATE:", plan.consolidate, "consolidate", plan.consolidateLine, plan.sourceFile)];
+}
+
+/** Plan 07a (D1): lint the declared domains. D1 says names are `[a-z0-9-]+`
+ * and unique, and each is `name=glob[,glob…]`; `domainDeclarationIssues` owns
+ * that grammar, so the linter and any other caller cannot drift. Absent means
+ * no domains and no findings. */
+export function lintDomains(plan: LintPlanInput): LintFinding[] {
+  const domains = plan.domains ?? (plan.phases ?? []).find((p) => p.domains && p.domains.length > 0)?.domains;
+  if (!domains || domains.length === 0) return [];
+  return domainDeclarationIssues(domains).map((problem) => ({
+    severity: "error" as const,
+    rule: "domain" as const,
+    phaseId: "domains",
+    item: problem,
+    line: plan.domainsLine,
+    sourceFile: plan.sourceFile,
+    problem,
+    fix: "write each domain as <name>=<glob>[,<glob>…] with a unique [a-z0-9-]+ name and at least one glob",
+  }));
+}
+
+/** Plan 07c (D4): lint the fix-round keywords. `#+TT_FIX_ROUNDS` needs
+ * `#+TT_DOMAINS` (there is nothing to group by without them) and its only
+ * value is `domains`; `#+TT_FIXERS` is a positive whole number. A plan
+ * without `#+TT_FIX_ROUNDS` is today's, whatever the other two say. */
+export function lintFixRounds(plan: LintPlanInput): LintFinding[] {
+  const out: LintFinding[] = [];
+  const fixRounds = plan.fixRounds ?? (plan.phases ?? []).find((p) => p.fixRounds !== undefined)?.fixRounds;
+  const domains = plan.domains ?? (plan.phases ?? []).find((p) => p.domains && p.domains.length > 0)?.domains;
+  if (fixRounds !== undefined) {
+    const value = typeof fixRounds === "string" ? fixRounds.trim() : fixRounds;
+    if (value !== "domains") {
+      out.push({
+        severity: "error",
+        rule: "fix-rounds",
+        phaseId: "fix-rounds",
+        item: `#+TT_FIX_ROUNDS: ${String(fixRounds)}`,
+        line: plan.fixRoundsLine,
+        sourceFile: plan.sourceFile,
+        problem: `#+TT_FIX_ROUNDS must be domains, got ${JSON.stringify(String(fixRounds))}`,
+        fix: "write #+TT_FIX_ROUNDS: domains (the only fix-round mode), or drop the keyword",
+      });
+    } else if (!domains || domains.length === 0) {
+      out.push({
+        severity: "error",
+        rule: "fix-rounds",
+        phaseId: "fix-rounds",
+        item: "#+TT_FIX_ROUNDS: domains",
+        line: plan.fixRoundsLine,
+        sourceFile: plan.sourceFile,
+        problem: "#+TT_FIX_ROUNDS: domains needs #+TT_DOMAINS: without declared domains there is nothing to group the fix findings by",
+        fix: "declare #+TT_DOMAINS: name=glob[,glob…] …, or drop #+TT_FIX_ROUNDS",
+      });
+    }
+    // Packet X: a fix round runs only after a lane round's pick, and a plan
+    // runs lane rounds only with two or more workers (the default is one).
+    // Each phase's own `:WORKERS:` wins over the plan's; a plan without
+    // phases is judged by its own count.
+    if (value === "domains") {
+      const whole = (n: unknown): number | undefined => (Number.isInteger(n) && (n as number) >= 1 ? (n as number) : undefined);
+      const planWorkers = whole(plan.workers) ?? 1;
+      const phases = plan.phases ?? [];
+      const counts = phases.length > 0 ? phases.map((p) => whole(p.workers) ?? planWorkers) : [planWorkers];
+      if (counts.some((n) => n < 2)) {
+        out.push({
+          severity: "error",
+          rule: "fix-rounds",
+          phaseId: "fix-rounds",
+          item: "#+TT_FIX_ROUNDS: domains",
+          line: plan.fixRoundsLine,
+          sourceFile: plan.sourceFile,
+          problem: "fix rounds run only in lane rounds; set #+TT_WORKERS: 2",
+          fix: "write #+TT_WORKERS: 2 (or more), or drop #+TT_FIX_ROUNDS",
+        });
+      }
+    }
+  }
+  const fixers = plan.fixers ?? (plan.phases ?? []).find((p) => p.fixers !== undefined)?.fixers;
+  if (fixers !== undefined && (!Number.isInteger(fixers) || (fixers as number) < 1)) {
+    out.push({
+      severity: "error",
+      rule: "fix-rounds",
+      phaseId: "fix-rounds",
+      item: `#+TT_FIXERS: ${String(fixers)}`,
+      line: plan.fixersLine,
+      sourceFile: plan.sourceFile,
+      problem: `#+TT_FIXERS must be a whole number of 1 or more, got ${String(fixers)}`,
+      fix: "write #+TT_FIXERS: 4 (the default), or a positive whole number of tasks",
+    });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

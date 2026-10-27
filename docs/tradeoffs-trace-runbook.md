@@ -602,6 +602,11 @@ its file and line.
 - `test "<name>"` (or `test <file>::<name>`): the test must exist and pass in
 the candidate's check run; the conductor matches it against the node test
 output. A missing or failed one is a blocking finding anchored to the item.
+- `test final "<name>"` (or `test final <file>::<name>`): a test the plan
+  runs only in `#+TT_FINAL_CHECKS` (a slow corpus gate). A round whose output
+  lacks it raises no finding and does not hold acceptance; the final checks
+  must show it passing, or they fail naming it. `tt lint` refuses it in a
+  phase with no final checks.
 - `review`: judged by the reviewers in turn 2. This is the default when
   `:VERIFY:` is absent.
 - `evidence`: the owner records it (`tt evidence <run> <item> <file-or-text>`

@@ -165,6 +165,35 @@
     (should (= (length cons) 2))
     (should (equal (mapcar (lambda (c) (alist-get 'id c)) cons) '("C1" "C2")))))
 
+(ert-deftest tradeoffs-trace-plan-final-tests ()
+  "`:VERIFY: test final' is carried into the plan JSON as `finalTests', each
+entry flagged `final: true'; an item without one carries no field."
+  (let* ((text (concat "#+TT_FINAL_CHECKS: make corpus\n"
+                       (replace-regexp-in-string
+                        (regexp-quote ":VERIFY:   test \"lanes: tally\"")
+                        ":VERIFY:   test final \"lanes: tally\" test final src/x.test.ts::gate test \"b\""
+                        +tt-test--structured-plan t t)))
+         (parsed (+tt-test--parse text))
+         (p1 (aref (alist-get 'phases (plist-get parsed :plan)) 0))
+         (reqs (alist-get 'requirements p1))
+         (r4 (aref reqs 3)))
+    (should (null (plist-get parsed :errors)))
+    (should (equal (alist-get 'verify r4)
+                   (vector "test final \"lanes: tally\" test final src/x.test.ts::gate test \"b\"")))
+    (should (equal (alist-get 'finalTests r4)
+                   (vector '((name . "lanes: tally") (final . t))
+                           '((name . "gate") (file . "src/x.test.ts") (final . t)))))
+    ;; JSON carries the flag as `true'.
+    (should (string-match-p "\"final\":true" (json-encode (alist-get 'finalTests r4))))
+    ;; R1 has a plain test verify: no field.
+    (should-not (assq 'finalTests (aref reqs 0))))
+  ;; The scan reads names whole and needs a bare `final' keyword.
+  (should (equal (+tt--final-tests "test \"my test final x\"") nil))
+  (should (equal (+tt--final-tests "test final::gate") nil))
+  (should (equal (+tt--final-tests "test final_gate") nil))
+  (should (equal (+tt--final-tests "test final acceptance::mark")
+                 '(((name . "acceptance::mark") (final . t))))))
+
 (ert-deftest tradeoffs-trace-plan-structured-schema-clean ()
   "Plan 06b (OD-1 R8): a parsed structured phase carries no null optional
 fields, and an old-format phase is marked synthesized so the conductor keeps

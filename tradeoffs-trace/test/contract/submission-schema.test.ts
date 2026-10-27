@@ -27,12 +27,15 @@ import { test } from "node:test";
 
 import {
   DECISION_DISCLOSURE_PARAMS,
+  REVIEW_BLOCKER_PARAMS,
+  REVIEW_FINDING_PARAMS,
   SUBMIT_BRIEF_PARAMS,
   SUBMIT_DISCOVERY_PARAMS,
   SUBMIT_PANEL_VOTE_PARAMS,
   SUBMIT_PHASE_PARAMS,
   SUBMIT_REVIEW_PARAMS,
 } from "../../extension/param-shapes.ts";
+import { validate } from "../../src/core/schema.ts";
 
 function loadJSON(relPath: string): Record<string, unknown> {
   return JSON.parse(readFileSync(new URL(relPath, import.meta.url), "utf8")) as Record<string, unknown>;
@@ -122,3 +125,52 @@ assertShapeMatchesSchema("submit_discovery", SUBMIT_DISCOVERY_PARAMS, submission
 assertShapeMatchesSchema("submit_review", SUBMIT_REVIEW_PARAMS, reviewSchema as unknown as { properties: Record<string, unknown>; required: string[] });
 assertShapeMatchesSchema("submit_panel_vote", SUBMIT_PANEL_VOTE_PARAMS, panelVoteSchema as unknown as { properties: Record<string, unknown>; required: string[] });
 assertShapeMatchesSchema("submit_brief", SUBMIT_BRIEF_PARAMS, decisionBriefSchema as unknown as { properties: Record<string, unknown>; required: string[] });
+
+// Plan 07a (D2): the nested finding/blocker shapes carry the six point fields
+// (domain, item, where, expected, doneWhen, from) in both the typebox params
+// and review.schema.json.
+const reviewProps = reviewSchema.properties as Record<string, { items: { properties: Record<string, unknown>; required: string[] } }>;
+assertShapeMatchesSchema("review.findings", REVIEW_FINDING_PARAMS, reviewProps.findings.items);
+assertShapeMatchesSchema("review.blockers", REVIEW_BLOCKER_PARAMS, reviewProps.blockers.items);
+
+const POINT_FIELDS = ["domain", "item", "where", "expected", "doneWhen", "from"];
+
+test("submit_review's finding and blocker params carry domain, item, where, expected, doneWhen and from", () => {
+  for (const field of POINT_FIELDS) {
+    assert.ok(REVIEW_FINDING_PARAMS.properties.includes(field), `FindingParam lists ${field}`);
+    assert.ok(REVIEW_BLOCKER_PARAMS.properties.includes(field), `BlockerParam lists ${field}`);
+    assert.ok(Object.keys(reviewProps.findings.items.properties).includes(field), `review.schema.json findings list ${field}`);
+    assert.ok(Object.keys(reviewProps.blockers.items.properties).includes(field), `review.schema.json blockers list ${field}`);
+  }
+  // The point fields are optional to the model: only kind/severity/evidence
+  // (finding) and kind/evidence (blocker) are required.
+  assert.deepEqual([...REVIEW_FINDING_PARAMS.required].sort(), ["evidence", "kind", "severity"]);
+  assert.deepEqual([...REVIEW_BLOCKER_PARAMS.required].sort(), ["evidence", "kind"]);
+});
+
+test("submission-schema: a review carrying the six point fields validates against review.schema.json", () => {
+  const review = {
+    reviewer: "M",
+    phaseId: "p1",
+    candidateSha: "c1",
+    contractVersion: { snapshot: 1, sectionSha256: "a".repeat(64) },
+    correctionStatements: [],
+    findingStatements: [],
+    findings: [
+      {
+        kind: "defect",
+        severity: "advisory",
+        evidence: "e",
+        domain: "booking",
+        item: "R1",
+        where: "src/b/x.ts:1 fn foo",
+        expected: "x",
+        doneWhen: "true",
+        from: { sha: "abc1234", paths: ["src/b/x.ts"] },
+      },
+    ],
+    blockers: [{ kind: "defect", evidence: "b", domain: "gates", item: "R2", where: "test/a.ts:1", expected: "y", doneWhen: "true" }],
+  };
+  const result = validate(reviewSchema, review);
+  assert.equal(result.valid, true, result.errors.join("; "));
+});

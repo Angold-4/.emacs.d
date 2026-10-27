@@ -191,7 +191,15 @@ function cloneCheckout(repo: string, sha: string, dir: string): void {
       // that diffs against a branch by name ("git diff feat/x--01a2") failed
       // with "bad revision" in every round (exex 01b1 run 75f19154). Give the
       // checkout the repo's branch names, as the repo itself has them.
-      git(["-C", dir, "fetch", "-q", "--update-head-ok", "origin", "+refs/heads/*:refs/heads/*"]);
+      // Best effort (packet X): a fetch that fails must not fail the
+      // checkout, which needs only the commit. The fallback names each
+      // `origin/<name>` the clone already has as a local branch, one at a
+      // time, skipping any that cannot be made.
+      try {
+        git(["-C", dir, "fetch", "-q", "--update-head-ok", "origin", "+refs/heads/*:refs/heads/*"]);
+      } catch {
+        localBranchesFromOrigin(dir);
+      }
       git(["-C", dir, "checkout", "-q", "--detach", sha]);
       return;
     } catch (err) {
@@ -199,6 +207,30 @@ function cloneCheckout(repo: string, sha: string, dir: string): void {
     }
   }
   throw lastError;
+}
+
+/** Packet X: the fallback when a check clone's branch fetch fails — each
+ * `refs/remotes/origin/<name>` (never `origin/HEAD`) becomes
+ * `refs/heads/<name>`, one at a time; a branch that cannot be made is
+ * skipped. Never throws. */
+function localBranchesFromOrigin(dir: string): void {
+  let refs: string;
+  try {
+    refs = git(["-C", dir, "for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes/origin/"]);
+  } catch {
+    return;
+  }
+  for (const line of refs.split("\n")) {
+    const [ref, sha] = line.trim().split(" ");
+    if (!ref || !sha) continue;
+    const name = ref.slice("refs/remotes/origin/".length);
+    if (name.length === 0 || name === "HEAD") continue;
+    try {
+      git(["-C", dir, "update-ref", `refs/heads/${name}`, sha]);
+    } catch {
+      // A name the clone cannot hold as a branch: skipped.
+    }
+  }
 }
 
 /** Collects regular files and directories under `root`, **never following
@@ -536,6 +568,42 @@ export function publishCAS(repo: string, branch: string, I: string, H: string): 
   if (attempt.ok) return { ok: true };
   const actualHead = git(["-C", repo, "rev-parse", ref]);
   return { ok: false, actualHead };
+}
+
+// ---------------------------------------------------------------------------
+// Plan 07c (D4.5): merge one fixer's commit into the fix worktree
+// ---------------------------------------------------------------------------
+
+/** Plan 07c (D4.5): merge one green fixer commit into `worktree` (a fresh
+ * worktree at the fix round's base) with `--no-ff`, using the same identity
+ * and no-hooks arguments `probe` uses. A conflict aborts the merge
+ * (`git merge --abort`) and returns the merge output; the worktree is left
+ * clean at whatever it held before. */
+export function mergeFixer(worktree: string, sha: string): { ok: true } | { ok: false; output: string } {
+  const merge = gitCapturingFailure(
+    [
+      "-C",
+      worktree,
+      ...IDENTITY_ARGS,
+      ...NO_HOOKS_ARGS,
+      "merge",
+      "--no-ff",
+      "--no-verify",
+      "-m",
+      `merge fixer commit ${sha}\n\nTT-Action: fix-merge-${sha}`,
+      sha,
+    ],
+    { cwd: worktree },
+  );
+  if (!merge.ok) {
+    try {
+      git(["-C", worktree, "merge", "--abort"]);
+    } catch {
+      // Nothing to abort, or already clean.
+    }
+    return { ok: false, output: merge.output };
+  }
+  return { ok: true };
 }
 
 // ---------------------------------------------------------------------------

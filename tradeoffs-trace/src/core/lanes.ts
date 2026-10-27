@@ -60,6 +60,9 @@ export interface LaneBuild {
   /** tt 09 (change 3): a consolidator's own report of what it changed beyond
    * the work it took (its submit_phase `deviations`). */
   added?: string[];
+  /** Plan 07c (C3): a consolidator/fixer commit with the base's own tree — it
+   * changed nothing, but its submission (disclosures) still counts. */
+  unchanged?: boolean;
 }
 
 /** One candidate's check result. `ok` false carries the note the status and
@@ -617,6 +620,32 @@ export function consolidatedBase(rounds: readonly RoundRecord[] | undefined, bef
   return c?.ok && typeof c.sha === "string" && c.sha.length > 0 && c.from === latest.picked!.sha ? c.sha : undefined;
 }
 
+/** Plan 07c (D4.7): the fix round that repairs `beforeRound`'s predecessor,
+ * when its merged candidate exists: the latest picked round before
+ * `beforeRound` whose fix step produced a candidate, and only when no round
+ * lies between it and `beforeRound`. Only the round IMMEDIATELY after the
+ * fixed round is a single-lane round on that candidate, checked from the fix
+ * round's base. A later round never replays it (packet X, B1): once a round
+ * ran on the candidate and picked nothing, the next is today's two-lane
+ * round from today's base. Undefined when the latest pick was not fixed, its
+ * fixers all failed, the pick regressed, or a round ran since. */
+export function fixRoundCandidate(
+  rounds: readonly RoundRecord[] | undefined,
+  beforeRound = Number.POSITIVE_INFINITY,
+): { candidate: string; base: string } | undefined {
+  let latest: RoundRecord | undefined;
+  for (const r of rounds ?? []) {
+    if (r.round >= beforeRound || !r.picked) continue;
+    if (!latest || r.round > latest.round) latest = r;
+  }
+  if (!latest || latest.regressed) return undefined;
+  const fixedRound = latest.round;
+  if ((rounds ?? []).some((r) => r.round > fixedRound && r.round < beforeRound)) return undefined;
+  const fixed = latest.fixed;
+  if (!fixed || typeof fixed.candidate !== "string" || fixed.candidate.length === 0) return undefined;
+  return { candidate: fixed.candidate, base: fixed.base };
+}
+
 /** How a consolidated commit is named in the views: `C2-a+b` (round 2's
  * winner a, with lane b's items). */
 export function consolidatedLabel(round: number, winnerLane: string, takes: readonly ConsolidationTake[]): string {
@@ -676,6 +705,13 @@ export interface ConsolidationOutcome {
   fixes: number;
   /** What the consolidator says it changed beyond the taken work. */
   added?: string[];
+  /** Plan 07c (C3): the consolidator's/fixer's own decision disclosures, so a
+   * fix round can carry them onto the merged candidate. */
+  disclosures?: DecisionDisclosure[];
+  /** Plan 07c (C3): the build changed nothing on the base (no commit), yet its
+   * submission is kept — the one failed outcome whose disclosures still
+   * reach the merged candidate. */
+  unchanged?: boolean;
   /** The owner stopped the run mid-way: nothing is recorded. */
   stopped?: boolean;
 }
@@ -695,7 +731,13 @@ export async function runConsolidation(host: ConsolidationHost): Promise<Consoli
   }
   if (host.stopRequested?.()) return { ok: false, fixes: 0, stopped: true };
   if (typeof build.sha !== "string" || build.sha.length === 0) {
-    return { ok: false, fixes: 0, note: build.note ?? "the consolidator produced no commit" };
+    return {
+      ok: false,
+      fixes: 0,
+      note: build.note ?? "the consolidator produced no commit",
+      ...submitted(build),
+      ...(build.unchanged === true ? { unchanged: true } : {}),
+    };
   }
   const check = async (sha: string): Promise<LaneCheck> => {
     try {
@@ -717,16 +759,47 @@ export async function runConsolidation(host: ConsolidationHost): Promise<Consoli
     }
     if (typeof fixed.sha !== "string" || fixed.sha.length === 0 || fixed.sha === build.sha) {
       fixNote = fixed.note;
+      build = { ...build, disclosures: unionDisclosures(build.disclosures, fixed.disclosures) };
       break;
     }
-    build = { ...fixed, added: fixed.added ?? build.added };
+    build = { ...fixed, added: fixed.added ?? build.added, disclosures: unionDisclosures(build.disclosures, fixed.disclosures) };
     result = await check(build.sha!);
   }
   if (host.stopRequested?.()) return { ok: false, fixes, stopped: true };
-  if (result.ok) return { ok: true, sha: build.sha, fixes, ...(build.added ? { added: build.added } : {}) };
+  if (result.ok) return { ok: true, sha: build.sha, fixes, ...submitted(build) };
   return {
     ok: false,
     fixes,
     note: `its commit ${build.sha!.slice(0, 7)} failed the round checks: ${result.note ?? "a check command failed"}${fixNote ? ` (${fixNote})` : ""}`,
+    ...submitted(build),
   };
+}
+
+/** Plan 07c (C3): what a consolidator's or fixer's submissions reported —
+ * kept on every outcome, a failed one included, so a fixer's disclosures are
+ * never lost with its commit. */
+function submitted(build: LaneBuild): Pick<ConsolidationOutcome, "added" | "disclosures"> {
+  return {
+    ...(build.added ? { added: build.added } : {}),
+    ...(build.disclosures && build.disclosures.length > 0 ? { disclosures: build.disclosures } : {}),
+  };
+}
+
+/** Plan 07c (C3): a fixer's decisions across its submissions (its build and
+ * each fix), in order, each once — a later submission that leaves out an
+ * earlier decision does not drop it. */
+function unionDisclosures(
+  earlier: readonly DecisionDisclosure[] | undefined,
+  later: readonly DecisionDisclosure[] | undefined,
+): DecisionDisclosure[] | undefined {
+  if (!earlier && !later) return undefined;
+  const seen = new Set<string>();
+  const out: DecisionDisclosure[] = [];
+  for (const d of [...(earlier ?? []), ...(later ?? [])]) {
+    const key = JSON.stringify(d);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(d);
+  }
+  return out;
 }

@@ -112,7 +112,22 @@
             "additionalProperties": false,
             "properties": { "command": { "type": "string", "minLength": 1 } }
           },
-          "runnable": { "type": "string", "minLength": 1 }
+          "runnable": { "type": "string", "minLength": 1 },
+          "domain": { "type": "string", "minLength": 1, "description": "Plan 07a (D2): the declared domain this point belongs to (required in domain mode)." },
+          "item": { "type": "string", "minLength": 1, "description": "Plan 07a (D2): the R/A/C id this point serves (required in domain mode)." },
+          "where": { "type": "string", "minLength": 1, "description": "Plan 07a (D2): `path:line symbol`." },
+          "expected": { "type": "string", "minLength": 1, "description": "Plan 07a (D2): what must be true, citing the design." },
+          "doneWhen": { "type": "string", "minLength": 1, "description": "Plan 07a (D2): a shell command that exits 0 exactly when the point is fixed (required in domain mode)." },
+          "from": {
+            "type": "object",
+            "description": "Plan 07a (D2): take the other lane's better work.",
+            "required": ["sha", "paths"],
+            "additionalProperties": false,
+            "properties": {
+              "sha": { "type": "string", "minLength": 1 },
+              "paths": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+            }
+          }
         }
       }
     },
@@ -143,7 +158,22 @@
             "additionalProperties": false,
             "properties": { "command": { "type": "string", "minLength": 1 } }
           },
-          "runnable": { "type": "string", "minLength": 1 }
+          "runnable": { "type": "string", "minLength": 1 },
+          "domain": { "type": "string", "minLength": 1, "description": "Plan 07a (D2): the declared domain this point belongs to (required in domain mode)." },
+          "item": { "type": "string", "minLength": 1, "description": "Plan 07a (D2): the R/A/C id this point serves (required in domain mode)." },
+          "where": { "type": "string", "minLength": 1, "description": "Plan 07a (D2): `path:line symbol`." },
+          "expected": { "type": "string", "minLength": 1, "description": "Plan 07a (D2): what must be true, citing the design." },
+          "doneWhen": { "type": "string", "minLength": 1, "description": "Plan 07a (D2): a shell command that exits 0 exactly when the point is fixed (required in domain mode)." },
+          "from": {
+            "type": "object",
+            "description": "Plan 07a (D2): take the other lane's better work.",
+            "required": ["sha", "paths"],
+            "additionalProperties": false,
+            "properties": {
+              "sha": { "type": "string", "minLength": 1 },
+              "paths": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+            }
+          }
         }
       }
     },
