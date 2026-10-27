@@ -127,8 +127,39 @@ test("plan 07e: a silent check is class silent and a check killed by a stop is i
     assert.equal(command.class, "interrupted", "a stop is not a failure");
     assert.equal(command.failureClass, "interrupted");
     assert.match(String(command.note), /interrupted/);
+    assert.match(String(command.note), /owner/, "an owner's stop says the owner stopped the run");
   } finally {
     cleanupDir(stopped.runRoot);
     cleanupDir(stopped.scriptsDir);
+  }
+
+  // 3. A stop the conductor asked for itself (a full disk, a terminal phase)
+  // is interrupted too, but it never claims the owner did it.
+  const selfStopped = await setupConductor({
+    checks: ["sleep 6"],
+    phaseChecks: ["sleep 30"],
+    rounds: 1,
+    stubReviews: true,
+    deadlines: { ...FAST, checkMs: 60_000 },
+    workerScript: () => quickWorker(),
+    reviewerScriptFor: (seat, state) => stubReviewer(seat, state),
+  });
+  try {
+    await selfStopped.conductor.start();
+    await waitFor(
+      () => readEvents(selfStopped.runDir).some((r) => r.kind === "intent" && String(r.actionId ?? "").startsWith("check-sh-")),
+      60_000,
+      50,
+      selfStopped.runDir,
+    );
+    await selfStopped.conductor.stop("conductor");
+    await waitFor(() => checkRecords(selfStopped.runDir).length > 0, 10_000, 50, selfStopped.runDir);
+    const command = (checkRecords(selfStopped.runDir)[0]!.commands as Array<Record<string, unknown>>)[0]!;
+    assert.equal(command.class, "interrupted", "a conductor stop is still not a failure");
+    assert.match(String(command.note), /conductor/, "the note names the stop the conductor itself asked for");
+    assert.doesNotMatch(String(command.note), /owner/, "a conductor self-stop never claims the owner stopped the run");
+  } finally {
+    cleanupDir(selfStopped.runRoot);
+    cleanupDir(selfStopped.scriptsDir);
   }
 });

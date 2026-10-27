@@ -1950,10 +1950,17 @@ async function cmdVerdict(
   const p = runPaths(runDir);
   const maskable = resolveSecrets(secretNames(plan.secrets)).maskable;
   const log = new EventLog(p.events, maskable);
+  let recorded = true;
   try {
-    log.append("event", event);
+    // Plan 07e (E4): a record the disk refused is not a recorded verdict.
+    recorded = log.append("event", event) !== undefined;
   } finally {
     log.close();
+  }
+  if (!recorded) {
+    process.stderr.write("tt: disk full — the verdict was not recorded\n");
+    process.exitCode = 1;
+    return;
   }
   const after = rebuildState(runDir, plan, { lenient: true });
   writeFileSync(p.messages, projectMessages(after.phase));
@@ -2465,10 +2472,18 @@ async function cmdEntry(positional: string[], root: string, reason: string | und
   const p = runPaths(runDir);
   const maskable = resolveSecrets(secretNames(plan.secrets)).maskable;
   const log = new EventLog(p.events, maskable);
+  let recorded = true;
   try {
-    for (const event of expanded.events) log.append("event", event);
+    // Plan 07e (E4): an entry change is recorded only when every one of its
+    // events reached the disk.
+    for (const event of expanded.events) if (log.append("event", event) === undefined) recorded = false;
   } finally {
     log.close();
+  }
+  if (!recorded) {
+    process.stderr.write("tt: disk full — the entry change was not fully recorded\n");
+    process.exitCode = 1;
+    return;
   }
   const after = rebuildState(runDir, plan, { lenient: true });
   const entryReview = projectEntryReview(

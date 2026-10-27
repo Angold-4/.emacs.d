@@ -39,11 +39,12 @@ test("plan 07e (E3): ENOSPC is reported once, fails the append visibly, and late
   const log = new EventLog(logPath, [], onDiskFull);
   try {
     const first = log.append("state", { a: 1 });
-    assert.equal(first.seq, 1, "the action still receives its record");
+    assert.equal(first, undefined, "a refused append hands back no record — the action failed, never 'recorded'");
     assert.equal(log.diskFull, true);
     assert.equal(log.droppedAppends, 1, "the append did not reach the disk — the action failed, not succeeded");
     assert.equal(onDiskFull.mock.callCount(), 1);
-    log.append("state", { a: 2 });
+    const second = log.append("state", { a: 2 });
+    assert.equal(second, undefined, "an append dropped while the disk stays full is not passed off as written");
     assert.equal(writeMock.mock.callCount(), 1, "no later append retries the full disk");
     assert.equal(onDiskFull.mock.callCount(), 1, "the notice is not repeated");
     assert.equal(log.droppedAppends, 2, "the dropped records are counted, never passed off as durable");
@@ -64,7 +65,8 @@ test("plan 07e (E4): the shutdown and final-failure records retry once after ENO
   try {
     log.append("state", { a: 1 });
     assert.equal(writeMock.mock.callCount(), 1);
-    log.appendCritical("stop", { reason: "conductor stopped" });
+    const critical = log.appendCritical("stop", { reason: "conductor stopped" });
+    assert.equal(critical, undefined, "a critical append the disk refused hands back no record either");
     // One bounded retry: two attempts for this record, never a loop.
     assert.equal(writeMock.mock.callCount(), 3, "the shutdown record is retried exactly once");
     assert.equal(log.droppedAppends, 3, "every failed attempt is counted");
@@ -88,7 +90,9 @@ test("plan 07e (E4): a shutdown record lands on disk when storage recovers after
   try {
     log.append("state", { a: 1 });
     assert.equal(log.diskFull, true);
-    log.appendCritical("stop", { reason: "conductor stopped" });
+    const critical = log.appendCritical("stop", { reason: "conductor stopped" });
+    assert.ok(critical, "a retry that landed hands back the durable record");
+    assert.equal(critical.seq, 2);
     assert.equal(log.diskFull, false, "the retried write landed, so the disk is writable again");
     assert.equal(log.droppedAppends, 1);
     log.close();
@@ -105,12 +109,14 @@ test("seq is monotonic within a session and across reopen", () => {
   const log1 = new EventLog(logPath);
   const r1 = log1.append("state", { a: 1 });
   const r2 = log1.append("state", { a: 2 });
+  assert.ok(r1 && r2, "both appends landed");
   assert.equal(r1.seq, 1);
   assert.equal(r2.seq, 2);
   log1.close();
 
   const log2 = new EventLog(logPath);
   const r3 = log2.append("state", { a: 3 });
+  assert.ok(r3, "the reopened log's append landed");
   assert.equal(r3.seq, 3);
   log2.close();
 
