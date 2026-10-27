@@ -8,8 +8,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { decisionFixPoint, fixTasks, FIXER_DUTY, otherTaskIndexLines, type DecisionFixPoint, type FixFinding } from "../../src/core/fix-rounds.ts";
-import { fixRoundCandidate } from "../../src/core/lanes.ts";
+import { decisionFixPoint, factKeepsOpen, fixTasks, FIXER_DUTY, otherTaskIndexLines, type DecisionFixPoint, type FixFinding } from "../../src/core/fix-rounds.ts";
+import { fixRoundCandidate, isFixRound } from "../../src/core/lanes.ts";
 import { lintPlan } from "../../src/core/plan-lint.ts";
 import { reduce } from "../../src/core/reduce.ts";
 import { validate } from "../../src/core/schema.ts";
@@ -386,4 +386,51 @@ test("an unclassified domain-mode point with a doneWhen is triaged fix (contract
     disposition({ itemId: point.id, source: "finding", impact: recordImpact(basePhase({ contract, findings: [noDone] }), point.id) }, evidenceForFinding(noDone, basePhase({ contract, findings: [noDone] }))).kind,
     "escalate",
   );
+});
+
+// exex 01c1a (2026-10-27, run f4d01766): the evaluator dropped confirmed domain
+// points as "already tracked by E-n" and the drop disproved them, so no fixer
+// got them. A point whose doneWhen fact fails on the candidate is kept open.
+test("factKeepsOpen keeps a domain point open while its doneWhen fact fails on the candidate", () => {
+  const point = {
+    id: "F-1",
+    version: 1,
+    phaseId: "p1",
+    kind: "defect",
+    severity: "blocking",
+    evidence: "booking/a.ts:1 wrong",
+    raisedBy: "A",
+    status: "open",
+    boundCandidateSha: "c1",
+    domain: "booking",
+    item: "R1",
+    where: "booking/a.ts:1 f",
+    expected: "right",
+    doneWhen: "test -f booking-fixed.txt",
+  } as Finding;
+  const fact = (exitCode: number | null, timedOut = false, candidateSha = "c1") => ({ findingId: "F-1", candidateSha, exitCode, timedOut, outputTail: "" });
+  assert.equal(factKeepsOpen(point, [fact(1)], "c1"), true, "a failing fact keeps it open");
+  assert.equal(factKeepsOpen(point, [fact(null, true)], "c1"), true, "a timed-out fact keeps it open");
+  assert.equal(factKeepsOpen(point, [fact(0)], "c1"), false, "a passing fact lets a drop close it");
+  assert.equal(factKeepsOpen(point, [fact(1, false, "c0")], "c1"), false, "a fact on another candidate says nothing");
+  assert.equal(factKeepsOpen(point, [], "c1"), false, "no fact: the drop applies as before");
+  assert.equal(factKeepsOpen({ ...point, doneWhen: undefined }, [fact(1)], "c1"), false, "not a domain point: as before");
+  assert.equal(factKeepsOpen({ ...point, domain: undefined }, [fact(1)], "c1"), false, "no domain: as before");
+  assert.equal(factKeepsOpen(point, [fact(1)], undefined), false, "no candidate: as before");
+});
+
+// exex 01b3p1 (2026-10-27, run cb38791b): ITEMS_REGRESSED undid a green fix
+// round's merged candidate and restarted every lane from round 1's pick.
+test("isFixRound marks the round that ran on a fix round's candidate, whose pick the regression guard never undoes", () => {
+  const picked = (round: number, sha: string, lanes = ["a", "b"]) => ({ round, base: "B0", lanes, candidates: [], picked: { lane: "a", sha, votes: 3 } });
+  const fixed1 = { ...picked(1, "P1"), fixed: { base: "P1", tasks: [], merges: [{ sha: "f1" }], candidate: "C" } };
+  // Round 2 ran on round 1's merged fixers: it is a fix round.
+  assert.equal(isFixRound([fixed1, picked(2, "C", ["a"])] as never, 2), true);
+  // A round after a round that was not fixed is an ordinary round.
+  assert.equal(isFixRound([picked(1, "P1"), picked(2, "P2")] as never, 2), false);
+  // A fix step with no merged candidate leaves the next round ordinary.
+  const noCandidate = { ...picked(1, "P1"), fixed: { base: "P1", tasks: [], merges: [] } };
+  assert.equal(isFixRound([noCandidate, picked(2, "P2")] as never, 2), false);
+  // Round 3, after the fix round, is ordinary again.
+  assert.equal(isFixRound([fixed1, picked(2, "C", ["a"]), picked(3, "P3")] as never, 3), false);
 });

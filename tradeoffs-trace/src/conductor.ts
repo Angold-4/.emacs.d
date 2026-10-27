@@ -51,6 +51,7 @@ import {
   runConsolidation,
   runRound,
   fixRoundCandidate,
+  isFixRound,
   type ConsolidationOutcome,
   type ConsolidationPlan,
   type LaneBuild,
@@ -167,6 +168,7 @@ import { whereKey, type Domain } from "./core/domains.ts";
 // Plan 07c (D4): the fix-round task rule and the fixer's fixed duty text.
 import {
   decisionFixPoint,
+  factKeepsOpen,
   DEFAULT_FIXERS,
   FIXER_DUTY,
   fixTasks,
@@ -5785,7 +5787,12 @@ export class Conductor {
         // Plan 05e (3c): an advisory finding the evaluator cannot confirm is
         // dropped with its reason, and the finding itself is disproved — it
         // never reaches the owner as an open defect.
-        if (sourceFinding && sourceFinding.status === "open") {
+        // 07 (reduce by facts): a domain point whose doneWhen still fails on
+        // the candidate is not disproved by a drop — the fact says the work is
+        // not done (e.g. the evaluator dropped it as "already tracked by
+        // E-n", a ledger entry, which no fixer reads). It stays open, so the
+        // fix round gets it; the dropped message keeps the owner's view clean.
+        if (sourceFinding && sourceFinding.status === "open" && !factKeepsOpen(sourceFinding, this.#state.phase.doneWhenFacts ?? [], this.#state.phase.candidate?.sha)) {
           events.push({ type: "FINDING_DISPROVED", findingId: sourceFinding.id, byReviewer: sourceFinding.raisedBy as Reviewer, evidence: reason });
         }
       } else {
@@ -8447,7 +8454,7 @@ export class Conductor {
     /** tt 09 (change 3): the consolidator — a worker by its tools, on the
      * `consolidator` model (`#+TT_MODELS consolidator=…`, else the leader
      * seat's). */
-    consolidation?: { round: number; worktree: string };
+    consolidation?: { round: number; worktree: string; fixer?: boolean };
   }): AgentHandle {
     let helloResolve!: (r: HelloResult) => void;
     const helloPromise = new Promise<HelloResult>((resolve) => {
@@ -8462,7 +8469,9 @@ export class Conductor {
       discoveryResolve = resolve;
     });
     fs.mkdirSync(opts.sessionDir, { recursive: true });
-    const providerModel = opts.consolidation
+    // A fixer (07c) is a mapper: it runs on the worker model, like a lane.
+    // Only the consolidator that combines the lanes runs on the leader's.
+    const providerModel = opts.consolidation && !opts.consolidation.fixer
       ? this.#providerModelFor?.("consolidator", this.#laneLeader())
       : opts.role === "worker"
         ? // Plan 06g2: `worker.1`/`worker.2` name a lane by its 1-based
@@ -9139,6 +9148,8 @@ export class Conductor {
      * consolidator's own wording differs from a fixer's). */
     changedNothingNote?: string;
     fix?: { of: string; timeoutMs: number };
+    /** A 07c fixer: runs on the worker model, not the consolidator's. */
+    fixer?: boolean;
   }): Promise<LaneBuild> {
     const { worktree, base, fix } = opts;
     try {
@@ -9163,7 +9174,7 @@ export class Conductor {
       sessionDir: opts.sessionDir,
       // It owes submit_phase only: no coverage turn (TT_ITEMS=0).
       env: { ...this.#laneEnv(worktree, this.#piEnvFor?.("worker", agentId) ?? {}), TT_ITEMS: "0" },
-      consolidation: { round: opts.round, worktree },
+      consolidation: { round: opts.round, worktree, ...(opts.fixer ? { fixer: true } : {}) },
       // A fix continues the session that holds the work; a first build (or a
       // restart's re-run) starts fresh.
       ...(fix ? {} : { freshSession: true }),
@@ -9388,6 +9399,7 @@ export class Conductor {
     return path.join(this.#runDir, "worktrees", `fix-${domain}`);
   }
 
+
   /** Fix packet Z: the fixer points of the decisions bound to `sha` (the
    * round's pick) — `decisionFixPoint` decides which (a non-reserved decision
    * whose vote failed or that the leader vetoed) and their domain; this only
@@ -9438,6 +9450,7 @@ export class Conductor {
           lane,
           logPrefix: "fixer",
           roleWord: `fixer ${task.domain}`,
+          fixer: true,
         }),
       check: (sha) => this.#checkFixer(task, round, sha),
       fix: async (sha, failure) => {
@@ -10960,6 +10973,12 @@ export class Conductor {
     }
     const items = regressedItems(guard.best, this.#itemOutcomes(), changed);
     if (items.length === 0) return;
+    // 07 (G2): a fix round's pick is never undone; the items it lost stay open
+    // as points (the conductor's item findings), so the next fix round gets them.
+    if (isFixRound(this.#state.phase.rounds, last.round)) {
+      this.#log.append("regression_skipped_fix_round", { round: last.round, items, sha: picked, best: guard.best.sha });
+      return;
+    }
     this.#log.append("items_regressed", { round: last.round, items, sha: picked, best: guard.best.sha, changed });
     this.#applyEvent({ type: "ITEMS_REGRESSED", round: last.round, items, sha: picked });
   }

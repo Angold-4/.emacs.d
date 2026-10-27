@@ -646,6 +646,17 @@ export function fixRoundCandidate(
   return { candidate: fixed.candidate, base: fixed.base };
 }
 
+/** 07 (reduce by facts, G2): true when `round` ran on a fix round's merged
+ * candidate — the round right after a fixed round. The regression guard never
+ * undoes such a round's pick: the fixers repaired points from the same base,
+ * and an item a seat now marks unmet is a point for the next fix round, not a
+ * reason to restart every lane from an older candidate (exex 01b3p1, run
+ * cb38791b: ITEMS_REGRESSED threw away a green fix round that added every
+ * missing test). */
+export function isFixRound(rounds: readonly RoundRecord[] | undefined, round: number): boolean {
+  return fixRoundCandidate(rounds, round) !== undefined;
+}
+
 /** How a consolidated commit is named in the views: `C2-a+b` (round 2's
  * winner a, with lane b's items). */
 export function consolidatedLabel(round: number, winnerLane: string, takes: readonly ConsolidationTake[]): string {
