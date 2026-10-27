@@ -51,6 +51,7 @@ import {
   runConsolidation,
   runRound,
   fixRoundCandidate,
+  isFixRound,
   type ConsolidationOutcome,
   type ConsolidationPlan,
   type LaneBuild,
@@ -10972,6 +10973,12 @@ export class Conductor {
     }
     const items = regressedItems(guard.best, this.#itemOutcomes(), changed);
     if (items.length === 0) return;
+    // 07 (G2): a fix round's pick is never undone; the items it lost stay open
+    // as points (the conductor's item findings), so the next fix round gets them.
+    if (isFixRound(this.#state.phase.rounds, last.round)) {
+      this.#log.append("regression_skipped_fix_round", { round: last.round, items, sha: picked, best: guard.best.sha });
+      return;
+    }
     this.#log.append("items_regressed", { round: last.round, items, sha: picked, best: guard.best.sha, changed });
     this.#applyEvent({ type: "ITEMS_REGRESSED", round: last.round, items, sha: picked });
   }
