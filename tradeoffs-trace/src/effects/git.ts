@@ -191,7 +191,15 @@ function cloneCheckout(repo: string, sha: string, dir: string): void {
       // that diffs against a branch by name ("git diff feat/x--01a2") failed
       // with "bad revision" in every round (exex 01b1 run 75f19154). Give the
       // checkout the repo's branch names, as the repo itself has them.
-      git(["-C", dir, "fetch", "-q", "--update-head-ok", "origin", "+refs/heads/*:refs/heads/*"]);
+      // Best effort (packet X): a fetch that fails must not fail the
+      // checkout, which needs only the commit. The fallback names each
+      // `origin/<name>` the clone already has as a local branch, one at a
+      // time, skipping any that cannot be made.
+      try {
+        git(["-C", dir, "fetch", "-q", "--update-head-ok", "origin", "+refs/heads/*:refs/heads/*"]);
+      } catch {
+        localBranchesFromOrigin(dir);
+      }
       git(["-C", dir, "checkout", "-q", "--detach", sha]);
       return;
     } catch (err) {
@@ -199,6 +207,30 @@ function cloneCheckout(repo: string, sha: string, dir: string): void {
     }
   }
   throw lastError;
+}
+
+/** Packet X: the fallback when a check clone's branch fetch fails — each
+ * `refs/remotes/origin/<name>` (never `origin/HEAD`) becomes
+ * `refs/heads/<name>`, one at a time; a branch that cannot be made is
+ * skipped. Never throws. */
+function localBranchesFromOrigin(dir: string): void {
+  let refs: string;
+  try {
+    refs = git(["-C", dir, "for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes/origin/"]);
+  } catch {
+    return;
+  }
+  for (const line of refs.split("\n")) {
+    const [ref, sha] = line.trim().split(" ");
+    if (!ref || !sha) continue;
+    const name = ref.slice("refs/remotes/origin/".length);
+    if (name.length === 0 || name === "HEAD") continue;
+    try {
+      git(["-C", dir, "update-ref", `refs/heads/${name}`, sha]);
+    } catch {
+      // A name the clone cannot hold as a branch: skipped.
+    }
+  }
 }
 
 /** Collects regular files and directories under `root`, **never following

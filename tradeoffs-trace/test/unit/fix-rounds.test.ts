@@ -177,12 +177,12 @@ test("ROUND_FIXED validates and makes the merged candidate the next round's sing
 });
 
 test("tt lint refuses TT_FIX_ROUNDS without TT_DOMAINS", () => {
-  const findings = lintPlan({ fixRounds: "domains", phases: [{ id: "p1", fixRounds: "domains" }] }).filter((f) => f.rule === "fix-rounds");
+  const findings = lintPlan({ fixRounds: "domains", workers: 2, phases: [{ id: "p1", fixRounds: "domains" }] }).filter((f) => f.rule === "fix-rounds");
   assert.equal(findings.length, 1);
   assert.equal(findings[0].severity, "error");
   assert.match(findings[0].problem, /needs #\+TT_DOMAINS/);
   // With domains declared it passes; without the keyword it is not checked.
-  assert.deepEqual(lintPlan({ fixRounds: "domains", domains: DOMAINS, phases: [] }).filter((f) => f.rule === "fix-rounds"), []);
+  assert.deepEqual(lintPlan({ fixRounds: "domains", workers: 2, domains: DOMAINS, phases: [] }).filter((f) => f.rule === "fix-rounds"), []);
   assert.deepEqual(lintPlan({ phases: [] }).filter((f) => f.rule === "fix-rounds"), []);
   // The only value is `domains`.
   const bad = lintPlan({ fixRounds: "all", domains: DOMAINS, phases: [] }).filter((f) => f.rule === "fix-rounds");
@@ -192,4 +192,33 @@ test("tt lint refuses TT_FIX_ROUNDS without TT_DOMAINS", () => {
   const badFixers = lintPlan({ fixers: 0, phases: [] }).filter((f) => f.rule === "fix-rounds");
   assert.equal(badFixers.length, 1);
   assert.match(badFixers[0].problem, /whole number of 1 or more/);
+});
+
+test("fixRoundCandidate serves only the round right after the fixed round, never a later one", () => {
+  const picked = (round: number, sha: string) => ({ round, base: "B0", lanes: ["a", "b"], candidates: [], picked: { lane: "a", sha, votes: 3 } });
+  const fixedRound = { ...picked(2, "P2"), fixed: { base: "B", tasks: [], merges: [{ sha: "f1" }], candidate: "C" } };
+  const rounds = [fixedRound, { round: 3, base: "C", lanes: ["a"], candidates: [] }] as never;
+  // Round 3 (right after the fixed round 2) runs on the merged candidate.
+  assert.deepEqual(fixRoundCandidate(rounds, 3), { candidate: "C", base: "B" });
+  // Round 3 ran on C and picked nothing: round 4 is today's round, not a
+  // replay of C (which would throw away round 3's lane-fix commit).
+  assert.equal(fixRoundCandidate(rounds, 4), undefined, "round 4 is not a synthetic round on C");
+  assert.equal(fixRoundCandidate(rounds, 5), undefined);
+  // A resumed, unfinished round 3 still reads its fix candidate.
+  assert.deepEqual(fixRoundCandidate([fixedRound] as never, 3), { candidate: "C", base: "B" });
+});
+
+test("tt lint refuses TT_FIX_ROUNDS with fewer than two workers", () => {
+  const rule = (plan: Record<string, unknown>) =>
+    lintPlan(plan as never).filter((f) => f.rule === "fix-rounds" && /lane rounds/.test(f.problem));
+  // No #+TT_WORKERS is one worker: fix rounds never run.
+  const absent = rule({ fixRounds: "domains", domains: DOMAINS, phases: [{ id: "p1", fixRounds: "domains" }] });
+  assert.equal(absent.length, 1, "TT_FIX_ROUNDS without TT_WORKERS is an error");
+  assert.equal(absent[0].severity, "error");
+  assert.match(absent[0].problem, /fix rounds run only in lane rounds; set #\+TT_WORKERS: 2/);
+  assert.equal(rule({ fixRounds: "domains", workers: 1, domains: DOMAINS, phases: [] }).length, 1, "one worker is an error");
+  assert.deepEqual(rule({ fixRounds: "domains", workers: 2, domains: DOMAINS, phases: [{ id: "p1", fixRounds: "domains" }] }), []);
+  // A phase's own two workers satisfy it; without the keyword nothing is checked.
+  assert.deepEqual(rule({ fixRounds: "domains", domains: DOMAINS, phases: [{ id: "p1", fixRounds: "domains", workers: 2 }] }), []);
+  assert.deepEqual(rule({ workers: 1, phases: [] }), []);
 });

@@ -1201,6 +1201,28 @@ export function lintFixRounds(plan: LintPlanInput): LintFinding[] {
         fix: "declare #+TT_DOMAINS: name=glob[,glob…] …, or drop #+TT_FIX_ROUNDS",
       });
     }
+    // Packet X: a fix round runs only after a lane round's pick, and a plan
+    // runs lane rounds only with two or more workers (the default is one).
+    // Each phase's own `:WORKERS:` wins over the plan's; a plan without
+    // phases is judged by its own count.
+    if (value === "domains") {
+      const whole = (n: unknown): number | undefined => (Number.isInteger(n) && (n as number) >= 1 ? (n as number) : undefined);
+      const planWorkers = whole(plan.workers) ?? 1;
+      const phases = plan.phases ?? [];
+      const counts = phases.length > 0 ? phases.map((p) => whole(p.workers) ?? planWorkers) : [planWorkers];
+      if (counts.some((n) => n < 2)) {
+        out.push({
+          severity: "error",
+          rule: "fix-rounds",
+          phaseId: "fix-rounds",
+          item: "#+TT_FIX_ROUNDS: domains",
+          line: plan.fixRoundsLine,
+          sourceFile: plan.sourceFile,
+          problem: "fix rounds run only in lane rounds; set #+TT_WORKERS: 2",
+          fix: "write #+TT_WORKERS: 2 (or more), or drop #+TT_FIX_ROUNDS",
+        });
+      }
+    }
   }
   const fixers = plan.fixers ?? (plan.phases ?? []).find((p) => p.fixers !== undefined)?.fixers;
   if (fixers !== undefined && (!Number.isInteger(fixers) || (fixers as number) < 1)) {

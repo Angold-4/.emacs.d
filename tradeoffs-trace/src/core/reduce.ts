@@ -800,6 +800,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         exitCode: event.exitCode,
         timedOut: event.timedOut,
         outputTail: event.outputTail,
+        ...(typeof event.passesOnBase === "boolean" ? { passesOnBase: event.passesOnBase } : {}),
       };
       const others = (p.doneWhenFacts ?? []).filter(
         (f) => !(f.findingId === fact.findingId && f.candidateSha === fact.candidateSha),

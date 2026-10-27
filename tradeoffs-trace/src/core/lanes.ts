@@ -618,11 +618,14 @@ export function consolidatedBase(rounds: readonly RoundRecord[] | undefined, bef
 }
 
 /** Plan 07c (D4.7): the fix round that repairs `beforeRound`'s predecessor,
- * when its merged candidate exists. Like `consolidatedBase`: the latest
- * picked round before `beforeRound` whose fix step produced a candidate. The
- * next round is then a single-lane round on that candidate, checked from the
- * fix round's base. Undefined when the latest pick was not fixed, its fixers
- * all failed, or the pick regressed. */
+ * when its merged candidate exists: the latest picked round before
+ * `beforeRound` whose fix step produced a candidate, and only when no round
+ * lies between it and `beforeRound`. Only the round IMMEDIATELY after the
+ * fixed round is a single-lane round on that candidate, checked from the fix
+ * round's base. A later round never replays it (packet X, B1): once a round
+ * ran on the candidate and picked nothing, the next is today's two-lane
+ * round from today's base. Undefined when the latest pick was not fixed, its
+ * fixers all failed, the pick regressed, or a round ran since. */
 export function fixRoundCandidate(
   rounds: readonly RoundRecord[] | undefined,
   beforeRound = Number.POSITIVE_INFINITY,
@@ -633,6 +636,8 @@ export function fixRoundCandidate(
     if (!latest || r.round > latest.round) latest = r;
   }
   if (!latest || latest.regressed) return undefined;
+  const fixedRound = latest.round;
+  if ((rounds ?? []).some((r) => r.round > fixedRound && r.round < beforeRound)) return undefined;
   const fixed = latest.fixed;
   if (!fixed || typeof fixed.candidate !== "string" || fixed.candidate.length === 0) return undefined;
   return { candidate: fixed.candidate, base: fixed.base };

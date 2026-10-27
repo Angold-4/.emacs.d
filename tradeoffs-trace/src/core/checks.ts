@@ -284,6 +284,8 @@ export interface CheckRecordFact {
   exitCode: number | null;
   timedOut: boolean;
   outputTail: string;
+  /** Packet X: whether the doneWhen also exits 0 on the round's base. */
+  passesOnBase?: boolean;
 }
 
 /** `checks/<sha>/record.json`: what one candidate's check run did, which tier
@@ -363,7 +365,13 @@ function parseCheckRecordFacts(value: unknown[]): CheckRecordFact[] {
     if (typeof f.timedOut !== "boolean") continue;
     if (f.exitCode !== null && !isNumber(f.exitCode)) continue;
     if (typeof f.outputTail !== "string") continue;
-    out.push({ findingId: f.findingId, exitCode: f.exitCode as number | null, timedOut: f.timedOut, outputTail: f.outputTail });
+    out.push({
+      findingId: f.findingId,
+      exitCode: f.exitCode as number | null,
+      timedOut: f.timedOut,
+      outputTail: f.outputTail,
+      ...(typeof f.passesOnBase === "boolean" ? { passesOnBase: f.passesOnBase } : {}),
+    });
   }
   return out;
 }
