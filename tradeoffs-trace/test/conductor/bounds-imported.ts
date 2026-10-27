@@ -839,16 +839,20 @@ test("an owner request open past its bound sends a reminder and decides nothing"
 // an already-due reminder by restarting the countdown.
 test("a resumed owner wait keeps its elapsed wait and reminds on the bound instead of restarting the clock", async () => {
   const ownerWaitMs = 6_000;
-  const setup = await setupFailingRun({ ownerWaitMs, inboxPollMs: 100 });
+  let nowMs = Date.now();
+  const setup = await setupFailingRun({ ownerWaitMs, inboxPollMs: 100 }, () => nowMs);
   let resumed: Conductor | undefined;
   try {
     await setup.conductor.start();
     await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 240_000, 50, setup.runDir);
+    const parkStart = nowMs;
+    const bounds = () => coreEvents(setup.runDir).filter((e) => e.type === "BOUND_REACHED" && e.kind === "owner-wait");
+    assert.equal(bounds().length, 0, "no reminder before the park passes its bound");
+
+    // Stop before the bound; the restart must not give the wait a new clock.
+    nowMs = parkStart + 300;
     await setup.conductor.stop();
-    const before = coreEvents(setup.runDir).filter((e) => e.type === "BOUND_REACHED" && e.kind === "owner-wait").length;
-    assert.equal(before, 0, "no reminder before the park passes its bound");
-    // Let the original park pass its bound while the conductor is stopped.
-    await sleep(ownerWaitMs + 500);
+    nowMs = parkStart + 500;
     resumed = new Conductor({
       runDir: setup.runDir,
       plan: setup.plan as RunPlanFile,
@@ -857,13 +861,25 @@ test("a resumed owner wait keeps its elapsed wait and reminds on the bound inste
       stubReviews: true,
       deadlines: { ...FAST, checkMs: 10_000, ownerWaitMs, inboxPollMs: 100 },
       checkLockPath: path.join(setup.runRoot, "check.lock"),
+      now: () => nowMs,
     });
-    const restartedAt = Date.now();
     await resumed.start();
-    // The resumed park is already past its bound: the reminder is due now, not
-    // one whole bound after the restart.
-    await waitFor(() => coreEvents(setup.runDir).filter((e) => e.type === "BOUND_REACHED" && e.kind === "owner-wait").length > before, 3_000, 50, setup.runDir);
-    assert.ok(Date.now() - restartedAt < ownerWaitMs, "the reminder followed the original park, not a restarted clock");
+    await sleep(300);
+    assert.equal(bounds().length, 0, "the restart at t0+500 has not reached the bound");
+
+    // One millisecond before the original wait's bound: still nothing.
+    nowMs = parkStart + ownerWaitMs - 1;
+    await sleep(300);
+    assert.equal(bounds().length, 0, "the bound is counted from the original wait start, not the restart");
+
+    // At the original bound, exactly one BOUND_REACHED and its elapsed wait.
+    nowMs = parkStart + ownerWaitMs;
+    await waitFor(() => bounds().length === 1, 10_000, 50, setup.runDir);
+    const bound = bounds()[0]!;
+    assert.equal(bound.limitMs, ownerWaitMs);
+    assert.equal(bound.elapsedMs, ownerWaitMs, "the bound is counted from the original wait start");
+    await sleep(300);
+    assert.equal(bounds().length, 1, "exactly one bound is recorded");
     assert.equal(resumed.state.phase.phase, "AWAITING_OWNER", "the reminder decides nothing");
     assert.ok(resumed.state.phase.ownerRequests.some((r) => r.status === "open"));
   } finally {
