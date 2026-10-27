@@ -1344,10 +1344,11 @@ test("plan-items: a met verdict citing a line that does not exist is refused; an
   }
 });
 
-test("plan 06c: a thin unanimous met verdict is sent to the evaluator as an item check and never withdrawn by code", async () => {
-  const promptLog = `/tmp/tt-06c-thin-${process.pid}-${Date.now()}.txt`;
+test("plan 07f (A-2): a thin unanimous met verdict is mechanically accepted and starts no evaluator", async () => {
+  const promptLog = `/tmp/tt-07f-thin-${process.pid}-${Date.now()}.txt`;
   // Every seat judges every item met/fits with a single anchor (the review()
-  // default), so each item is a thin unanimous met/fits.
+  // default), so each item is thin — but the seats are unanimous and the
+  // anchor resolves, so code decides it without an evaluator session.
   const setup = await setupConductor({
     items: ITEMS,
     phaseChecks: [CHECK_OUTPUT],
@@ -1363,69 +1364,26 @@ test("plan 06c: a thin unanimous met verdict is sent to the evaluator as an item
       ],
     }),
     reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({})),
-    // The evaluator is asked to audit the thin met items; it contradicts R2
-    // with valid anchors, which overturns the met verdict.
     evaluatorScriptFor: () => ({
       hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
-      steps: [
-        {
-          kind: "call-submit",
-          tool: "submit_evaluation",
-          args: {
-            evaluations: [],
-            itemChecks: [
-              { id: "R2", verdict: "contradicted", evidence: "src/core/rounds.ts:1 does not implement R2" },
-              { id: "R1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
-              { id: "C1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
-              { id: "A1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
-            ],
-          },
-        },
-      ],
+      steps: [{ kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [] } }],
     }),
   });
   try {
     await setup.conductor.start();
-    // The audit is listed in the evaluator's prompt.
-    await waitFor(() => fs.existsSync(promptLog) && fs.readFileSync(promptLog, "utf8").includes("Plan-item re-check"), 90_000, 50, setup.runDir);
-    const prompts = fs.readFileSync(promptLog, "utf8");
-    assert.match(prompts, /Plan-item re-check/);
-    assert.match(prompts, /- R2 .*thin unanimous evidence/, "the thin met R2 is an owed item check");
-    // The evaluator's contradiction overturns the thin met verdict (it is the
-    // evaluator's check, never the code, that withdrew it).
-    await waitFor(() => (setup.conductor.state.phase.overturns ?? []).some((o) => o.id === "R2"), 90_000, 50, setup.runDir);
-    const overturn = (setup.conductor.state.phase.overturns ?? []).find((o) => o.id === "R2")!;
-    assert.equal(overturn.effect, "flip");
-    assert.match(overturn.reason, /thin met verdict/);
-    assert.ok((setup.conductor.state.phase.itemChecks ?? []).some((c) => c.itemId === "R2" && c.verdict === "contradicted"));
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
+    const events = readEvents(setup.runDir).filter((r) => r.kind === "event").map((r) => (r.event as { type?: string }).type);
+    assert.ok(events.includes("EVALUATION_SKIPPED"), "no exception: the mechanical verdict stands");
+    assert.ok(
+      !readEvents(setup.runDir).some(
+        (r) => r.kind === "intent" && (r.event as { agentId?: string }).agentId?.startsWith("evaluator-"),
+      ),
+      "thin evidence alone starts no evaluator",
+    );
+    assert.deepEqual(setup.conductor.state.phase.overturns ?? [], [], "code never withdraws a thin met verdict");
   } finally {
     await teardown(setup);
     fs.rmSync(promptLog, { force: true });
-  }
-
-  // Control: with no contradiction the thin met verdict is never withdrawn by
-  // code — the phase reaches DONE with R2 still met.
-  const control = await setupConductor({
-    items: ITEMS,
-    phaseChecks: [CHECK_OUTPUT],
-    stubReviews: false,
-    deadlines: FAST,
-    workerScript: () => ({
-      hello: defaultWorkerHello(),
-      steps: [
-        { kind: "call-sh", command: WRITE_ROUNDS },
-        { kind: "call-submit", tool: "submit_coverage", args: coverage() },
-        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
-      ],
-    }),
-    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({})),
-  });
-  try {
-    await control.conductor.start();
-    await waitFor(() => control.conductor.state.phase.phase === "DONE", 120_000, 50, control.runDir);
-    assert.deepEqual(control.conductor.state.phase.overturns ?? [], [], "code never withdraws a thin met verdict");
-  } finally {
-    await teardown(control);
   }
 });
 

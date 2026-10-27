@@ -18,11 +18,11 @@ import { parseWorkerPromptRecord, workerPromptLineText } from "./core/worker-pro
 import { modelsCheckStatusText, parseModelsCheck, type ModelsCheck } from "./core/models-check.ts";
 // Plan 01f: the gate stage's own record (the conductor's live proof).
 import { gateOutcomeText, parseGateRecord, type GateRecord } from "./core/gate.ts";
-import { decisionStatus, isLiveDecision } from "./core/predicate.ts";
+import { acceptanceBlockers, decisionStatus, isLiveDecision } from "./core/predicate.ts";
 import { baselineCoversCommands, baselineStatusLine, parseBaseline, type Baseline } from "./core/test-failures.ts";
 // Plan 05i: the environment block's one-line reason and the resolved tool rows.
 import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
-import { notAcceptedReasons, reviewerOutcomes, tradeoffEntries, type ReviewerOutcome, type TradeoffEntry } from "./core/verdict.ts";
+import { reviewerOutcomes, tradeoffEntries, type ReviewerOutcome, type TradeoffEntry } from "./core/verdict.ts";
 import { countsLine, isStructured, matrixMarkdown, overturnCounts, phaseItemCounts } from "./core/items.ts";
 // Plan 05c: the status view's `review' row is counted from the same messages
 // the review renderer shows, so the two views never disagree.
@@ -756,7 +756,9 @@ export function buildView(
   const repairing = (stage === "implement" && phase.attempt.n > 1) || stage === "needs you";
   const C = phase.candidate?.sha;
   const reviewers = reviewerOutcomes(phase);
-  const reasons = notAcceptedReasons(phase);
+  // Plan 07f (F1/C3): the status reads the ONE blocker list and ends each
+  // blocker line with the command that clears it.
+  const reasons = acceptanceBlockers(phase).map((b) => `${b.detail} — ${b.command}`);
   // Plan 06n (A6): the header's round is the round of the last ROUND_STARTED,
   // so it always equals the events. The old `timeline.rounds.length + 1`
   // inferred it from completed freezes, which drifts when a round was

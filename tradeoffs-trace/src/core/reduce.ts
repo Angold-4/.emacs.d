@@ -31,6 +31,7 @@ import {
   recordRulings,
 } from "./owner-commands.ts";
 import { isLiveDecision, panelOutcome, panelSeatNumbers, panelSeatSettled, panelSeatsSettled, reviewIngestionIssue, sameVersion } from "./predicate.ts";
+import { factKeepsOpen } from "./fix-rounds.ts";
 import { seatsOf } from "./seats.ts";
 import { findOwnerRequest } from "./triage.ts";
 import { rowsFor } from "./transitions.ts";
@@ -832,6 +833,15 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       }
       if (!event.evidence || event.evidence.trim().length === 0) {
         return rejected(state, `finding ${event.findingId} repaired by evaluator requires the evidence anchor`);
+      }
+      // Plan 07f (F0/A2/R5): the evaluator never closes a point whose
+      // doneWhen fact fails or times out on the current candidate. The fact
+      // is the proof; an evaluator's `repaired` entry is not one.
+      if (factKeepsOpen(finding, p.doneWhenFacts ?? [], event.candidateSha)) {
+        return rejected(
+          state,
+          `finding ${event.findingId} has a failing doneWhen fact on candidate ${event.candidateSha}; the evaluator cannot close it`,
+        );
       }
       const findings = p.findings.map((f) =>
         f.id === event.findingId ? { ...f, status: "repaired" as const, repairedByCandidateSha: event.candidateSha } : f,

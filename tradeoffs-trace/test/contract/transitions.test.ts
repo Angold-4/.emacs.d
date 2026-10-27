@@ -450,9 +450,9 @@ const BUILD: Record<string, Fixture> = {
       checks: { candidateSha: "C1", passed: true },
       probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
       reviews: {
-        M: { review: { ...approvingReview("M", "C1", K), items: [{ id: "R1", verdict: "met", evidence: "src/x.ts:1" }] } },
-        A: { review: { ...approvingReview("A", "C1", K), items: [{ id: "R1", verdict: "met", evidence: "src/x.ts:1" }] } },
-        B: { review: { ...approvingReview("B", "C1", K), items: [{ id: "R1", verdict: "met", evidence: "src/x.ts:1" }] } },
+        M: { review: { ...approvingReview("M", "C1", K), items: [{ id: "R1", verdict: "met", evidence: "README.md:1" }] } },
+        A: { review: { ...approvingReview("A", "C1", K), items: [{ id: "R1", verdict: "met", evidence: "README.md:1" }] } },
+        B: { review: { ...approvingReview("B", "C1", K), items: [{ id: "R1", verdict: "met", evidence: "README.md:1" }] } },
       },
       itemEvidence: [{ id: "R1", text: "recorded" }],
       ownerRequests: [

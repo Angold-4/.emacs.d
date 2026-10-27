@@ -29,13 +29,15 @@
 // itself, or directly) rather than re-deriving the same facts — round-1
 // review item 5's last bullet: openItemsRemain must not reimplement this.
 
+import { readFileSync } from "node:fs";
+
 import { leaderOf, seatsOf } from "./seats.ts";
 import { currentBallot, isValidBallot, tally } from "./tally.ts";
 import type { Domain } from "./domains.ts";
 // Plan 06b: the per-item acceptance half — every R and C met by majority with
 // its test verifies passed, every A fitting by majority or its deviation
 // accepted by the owner, and every evidence item recorded.
-import { evidenceFileAnchors, flatItems, isStructured, itemNeedsEvidence, itemsFromPhase, phaseItemOutcomes, testVerifyProblems, thinMetItems, workerAnchorsOf } from "./items.ts";
+import { evidenceFileAnchors, evidenceHasAnchor, flatItems, isStructured, itemNeedsEvidence, itemsFromPhase, phaseItemOutcomes, testVerifyProblems } from "./items.ts";
 import { factKeepsOpen } from "./fix-rounds.ts";
 import {
   blockingTriageRecords,
@@ -206,9 +208,9 @@ export function itemsNeedingEvaluatorReverify(phase: PhaseState): boolean {
   // Plan 07f (F0): the seats split on an item — at least one says met/fits
   // and at least one does not. The mechanical majority still decides the
   // verdict, but the split is exactly what the evaluator exists to resolve.
-  if (outcomes.some(itemIsSplit)) return true;
-  // Plan 06c (R5): a unanimous thin met/fits is audited by the evaluator.
-  return thinMetItems(outcomes, workerAnchorsOf(phase.coverage)).length > 0;
+  // A unanimous met/fits item with resolving anchors is mechanically decided:
+  // thin evidence alone never starts an evaluator session (plan 07f A-2).
+  return outcomes.some(itemIsSplit);
 }
 
 /** True when the seats do not unanimously agree on an item's required
@@ -656,8 +658,70 @@ export function shortId(id: string): string {
   return `${m[1]}-${tail}`;
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/** A decision-view owner command through `tt input`'s ONE writer. `tt input`
+ * reads its JSON from the file in its second positional or, when none is
+ * given, from stdin — never inline in argv — so the clearing command pipes
+ * the payload. */
 function inputCommand(phase: PhaseState, payload: Record<string, unknown>): string {
-  return `tt input ${phase.runId} '${JSON.stringify(payload)}'`;
+  return `printf %s ${shellQuote(JSON.stringify(payload))} | tt input ${phase.runId}`;
+}
+
+function recordBinding(
+  phase: PhaseState,
+  candidateSha: string,
+  contractVersion: ContractVersion,
+  recordId: string,
+  recordVersion: number,
+) {
+  return { runId: phase.runId, phaseId: phase.phaseId, recordId, candidateSha, recordVersion, contractVersion };
+}
+
+function overrideCommand(phase: PhaseState, C: string, K: ContractVersion, decision: Decision): string {
+  return inputCommand(phase, {
+    type: "override",
+    vote: "approve",
+    binding: recordBinding(phase, C, K, decision.id, decision.version),
+  });
+}
+
+function resolveCommand(phase: PhaseState, C: string, K: ContractVersion, request: PhaseState["ownerRequests"][number]): string {
+  const option =
+    request.options.find((o) => o.id === "repair")?.id ?? request.options.find((o) => o.id === "accept_risk")?.id ?? request.options[0]?.id ?? "repair";
+  return inputCommand(phase, {
+    type: "resolve",
+    option,
+    binding: recordBinding(phase, C, K, request.id, request.version),
+  });
+}
+
+function acceptFindingCommand(phase: PhaseState, C: string, K: ContractVersion, finding: { id: string; version: number }): string {
+  return inputCommand(phase, {
+    type: "accept-finding",
+    scope: "trade-off",
+    binding: recordBinding(phase, C, K, finding.id, finding.version),
+  });
+}
+
+/** A2/C1: the review-lint anchor check applied to one seat's item evidence:
+ * a file:line-range must resolve in the candidate (in range), while a test
+ * name or a command the reviewer ran is an anchor by itself. A bare
+ * file:line token that names no candidate file is not an anchor. */
+function seatAnchorResolves(evidence: string): boolean {
+  if (!evidenceHasAnchor(evidence)) return false;
+  const anchors = evidenceFileAnchors(evidence);
+  if (anchors.length === 0) return true;
+  return anchors.every((a) => {
+    try {
+      const lines = readFileSync(a.path, "utf8").split("\n").length;
+      return a.start >= 1 && a.end <= lines;
+    } catch {
+      return false;
+    }
+  });
 }
 
 /** Plan 07f (F1): every condition `accept` requires, in one list. The
@@ -728,10 +792,13 @@ function acceptanceBlockersFor(phase: PhaseState, C: string, K: ContractVersion)
     // owner must accept before acceptance, whatever the seats said.
     for (const id of phase.archSymbolDeviations ?? []) {
       if (acceptedDeviations.has(id)) continue;
+      const deviationFinding = phase.findings.find((f) => f.itemId === id);
       blockers.push({
         kind: "symbol-deviation",
         detail: `architecture symbol deviation ${id} is not accepted`,
-        command: inputCommand(phase, { type: "accept-deviation", binding: { recordId: id } }),
+        command: deviationFinding
+          ? acceptFindingCommand(phase, C, K, deviationFinding)
+          : `tt resume ${phase.runId}`,
       });
     }
     evidenceRecorded = (phase.itemEvidence ?? []).map((e) => e.id);
@@ -741,7 +808,7 @@ function acceptanceBlockersFor(phase: PhaseState, C: string, K: ContractVersion)
       blockers.push({
         kind: "evidence",
         detail: `evidence for ${item.id} has not been recorded`,
-        command: inputCommand(phase, { type: "evidence", binding: { recordId: item.id } }),
+        command: `tt evidence ${phase.runId} ${item.id} ${shellQuote(`evidence for ${item.id}`)}`,
       });
     }
   }
@@ -756,7 +823,7 @@ function acceptanceBlockersFor(phase: PhaseState, C: string, K: ContractVersion)
       blockers.push({
         kind: "carry",
         detail: `the carried-items acceptance is for ${phase.carriedCandidateSha ?? "another candidate"}, not ${C}`,
-        command: inputCommand(phase, { type: "carry", binding: { candidateSha: C } }),
+        command: `tt resume ${phase.runId}`,
       });
     }
     return blockers;
@@ -790,7 +857,7 @@ function acceptanceBlockersFor(phase: PhaseState, C: string, K: ContractVersion)
       const outcome = outcomes.find((o) => o.item.id === item.id);
       const required = item.kind === "architecture" ? "fits" : "met";
       const resolving = outcome
-        ? outcome.seats.filter((s) => s.verdict === required && evidenceFileAnchors(s.evidence).length > 0).length
+        ? outcome.seats.filter((s) => s.verdict === required && seatAnchorResolves(s.evidence)).length
         : 0;
       if (resolving >= needed) continue;
       const split = outcome ? itemIsSplit(outcome) : false;
@@ -800,7 +867,7 @@ function acceptanceBlockersFor(phase: PhaseState, C: string, K: ContractVersion)
           `${item.id} is ${outcome?.outcome ?? "incomplete"}` +
           (split ? " (the seats split on it)" : "") +
           (outcome && outcome.seats.some((s) => s.verdict === required) ? " without a majority of resolving anchors" : ""),
-        command: inputCommand(phase, { type: "note", text: `meet ${item.id}` }),
+        command: `tt resume ${phase.runId}`,
       });
     }
   }
@@ -814,20 +881,30 @@ function acceptanceBlockersFor(phase: PhaseState, C: string, K: ContractVersion)
   const open = openFindings(phase);
   const pointIds = new Set<string>();
   const pointsByDomain = new Map<string, string[]>();
+  const pointFindings = new Map<string, import("./types.ts").Finding>();
   for (const finding of open) {
     if (!finding.domain && !finding.doneWhen) continue;
     const proves = pointHasProvingFact(phase, finding);
-    const approved = findingDispositionIsTradeoff(phase.triage, finding.id);
-    if (!factKeepsOpen(finding, facts, C) && (proves || approved)) continue;
+    // Plan 07f (F0/A1): a point is closed by a proving fact (or a domain
+    // review that the conductor records as a closed finding). An evaluator's
+    // trade-off triage record alone is not a closure — the owner accepts the
+    // finding, or the fact/domain review proves it.
+    if (!factKeepsOpen(finding, facts, C) && proves) continue;
     pointIds.add(finding.id);
+    pointFindings.set(finding.id, finding);
     const key = finding.domain ?? "ungrouped";
-    pointsByDomain.set(key, [...(pointsByDomain.get(key) ?? []), shortId(finding.id)]);
+    pointsByDomain.set(key, [...(pointsByDomain.get(key) ?? []), finding.id]);
   }
   for (const [domain, ids] of pointsByDomain) {
+    const commands = ids
+      .map((id) => pointFindings.get(id))
+      .filter((f): f is import("./types.ts").Finding => f !== undefined)
+      .map((f) => acceptFindingCommand(phase, C, K, f));
+    const names = ids.map(shortId).join(", ");
     blockers.push({
       kind: "point",
-      detail: `open point${ids.length === 1 ? "" : "s"} in ${domain}: ${ids.join(", ")} — no proving fact closes ${ids.length === 1 ? "it" : "them"}`,
-      command: inputCommand(phase, { type: "note", text: `close points ${ids.join(", ")} in ${domain}` }),
+      detail: `open point${ids.length === 1 ? "" : "s"} in ${domain}: ${names} — no proving fact closes ${ids.length === 1 ? "it" : "them"}`,
+      command: commands.length > 0 ? commands.join(" && ") : `tt resume ${phase.runId}`,
     });
   }
 
@@ -852,9 +929,10 @@ function acceptanceBlockersFor(phase: PhaseState, C: string, K: ContractVersion)
     });
   }
 
-  // Failed decisions are grouped by why, so the owner reads "16 trade-offs
-  // failed (missing ballot from M)" rather than sixteen clauses.
-  const failedBy = new Map<string, string[]>();
+  // Plan 07f (F1): one blocker (and one override) per unsettled decision, so
+  // every outstanding decision has its own visible clearing action. A
+  // decision `decisionSettled` already settles is not a blocker whatever its
+  // binding (C1: acceptance keeps its old result for those records).
   for (const decision of phase.decisions) {
     // A decision superseded by a correction (design §7.5 step 1) is
     // historical: the correction, not the original decision's vote or
@@ -862,27 +940,24 @@ function acceptanceBlockersFor(phase: PhaseState, C: string, K: ContractVersion)
     if (!isLiveDecision(decision)) continue;
     // Plan 01g: an amendment record is never an acceptance blocker by itself.
     if (decision.amendment) continue;
+    if (decisionSettled(decision, phase, C, K)) continue;
     if (decision.boundCandidateSha !== C) {
       blockers.push({
         kind: "decision",
         detail: `trade-off ${shortId(decision.id)} is not bound to the current candidate`,
-        command: inputCommand(phase, { type: "override", binding: { recordId: decision.id } }),
+        // The owner's override is the one command that settles a decision
+        // without another review round; it also clears a flagged reserved one.
+        command: overrideCommand(phase, C, K, decision),
       });
       continue;
     }
-    if (decisionSettled(decision, phase, C, K)) continue;
     const why = decisionStatus(decision, phase).reason ?? "failed";
-    failedBy.set(why, [...(failedBy.get(why) ?? []), decision.id]);
-  }
-  for (const [why, ids] of failedBy) {
     const veto = /([A-Za-z0-9_]+) veto/.exec(why);
     const verb = veto ? `vetoed by ${veto[1]}` : `failed (${why})`;
     blockers.push({
       kind: "decision",
-      detail: ids.length <= 2 ? `${ids.map(shortId).join(", ")} ${verb}` : `${ids.length} trade-offs ${verb}`,
-      // The owner's override is the one command that settles a decision
-      // without another review round; it also clears a flagged reserved one.
-      command: inputCommand(phase, { type: "override", binding: { recordId: ids[0] } }),
+      detail: `${shortId(decision.id)} ${verb}`,
+      command: overrideCommand(phase, C, K, decision),
     });
   }
 
@@ -895,7 +970,7 @@ function acceptanceBlockersFor(phase: PhaseState, C: string, K: ContractVersion)
     blockers.push({
       kind: "owner-request",
       detail: `owner request ${shortId(request.id)} is open: ${request.reason}`,
-      command: inputCommand(phase, { type: "resolve", binding: { recordId: request.id } }),
+      command: resolveCommand(phase, C, K, request),
     });
   }
 
@@ -905,7 +980,7 @@ function acceptanceBlockersFor(phase: PhaseState, C: string, K: ContractVersion)
     blockers.push({
       kind: "correction",
       detail: `owner correction ${shortId(correction.id)} has not been addressed by every seat`,
-      command: inputCommand(phase, { type: "correction", binding: { recordId: correction.id } }),
+      command: `tt resume ${phase.runId}`,
     });
   }
 
@@ -1013,7 +1088,7 @@ export function decisionStatus(decision: Decision, phase: PhaseState): DecisionS
   }
   const C = phase.candidate?.sha;
   const K = phase.contract.contractVersion;
-  if (!C || decision.boundCandidateSha !== C) return { status: "pending", reason: "not bound to the current candidate", ...(amendment ? { amendment } : {}) };
+  if (!C || C !== decision.boundCandidateSha) return { status: "pending", reason: "not bound to the current candidate", ...(amendment ? { amendment } : {}) };
   const flag = decision.class === "reserved" ? { flagged: true } : {};
   return { ...votedStatus(decision, phase, C, K), ...flag, ...(amendment ? { amendment } : {}) };
 }
