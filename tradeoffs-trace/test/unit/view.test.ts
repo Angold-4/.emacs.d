@@ -71,6 +71,41 @@ test("tt status shows elapsed over limit for a running check", () => {
   assert.match(text, /^pipeline: checks 6m00s… \(limit reached\) \[check 6m\/5m\]$/m);
 });
 
+test("plan 07e (E3/R9): an ordinary check derives its elapsed and limit from the timeline and the plan", () => {
+  // The status pair is never a literal: the elapsed time comes from the phase
+  // timeline through `stageSpans`, the limit from the plan's
+  // `#+TT_CHECK_MINUTES` through `stageLimits`, and `pipelineLine` renders
+  // both. Inside the bound the line counts down; past it, it says so.
+  const startedAt = "2026-10-27T10:00:00.000Z";
+  const timeline = {
+    state: {} as Timeline["state"],
+    phases: [{ phase: "CHECKING", at: startedAt }],
+    rounds: [],
+  } as unknown as Timeline;
+  const plan = { deadlines: { checkMs: 5 * 60_000 } } as Pick<RunPlanFile, "deadlines">;
+  const limits = stageLimits(plan);
+  assert.equal(limits.checks, 5 * 60_000, "the plan's check keyword is the ordinary check's limit");
+
+  const running = stageSpans(timeline, new Date("2026-10-27T10:02:00.000Z"));
+  assert.equal(running.length, 1, "the running ordinary check is the one stage");
+  assert.equal(running[0]!.stage, "checks");
+  assert.equal(running[0]!.ms, 2 * 60_000, "the elapsed time is the check stage's own");
+  assert.equal(stageBoundText("checks", running[0]!.ms, limits.checks), "check 2m/5m");
+  assert.match(pipelineLine(running, limits), /checks 2m00s… \(3m00s left\) \[check 2m\/5m\]/);
+
+  const over = stageSpans(timeline, new Date("2026-10-27T10:06:30.000Z"));
+  assert.equal(over[0]!.ms, 6.5 * 60_000, "the elapsed time keeps counting past the limit");
+  const line = pipelineLine(over, limits);
+  assert.match(line, /checks 6m30s… \(limit reached\) \[check 6m\/5m\]/, "elapsed over limit is named, never a bare overrun");
+  const text = renderStatusText(
+    "/tmp/tt-07e-ordinary-check",
+    { run: "live", phase: { phaseId: "p1", phase: "CHECKING" } },
+    { bounds: stageBoundText("checks", over[0]!.ms, limits.checks), pipeline: line, gates: "no candidate yet", reviewLine: "none" } as never,
+  );
+  assert.match(text, /^bounds: check 6m\/5m$/m);
+  assert.match(text, /^pipeline: checks 6m30s… \(limit reached\) \[check 6m\/5m\]$/m);
+});
+
 test("plan 07e: status prints the bound and the pause cause naming the other run", () => {
   const view = {
     pausedBy: "run-a",

@@ -1358,6 +1358,12 @@ function worktreeNumstat(worktree: string): Promise<Map<string, [number, number]
 // The conductor
 // ---------------------------------------------------------------------------
 
+/** Plan 07e (E4): who asked the conductor to stop. `stop()`'s public caller is
+ * the owner (`tt stop`, SIGTERM/SIGINT); the conductor's own callers (an env
+ * block, a terminal phase, a full disk) pass their own cause, so a check the
+ * stop killed is never reported as the owner's doing. */
+export type StopCause = "owner" | "conductor" | "disk full";
+
 interface AgentHandle {
   agent: PiAgent;
   role: Role;
@@ -1712,6 +1718,9 @@ export class Conductor {
    * gate) that are still running, each with the time it was recorded. */
   #liveStageGroups = new Map<number, number>();
   #stopRequested = false;
+  /** Plan 07e (E4): why the stop was requested, read by the honest check
+   * record. Set with `#stopRequested`; never read before it is true. */
+  #stopCause: StopCause = "conductor";
   /** Plan 06n (A3): set when this start reconciled a lane round's dispatch
    * that a clean `tt stop` ended, so the next `#runLaneRound` resumes that
    * round under its own number even when every lane was already checked (a
@@ -1952,7 +1961,7 @@ export class Conductor {
     // environment is fixed); it is never a code failure. A run already
     // ENV_BLOCKED whose tools now resolve is unblocked here and continues.
     if (!this.#envPreflightGate()) {
-      await this.stop();
+      await this.stop("conductor");
       return;
     }
     // Plan 05j: backfill the entry ledger from any messages that predate it
@@ -2697,9 +2706,13 @@ export class Conductor {
     return decisions;
   }
 
-  stop(): Promise<void> {
+  /** Stops the run. `cause` (plan 07e E4) names who asked: the owner by
+   * default, because the public callers are `tt stop` and the signal
+   * handlers; the conductor's own stops pass their own cause. */
+  stop(cause: StopCause = "owner"): Promise<void> {
     if (!this.#stopping) {
       this.#closed = true;
+      this.#stopCause = cause;
       this.#stopping = this.#doStop();
     }
     return this.#stopping;
@@ -2724,7 +2737,7 @@ export class Conductor {
     try {
       // Plan 07e (E4): the shutdown record is retried once after an ENOSPC,
       // so the last state survives a disk that frees up before the exit.
-      this.#log?.appendCritical("stop", { reason: "conductor stopped", at: new Date().toISOString() });
+      this.#log?.appendCritical("stop", { reason: "conductor stopped", cause: this.#stopCause, at: new Date().toISOString() });
     } catch {
       // the log may already be closed (a second stop call); never fatal.
     }
@@ -2889,6 +2902,7 @@ export class Conductor {
   /** Plan 07e (E3): a disk-full error is reported once and stops the run
    * cleanly; it is never retried forever and never crashes on a closed log. */
   #noteDiskFull(err: unknown, where = "events"): void {
+    this.#stopCause = "disk full";
     this.#stopRequested = true;
     if (!this.#diskFullNotified) {
       this.#diskFullNotified = true;
@@ -2904,7 +2918,7 @@ export class Conductor {
       reason: "disk full",
       error: String((err as Error)?.message ?? err),
     });
-    void this.stop();
+    void this.stop("disk full");
   }
 
   /** Plan 07e (E4/A5): only an opt-in run pauses its workers for another
@@ -4539,7 +4553,7 @@ export class Conductor {
       this.#state.phase.phase === "BLOCKED" ||
       this.#state.run === "ENV_BLOCKED"
     ) {
-      void this.stop();
+      void this.stop("conductor");
     }
   }
 
@@ -12033,14 +12047,29 @@ export class Conductor {
    * candidate C and the probed integration I each get one file per
    * command. */
   /** Plan 07e (E3): a failed check that says nothing is recorded as silent;
-   * one the owner's stop cut off is interrupted, never an ordinary failure. A
-   * timeout keeps its own `timedOut` marker. */
-  #checkFailureClass(result: RunCommandResult): "silent" | "interrupted" | undefined {
-    if (result.cancelled) return "interrupted";
+   * one a stop cut off is interrupted (or `disk-full` when the stop was the
+   * full disk's own), never an ordinary failure. A timeout keeps its own
+   * `timedOut` marker. */
+  #checkFailureClass(result: RunCommandResult): "silent" | "interrupted" | "disk-full" | undefined {
+    if (result.cancelled) return this.#stopCause === "disk full" ? "disk-full" : "interrupted";
     if (result.timedOut || (result.exitCode === 0 && !result.signal)) return undefined;
-    if (this.#stopRequested) return "interrupted";
+    if (this.#stopRequested) return this.#stopCause === "disk full" ? "disk-full" : "interrupted";
     if (result.exitCode !== null && result.exitCode !== 0 && result.output.trim().length === 0) return "silent";
     return undefined;
+  }
+
+  /** Plan 07e (E4): the honest sentence for a check a stop cut off. Only an
+   * owner's own stop is named as the owner's; a conductor self-stop (a full
+   * disk, an env block, a terminal phase) says so instead. */
+  #interruptedNote(): string {
+    switch (this.#stopCause) {
+      case "owner":
+        return "check interrupted (the owner stopped the run)";
+      case "disk full":
+        return "check interrupted (disk full)";
+      default:
+        return "check interrupted (the conductor stopped the run)";
+    }
   }
 
   /** 07e (A4): record how a command ended while preserving the existing
@@ -12049,7 +12078,7 @@ export class Conductor {
     const failureClass = recordFailure ?? this.#checkFailureClass(result);
     const passed = !failureClass && result.exitCode === 0 && !result.timedOut;
     const note = failureClass === "interrupted"
-      ? "check interrupted (the owner stopped the run)"
+      ? this.#interruptedNote()
       : failureClass === "silent"
         ? `check exited ${result.exitCode} with no output`
         : failureClass === "disk-full"
@@ -12087,8 +12116,10 @@ export class Conductor {
       failureClass === "silent"
         ? `check exited ${result.exitCode} with no output\n`
         : failureClass === "interrupted"
-          ? "check interrupted by the owner's stop\n"
-          : "";
+          ? `${this.#interruptedNote()}\n`
+          : failureClass === "disk-full"
+            ? "disk full\n"
+            : "";
     try {
       fs.writeFileSync(
         path.join(outDir, this.#checkLogName(command)),
