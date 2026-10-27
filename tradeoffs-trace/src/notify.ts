@@ -155,11 +155,30 @@ export function notify(entry: NotifyEntry, opts: NotifyOptions): "initial" | "re
   const reminderMs = opts.reminderMs ?? NOTIFY_REMINDER_MS;
   const windowMs = opts.everyMs ?? reminderMs;
   const previous = readNotifications(opts.root).filter((r) => r.waitKey === entry.waitKey);
+  const first = previous[0];
   const last = previous[previous.length - 1];
   // A bounded wait may remind more than once (07e); the ordinary wait keeps
   // today's single reminder.
   if (opts.everyMs === undefined && last?.reminder) return "none";
-  if (last && now - Date.parse(last.at) < windowMs) return "none";
+  // 07e (E1/A2): the owner-wait bound keeps its OWN cadence, counted from the
+  // wait's start (its first record), so the ordinary 30-minute reminder's
+  // timestamp neither postpones the first bound (270 instead of 240 minutes at
+  // the defaults) nor suppresses one when the two intervals coincide. One
+  // lattice point yields at most one record, so a late poll cannot append
+  // twice for the same bound.
+  if (opts.everyMs !== undefined && first !== undefined) {
+    const start = Date.parse(first.at);
+    if (Number.isFinite(start)) {
+      const k = Math.floor((now - start) / windowMs);
+      if (k < 1) return "none";
+      const dueAt = start + k * windowMs;
+      if (last !== undefined && Date.parse(last.at) >= dueAt) return "none";
+    } else if (last && now - Date.parse(last.at) < windowMs) {
+      return "none";
+    }
+  } else if (last && now - Date.parse(last.at) < windowMs) {
+    return "none";
+  }
   const record: NotificationRecord = {
     ...entry,
     at: new Date(now).toISOString(),

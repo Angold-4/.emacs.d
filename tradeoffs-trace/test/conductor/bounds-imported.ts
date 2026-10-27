@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 import { Conductor, DEFAULT_DEADLINES, type RunPlanFile } from "../../src/conductor.ts";
+import { buildView } from "../../src/view.ts";
 import { cleanupDir, defaultReviewerHello, defaultWorkerHello, FAKE_PI_PATH, readEvents, setupConductor, sleep, waitFor, type FakePiStep, type TestConductorSetup } from "./harness.ts";
 import type { Reviewer, State } from "../../src/core/types.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
@@ -475,6 +476,9 @@ test("a fix merge that exceeds TT_MERGE_MINUTES is aborted and the merges done s
   const shimDir = fs.mkdtempSync("/tmp/tt-07e-git-");
   const counter = path.join(shimDir, "count");
   fs.writeFileSync(counter, "0\n");
+  // R5: the SECOND merge COMMITS FIRST and only then hangs, so the merge bound
+  // kills it with its own merge commit already in HEAD. Only restoring the
+  // pre-merge HEAD keeps that timed-out merge out of the candidate.
   fs.writeFileSync(
     path.join(shimDir, "git"),
     `#!/bin/sh
@@ -483,7 +487,11 @@ case "$*" in
     n=$(cat "${counter}")
     n=$((n + 1))
     echo "$n" > "${counter}"
-    if [ "$n" -ge 2 ]; then sleep 6; fi
+    if [ "$n" -ge 2 ]; then
+      "${realGit}" "$@"
+      sleep 6
+      exit 0
+    fi
     ;;
 esac
 exec "${realGit}" "$@"
@@ -510,6 +518,17 @@ exec "${realGit}" "$@"
     const files = execFileSync("git", ["-C", setup.plan.repo, "diff", "--name-only", `${fixed.base}..${fixed.candidate}`], { encoding: "utf8" });
     assert.match(files, new RegExp(`${mergedTask!.domain}-fixed\\.txt`));
     assert.doesNotMatch(files, new RegExp(`${timedOutTask!.domain}-fixed\\.txt`), "the timed-out fixer's work is not in the candidate");
+    // R5: the timed-out merge's own commit (the shim committed before it hung)
+    // was rolled back, so the candidate's tree is exactly the first fixer's
+    // merge — no half-merged or self-committed state survives.
+    const tree = execFileSync("git", ["-C", setup.plan.repo, "rev-parse", `${fixed.candidate}^{tree}`], { encoding: "utf8" }).trim();
+    const firstOnly = execFileSync(
+      "git",
+      ["-C", setup.plan.repo, "merge-tree", "--write-tree", fixed.base, mergedTask!.sha],
+      { encoding: "utf8" },
+    ).split("\n")[0]!.trim();
+    assert.equal(tree, firstOnly, "the candidate is the merges done so far, never the timed-out merge's commit");
+    assert.ok(readEvents(setup.runDir).some((r) => r.kind === "fix_merge_restored"), "the rollback is recorded");
   } finally {
     process.env.PATH = oldPath;
     await teardown(setup);
@@ -517,19 +536,229 @@ exec "${realGit}" "$@"
   }
 });
 
+test("plan 07e: a worker paused by another run's check is resumed and paired when its attempt ends", async () => {
+  // E5/A5: every pause is paired with a resume. A worker whose attempt ends
+  // WHILE it is paused must be resumed on the record too, so status does not
+  // keep claiming "paused by run <id>'s check" for a worker that is gone and
+  // the pause's duration is counted honestly.
+  const lockDir = fs.mkdtempSync("/tmp/tt-07e-window-stop-");
+  const checkLockPath = path.join(lockDir, "check.lock");
+  const setupA = await setupConductor({
+    checks: ["sleep 8"],
+    phaseChecks: ["sleep 8"],
+    stubReviews: true,
+    deadlines: { ...FAST, workerAttemptMs: 60_000, checkMs: 60_000 },
+    checkWindow: "exclusive",
+    checkLockPath,
+    workerScript: () => quickWorker(),
+    reviewerScriptFor: (seat, state) => stubReviewer(seat, state),
+  });
+  const setupB = await setupConductor({
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: { ...FAST, workerAttemptMs: 60_000, checkMs: 60_000 },
+    checkWindow: "exclusive",
+    checkLockPath,
+    // Long enough that A's check window pauses it mid-attempt.
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [{ kind: "sleep", ms: 20_000 }, ...quickWorker().steps],
+    }),
+    reviewerScriptFor: (seat, state) => stubReviewer(seat, state),
+  });
+  try {
+    await Promise.all([setupA.conductor.start(), setupB.conductor.start()]);
+    await waitFor(
+      () => readEvents(setupB.runDir).some((r) => r.kind === "worker_paused"),
+      60_000,
+      50,
+      setupB.runDir,
+    );
+    // The attempt ends while the worker is paused by A's check.
+    await setupB.conductor.stop();
+    await waitFor(
+      () => {
+        const records = readEvents(setupB.runDir);
+        const paused = records.filter((r) => r.kind === "worker_paused").length;
+        const resumed = records.filter((r) => r.kind === "worker_resumed").length;
+        return paused > 0 && resumed === paused;
+      },
+      10_000,
+      50,
+      setupB.runDir,
+    );
+    const records = readEvents(setupB.runDir);
+    const paused = records.filter((r) => r.kind === "worker_paused").length;
+    const resumed = records.filter((r) => r.kind === "worker_resumed").length;
+    assert.equal(resumed, paused, "every pause is paired with a resume, even when the attempt ends while paused");
+    assert.doesNotMatch(
+      String(buildView(setupB.runDir, setupB.plan as RunPlanFile, false).attention ?? ""),
+      /paused by run/,
+      "status does not keep the expired pause",
+    );
+  } finally {
+    await setupA.conductor.stop();
+    cleanupDir(setupA.runRoot);
+    cleanupDir(setupA.scriptsDir);
+    cleanupDir(setupB.runRoot);
+    cleanupDir(setupB.scriptsDir);
+    cleanupDir(lockDir);
+  }
+});
+
+test("plan 07e: a check that only PRINTS ENOSPC fails as an ordinary check, recorded class disk-full", async () => {
+  // C1/the seats' veto of the output-text environment block: a plan with none of
+  // the new keywords is unaffected by a check that merely prints ENOSPC. The
+  // check is recorded honestly (class `disk-full`) and still fails the ordinary
+  // way — a CHECKS_FAILED and a repair round, never an ENV_BLOCKED.
+  const failing = "printf 'No space left on device\\n'; exit 1";
+  const setup = await setupConductor({
+    checks: [failing],
+    phaseChecks: [failing],
+    stubReviews: true,
+    deadlines: { ...FAST, checkMs: 10_000 },
+    workerScript: () => quickWorker(),
+    reviewerScriptFor: (seat, state) => stubReviewer(seat, state),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () => checkRecords(setup.runDir).some((r) => ((r.commands as Array<Record<string, unknown>>) ?? []).some((c) => c.class === "disk-full")),
+      60_000,
+      100,
+      setup.runDir,
+    );
+    const record = checkRecords(setup.runDir).find((r) =>
+      ((r.commands as Array<Record<string, unknown>>) ?? []).some((c) => c.class === "disk-full"),
+    )!;
+    const command = (record.commands as Array<Record<string, unknown>>).find((c) => c.class === "disk-full")!;
+    assert.equal(command.passed, false, "the check still fails");
+    assert.equal(command.failureClass, "disk-full");
+    assert.equal(command.note, "disk full");
+    await waitFor(() => coreEvents(setup.runDir).some((e) => e.type === "CHECKS_FAILED"), 30_000, 100, setup.runDir);
+    assert.ok(
+      !coreEvents(setup.runDir).some((e) => e.type === "ENV_CHECK_FAILED"),
+      "output text alone is never an environment failure",
+    );
+    assert.notEqual(setup.conductor.state.phase.phase, "BLOCKED", "the run is not blocked");
+    await waitFor(() => coreEvents(setup.runDir).some((e) => e.type === "REPAIR_ATTEMPT_STARTED"), 60_000, 100, setup.runDir);
+  } finally {
+    await teardown(setup);
+  }
+});
+
 /** A run whose checks always fail: every repair round is spent, then the
  * rounds bound parks the phase on the owner. */
-async function setupFailingRun(deadlines: Record<string, number> = {}) {
+async function setupFailingRun(deadlines: Record<string, number> = {}, now?: () => number) {
   return setupConductor({
     checks: ["false"],
     phaseChecks: ["false"],
     rounds: 1,
     stubReviews: true,
     deadlines: { ...FAST, checkMs: 10_000, ...deadlines },
+    ...(now ? { now } : {}),
     workerScript: () => quickWorker(),
     reviewerScriptFor: (seat, state) => stubReviewer(seat, state),
   });
 }
+
+test("plan 07e: a merge --abort that itself times out also records BOUND_REACHED merge and the pre-merge HEAD is restored", async () => {
+  const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+  const shimDir = fs.mkdtempSync("/tmp/tt-07e-git-abort-");
+  const counter = path.join(shimDir, "count");
+  fs.writeFileSync(counter, "0\n");
+  // The second merge commits and hangs (the merge bound kills it), and the
+  // `merge --abort` after it hangs too: that abort command is a bounded git
+  // command like the merge, so ITS timeout must be recorded as well.
+  fs.writeFileSync(
+    path.join(shimDir, "git"),
+    `#!/bin/sh
+case "$*" in
+  *"merge --abort"*)
+    sleep 6
+    exit 0
+    ;;
+  *"merge fixer commit"*)
+    n=$(cat "${counter}")
+    n=$((n + 1))
+    echo "$n" > "${counter}"
+    if [ "$n" -ge 2 ]; then
+      "${realGit}" "$@"
+      sleep 6
+      exit 0
+    fi
+    ;;
+esac
+exec "${realGit}" "$@"
+`,
+    { mode: 0o755 },
+  );
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${shimDir}:${oldPath ?? ""}`;
+  const setup = await setupFixRun(BOOKING_DONE, { deadlines: { mergeMs: 1_500 } });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.rounds?.[0]?.fixed !== undefined, 240_000, 50, setup.runDir);
+    const fixed = setup.conductor.state.phase.rounds![0].fixed!;
+    const mergeBounds = coreEvents(setup.runDir).filter((e) => e.type === "BOUND_REACHED" && e.kind === "merge");
+    const abortBound = mergeBounds.find((b) => /merge --abort/.test(String(b.scope)));
+    assert.ok(abortBound, `the abort command's timeout is recorded: ${JSON.stringify(mergeBounds)}`);
+    assert.equal(abortBound!.limitMs, 1_500);
+    const timedOutTask = fixed.tasks.find((t) => /bound: merge/.test(String(t.note)));
+    assert.ok(timedOutTask, `the timed-out merge is noted: ${JSON.stringify(fixed.tasks)}`);
+    if (fixed.candidate) {
+      const files = execFileSync("git", ["-C", setup.plan.repo, "diff", "--name-only", `${fixed.base}..${fixed.candidate}`], { encoding: "utf8" });
+      assert.doesNotMatch(files, new RegExp(`${timedOutTask!.domain}-fixed\\.txt`), "the timed-out fixer's work is not in the candidate");
+    }
+    assert.ok(readEvents(setup.runDir).some((r) => r.kind === "fix_merge_restored"), "the rollback is recorded");
+  } finally {
+    process.env.PATH = oldPath;
+    await teardown(setup);
+    cleanupDir(shimDir);
+  }
+});
+
+test("plan 07e: the owner-wait bound keeps its own cadence, so the ordinary reminder cannot postpone it", async () => {
+  // E1: the owner-wait bound is `TT_OWNER_WAIT_MINUTES` from the START of the
+  // wait. The ordinary 30-minute reminder shares the wait (and its record), so
+  // its timestamp must not shift the bound: at defaults the first bound is due
+  // after 240 minutes, never 270.
+  let nowMs = Date.now();
+  const setup = await setupFailingRun({ ownerWaitMs: 1_000, notifyReminderMs: 400, inboxPollMs: 100 }, () => nowMs);
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 240_000, 50, setup.runDir);
+    const parkStart = nowMs;
+    const notificationCount = () => {
+      const file = path.join(setup.runRoot, "notifications.jsonl");
+      if (!fs.existsSync(file)) return 0;
+      return fs.readFileSync(file, "utf8").trim().split("\n").filter((l) => l.trim()).length;
+    };
+    // The ordinary reminder is due 400 ms into the wait, and lands.
+    nowMs = parkStart + 500;
+    await waitFor(() => notificationCount() >= 2, 10_000, 50, setup.runDir);
+    assert.equal(
+      coreEvents(setup.runDir).filter((e) => e.type === "BOUND_REACHED" && e.kind === "owner-wait").length,
+      0,
+      "the ordinary reminder is not the bound",
+    );
+    // One full owner-wait bound after the park — not 400 ms after the ordinary
+    // reminder — the bound is reached and recorded.
+    nowMs = parkStart + 1_000;
+    await waitFor(
+      () => coreEvents(setup.runDir).some((e) => e.type === "BOUND_REACHED" && e.kind === "owner-wait"),
+      10_000,
+      50,
+      setup.runDir,
+    );
+    const bound = coreEvents(setup.runDir).find((e) => e.type === "BOUND_REACHED" && e.kind === "owner-wait")!;
+    assert.equal(bound.limitMs, 1_000);
+    assert.equal(setup.conductor.state.phase.phase, "AWAITING_OWNER", "the bound decides nothing");
+  } finally {
+    await teardown(setup);
+  }
+});
 
 test("an owner request open past its bound sends a reminder and decides nothing", async () => {
   const setup = await setupFailingRun({ ownerWaitMs: 1_000, inboxPollMs: 100 });
