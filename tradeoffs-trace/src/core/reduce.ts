@@ -52,6 +52,7 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "BASELINE_TIMED_OUT",
   "BASELINE_INTERRUPTED",
   "EVALUATION_COMPLETED",
+  "EVALUATION_SKIPPED",
   "EVALUATION_TIMED_OUT",
   "EVALUATION_INTERRUPTED",
   "EVALUATOR_FINISHED",
@@ -1017,6 +1018,16 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const inFlight = { ...p.inFlight };
       delete inFlight[key];
       return ok({ ...state, phase: { ...p, inFlight } });
+    }
+
+    case "EVALUATION_SKIPPED": {
+      // Plan 07f (F1): no exception existed, so no evaluator ran. Record-only
+      // inside EVALUATING; the mechanical verdict stands.
+      if (p.phase !== "EVALUATING") {
+        return rejected(state, `EVALUATION_SKIPPED is only valid in EVALUATING, not ${p.phase}`);
+      }
+      if (p.evaluation?.skipped) return ok(state);
+      return ok({ ...state, phase: { ...p, evaluation: { ...(p.evaluation ?? {}), skipped: true } } });
     }
 
     case "EVALUATOR_FINISHED": {

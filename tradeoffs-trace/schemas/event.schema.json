@@ -9,7 +9,7 @@
     "type": {
       "enum": [
         "ATTEMPT_STARTED", "BASELINE_COMPLETED", "BASELINE_TIMED_OUT", "BASELINE_INTERRUPTED",
-        "EVALUATION_COMPLETED", "EVALUATION_TIMED_OUT", "EVALUATION_INTERRUPTED", "EVALUATOR_FINISHED",
+        "EVALUATION_COMPLETED", "EVALUATION_SKIPPED", "EVALUATION_TIMED_OUT", "EVALUATION_INTERRUPTED", "EVALUATOR_FINISHED",
         "PANEL_VOTE", "PANEL_SEAT_UNAVAILABLE", "PANEL_DECIDED",
         "SUBMIT_PHASE", "ATTEMPT_TIMED_OUT", "BOUND_REACHED", "LEAD_CALLED", "ATTEMPT_NO_SUBMISSION",
         "ATTEMPT_INTERRUPTED", "FREEZE_COMPLETED", "FREEZE_TIMED_OUT", "FREEZE_INTERRUPTED",
@@ -34,6 +34,7 @@
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "BASELINE_COMPLETED" } } },
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "BASELINE_TIMED_OUT" } } },
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "BASELINE_INTERRUPTED" } } },
+    { "type": "object", "required": ["type", "reason"], "properties": { "type": { "const": "EVALUATION_SKIPPED" }, "reason": { "type": "string", "minLength": 1 } } },
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "EVALUATION_COMPLETED" } } },
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "EVALUATION_TIMED_OUT" } } },
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "EVALUATION_INTERRUPTED" } } },

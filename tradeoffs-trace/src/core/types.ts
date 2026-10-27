@@ -1303,7 +1303,12 @@ export interface PhaseState {
    * set by that type's `EVALUATOR_FINISHED` (or its timeout); `timedOut`
    * records that only that type's raw messages were published unevaluated;
    * `interruptedOnce` is the same one-redispatch bookkeeping as `baseline`. */
-  evaluation?: { types?: Partial<Record<MessageType, EvaluatorOutcome>> };
+  evaluation?: {
+    types?: Partial<Record<MessageType, EvaluatorOutcome>>;
+    /** Plan 07f (F1): no evaluator session was needed this round; the
+     * mechanical verdict stands. Recorded once inside EVALUATING. */
+    skipped?: boolean;
+  };
   /** Plan 04b: the blocker panel's state, one entry per raw blocker message
    * of this round (keyed by the blocker message id). Plan 05e adds the
    * round panel for trade-offs and blocking findings. EVALUATING completes
@@ -1760,6 +1765,14 @@ export interface EvEvaluationInterrupted {
 /** Plan 04a: all dispatched evaluators settled; EVALUATING -> RESOLVING. */
 export interface EvEvaluationCompleted {
   type: "EVALUATION_COMPLETED";
+}
+
+/** Plan 07f (F1): there was no exception for an evaluator to judge, so no
+ * session started; the mechanical verdict stands. A record event inside
+ * EVALUATING. */
+export interface EvEvaluationSkipped {
+  type: "EVALUATION_SKIPPED";
+  reason: string;
 }
 
 /** Plan 04b: one panel seat's vote on one raw blocker, a record event inside
@@ -2866,6 +2879,7 @@ export type Event =
   | EvBaselineTimedOut
   | EvBaselineInterrupted
   | EvEvaluationCompleted
+  | EvEvaluationSkipped
   | EvEvaluationTimedOut
   | EvEvaluationInterrupted
   | EvEvaluatorFinished

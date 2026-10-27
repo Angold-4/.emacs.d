@@ -197,6 +197,7 @@ import {
   decisionStatus,
   findingCitesAcceptanceOrReserved,
   isLiveDecision,
+  itemIsSplit,
   reviewIngestionIssue,
   panelMajority,
   ownerRuledDecision,
@@ -214,7 +215,7 @@ import {
 import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { FAILED_VOTE_OPTIONS, isRepairForcingOption, openFindingOptions } from "./core/owner-requests.ts";
 import { BRIEF_GLOSSARY, briefIssue, enrichBriefRelated, evidenceFile, fallbackBrief, fallbackDecisionBrief, fallbackEntryBrief, parseCatalogs, renderGlossaryOrg, stripCodeTokens, stripCounts, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
-import { notAcceptedReasons } from "./core/verdict.ts";
+import { evaluationExceptions, notAcceptedReasons } from "./core/verdict.ts";
 import { itemsNeedingEvaluatorReverify, pendingEvidenceItems } from "./core/predicate.ts";
 // Plan 06b: the pure item machinery (coverage, test-verify resolution,
 // verdict validation, per-item majority, the matrix and the status counts).
@@ -4616,6 +4617,15 @@ export class Conductor {
       case "evaluation_complete":
         // Plan 05e (finding #34): the round's evaluators and panels have
         // settled, so the candidate's final approval state is known.
+        // Plan 07f (F1): when there was no exception to judge, no evaluator
+        // session ran; record that fact (still inside EVALUATING) so the
+        // mechanical verdict is visibly the one that stands.
+        if (evaluationExceptions(this.#state.phase).length === 0 && this.#state.phase.evaluation?.skipped !== true) {
+          this.#applyEvent({
+            type: "EVALUATION_SKIPPED",
+            reason: "every item has a seat majority with resolving anchors and every point is closed by a proving fact",
+          });
+        }
         try {
           // Plan 06b: the item loop settles FIRST — the per-item majority, the
           // evaluator's overturns, and a blocking finding for every item a
@@ -8038,6 +8048,11 @@ export class Conductor {
       // `contradicted` check with valid anchors overturns it, and code never
       // withdraws the verdict on its own.
       for (const o of thinMetItems(phaseItemOutcomes(this.#state.phase), this.#workerAnchors())) ids.add(o.item.id);
+      // Plan 07f (F0): a split item is an evaluator exception; its check is
+      // owed so the evaluator gets exactly that item in its brief.
+      for (const o of phaseItemOutcomes(this.#state.phase)) {
+        if (itemIsSplit(o)) ids.add(o.item.id);
+      }
     }
     // Plan 06i (A3): every open finding owes its impact classification
     // through the same form.
@@ -8074,6 +8089,18 @@ export class Conductor {
             out.push({ seat: v.seat, id: o.item.id, kind: o.item.kind, verdict: v.verdict, effect: "flip", reason: `evaluator re-check contradicted it: ${check.evidence}` });
           }
         }
+      }
+      // Plan 07f (F0): a split item (a seat majority met/fits, a minority did
+      // not) is exactly what the evaluator rules on. A `contradicted` check
+      // with valid anchors overturns the seats that made the majority.
+      if ((o.outcome === "met" || o.outcome === "fits") && itemIsSplit(o)) {
+        const check = (this.#state.phase.itemChecks ?? []).find((c) => c.itemId === o.item.id && c.verdict === "contradicted");
+        if (check && this.#itemCheckAnchorsValid(check.evidence, ctx)) {
+          for (const v of o.seats.filter((s) => s.verdict === o.outcome)) {
+            out.push({ seat: v.seat, id: o.item.id, kind: o.item.kind, verdict: v.verdict, effect: "flip", reason: `evaluator re-check contradicted the split majority: ${check.evidence}` });
+          }
+        }
+        continue;
       }
       // Plan 06c (R5): a unanimous thin met/fits the evaluator contradicts
       // (with valid anchors) is overturned too.
@@ -15005,7 +15032,10 @@ export class Conductor {
     // Plan 06b (OD-1 R3b): a majority unmet/deviates item needs the
     // evaluator's substantive re-check against the candidate before it
     // blocks. The check is recorded with what was checked.
-    const owedIds = this.#owedItemCheckIds("finding");
+    // Plan 07f (F0): the brief carries ONLY the records that made this
+    // session necessary — no other item and no other point.
+    const exceptionIds = new Set(evaluationExceptions(phase).map((e) => e.id));
+    const owedIds = this.#owedItemCheckIds("finding").filter((id) => exceptionIds.has(id));
     const reverifyItems = itemsNeedingEvaluatorReverify(phase)
       ? phaseItemOutcomes(phase).filter((o) => owedIds.includes(o.item.id))
       : [];
@@ -15015,7 +15045,13 @@ export class Conductor {
         "Plan-item re-check: each item below owes an evaluator check. Re-check it against the candidate's code and record exactly what you checked:",
         ...reverifyItems.map(
           (o) =>
-            `- ${o.item.id} ${o.item.title}: ${o.outcome}${o.outcome === "met" || o.outcome === "fits" ? " (thin unanimous evidence — audit it)" : " (a majority judged it unmet or deviating)"}; seats: ${o.evidence.join(" | ")}`,
+            `- ${o.item.id} ${o.item.title}: ${o.outcome}${
+              itemIsSplit(o)
+                ? " (the seats split on it)"
+                : o.outcome === "met" || o.outcome === "fits"
+                  ? " (thin unanimous evidence — audit it)"
+                  : " (a majority judged it unmet or deviating)"
+            }; seats: ${o.evidence.join(" | ")}`,
         ),
         "Add one `itemChecks[]` entry = { id, verdict: confirmed|contradicted, evidence } for each item above. `evidence` must cite a file:line in the candidate. Use `contradicted` only when the candidate's code proves the verdict wrong; otherwise `confirmed`.",
       );
@@ -15030,9 +15066,13 @@ export class Conductor {
     {
       const rows =
         messageType === "finding"
-          ? openFindings(phase).map((f) => `- ${f.id} (finding, raised ${f.raisedBy}, severity ${f.severity}): ${f.evidence}`)
+          ? openFindings(phase)
+              .filter((f) => exceptionIds.has(f.id))
+              .map((f) => `- ${f.id} (finding, raised ${f.raisedBy}, severity ${f.severity}): ${f.evidence}`)
           : messageType === "tradeoff"
-            ? discoveredDecisions(phase).map((d) => `- ${d.id} (discovered decision): ${d.choice} — ${d.whyItMatters}`)
+            ? discoveredDecisions(phase)
+                .filter((d) => exceptionIds.has(d.id))
+                .map((d) => `- ${d.id} (discovered decision): ${d.choice} — ${d.whyItMatters}`)
             : [];
       if (rows.length > 0) {
         lines.push(
