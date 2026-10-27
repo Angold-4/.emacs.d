@@ -64,6 +64,10 @@ export interface NotifyOptions {
   env?: NodeJS.ProcessEnv;
   /** Override the 30-minute reminder window (tests). */
   reminderMs?: number;
+  /** 07e (E1): when set, the wait reminds the owner every `everyMs` instead
+   * of only once after `reminderMs` — the owner-wait bound. Unlimited while
+   * the wait stays open; each reminder is a `reminder: true` record. */
+  everyMs?: number;
   /** How long the notifier may run before it is killed and logged. */
   timeoutMs?: number;
   /** Called once with a message when the notifier fails or times out. Never
@@ -149,10 +153,13 @@ export function waitReason(phase: {
 export function notify(entry: NotifyEntry, opts: NotifyOptions): "initial" | "reminder" | "none" {
   const now = opts.now?.() ?? Date.now();
   const reminderMs = opts.reminderMs ?? NOTIFY_REMINDER_MS;
+  const windowMs = opts.everyMs ?? reminderMs;
   const previous = readNotifications(opts.root).filter((r) => r.waitKey === entry.waitKey);
   const last = previous[previous.length - 1];
-  if (last?.reminder) return "none";
-  if (last && now - Date.parse(last.at) < reminderMs) return "none";
+  // A bounded wait may remind more than once (07e); the ordinary wait keeps
+  // today's single reminder.
+  if (opts.everyMs === undefined && last?.reminder) return "none";
+  if (last && now - Date.parse(last.at) < windowMs) return "none";
   const record: NotificationRecord = {
     ...entry,
     at: new Date(now).toISOString(),

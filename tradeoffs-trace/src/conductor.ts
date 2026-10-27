@@ -62,7 +62,7 @@ import {
 // plan's, read from one place (`seatsOf`/`leaderOf`).
 import { leaderOf, seatsOf, seatsRecordOf, workerCountOf } from "./core/seats.ts";
 // Plan 07e (E1/A1): the one named table of every bound kind.
-import { boundDefaultMs, boundDefinition, boundText, type BoundKind } from "./core/bounds.ts";
+import { boundDefaultMs, boundDefinition, type BoundKind } from "./core/bounds.ts";
 // Plan 06i: triage — the only place fix / trade-off / escalate is decided.
 import {
   blockingTriageRecords,
@@ -564,8 +564,7 @@ export interface RunPlanFile {
    * longer than the defaults (e.g. a Rust workspace). */
   deadlines?: Partial<Deadlines>;
   /** Plan 07e (E4/A5): `#+TT_CHECK_WINDOW: exclusive`. Off by default: a run
-   * pauses its own workers for another run's check, and opens a window that
-   * pauses other runs' workers, only when the plan opts in. */
+   * pauses its own workers for another run's check only when it opts in. */
   checkWindow?: "exclusive" | "off";
   /** Documents the plan cites that live outside the repository (absolute
    * paths; Emacs collects them from #+TT_REFS and from the plan text). They
@@ -1532,10 +1531,6 @@ export class Conductor {
    * owner resolving one request of several stays in the same episode and is
    * not re-banner-stormed, while a genuinely new park is announced again. */
   #awaitingEpisode = 0;
-  /** Plan 07e (E2): when this park began, and how many owner-wait bounds it
-   * has already announced. Both reset on every new park. */
-  #awaitingSince: number | undefined;
-  #ownerWaitBoundCount = 0;
   /** Plan 07e (E2): the exhaustion already reported for a phase/round, so the
    * action path and the transition it causes cannot record it twice. */
   #roundsBoundReported = "";
@@ -1779,6 +1774,10 @@ export class Conductor {
     this.#paths = runPaths(opts.runDir);
     this.#plan = opts.plan;
     this.#deadlines = { ...DEFAULT_DEADLINES, ...opts.deadlines };
+    // Fixers shared the worker attempt before the dedicated keyword existed.
+    if (opts.deadlines?.fixerAttemptMs === undefined) {
+      this.#deadlines.fixerAttemptMs = this.#deadlines.workerAttemptMs;
+    }
     // Plan 07e (E1): the final check follows the ordinary check unless the
     // plan sets its own keyword, exactly as `TT_CHECK_MINUTES` has always
     // covered both.
@@ -1974,9 +1973,6 @@ export class Conductor {
     // Plan 05k (OD-7): the retry gate counts only AWAITING_OWNER entries;
     // entering BLOCKED neither dispatches the retry nor spends it.
     this.#awaitingEpisode = rebuildTimeline(this.#runDir, this.#plan).phases.filter((p) => p.phase === "AWAITING_OWNER").length;
-    // Plan 07e (E2): a resumed park starts its owner-wait bound clock now;
-    // the log does not carry the original park's wall-clock start.
-    if (this.#state.phase.phase === "AWAITING_OWNER") this.#awaitingSince = this.#now();
     if (this.#secretNames.length > 0) this.#recordSecrets();
     // design §9.3: "If the command ID is already in the log, the command is
     // only moved to applied/." Every applied conductor-state command's event
@@ -2825,8 +2821,6 @@ export class Conductor {
     // is not.
     if (before !== "AWAITING_OWNER" && this.#state.phase.phase === "AWAITING_OWNER") {
       this.#awaitingEpisode += 1;
-      this.#awaitingSince = this.#now();
-      this.#ownerWaitBoundCount = 0;
       // Plan 07e (E2/A3): a failure transition guarded by `budgetExhausted`
       // parks directly, without ever emitting the `repair_budget_exhausted`
       // action. The open budget request is the FSM's own marker of that park.
@@ -2904,19 +2898,16 @@ export class Conductor {
     void this.stop();
   }
 
-  /** Plan 07e (E4/A5): only an opt-in run opens a host-wide check window or
-   * pauses its workers for one. Off is exactly today's behaviour for every
-   * plan that does not declare `#+TT_CHECK_WINDOW: exclusive`. */
+  /** Plan 07e (E4/A5): only an opt-in run pauses its workers for another
+   * run's check window. */
   #checkWindowExclusive(): boolean {
     return this.#plan.checkWindow === "exclusive";
   }
 
-  /** The window every check path opens; a non-exclusive run gets a no-op so
-   * it never pauses another run's workers. */
+  /** Every check advertises its window; only workers in an exclusive run
+   * opt into pausing for it. */
   #openCheckWindow(): { release: () => void } {
-    return this.#checkWindowExclusive()
-      ? openCheckWindow(this.#checkLockPath, this.#state.phase.runId)
-      : { release: () => undefined };
+    return openCheckWindow(this.#checkLockPath, this.#state.phase.runId);
   }
 
   // -- inbox: owner commands (design §7.4, §9.3) --------------------------
@@ -4221,58 +4212,37 @@ export class Conductor {
     // The user-visible run id is the directory's name (`tt list`), not the
     // conductor's own `phase.runId` (a separate uuid in the init record).
     const runId = path.basename(this.#runDir);
-    notify(
-      {
-        id: runId,
-        kind: "run",
-        title: redactText(this.#plan.title, this.#secretMaskable),
-        ...(node ? { node } : {}),
-        phase: phase.phaseId,
-        reason: redactText(waitReason(phase), this.#secretMaskable),
-        ...(answeringCommand(runId, phase) ? { command: redactText(answeringCommand(runId, phase)!, this.#secretMaskable) } : {}),
-        waitKey: `${runId}:${wait}`,
-      },
-      {
+    const entry = {
+      id: runId,
+      kind: "run" as const,
+      title: redactText(this.#plan.title, this.#secretMaskable),
+      ...(node ? { node } : {}),
+      phase: phase.phaseId,
+      reason: redactText(waitReason(phase), this.#secretMaskable),
+      ...(answeringCommand(runId, phase) ? { command: redactText(answeringCommand(runId, phase)!, this.#secretMaskable) } : {}),
+      waitKey: `${runId}:${wait}`,
+    };
+    notify(entry, {
+      root: path.dirname(this.#runDir),
+      now: this.#now,
+      reminderMs: this.#deadlines.notifyReminderMs,
+      onError: (message) => this.#logUnexpected("notify", new Error(message)),
+    });
+    // 07e (E1/E2): an open owner request also reminds on the owner-wait bound.
+    // It never decides anything (C3) and never closes the request; each
+    // reminder is recorded as BOUND_REACHED so the log shows the cadence. A
+    // BLOCKED phase keeps today's single reminder, not this bound.
+    if (phase.phase === "AWAITING_OWNER") {
+      const bound = notify(entry, {
         root: path.dirname(this.#runDir),
         now: this.#now,
-        reminderMs: this.#deadlines.notifyReminderMs,
+        everyMs: this.#deadlines.ownerWaitMs,
         onError: (message) => this.#logUnexpected("notify", new Error(message)),
-      },
-    );
-    // Plan 07e (E1/E2): the owner-wait bound is a reminder bound, never an
-    // automatic decision. Each whole bound the park reaches is recorded once
-    // and announced with its own waitKey, so it is not deduped against the
-    // ordinary 30-minute reminder. The request stays open.
-    if (phase.phase !== "AWAITING_OWNER") return;
-    const since = this.#awaitingSince ?? this.#now();
-    const elapsedMs = Math.max(0, this.#now() - since);
-    // A malformed zero would otherwise divide by zero; `tt lint` refuses it
-    // before a run starts, and the conductor still stays finite if it slips
-    // through.
-    const ownerWaitMs = Math.max(1, this.#deadlines.ownerWaitMs);
-    const boundCount = Math.floor(elapsedMs / ownerWaitMs);
-    if (boundCount <= this.#ownerWaitBoundCount) return;
-    this.#ownerWaitBoundCount = boundCount;
-    this.#recordBound("owner-wait", phase.phaseId, ownerWaitMs, elapsedMs);
-    const minutes = Math.max(1, Math.floor(elapsedMs / 60_000));
-    notify(
-      {
-        id: runId,
-        kind: "run",
-        title: redactText(this.#plan.title, this.#secretMaskable),
-        ...(node ? { node } : {}),
-        phase: phase.phaseId,
-        reason: redactText(`owner wait bound reached after ${minutes}m (${boundText("owner-wait", elapsedMs, ownerWaitMs)}); the owner still decides`, this.#secretMaskable),
-        ...(answeringCommand(runId, phase) ? { command: redactText(answeringCommand(runId, phase)!, this.#secretMaskable) } : {}),
-        waitKey: `${runId}:${wait}:bound:${boundCount}`,
-      },
-      {
-        root: path.dirname(this.#runDir),
-        now: this.#now,
-        reminderMs: this.#deadlines.notifyReminderMs,
-        onError: (message) => this.#logUnexpected("notify", new Error(message)),
-      },
-    );
+      });
+      if (bound === "reminder") {
+        this.#recordBound("owner-wait", `phase ${phase.phaseId}`, this.#deadlines.ownerWaitMs, this.#deadlines.ownerWaitMs);
+      }
+    }
   }
 
   /** The program node this run is, if the scheduler started it (`program.json`
@@ -4408,7 +4378,7 @@ export class Conductor {
       } catch {
         // the agent may have exited; the attempt race handles that
       }
-      this.#log.append("worker_paused", { agentId, reason: "another run's check window is open", by });
+      this.#log.append("worker_paused", { agentId, reason: `paused by run ${by}'s check`, by });
     };
     const resume = () => {
       paused = false;
@@ -9515,7 +9485,20 @@ export class Conductor {
         taskRecords[i].note = result.note ?? "the fixer produced no commit";
         continue;
       }
-      const merge = await this.#mergeFixerBounded(mergeWorktree, result.sha, tasks[i].domain);
+      const merge = await this.#mergeFixerBounded(mergeWorktree, result.sha, tasks[i].domain, roundNo);
+      // Keep the commits merged so far as the candidate; do not risk another
+      // hung merge after this round has reached the merge bound.
+      if (!merge.ok && merge.timedOut) {
+        this.#log.append("fix_merge_timed_out", { round: roundNo, domain: tasks[i].domain, sha: result.sha });
+        taskRecords[i].note = `its commit ${result.sha.slice(0, 7)} could not be merged within the merge bound (bound: merge)`;
+        for (let j = i + 1; j < tasks.length; j += 1) {
+          if (typeof results[j].sha === "string" && results[j].sha!.length > 0) {
+            taskRecords[j].sha = results[j].sha;
+            taskRecords[j].note = "not merged: the merge bound was reached on an earlier fixer (bound: merge)";
+          }
+        }
+        break;
+      }
       if (!merge.ok) {
         taskRecords[i].note = merge.timedOut
           ? `its merge timed out and was skipped (bound: merge)`
@@ -9595,7 +9578,7 @@ export class Conductor {
    * git command runs through the conductor's process-group machinery, so a
    * hung merge (a credential prompt, a wrapper, a huge tree) is killed and
    * skipped instead of hanging the fix round. */
-  async #mergeFixerBounded(worktree: string, sha: string, domain: string): Promise<{ ok: boolean; timedOut: boolean; output: string }> {
+  async #mergeFixerBounded(worktree: string, sha: string, domain: string, round: number): Promise<{ ok: boolean; timedOut: boolean; output: string }> {
     const startedAt = Date.now();
     const gitArgs = [
       "-C",
@@ -9625,7 +9608,7 @@ export class Conductor {
       },
     }).result;
     if (result.timedOut) {
-      this.#recordBound("merge", domain, this.#deadlines.mergeMs, Math.max(this.#deadlines.mergeMs, Date.now() - startedAt));
+      this.#recordBound("merge", `round ${round} fixer ${domain}`, this.#deadlines.mergeMs, Math.max(this.#deadlines.mergeMs, Date.now() - startedAt));
       await this.#abortMerge(worktree);
       return { ok: false, timedOut: true, output: result.output };
     }
@@ -10005,17 +9988,7 @@ export class Conductor {
         // Plan 07e (E2): every timed-out check names its bound.
         if (result.timedOut) this.#recordBound(tier === "final" ? "final-check" : "check", `${lane}:${candidateSha}`, checkLimitMs, Date.now() - startedAt);
         const recordFailure = this.#recordCheck(outDir, command, result);
-        const failureClass = recordFailure ?? this.#checkFailureClass(result);
-        recordCommands.push({
-          command,
-          exitCode: result.exitCode,
-          signal: result.signal,
-          timedOut: result.timedOut,
-          durationMs: Date.now() - startedAt,
-          passed: result.exitCode === 0 && !result.timedOut,
-          ...(failureClass ? { failureClass } : {}),
-          log: this.#checkLogName(command),
-        });
+        recordCommands.push(this.#checkRecordCommand(command, result, startedAt, recordFailure));
         if (!verifyIntegrity(this.#plan.repo, checkoutDir.dir, candidateSha)) {
           passed = false;
           firstFailure = "the checkout no longer matches the candidate commit";
@@ -10176,7 +10149,7 @@ export class Conductor {
         }).result;
         // Plan 07e (E2): a doneWhen fact's own bound. It is recorded and the
         // fact keeps `timedOut: true`; it is never retried.
-        if (result.timedOut) this.#recordBound("fact", `${lane}:${finding.id}`, this.#deadlines.reproductionMs, Date.now() - startedAt);
+        if (result.timedOut) this.#recordBound("fact", `lane ${lane} finding ${finding.id}`, this.#deadlines.reproductionMs, Date.now() - startedAt);
         let passesOnBase: boolean | undefined;
         if (result.exitCode === 0 && !result.timedOut) {
           const key = `${baseSha}\0${finding.id}`;
@@ -11990,10 +11963,37 @@ export class Conductor {
    * one the owner's stop cut off is interrupted, never an ordinary failure. A
    * timeout keeps its own `timedOut` marker. */
   #checkFailureClass(result: RunCommandResult): "silent" | "interrupted" | undefined {
+    if (result.cancelled) return "interrupted";
     if (result.timedOut || (result.exitCode === 0 && !result.signal)) return undefined;
     if (this.#stopRequested) return "interrupted";
     if (result.exitCode !== null && result.exitCode !== 0 && result.output.trim().length === 0) return "silent";
     return undefined;
+  }
+
+  /** 07e (A4): record how a command ended while preserving the existing
+   * disk-full classification and failureClass readers. */
+  #checkRecordCommand(command: string, result: RunCommandResult, startedAt: number, recordFailure?: "disk-full"): CheckRecordCommand {
+    const failureClass = recordFailure ?? this.#checkFailureClass(result);
+    const passed = !failureClass && result.exitCode === 0 && !result.timedOut;
+    const note = failureClass === "interrupted"
+      ? "check interrupted (the owner stopped the run)"
+      : failureClass === "silent"
+        ? `check exited ${result.exitCode} with no output`
+        : failureClass === "disk-full"
+          ? "disk full"
+          : undefined;
+    return {
+      command,
+      exitCode: result.exitCode,
+      signal: result.signal,
+      timedOut: result.timedOut,
+      durationMs: Date.now() - startedAt,
+      passed,
+      class: failureClass ?? (passed ? "passed" : "failed"),
+      ...(failureClass ? { failureClass } : {}),
+      ...(note ? { note } : {}),
+      log: this.#checkLogName(command),
+    };
   }
 
   #recordCheck(outDir: string, command: string, result: RunCommandResult): "disk-full" | undefined {
@@ -12950,26 +12950,23 @@ export class Conductor {
             timedOut = true;
             // Plan 07e (E2): the final tier names its own bound; every other
             // check names the check bound.
-            this.#recordBound(tier === "final" ? "final-check" : "check", candidateSha, checkLimitMs, Date.now() - startedAt);
+            this.#recordBound(tier === "final" ? "final-check" : "check", `check \`${command}\``, checkLimitMs, Date.now() - startedAt);
           }
           const recordFailure = this.#recordCheck(outDir, command, result);
-          const failureClass = recordFailure ?? this.#checkFailureClass(result);
-          recordCommands.push({
-            command,
-            exitCode: result.exitCode,
-            signal: result.signal,
-            timedOut: result.timedOut,
-            durationMs: Date.now() - startedAt,
-            passed: result.exitCode === 0 && !result.timedOut,
-            ...(failureClass ? { failureClass } : {}),
-            log: this.#checkLogName(command),
-          });
+          recordCommands.push(this.#checkRecordCommand(command, result, startedAt, recordFailure));
           // Plan 05i: 126/127 means the shell could not execute the command
           // (`command not found` / `not executable`). That is the machine, not
           // the code: stop the run in ENV_BLOCKED instead of recording a
           // `checks failed`, a repair round or a finding.
           if (!result.timedOut && (result.exitCode === 126 || result.exitCode === 127)) {
             this.#log.completion(actionId, { candidateSha, passed: false, reason: "environment", command, exitCode: result.exitCode });
+            this.#applyEnvFailure("checks", command, result);
+            return;
+          }
+          // 07e (A4): a full disk is the machine, not the candidate.
+          if (!result.timedOut && result.exitCode !== 0 && /ENOSPC|No space left on device/i.test(result.output)) {
+            this.#log.append("disk_full", { stage: "checks", command, exitCode: result.exitCode });
+            this.#log.completion(actionId, { candidateSha, passed: false, reason: "disk full", command, exitCode: result.exitCode });
             this.#applyEnvFailure("checks", command, result);
             return;
           }
@@ -13059,6 +13056,20 @@ export class Conductor {
           }
         }
       }
+      // Plan 07e (A4): write the record before events that a stop can refuse,
+      // so an interrupted command keeps its own class even after log closure.
+      this.#writeCheckRecord(outDir, {
+        candidateSha,
+        ...(this.#baselineBaseSha() ? { baseSha: this.#baselineBaseSha() } : {}),
+        tier,
+        passed,
+        commands: recordCommands,
+        finalCommands,
+        load1: recordLoad1,
+        freeMemMB: recordFreeMemMB,
+        at: new Date().toISOString(),
+      });
+      if (this.#closed) return;
       // design §2.2: a checkout that no longer matches its candidate commit
       // invalidates that gate's result (never counted as passed — `passed`
       // above is already forced `false` by the `!after` check) and marks
@@ -13082,19 +13093,7 @@ export class Conductor {
         ...(checkFailures.length > 0 ? { checkFailures } : {}),
         reason: !passed && timedOut ? "timeout" : undefined,
       });
-      // Plan 06c: the record names the tier, the final command when there was
-      // one, and the machine's load at the run.
-      this.#writeCheckRecord(outDir, {
-        candidateSha,
-        ...(this.#baselineBaseSha() ? { baseSha: this.#baselineBaseSha() } : {}),
-        tier,
-        passed,
-        commands: recordCommands,
-        finalCommands,
-        load1: recordLoad1,
-        freeMemMB: recordFreeMemMB,
-        at: new Date().toISOString(),
-      });
+      // The check record is already written above, before events a stop can refuse.
       // Plan 06b: resolve every item's `test` verify against the candidate's
       // own (round) check run. A named test that is missing from or failed in
       // the output is a blocking finding anchored to its item, except a

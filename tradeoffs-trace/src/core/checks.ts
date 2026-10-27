@@ -277,6 +277,10 @@ export interface CheckRecordCommand {
    * output; `interrupted` was cut off by the owner's stop; `disk-full` could
    * not record its output. */
   failureClass?: "silent" | "interrupted" | "disk-full";
+  /** 07e (A4): how the command ended, including a silent or interrupted check. */
+  class?: "passed" | "failed" | "silent" | "interrupted" | "disk-full";
+  /** 07e (A4): the one-line reason, e.g. `check exited 3 with no output`. */
+  note?: string;
   /** The log file name under the candidate's checks directory. */
   log?: string;
 }
@@ -345,6 +349,8 @@ export function parseCheckRecord(value: unknown): CheckRecord | undefined {
       ...(e.failureClass === "silent" || e.failureClass === "interrupted" || e.failureClass === "disk-full"
         ? { failureClass: e.failureClass }
         : {}),
+      ...(e.class === "passed" || e.class === "failed" || e.class === "silent" || e.class === "interrupted" || e.class === "disk-full" ? { class: e.class } : {}),
+      ...(typeof e.note === "string" ? { note: e.note } : {}),
       ...(typeof e.log === "string" ? { log: e.log } : {}),
     });
   }

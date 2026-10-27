@@ -2,6 +2,9 @@
 // machine, another run's worker is SIGSTOPped and its attempt clock does not
 // advance; it resumes (SIGCONT) when the check ends.
 
+// Preserve both lanes' check-window scenarios in the targeted test entry point.
+import "./check-window-imported.ts";
+
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync } from "node:fs";

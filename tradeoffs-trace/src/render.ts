@@ -936,6 +936,8 @@ export function renderStatusView(input: StatusViewInput): string {
   // Plan 06m (OD-3 point 3): a stage past its limit reads `limit reached` in
   // the master panel too, never a blank or a cumulative overrun.
   push(row("loop", view.pipeline?.includes("limit reached") ? `${view.loop ?? ""} (limit reached)`.trim() : view.loop));
+  // 07e (A5): name the run whose check paused this worker.
+  if (view.pausedBy) push(row("paused", `paused by run ${view.pausedBy}'s check`));
   // Plan 06b: the status line's item counts, e.g. `R 7/8 met · A 3/3 fit · C 2/2`.
   let unmet: Array<{ id: string; title?: string }> = [];
   let overturnsText: string | undefined;

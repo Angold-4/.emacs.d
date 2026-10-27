@@ -1,6 +1,9 @@
 // Plan 07e (E2): every timeout branch records which bound it reached, and the
 // owner still decides — a bound never accepts, rejects or rules.
 
+// Keep lane a's additional integration cases in this targeted test entry point.
+import "./bounds-imported.ts";
+
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";

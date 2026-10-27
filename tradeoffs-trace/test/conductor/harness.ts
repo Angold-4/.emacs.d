@@ -173,6 +173,8 @@ export async function setupConductor(opts: {
   /** Plan 05e: the default round-panel vote for every item. */
   defaultRoundPanelVote?: "keep" | "drop" | "downgrade";
   deadlines?: ConductorOptions["deadlines"];
+  /** Plan 07e: `#+TT_ROUNDS` (the rounds bound). */
+  rounds?: number;
   /** Plan 07e (E4): the plan's `#+TT_CHECK_WINDOW` opt-in. */
   checkWindow?: "exclusive" | "off";
   /** Extra argv tokens prepended before fake-pi.ts's own path — fake-pi
@@ -281,6 +283,7 @@ export async function setupConductor(opts: {
     ...(opts.envFile ? { envFile: opts.envFile } : {}),
     ...(opts.models ? { models: opts.models } : {}),
     ...(opts.workerPrompt ? { workerPrompt: opts.workerPrompt } : {}),
+    ...(opts.rounds !== undefined ? { rounds: opts.rounds } : {}),
     phases: [
       opts.phase ?? {
         id: "p1",
