@@ -133,8 +133,25 @@ test("plan 07e: a worker sh command past its bound records BOUND_REACHED sh", as
 });
 
 test("an exhausted repair budget records BOUND_REACHED rounds and LEAD_CALLED and parks in AWAITING_OWNER as today", async () => {
+  // R6: the BOUND itself, with the budget actually exhausted. `rounds: 1` sets
+  // both the plan's TT_ROUNDS and the phase's frozen contract, so the phase has
+  // no repair round to spend; the reviewers never approve the candidate (this
+  // stub review carries no correction statement, finding statement or ballot),
+  // and the failing checks leave the candidate unaccepted. The park must be
+  // today's `repair_budget_exhausted` owner request, not a bare AWAITING_OWNER.
   const setup = await setupConductor({
     checks: ["false"],
+    phaseChecks: ["false"],
+    rounds: 1,
+    phase: {
+      id: "p1",
+      goal: "do the thing",
+      acceptance: ["it works"],
+      checks: ["false"],
+      boundaries: [],
+      reserved: [],
+      rounds: 1,
+    },
     workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhase()] }),
     reviewerScriptFor: (reviewer: Reviewer, state: State) => stubReviewer(reviewer, state),
     deadlines: FAST,
@@ -143,13 +160,26 @@ test("an exhausted repair budget records BOUND_REACHED rounds and LEAD_CALLED an
     await setup.conductor.start();
     await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 30_000, 50, setup.runDir);
     const all = bounds(setup.runDir);
+    const roundBound = all.find((b) => b.kind === "rounds");
     assert.ok(
-      all.some((b) => b.kind === "rounds"),
+      roundBound,
       `rounds bound recorded: ${JSON.stringify(all)}; events: ${JSON.stringify(readEvents(setup.runDir).slice(-16))}`,
     );
+    // The bound names the plan's own budget and how much of it was spent.
+    assert.equal(roundBound!.limitMs, 1);
+    assert.equal(roundBound!.elapsedMs, setup.conductor.state.phase.repairRoundsUsed);
     const lead = readEvents(setup.runDir).find((r) => r.kind === "event" && (r.event as { type?: string }).type === "LEAD_CALLED");
     assert.ok(lead, "the lead is called when the rounds are exhausted");
-    assert.ok(((lead!.event as { reasons?: string[] }).reasons ?? []).length > 0, "the lead is told why it is not accepted");
+    // Today's not-accepted reasons, unchanged: the checks failed on the
+    // candidate and nothing else stands in the way.
+    assert.deepEqual(((lead!.event as { reasons?: string[] }).reasons ?? []), ["checks failed"]);
+    // The park is today's repair-budget owner request, still open, so the
+    // owner is the one who decides (the bound never does).
+    const open = setup.conductor.state.phase.ownerRequests.filter((r) => r.status === "open");
+    assert.ok(
+      open.some((r) => r.origin === "repair_budget_exhausted"),
+      `the park is the repair-budget request: ${JSON.stringify(open.map((r) => r.origin))}`,
+    );
     assert.equal(setup.conductor.state.phase.phase, "AWAITING_OWNER");
   } finally {
     await setup.conductor.stop();

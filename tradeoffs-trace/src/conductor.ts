@@ -2752,6 +2752,11 @@ export class Conductor {
     // worker's orphaned command), or one that started while stopping.
     await this.#killLiveShGroups();
     await this.#killLiveStageGroups();
+    // Plan 07e (E5/A5): the agents' own teardown may have resumed a worker
+    // that another run's check window had paused, so the status view is
+    // flushed once more AFTER that (see `#watchCheckWindow`'s stop function):
+    // a stopped run must not keep reading as "paused by run <id>'s check".
+    this.#writeStatusViewSafe();
     await this.#socket?.close();
     await this.#lock?.release();
     this.#log?.close();
@@ -4243,7 +4248,11 @@ export class Conductor {
         everyMs: this.#deadlines.ownerWaitMs,
         onError: (message) => this.#logUnexpected("notify", new Error(message)),
       });
-      if (bound === "reminder") {
+      // 07e (E2/A2): the bound is reached whenever the bound's own cadence
+      // appends a reminder, not only when `notify` happens to classify that
+      // append as a repeat of an earlier record (the wait's announcement is
+      // the ordinary reminder's record, which the bound must not depend on).
+      if (bound !== "none") {
         this.#recordBound("owner-wait", `phase ${phase.phaseId}`, this.#deadlines.ownerWaitMs, this.#deadlines.ownerWaitMs);
       }
     }
@@ -4384,7 +4393,7 @@ export class Conductor {
       }
       this.#log.append("worker_paused", { agentId, reason: `paused by run ${by}'s check`, by });
     };
-    const resume = () => {
+    const resume = (reason = "the check window closed") => {
       paused = false;
       for (const timer of timers) timer.resume();
       const a = this.#activity.get(agentId);
@@ -4397,7 +4406,17 @@ export class Conductor {
       } catch {
         // best effort
       }
-      this.#log.append("worker_resumed", { agentId, reason: "the check window closed" });
+      this.#log.append("worker_resumed", { agentId, reason });
+    };
+    /** The stop function itself can run after `stop()` closed the log (the
+     * attempt's race settles during teardown), so this one record is written
+     * best-effort and never throws EBADF from a dead log. */
+    const resumeSafely = (reason: string): void => {
+      try {
+        resume(reason);
+      } catch {
+        // the log is already closed; the pause simply stays unpaired
+      }
     };
     const iv = setInterval(() => {
       if (this.#closed) return;
@@ -4408,14 +4427,11 @@ export class Conductor {
     iv.unref?.();
     return () => {
       clearInterval(iv);
-      if (paused) {
-        paused = false;
-        try {
-          process.kill(-agent.pgid, "SIGCONT");
-        } catch {
-          // best effort
-        }
-      }
+      // Plan 07e (E5/A5): an attempt that ends while the worker is paused still
+      // pairs its `worker_paused` with a `worker_resumed`, so status never
+      // keeps claiming "paused by run <id>'s check" for a worker that is gone
+      // and the pause's duration is counted honestly.
+      if (paused) resumeSafely("the paused worker's attempt ended");
     };
   }
 
@@ -9588,9 +9604,13 @@ export class Conductor {
   /** Plan 07e (E2): merge one fixer commit under the merge bound. The same
    * git command runs through the conductor's process-group machinery, so a
    * hung merge (a credential prompt, a wrapper, a huge tree) is killed and
-   * skipped instead of hanging the fix round. */
+   * skipped instead of hanging the fix round. R5: the worktree's HEAD before
+   * the merge is the only state that may survive, so a merge wrapper that
+   * commits and only then hangs cannot leave its commit in the candidate. */
   async #mergeFixerBounded(worktree: string, sha: string, domain: string, round: number): Promise<{ ok: boolean; timedOut: boolean; output: string }> {
     const startedAt = Date.now();
+    const before = headOf(worktree);
+    const scope = `round ${round} fixer ${domain}`;
     const gitArgs = [
       "-C",
       shellQuote(worktree),
@@ -9619,27 +9639,50 @@ export class Conductor {
       },
     }).result;
     if (result.timedOut) {
-      this.#recordBound("merge", `round ${round} fixer ${domain}`, this.#deadlines.mergeMs, Math.max(this.#deadlines.mergeMs, Date.now() - startedAt));
-      await this.#abortMerge(worktree);
+      this.#recordBound("merge", scope, this.#deadlines.mergeMs, Math.max(this.#deadlines.mergeMs, Date.now() - startedAt));
+      await this.#restoreMergeState(worktree, before, `${scope} merge --abort`);
       return { ok: false, timedOut: true, output: result.output };
     }
     if (result.exitCode !== 0) {
-      await this.#abortMerge(worktree);
+      await this.#restoreMergeState(worktree, before, `${scope} merge --abort`);
       return { ok: false, timedOut: false, output: result.output };
     }
     return { ok: true, timedOut: false, output: result.output };
   }
 
-  /** Best-effort `git merge --abort` after a conflict or a killed merge. */
-  async #abortMerge(worktree: string): Promise<void> {
-    await runCommand({
+  /** Plan 07e (E2/A2): undo a failed or killed merge, bounded like the merge
+   * itself. R5: `git merge --abort` only undoes an in-progress merge, so a
+   * wrapper that committed before it hung (or failed) leaves HEAD moved; the
+   * pre-merge HEAD is restored in that case, so the timed-out merge's own
+   * commit never becomes the fix round's candidate. Both git commands are
+   * bounded, and a bound reached here is recorded too. */
+  async #restoreMergeState(worktree: string, before: string | undefined, scope: string): Promise<void> {
+    const startedAt = Date.now();
+    const abort = await runCommand({
       command: `git -C ${shellQuote(worktree)} merge --abort`,
       cwd: worktree,
       env: process.env,
-      deadlineMs: 10_000,
+      deadlineMs: this.#deadlines.mergeMs,
       termGraceMs: this.#deadlines.termGraceMs,
       onIntent: () => undefined,
     }).result.catch(() => undefined);
+    if (abort?.timedOut) {
+      this.#recordBound("merge", scope, this.#deadlines.mergeMs, Math.max(this.#deadlines.mergeMs, Date.now() - startedAt));
+    }
+    if (before === undefined || headOf(worktree) === before) return;
+    const resetStartedAt = Date.now();
+    const reset = await runCommand({
+      command: `git -C ${shellQuote(worktree)} reset --hard ${shellQuote(before)}`,
+      cwd: worktree,
+      env: process.env,
+      deadlineMs: this.#deadlines.mergeMs,
+      termGraceMs: this.#deadlines.termGraceMs,
+      onIntent: () => undefined,
+    }).result.catch(() => undefined);
+    this.#log.append("fix_merge_restored", { scope, before, head: headOf(worktree), resetExitCode: reset?.exitCode ?? null });
+    if (reset?.timedOut) {
+      this.#recordBound("merge", `${scope} reset --hard`, this.#deadlines.mergeMs, Math.max(this.#deadlines.mergeMs, Date.now() - resetStartedAt));
+    }
   }
 
 
@@ -12977,7 +13020,22 @@ export class Conductor {
             this.#recordBound(tier === "final" ? "final-check" : "check", `check \`${command}\``, checkLimitMs, Date.now() - startedAt);
           }
           const recordFailure = this.#recordCheck(outDir, command, result);
-          recordCommands.push(this.#checkRecordCommand(command, result, startedAt, recordFailure));
+          // 07e (E4), the seats' alternative to the vetoed output-text
+          // environment block: a check that exits non-zero and whose output
+          // reports ENOSPC is RECORDED as class `disk-full`, and still fails
+          // as an ordinary check — the round continues and spends its repair
+          // round. Output text alone is never proof that the machine failed,
+          // so it can neither block the run nor change a plan without the new
+          // keywords.
+          const diskFullOutput =
+            recordFailure === undefined &&
+            !result.timedOut &&
+            result.exitCode !== 0 &&
+            /ENOSPC|No space left on device/i.test(result.output);
+          if (diskFullOutput) {
+            this.#log.append("disk_full", { stage: "checks", command, exitCode: result.exitCode, action: "ordinary failure" });
+          }
+          recordCommands.push(this.#checkRecordCommand(command, result, startedAt, recordFailure ?? (diskFullOutput ? "disk-full" : undefined)));
           // Plan 07e (A4/E4): a check whose own log the disk refused fails its
           // action with `disk full`, never as a pass (`#noteDiskFull` stops the
           // run cleanly, exactly as for a command that reported ENOSPC).
@@ -12996,12 +13054,6 @@ export class Conductor {
             return;
           }
           // 07e (A4): a full disk is the machine, not the candidate.
-          if (!result.timedOut && result.exitCode !== 0 && /ENOSPC|No space left on device/i.test(result.output)) {
-            this.#log.append("disk_full", { stage: "checks", command, exitCode: result.exitCode });
-            this.#log.completion(actionId, { candidateSha, passed: false, reason: "disk full", command, exitCode: result.exitCode });
-            this.#applyEnvFailure("checks", command, result);
-            return;
-          }
           const after = verifyIntegrity(this.#plan.repo, checkoutDir.dir, candidateSha);
           if (!after) integrityViolated = true;
           const failed = result.exitCode !== 0 || result.timedOut || !after;
