@@ -126,8 +126,7 @@ test("plan 07e: a silent check is class silent and a check killed by a stop is i
     const command = (checkRecords(stopped.runDir)[0]!.commands as Array<Record<string, unknown>>)[0]!;
     assert.equal(command.class, "interrupted", "a stop is not a failure");
     assert.equal(command.failureClass, "interrupted");
-    assert.match(String(command.note), /interrupted/);
-    assert.match(String(command.note), /owner/, "an owner's stop says the owner stopped the run");
+    assert.equal(command.note, "check interrupted (the owner stopped the run)", "an owner's stop names the owner");
   } finally {
     cleanupDir(stopped.runRoot);
     cleanupDir(stopped.scriptsDir);
@@ -156,10 +155,41 @@ test("plan 07e: a silent check is class silent and a check killed by a stop is i
     await waitFor(() => checkRecords(selfStopped.runDir).length > 0, 10_000, 50, selfStopped.runDir);
     const command = (checkRecords(selfStopped.runDir)[0]!.commands as Array<Record<string, unknown>>)[0]!;
     assert.equal(command.class, "interrupted", "a conductor stop is still not a failure");
-    assert.match(String(command.note), /conductor/, "the note names the stop the conductor itself asked for");
+    assert.equal(command.note, "check interrupted (the conductor stopped the run)", "the note names the conductor's own stop");
     assert.doesNotMatch(String(command.note), /owner/, "a conductor self-stop never claims the owner stopped the run");
   } finally {
     cleanupDir(selfStopped.runRoot);
     cleanupDir(selfStopped.scriptsDir);
+  }
+});
+
+test("plan 07e: a check that reports a full disk is class disk-full", async () => {
+  const fullDisk = "printf 'No space left on device\\n'; exit 1";
+  const setup = await setupConductor({
+    checks: [fullDisk],
+    phaseChecks: [fullDisk],
+    rounds: 1,
+    stubReviews: true,
+    deadlines: { ...FAST, checkMs: 10_000 },
+    workerScript: () => quickWorker(),
+    reviewerScriptFor: (seat, state) => stubReviewer(seat, state),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () => checkRecords(setup.runDir).some((r) => ((r.commands as Array<Record<string, unknown>>) ?? []).some((c) => c.class === "disk-full")),
+      60_000,
+      100,
+      setup.runDir,
+    );
+    const record = checkRecords(setup.runDir).find((r) =>
+      ((r.commands as Array<Record<string, unknown>>) ?? []).some((c) => c.class === "disk-full"),
+    )!;
+    const command = (record.commands as Array<Record<string, unknown>>).find((c) => c.class === "disk-full")!;
+    assert.equal(command.failureClass, "disk-full", "a full disk is its own class, never an ordinary failure");
+    assert.equal(command.note, "disk full");
+    assert.equal(command.passed, false, "a full disk never passes the check");
+  } finally {
+    await teardown(setup);
   }
 });
