@@ -262,7 +262,7 @@ import {
   removeWorktree,
   candidateTree,
   saveUnsubmittedWork as gitSaveUnsubmittedWork,
-  verifyIntegrity, removedTestsBetween, headOf, mergeFixer } from "./effects/git.ts";
+  verifyIntegrity, removedTestsBetween, headOf, mergeFixer, type DisposableCheckout } from "./effects/git.ts";
 import { RunSocketServer, type HelloResult, type SubmitResult } from "./effects/socket.ts";
 import { PiAgent, spawnPiAgent } from "./effects/pi-rpc.ts";
 import { redactBytes, redactRecord, redactText, resolveSecrets, secretNames, secretPromptLines, utf16Kind, type Secret } from "./effects/secrets.ts";
@@ -1526,6 +1526,10 @@ export class Conductor {
    * persisted in its `record.json`. Only the picked candidate's are emitted as
    * events; a loser's never repair anything. */
   #laneFacts = new Map<string, FindingFact[]>();
+  /** Packet X: each doneWhen's result on a round base, keyed by
+   * `<base sha>\0<finding id>`, so both lanes of a round (and a lane fix)
+   * run it on the base once. */
+  #doneWhenBaseRuns = new Map<string, { exitCode: number | null; timedOut: boolean }>();
   /** Plan 06g2: each lane candidate's own `test`-verify resolution. */
   #laneCheckResolutions = new Map<string, ReturnType<typeof resolveTestVerifies>>();
   /** Plan 06g2: this round's lane builds, keyed `<round>-<lane>` — the lane
@@ -6395,7 +6399,8 @@ export class Conductor {
    *
    * The fold never loses information: the key is all four fields, so two
    * points in different domains (or with a different item, location or
-   * doneWhen) are never folded together. A duplicate is folded only when its
+   * doneWhen) are never folded together, nor two with a different severity
+   * or a different `from`. A duplicate is folded only when its
    * contract amendment (`criterionDispute`) and decision link
    * (`linkedDecisionId`) are compatible with the open finding's: both absent,
    * or both present and exactly equal. One present and one absent, or two
@@ -6425,6 +6430,11 @@ export class Conductor {
       if (f.status !== "open" || f.item !== item || f.doneWhen !== doneWhen || whereKey(f.where ?? "") !== key || (f.domain ?? "") !== domain) return false;
       if (!this.#disputesCompatible(fd.criterionDispute, f.criterionDispute)) return false;
       if (fd.linkedDecisionId !== f.linkedDecisionId) return false;
+      // Packet X: a fold must not lose information. A duplicate whose
+      // severity differs (a blocking point beside an open advisory one) or
+      // whose `from` differs (another lane's work) is raised on its own.
+      if (fd.severity !== f.severity) return false;
+      if (!this.#fromsEqual(fd.from, f.from)) return false;
       return true;
     });
     if (!existing) return false;
@@ -6440,6 +6450,13 @@ export class Conductor {
   #disputesCompatible(a: CriterionDispute | undefined, b: CriterionDispute | undefined): boolean {
     if (a === undefined || b === undefined) return a === b;
     return a.criterion === b.criterion && a.why === b.why && a.proposedWording === b.proposedWording;
+  }
+
+  /** Packet X: two point `from`s are the same iff both are absent or both
+   * name the same commit and the same paths, in order. */
+  #fromsEqual(a: { sha: string; paths: string[] } | undefined, b: { sha: string; paths: string[] } | undefined): boolean {
+    if (a === undefined || b === undefined) return a === b;
+    return a.sha === b.sha && a.paths.length === b.paths.length && a.paths.every((p, i) => p === b.paths[i]);
   }
 
   /** Plan 06b (OD-1 R6): the requirement item id whose text is the disputed
@@ -8642,7 +8659,7 @@ export class Conductor {
     round: number,
     base: string,
     prompt: string,
-    fix?: { of: string; timeoutMs: number },
+    fix?: { of: string; timeoutMs: number; freshSession?: boolean },
   ): Promise<LaneBuild> {
     // Plan 06n (A5): remember this lane's own start, so its check can diff
     // against it and pick the final tier when a wide path is touched. A fix
@@ -8660,11 +8677,13 @@ export class Conductor {
     // starts fresh every lane whose own previous candidate is not that base.
     const own = previous?.candidates.find((c) => c.lane === lane)?.sha;
     // exex 01a2: a fix continues the lane's own session, which holds the work
-    // it is fixing.
+    // it is fixing — except a fix of the fixers' merge (packet X), which this
+    // lane's session never saw.
     const freshSession =
-      !fix &&
-      ((previous?.picked !== undefined && previous.picked.lane !== lane) ||
-        (this.#laneRoundRestartFromBest === base && own !== undefined && own !== base));
+      fix?.freshSession === true ||
+      (!fix &&
+        ((previous?.picked !== undefined && previous.picked.lane !== lane) ||
+          (this.#laneRoundRestartFromBest === base && own !== undefined && own !== base)));
     // Recorded so a test (and the owner) can see the session decision; the
     // production session dir still exists, the fresh start just skips
     // `--continue`.
@@ -8858,6 +8877,29 @@ export class Conductor {
     }
     const digest = this.#laneCheckFailureDigest(sha);
     this.#log.append("lane_fix_started", { lane, round, sha, remainingMs });
+    // Packet X: a fix round's synthetic lane holds the fixers' merge, not
+    // this lane worker's own work. Its first fix starts a FRESH session with
+    // a prompt that names the merge; a later fix (of that fix's own commit)
+    // continues that session as usual.
+    const fixRound = lane === "a" ? fixRoundCandidate(this.#state.phase.rounds, round) : undefined;
+    if (fixRound && fixRound.candidate === sha) {
+      const mergePrompt = [
+        `Commit ${sha.slice(0, 7)} is the fixers' merge: the previous round's fixer commits merged onto base ${fixRound.base.slice(0, 7)}. It FAILED the round checks, so its reviews were cancelled. A lane never hands in a red tree.`,
+        "",
+        "This worktree holds that merge; you did not write it, and this is a fresh session. Fix exactly what fails. Keep the fixers' work; do not delete, skip or #[ignore] a test, weaken an assertion, or remove required work to make a check pass (ODP-2) — if the failure is a real limit, raise it as a BLOCKER with the exact error instead.",
+        "Run the failing command yourself until it passes, then run the full round checks, then call submit_coverage and submit_phase with your complete payload (your disclosures, the coverage of the commit as it stands, and your answers).",
+        `You have about ${Math.max(1, Math.floor(remainingMs / 60_000))} minutes of this attempt left.`,
+        "",
+        `The failure: ${failure}`,
+        ...(digest ? ["", "Its output (errors first):", "```", digest, "```"] : []),
+      ].join("\n");
+      const fixed = await this.#buildLane(lane, round, sha, mergePrompt, { of: sha, timeoutMs: remainingMs, freshSession: true });
+      if (fixed.sha && treeOf(this.#plan.repo, fixed.sha) === treeOf(this.#plan.repo, sha)) {
+        this.#log.append("lane_fix_unchanged", { lane, round, sha, fixedSha: fixed.sha });
+        return { lane, note: `the lane's fix of ${sha.slice(0, 7)} changed nothing` };
+      }
+      return fixed;
+    }
     const prompt = [
       `Your round-${round} candidate ${sha.slice(0, 7)} FAILED the round checks, so its reviews were cancelled. A lane never hands in a red tree: a candidate's reviews count only once its checks pass.`,
       "",
@@ -9278,6 +9320,13 @@ export class Conductor {
       merges.push({ sha: result.sha });
     }
     if (mergeWorktreeReady && merges.length > 0) candidate = headOf(mergeWorktree);
+    // Packet X: a merge whose tree is B's own changed nothing (e.g. a fixer
+    // whose fix undid its own commit): there is no candidate, and the next
+    // round is today's.
+    if (candidate && treeOf(this.#plan.repo, candidate) === treeOf(this.#plan.repo, base)) {
+      this.#log.append("fix_merge_unchanged", { round: roundNo, base, candidate });
+      candidate = undefined;
+    }
     // The merged candidate is the next round's candidate: materialize its
     // read-only checkout now, before the next round's lane reviews (which run
     // in it) start.
@@ -9304,14 +9353,29 @@ export class Conductor {
       ...(disclosures.length > 0 ? { disclosures } : {}),
       ...(added.length > 0 ? { added } : {}),
     });
+    // Packet X: once ROUND_FIXED records every fixer's outcome and the merged
+    // candidate has its own checkout, the fix worktrees are spent. Only the
+    // worktrees go; every commit stays (the record names them).
+    for (const dir of [mergeWorktree, ...tasks.map((t) => this.#fixerWorktree(t.domain))]) {
+      try {
+        if (fs.existsSync(dir)) removeWorktree(this.#plan.repo, dir);
+      } catch (err) {
+        this.#log.append("fix_worktree_remove_failed", { round: roundNo, worktree: dir, error: String((err as Error)?.message ?? err) });
+      }
+    }
     return undefined;
+  }
+
+  /** Plan 07c (D4.3): one fixer's own worktree, beside the lanes'. */
+  #fixerWorktree(domain: string): string {
+    return path.join(this.#runDir, "worktrees", `fix-${domain}`);
   }
 
   /** Plan 07c (D4.3): one fixer — its own worktree at B, its own session, and
    * `runConsolidation` with `#+TT_FIX_CHECKS` as its gate. The fixer's handle
    * is a consolidation handle: it owes `submit_phase` only. */
   async #runFixer(task: FixTask, round: number, base: string, allTasks: readonly FixTask[]): Promise<ConsolidationOutcome> {
-    const worktree = path.join(this.#runDir, "worktrees", `fix-${task.domain}`);
+    const worktree = this.#fixerWorktree(task.domain);
     const sessionDir = path.join(this.#paths.sessions, `fix-${round}-${task.domain}`);
     const prompt = this.#fixerPrompt(task, round, base, allTasks);
     const startedAt = Date.now();
@@ -9399,6 +9463,10 @@ export class Conductor {
             this.#log.intent(`fixer-check-sh-${task.domain}-${pgid}`, { pgid, domain: task.domain, candidateSha: sha });
           },
         }).result;
+        // Packet X: the fixer check's output is kept under checks/<sha>/, as a
+        // lane check's is, so a red fixer's fix prompt carries the failure
+        // (`#laneCheckFailureDigest`).
+        this.#recordCheck(path.join(this.#paths.checks, sha), this.#withValues(command), result);
         const ok = result.exitCode === 0 && !result.timedOut;
         this.#log.append("fixer_check_finished", { round, domain: task.domain, sha, passed: ok, exitCode: result.exitCode, timedOut: result.timedOut });
         return ok ? { ok: true } : { ok: false, note: `the fixer check \`${command}\` ${result.timedOut ? "timed out" : `exited ${result.exitCode}`}` };
@@ -9689,9 +9757,13 @@ export class Conductor {
       // environment, one at a time, bounded by the reproduction deadline. The
       // results stay with the candidate (persisted in its record) so a resumed
       // round reads them; only the picked candidate's become events.
+      // Packet X: each doneWhen that passes here also runs on the round's base
+      // (the lane's start), so a command that passes there too repairs
+      // nothing. The consolidator's commit gets no facts: its facts are never
+      // used (the next round's candidates are checked on their own).
       const facts =
-        passed && (this.#state.phase.contract.domains?.length ?? 0) > 0
-          ? await this.#runDoneWhenFacts(lane, candidateSha, checkoutDir.dir)
+        passed && lane !== "consolidator" && (this.#state.phase.contract.domains?.length ?? 0) > 0
+          ? await this.#runDoneWhenFacts(lane, candidateSha, checkoutDir.dir, laneBase ?? this.#baselineBaseSha())
           : [];
       this.#laneFacts.set(candidateSha, facts);
       this.#writeCheckRecord(outDir, {
@@ -9702,7 +9774,15 @@ export class Conductor {
         commands: recordCommands,
         finalCommands,
         ...(facts.length > 0
-          ? { facts: facts.map(({ findingId, exitCode, timedOut, outputTail }) => ({ findingId, exitCode, timedOut, outputTail })) }
+          ? {
+              facts: facts.map(({ findingId, exitCode, timedOut, outputTail, passesOnBase }) => ({
+                findingId,
+                exitCode,
+                timedOut,
+                outputTail,
+                ...(passesOnBase !== undefined ? { passesOnBase } : {}),
+              })),
+            }
           : {}),
         load1: recordLoad1,
         freeMemMB: recordFreeMemMB,
@@ -9723,8 +9803,14 @@ export class Conductor {
   /** Plan 07b (D3): run each open domain-mode finding's `doneWhen` in the
    * candidate's own check checkout, with the check environment, one at a time,
    * each bounded by the reproduction deadline. Correctness over speed: no
-   * parallelism, and a timeout is recorded, never retried. */
-  async #runDoneWhenFacts(lane: string, candidateSha: string, cwd: string): Promise<FindingFact[]> {
+   * parallelism, and a timeout is recorded, never retried.
+   *
+   * Packet X: a doneWhen that exits 0 on the candidate also runs on the
+   * round's base `baseSha` (a checkout of it, the check environment, the
+   * same deadline; cached per base and finding). The fact records whether it
+   * passes there too (`passesOnBase`); only one that fails on the base (a
+   * non-zero exit or a timeout) and passes on the candidate repairs. */
+  async #runDoneWhenFacts(lane: string, candidateSha: string, cwd: string, baseSha: string): Promise<FindingFact[]> {
     const open = this.#state.phase.findings.filter(
       (f) =>
         f.status === "open" &&
@@ -9737,38 +9823,79 @@ export class Conductor {
         f.doneWhen.trim().length > 0,
     );
     const facts: FindingFact[] = [];
-    for (const finding of open) {
-      const command = finding.doneWhen!;
-      const startedAt = Date.now();
-      const result = await runCommand({
-        command,
-        cwd,
-        env: this.#checkEnv(),
-        deadlineMs: this.#deadlines.reproductionMs,
-        termGraceMs: this.#deadlines.termGraceMs,
-        onIntent: ({ pgid }) => {
-          this.#onStageShIntent(pgid);
-          // The finding id is in the key so a resumed round can tell which
-          // doneWhen a staged command was, not just that the lane staged one.
-          this.#log.intent(`done-when-${lane}-${finding.id}-${pgid}`, { pgid, findingId: finding.id, candidateSha });
-        },
-      }).result;
-      facts.push({
-        findingId: finding.id,
-        candidateSha,
-        exitCode: result.exitCode,
-        timedOut: result.timedOut,
-        outputTail: result.output.slice(-2000),
-      });
-      this.#log.append("done_when_fact", {
-        lane,
-        findingId: finding.id,
-        candidateSha,
-        command,
-        exitCode: result.exitCode,
-        timedOut: result.timedOut,
-        durationMs: Date.now() - startedAt,
-      });
+    // The base checkout is made once, on the first doneWhen that passes here.
+    let baseCheckout: DisposableCheckout | undefined;
+    let baseCheckoutFailed = false;
+    try {
+      for (const finding of open) {
+        const command = finding.doneWhen!;
+        const startedAt = Date.now();
+        const result = await runCommand({
+          command,
+          cwd,
+          env: this.#checkEnv(),
+          deadlineMs: this.#deadlines.reproductionMs,
+          termGraceMs: this.#deadlines.termGraceMs,
+          onIntent: ({ pgid }) => {
+            this.#onStageShIntent(pgid);
+            // The finding id is in the key so a resumed round can tell which
+            // doneWhen a staged command was, not just that the lane staged one.
+            this.#log.intent(`done-when-${lane}-${finding.id}-${pgid}`, { pgid, findingId: finding.id, candidateSha });
+          },
+        }).result;
+        let passesOnBase: boolean | undefined;
+        if (result.exitCode === 0 && !result.timedOut) {
+          const key = `${baseSha}\0${finding.id}`;
+          let onBase = this.#doneWhenBaseRuns.get(key);
+          if (!onBase && !baseCheckoutFailed) {
+            try {
+              baseCheckout ??= disposableCheckout(this.#plan.repo, baseSha);
+            } catch (err) {
+              baseCheckoutFailed = true;
+              this.#log.append("done_when_base_checkout_failed", { lane, candidateSha, baseSha, error: String((err as Error)?.message ?? err) });
+            }
+            if (baseCheckout) {
+              const checkoutDir = baseCheckout.dir;
+              const run = await runCommand({
+                command,
+                cwd: checkoutDir,
+                env: this.#checkEnv(),
+                deadlineMs: this.#deadlines.reproductionMs,
+                termGraceMs: this.#deadlines.termGraceMs,
+                onIntent: ({ pgid }) => {
+                  this.#onStageShIntent(pgid);
+                  this.#log.intent(`done-when-base-${lane}-${finding.id}-${pgid}`, { pgid, findingId: finding.id, baseSha });
+                },
+              }).result;
+              onBase = { exitCode: run.exitCode, timedOut: run.timedOut };
+              this.#doneWhenBaseRuns.set(key, onBase);
+              this.#log.append("done_when_base", { lane, findingId: finding.id, baseSha, command, exitCode: run.exitCode, timedOut: run.timedOut });
+            }
+          }
+          if (onBase) passesOnBase = onBase.exitCode === 0 && !onBase.timedOut;
+        }
+        facts.push({
+          findingId: finding.id,
+          candidateSha,
+          exitCode: result.exitCode,
+          timedOut: result.timedOut,
+          outputTail: result.output.slice(-2000),
+          ...(passesOnBase !== undefined ? { passesOnBase } : {}),
+        });
+        this.#log.append("done_when_fact", {
+          lane,
+          findingId: finding.id,
+          candidateSha,
+          command,
+          exitCode: result.exitCode,
+          timedOut: result.timedOut,
+          durationMs: Date.now() - startedAt,
+          baseSha,
+          ...(passesOnBase !== undefined ? { passesOnBase } : {}),
+        });
+      }
+    } finally {
+      baseCheckout?.dispose();
     }
     return facts;
   }
@@ -10877,10 +11004,23 @@ export class Conductor {
           exitCode: fact.exitCode,
           timedOut: fact.timedOut,
           outputTail: fact.outputTail,
+          ...(fact.passesOnBase !== undefined ? { passesOnBase: fact.passesOnBase } : {}),
         });
       }
       for (const fact of winnerFacts) {
         if (fact.timedOut || fact.exitCode !== 0) continue;
+        // Packet X: a doneWhen repairs only what failed on the round's base.
+        // One that passes there too (e.g. a test filter that matches nothing)
+        // proves nothing, and one whose base run could not be made is not
+        // proven either.
+        if (fact.passesOnBase !== false) {
+          this.#log.append("done_when_not_repairing", {
+            findingId: fact.findingId,
+            candidateSha: fact.candidateSha,
+            reason: fact.passesOnBase ? "the doneWhen passes on the round's base too" : "the doneWhen was not run on the round's base",
+          });
+          continue;
+        }
         const finding = this.#state.phase.findings.find((f) => f.id === fact.findingId);
         if (!finding || finding.status !== "open") continue;
         this.#applyEvent({
@@ -14268,7 +14408,8 @@ export class Conductor {
               const finding = phase.findings.find((x) => x.id === f.findingId);
               const doneWhen = finding?.doneWhen ?? "(no doneWhen recorded)";
               const outcome = f.timedOut ? "timed out" : `exit ${f.exitCode}`;
-              return `- ${f.findingId} \`${doneWhen}\`: ${outcome}`;
+              const onBase = f.passesOnBase ? " (it passes on the round's base too, so it proves no repair)" : "";
+              return `- ${f.findingId} \`${doneWhen}\`: ${outcome}${onBase}`;
             }),
           ]
         : []),

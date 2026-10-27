@@ -2095,6 +2095,13 @@ export interface FindingFact {
   exitCode: number | null;
   timedOut: boolean;
   outputTail: string;
+  /** Packet X: set when the doneWhen exited 0 on the candidate — whether it
+   * also exits 0 on the round's base B (in a checkout of B, with the check
+   * environment and the same deadline). True means the command proves
+   * nothing (e.g. a test filter that matches nothing), so the fact repairs
+   * nothing; only `false` (it fails on B and passes on the candidate)
+   * repairs. Absent when the base run could not be made. */
+  passesOnBase?: boolean;
 }
 export interface EvFindingFact {
   type: "FINDING_FACT";
@@ -2103,6 +2110,8 @@ export interface EvFindingFact {
   exitCode: number | null;
   timedOut: boolean;
   outputTail: string;
+  /** Packet X: see `FindingFact.passesOnBase`. */
+  passesOnBase?: boolean;
 }
 
 /** Plan 06n (A2/R3): the evaluator's open-finding re-check answered `repaired`

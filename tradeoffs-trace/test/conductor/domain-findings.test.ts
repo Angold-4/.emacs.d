@@ -394,6 +394,44 @@ test("a point with trailing whitespace still folds into the open one", async () 
   }
 });
 
+test("a duplicate point with a different severity or a different from is raised on its own", async () => {
+  // Packet X: a fold must not lose information. M raises an advisory point;
+  // A the same point with a `from` (another lane's work); B the same point as
+  // a blocking one. Each differs from the others, so none is folded.
+  const point = { domain: "booking", item: "R1", where: "src/core/rounds.ts:1 fn", expected: "x", doneWhen: "true" };
+  const setup = await setupConductor({
+    items: ITEMS,
+    domains: DOMAINS,
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript,
+    reviewerScriptFor: (reviewer, state) =>
+      reviewerScript(reviewer, state, {
+        findings: [
+          reviewer === "M"
+            ? { kind: "defect", severity: "advisory", evidence: "the advisory point", ...point }
+            : reviewer === "A"
+              ? { kind: "defect", severity: "advisory", evidence: "the point from another lane", ...point, from: { sha: state.phase.candidate?.sha ?? "HEAD", paths: ["src/core/rounds.ts"] } }
+              : { kind: "defect", severity: "blocking", evidence: "the blocking point", ...point },
+        ],
+      }),
+  });
+  try {
+    await setup.conductor.start();
+    const matching = () => setup.conductor.state.phase.findings.filter((f) => f.item === "R1" && f.doneWhen === "true");
+    await waitFor(() => matching().length >= 3, 90_000, 50, setup.runDir);
+    const findings = matching();
+    assert.equal(findings.length, 3, `three points, none folded: ${JSON.stringify(findings.map((f) => [f.raisedBy, f.severity, f.from]))}`);
+    assert.ok(findings.every((f) => (f.alsoRaisedBy ?? []).length === 0), "no seat was folded into another's point");
+    assert.deepEqual(findings.map((f) => f.severity).sort(), ["advisory", "advisory", "blocking"], "the blocking point kept its severity");
+    assert.equal(findings.filter((f) => f.from !== undefined).length, 1, "the point with a from kept it");
+    assert.ok(!readEvents(setup.runDir).some((r) => r.kind === "event" && (r.event as { type?: string }).type === "FINDING_ALSO_RAISED"), "nothing folded");
+  } finally {
+    await teardown(setup);
+  }
+});
+
 test("a duplicate carrying a criterion dispute is not folded and its dispute survives", async () => {
   const point = { domain: "booking", item: "R1", where: "src/core/rounds.ts:1 fn", expected: "x" };
   // M raises two DIFFERENT points that dispute the SAME criterion with

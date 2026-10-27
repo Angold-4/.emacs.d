@@ -233,6 +233,75 @@ test("after a passing check a finding whose doneWhen exits 0 on the picked candi
   }
 });
 
+test("a doneWhen that fails on the round's base and passes on the candidate repairs the finding", async () => {
+  // Packet X (B4): round 2's base is round 1's pick, which has no fixed-a;
+  // round 2's candidate adds it. The fact runs on both.
+  const doneWhen = "test -f fixed-a";
+  const setup = await setupConductor({
+    phase: lanePhase(),
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorker(1, "a"),
+    laneWorkerScriptFor: (lane, round) => (lane === "b" ? crashedLane() : laneWorker(round, lane, round === 1 ? [] : ["fixed-a"])),
+    laneReviewerScriptFor: (seat, candidate, state) => reviewerWithPoint(doneWhen)(seat, candidate, state),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () => setup.conductor.state.phase.findings.some((f) => f.doneWhen === doneWhen && f.status === "repaired"),
+      150_000,
+      50,
+      setup.runDir,
+    );
+    const finding = setup.conductor.state.phase.findings.find((f) => f.doneWhen === doneWhen)!;
+    const fact = coreEvents(setup.runDir).find((e) => e.type === "FINDING_FACT" && e.findingId === finding.id)!;
+    assert.equal(fact.exitCode, 0, "it passes on the candidate");
+    assert.equal(fact.passesOnBase, false, "the fact records that it fails on the base");
+    const base = setup.conductor.state.phase.rounds!.find((r) => r.round === 2)!.base;
+    const baseRuns = readEvents(setup.runDir).filter((r) => r.kind === "done_when_base" && (r.event as { findingId?: string }).findingId === finding.id);
+    assert.ok(baseRuns.length >= 1, "the doneWhen ran on the base");
+    assert.equal((baseRuns[0].event as { baseSha?: string }).baseSha, base, "on round 2's own base");
+    assert.notEqual((baseRuns[0].event as { exitCode?: number }).exitCode, 0, "and failed there");
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("a doneWhen that already passes on the round's base records a flagged fact and repairs nothing", async () => {
+  // Packet X (B4): a doneWhen that proves nothing (like a test filter that
+  // matches no test) exits 0 on the base too, so its exit 0 on the candidate
+  // is no repair.
+  const doneWhen = "exit 0";
+  const setup = await setupConductor({
+    phase: lanePhase(),
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorker(1, "a"),
+    laneWorkerScriptFor: (lane, round) => (lane === "b" ? crashedLane() : laneWorker(round, lane)),
+    laneReviewerScriptFor: (seat, candidate, state) => reviewerWithPoint(doneWhen)(seat, candidate, state),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => coreEvents(setup.runDir).some((e) => e.type === "FINDING_FACT"), 150_000, 50, setup.runDir);
+    const finding = setup.conductor.state.phase.findings.find((f) => f.doneWhen === doneWhen)!;
+    const fact = coreEvents(setup.runDir).find((e) => e.type === "FINDING_FACT" && e.findingId === finding.id)!;
+    assert.equal(fact.exitCode, 0, "it passes on the candidate");
+    assert.equal(fact.passesOnBase, true, "the fact is flagged: it passes on the base too");
+    assert.ok(
+      (setup.conductor.state.phase.doneWhenFacts ?? []).some((f) => f.findingId === finding.id && f.passesOnBase === true),
+      "the phase record keeps the flag",
+    );
+    assert.ok(!coreEvents(setup.runDir).some((e) => e.type === "FINDING_CONFIRMED_REPAIRED" && e.findingId === finding.id), "nothing repairs it");
+    assert.equal(setup.conductor.state.phase.findings.find((f) => f.id === finding.id)!.status, "open", "the finding stays open");
+  } finally {
+    await teardown(setup);
+  }
+});
+
 test("a finding whose doneWhen exits non-zero on the picked candidate stays open with its fact", async () => {
   const doneWhen = "test -f fixed-b";
   const setup = await setupConductor({
@@ -364,7 +433,9 @@ test("a doneWhen runs in the checked checkout with the check environment", async
 test("a round resumed after its check reads the persisted facts instead of running them again", async () => {
   const counter = `/tmp/tt-done-when-counter-${process.pid}`;
   fs.rmSync(counter, { force: true });
-  const doneWhen = `echo run >> ${counter}`;
+  // It counts its runs and passes only where round 2's lane-a file exists
+  // (so it fails on round 2's base and the fact repairs).
+  const doneWhen = `echo run >> ${counter}; test -f lane-a-r2.txt`;
   const setup = await setupConductor({
     phase: lanePhase(),
     checks: ["true"],
@@ -392,7 +463,7 @@ test("a round resumed after its check reads the persisted facts instead of runni
     );
     await setup.conductor.stop();
     const counterLines = () => fs.readFileSync(counter, "utf8").split("\n").filter((l) => l.length > 0);
-    assert.equal(counterLines().length, 1, "the doneWhen ran once before the stop");
+    assert.equal(counterLines().length, 2, "the doneWhen ran once on the candidate and once on the base before the stop");
     assert.ok(!coreEvents(setup.runDir).some((e) => e.type === "FINDING_FACT"), "no fact is recorded before the hand-off");
 
     resumed = resumeConductor(setup);
@@ -403,7 +474,7 @@ test("a round resumed after its check reads the persisted facts instead of runni
       50,
       setup.runDir,
     );
-    assert.equal(counterLines().length, 1, "the resumed round did not run the doneWhen again");
+    assert.equal(counterLines().length, 2, "the resumed round did not run the doneWhen again");
     const facts = coreEvents(setup.runDir).filter((e) => e.type === "FINDING_FACT");
     assert.equal(facts.length, 1, "the fact is recorded exactly once");
   } finally {
