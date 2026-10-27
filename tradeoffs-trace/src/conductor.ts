@@ -1817,11 +1817,14 @@ export class Conductor {
     this.#checkSlots = opts.checkSlots ?? (Number(process.env.TT_CHECK_SLOTS) || DEFAULT_CHECK_SLOTS);
     this.#integrationBranch = opts.plan.integrationBranch;
     this.#budgetRemainingMs = this.#deadlines.runBudgetMs;
-    // Plan 07f (A2): acceptance decides whether a seat's item evidence
-    // resolves in the candidate. Only this conductor can read the candidate's
-    // own tree (a lane's candidate lives in its worktree), so it installs the
-    // resolver the pure acceptance check calls.
-    setSeatAnchorResolver((evidence) => this.#seatEvidenceResolves(evidence));
+    // Plan 07f (A2/C1): a review reaches the phase only after `verdictIssues`
+    // resolved every file:line it cites against the candidate (an unresolvable
+    // anchor is refused at ingestion), so a stored anchor IS resolved. The
+    // conductor installs the review-lint anchor rule (a file:line-range, a
+    // test name, or a command the reviewer ran) as the resolver acceptance
+    // reads. It is stateless, so it stays installed after the conductor stops:
+    // a logged ACCEPTED event must still reduce when replayed (rebuildState).
+    setSeatAnchorResolver((evidence) => evidenceHasAnchor(evidence));
   }
 
   get state(): State {
@@ -2727,10 +2730,6 @@ export class Conductor {
 
   async #doStop(): Promise<void> {
     this.#stopRequested = true;
-    // Plan 07f (A2): the installed anchor resolver names this conductor's
-    // candidate tree; drop it with the conductor so it can never answer for
-    // another one.
-    setSeatAnchorResolver(undefined);
     if (this.#budgetTimer) clearTimeout(this.#budgetTimer);
     if (this.#inboxTimer) clearInterval(this.#inboxTimer);
     if (this.#statusTimer) {
@@ -7988,19 +7987,6 @@ export class Conductor {
         return false;
       }
     });
-  }
-
-  /** Plan 07f (A2): a seat's item evidence resolves in the current
-   * candidate. A test name or a command the reviewer ran is an anchor by
-   * itself; a file:line anchor must name a tracked candidate file and an
-   * in-range line. */
-  #seatEvidenceResolves(evidence: string): boolean {
-    // A review reaches the phase only after `verdictIssues` resolved every
-    // file:line it cites against the candidate (an unresolvable anchor is
-    // refused at ingestion), so the stored anchor IS resolved. Acceptance
-    // therefore reads the anchor structurally, which also keeps the logged
-    // ACCEPTED event replayable from state alone (no live tree).
-    return evidenceHasAnchor(evidence);
   }
 
   /** Plan 06k2 (A2): the tracked files of the current candidate, for
