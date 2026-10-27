@@ -539,6 +539,42 @@ export function publishCAS(repo: string, branch: string, I: string, H: string): 
 }
 
 // ---------------------------------------------------------------------------
+// Plan 07c (D4.5): merge one fixer's commit into the fix worktree
+// ---------------------------------------------------------------------------
+
+/** Plan 07c (D4.5): merge one green fixer commit into `worktree` (a fresh
+ * worktree at the fix round's base) with `--no-ff`, using the same identity
+ * and no-hooks arguments `probe` uses. A conflict aborts the merge
+ * (`git merge --abort`) and returns the merge output; the worktree is left
+ * clean at whatever it held before. */
+export function mergeFixer(worktree: string, sha: string): { ok: true } | { ok: false; output: string } {
+  const merge = gitCapturingFailure(
+    [
+      "-C",
+      worktree,
+      ...IDENTITY_ARGS,
+      ...NO_HOOKS_ARGS,
+      "merge",
+      "--no-ff",
+      "--no-verify",
+      "-m",
+      `merge fixer commit ${sha}\n\nTT-Action: fix-merge-${sha}`,
+      sha,
+    ],
+    { cwd: worktree },
+  );
+  if (!merge.ok) {
+    try {
+      git(["-C", worktree, "merge", "--abort"]);
+    } catch {
+      // Nothing to abort, or already clean.
+    }
+    return { ok: false, output: merge.output };
+  }
+  return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
 // Diff introspection (work packet 2a: boundary triggers, §3.5 sampling)
 // ---------------------------------------------------------------------------
 

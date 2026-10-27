@@ -15,6 +15,7 @@
 import * as path from "node:path";
 
 import { expandPromptPath } from "./worker-prompt.ts";
+import { parseDomains, type Domain } from "./domains.ts";
 import type { LintItemInput, LintModels, LintPhaseInput, LintPlanInput } from "./plan-lint.ts";
 
 interface OrgNode {
@@ -133,6 +134,8 @@ function itemInput(node: OrgNode, kind: "architecture" | "requirement" | "constr
     rawText,
     line: node.line,
   };
+  // Plan 07a (D1): a `:DOMAIN:` property on any R/A/C item.
+  if (node.props.DOMAIN) item.domain = node.props.DOMAIN;
   if (kind === "architecture") {
     if (node.props.WHERE) item.where = node.props.WHERE;
     if (node.propLines.WHERE) item.whereLine = node.propLines.WHERE;
@@ -157,6 +160,10 @@ function parsePhaseNode(
   globalGenerated?: string[],
   globalRegen?: string[],
   globalWidePaths?: string[],
+  globalDomains?: Domain[],
+  globalFixRounds?: string,
+  globalFixers?: number,
+  globalFixChecks?: string,
 ): LintPhaseInput {
   const byTitle = (name: string) => node.children.find((c) => c.title === name);
   const goalNode = byTitle("Goal");
@@ -210,6 +217,14 @@ function parsePhaseNode(
     // tt 09 (change 3): the phase's own :CONSOLIDATE: (on/off), kept as
     // written so lint can name a bad value.
     ...(node.props.CONSOLIDATE ? { consolidate: node.props.CONSOLIDATE.trim() } : {}),
+    // Plan 07a (D1): the plan's #+TT_DOMAINS applies to every phase (there
+    // is no phase-level override; D1 makes it a per-plan switch).
+    ...(globalDomains && globalDomains.length > 0 ? { domains: globalDomains } : {}),
+    // Plan 07c (D4): the fix-round keywords are per-plan switches too, so
+    // every phase inherits them, exactly like #+TT_DOMAINS.
+    ...(globalFixRounds ? { fixRounds: globalFixRounds } : {}),
+    ...(globalFixers !== undefined ? { fixers: globalFixers } : {}),
+    ...(globalFixChecks ? { fixChecks: globalFixChecks } : {}),
   };
   if (structured) {
     phase.architecture = (architecture?.children ?? []).map((c) => itemInput(c, "architecture"));
@@ -368,7 +383,21 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   const globalGenerated = first("TT_GENERATED") ? splitList(first("TT_GENERATED")!.value) : undefined;
   const globalRegen = first("TT_REGEN") ? splitCommands(first("TT_REGEN")!.value) : undefined;
   const globalWidePaths = first("TT_WIDE_PATHS") ? splitList(first("TT_WIDE_PATHS")!.value) : undefined;
-  const phases = roots.filter((r) => r.level === 1).map((r) => parsePhaseNode(r, [], globalFinalChecks, globalGenerated, globalRegen, globalWidePaths));
+  const globalDomainsKeyword = first("TT_DOMAINS");
+  const globalDomains = globalDomainsKeyword ? parseDomains(globalDomainsKeyword.value) : undefined;
+  // Plan 07c (D4): the fix-round keywords, read as written so lint can name
+  // a bad value; carried onto every phase like the domains.
+  const globalFixRoundsKeyword = first("TT_FIX_ROUNDS");
+  const globalFixRounds = globalFixRoundsKeyword ? globalFixRoundsKeyword.value.trim() : undefined;
+  const globalFixersKeyword = first("TT_FIXERS");
+  const globalFixers = globalFixersKeyword ? parseCount(globalFixersKeyword) : undefined;
+  const globalFixChecksKeyword = first("TT_FIX_CHECKS");
+  const globalFixChecks = globalFixChecksKeyword ? globalFixChecksKeyword.value.trim() : undefined;
+  const phases = roots
+    .filter((r) => r.level === 1)
+    .map((r) =>
+      parsePhaseNode(r, [], globalFinalChecks, globalGenerated, globalRegen, globalWidePaths, globalDomains, globalFixRounds, globalFixers, globalFixChecks),
+    );
   const rerun = first("TT_RERUN");
   const envFile = first("TT_ENV_FILE")?.value;
   const workers = first("TT_WORKERS");
@@ -405,6 +434,11 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
     ...(golden && golden.value.trim().length > 0 ? { golden: golden.value.trim(), goldenLine: golden.line } : {}),
     ...(leader ? { leader: leader.value.trim(), leaderLine: leader.line } : {}),
     ...(consolidate ? { consolidate: consolidate.value.trim(), consolidateLine: consolidate.line } : {}),
+    ...(globalDomains && globalDomains.length > 0 ? { domains: globalDomains } : {}),
+    ...(globalDomainsKeyword ? { domainsLine: globalDomainsKeyword.line } : {}),
+    ...(globalFixRounds ? { fixRounds: globalFixRounds, fixRoundsLine: globalFixRoundsKeyword!.line } : {}),
+    ...(globalFixers !== undefined ? { fixers: globalFixers, fixersLine: globalFixersKeyword!.line } : {}),
+    ...(globalFixChecks ? { fixChecks: globalFixChecks, fixChecksLine: globalFixChecksKeyword!.line } : {}),
   };
 }
 

@@ -4,6 +4,8 @@
 //
 // Design references (docs/tradeoffs-trace.md) are noted per type.
 
+import type { Domain } from "./domains.ts";
+
 // ---------------------------------------------------------------------------
 // §7.1 Versions and binding
 // ---------------------------------------------------------------------------
@@ -96,6 +98,9 @@ export interface PhaseContract {
   phaseId: string;
   contractVersion: ContractVersion;
   goal: string;
+  /** Plan 07a (D1): the phase's declared domains (`#+TT_DOMAINS`), frozen
+   * into the contract. Absent means domain mode is off, exactly as today. */
+  domains?: Domain[];
   /** Plan 06i (A3): the phase's golden note — the current source a choice
    * that matches an earlier drafting decision is re-checked against. A
    * `contract` classification must cite it. */
@@ -112,6 +117,16 @@ export interface PhaseContract {
    * the phase's `:WIDE_PATHS:`). A candidate whose diff touches one runs the
    * final check in its round. */
   widePaths?: string[];
+  /** Plan 07c (D4): `#+TT_FIX_ROUNDS: domains` frozen into the contract.
+   * Present only when the plan switched fix rounds on; absent means every
+   * round is today's. */
+  fixRounds?: "domains";
+  /** Plan 07c (D4): `#+TT_FIXERS` (default 4) — the most fixer tasks (one
+   * per domain) one fix round runs. */
+  fixers?: number;
+  /** Plan 07c (D4): `#+TT_FIX_CHECKS` — the fast command every fixer's own
+   * commit must pass before it is merged. */
+  fixChecks?: string;
   /** Plan 06g: `#+TT_WORKERS:` frozen into the contract — how many lanes one
    * round runs. Absent (or 1) is today's single-candidate loop. */
   workers?: number;
@@ -310,6 +325,14 @@ export interface Finding {
    * (set when it was raised with a `criterionDispute`). A later amendment of
    * that item supersedes the finding. */
   criterionDisputed?: string;
+  /** Plan 07a (OD-7): the whole `criterionDispute` the reviewer raised with
+   * this finding — criterion, why and proposedWording. Stored verbatim so a
+   * duplicate point's dispute is compared as a whole and uniquely to THIS
+   * finding: a fold must never drop a different amendment, and an amendment
+   * lookup keyed only by criterion/seat/candidate is ambiguous when one seat
+   * raises two disputes on the same criterion. `criterionDisputed` stays the
+   * criterion-only view the rest of the conductor reads. */
+  criterionDispute?: CriterionDispute;
   /** Plan 01g: why this finding was closed without repair — set when an
    * amendment replaced the wording it cited. */
   supersededBy?: string;
@@ -338,6 +361,15 @@ export interface Finding {
    * variant limit can count the same requirement's blocking findings across
    * consecutive rounds. Set by the conductor when the finding is raised. */
   roundRaised?: number;
+  /** Plan 07a (D2): the domain-mode point fields — a declared `domain`, the
+   * R/A/C `item` it serves, `where` (`path:line symbol`), `expected` and the
+   * `doneWhen` command, plus the optional `from` (another lane's work). */
+  domain?: string;
+  item?: string;
+  where?: string;
+  expected?: string;
+  doneWhen?: string;
+  from?: { sha: string; paths: string[] };
 }
 
 // ---------------------------------------------------------------------------
@@ -702,6 +734,15 @@ export interface FindingDisclosure {
    * published only if it exits non-zero (and dropped with the run recorded
    * when it passes). */
   runnable?: string;
+  /** Plan 07a (D2): the domain-mode point fields. Required in domain mode
+   * (refused by `reviewIngestionIssue` naming the missing field), optional
+   * and ignored otherwise. */
+  domain?: string;
+  item?: string;
+  where?: string;
+  expected?: string;
+  doneWhen?: string;
+  from?: { sha: string; paths: string[] };
 }
 
 /** Plan 04b: one entry of a reviewer's `blockers` list. Exactly a finding
@@ -722,6 +763,13 @@ export interface BlockerDisclosure {
   /** Plan 05e: a runnable test or command, checked by the same 3a/3b rule as
    * an ordinary finding. */
   runnable?: string;
+  /** Plan 07a (D2): the domain-mode point fields, exactly as on a finding. */
+  domain?: string;
+  item?: string;
+  where?: string;
+  expected?: string;
+  doneWhen?: string;
+  from?: { sha: string; paths: string[] };
 }
 
 export interface Review {
@@ -1141,6 +1189,10 @@ export interface PhaseState {
   findings: Finding[];
   ownerRequests: OwnerRequest[];
   corrections: Correction[];
+  /** Plan 07b (D3): the done-when facts recorded for the candidate the phase
+   * judges (one per open domain-mode finding). Recorded only at the winner's
+   * hand-off; a losing lane's fact never appears here. */
+  doneWhenFacts?: FindingFact[];
   /** Plan 06k1 (A2): decisions the owner ruled on by an owner correction or
    * directive that names the id as ruled. A ruling settles the decision on
    * every later candidate whose decision has the same id and choice, with no
@@ -1438,6 +1490,11 @@ export interface RoundRecord {
    * not. `ok` with a `sha` makes that commit the next round's base for every
    * lane; `ok` false records why the next round starts from the winner. */
   consolidated?: RoundConsolidation;
+  /** Plan 07c (D4): set by ROUND_FIXED once the round's open fix findings
+   * were grouped by domain and one fixer per domain ran from the same base.
+   * With a `candidate`, the next round is a single-lane round on that merged
+   * commit; without one it is today's two-lane round. */
+  fixed?: RoundFixed;
 }
 
 /** tt 09 (change 3): one lane's work a consolidation takes onto the winner —
@@ -1466,6 +1523,36 @@ export interface RoundConsolidation {
   added?: string[];
   /** How many times the consolidator fixed a red commit. */
   fixes?: number;
+}
+
+/** Plan 07c (D4.6): one fixer task as `ROUND_FIXED` records it — the domain,
+ * the findings it owned, its green commit (when it produced one) and, when it
+ * was skipped, why. */
+export interface FixTaskRecord {
+  domain: string;
+  findingIds: string[];
+  sha?: string;
+  note?: string;
+}
+
+/** Plan 07c (D4.6): the fix step of one round, as `ROUND_FIXED` records it.
+ * `base` is the commit the fixers started from and the merged candidate's own
+ * check base; `tasks` is one entry per fixer (its commit or why it was
+ * skipped); `merges` are the fixer commits actually merged, in task order;
+ * `candidate` is the merged commit, when at least one fixer's work merged. */
+export interface RoundFixed {
+  base: string;
+  tasks: FixTaskRecord[];
+  merges: { sha: string }[];
+  candidate?: string;
+  /** Plan 07c (C3): the fixers' own decision disclosures, unioned. The merged
+   * candidate's synthetic lane build carries them so the hand-off records
+   * them as the phase's decisions — a fixer's out-of-task trade-off reaches
+   * the reviewers instead of being silently dropped. */
+  disclosures?: DecisionDisclosure[];
+  /** Plan 07c (C3): the fixers' own assumptions and deviations, unioned, so
+   * their free-form notes are kept rather than discarded. */
+  added?: string[];
 }
 
 export interface FlakeObservation {
@@ -1779,6 +1866,25 @@ export interface EvRoundConsolidated {
   added?: string[];
   fixes?: number;
 }
+/** Plan 07c (D4.6): the fix step between a picked-but-not-accepted round and
+ * the next one. `base` is what the fixers started from, `tasks` one entry per
+ * fixer (its commit or why it was skipped), `merges` the fixer commits merged
+ * in task order and `candidate` the merged commit. Record-only: a candidate
+ * makes the next round a single-lane round on it; without one the next round
+ * is today's two-lane round. */
+export interface EvRoundFixed {
+  type: "ROUND_FIXED";
+  round: number;
+  base: string;
+  tasks: FixTaskRecord[];
+  merges: { sha: string }[];
+  candidate?: string;
+  /** Plan 07c (C3): the fixers' unioned decision disclosures, replayed into
+   * the merged candidate's synthetic lane build at the hand-off. */
+  disclosures?: DecisionDisclosure[];
+  /** Plan 07c (C3): the fixers' unioned assumptions and deviations. */
+  added?: string[];
+}
 /** Plan 06n (A7): the round's evaluated pick `sha` lost `items` that the
  * phase's best candidate met, in code it changed, so it is not adopted as the
  * next round's base. Record-only: it marks the round, never accepts or
@@ -1976,6 +2082,27 @@ export interface EvFindingConfirmedRepaired {
   findingId: string;
   byReviewer: Reviewer;
   candidateSha: string;
+}
+
+/** Plan 07b (D3): one open domain-mode finding's `doneWhen` run on one
+ * candidate, in that candidate's own check checkout with the check
+ * environment and the reproduction deadline. `exitCode` is null when the
+ * command was killed on timeout. Facts are recorded only for the picked
+ * candidate; a losing lane's fact repairs nothing. */
+export interface FindingFact {
+  findingId: string;
+  candidateSha: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  outputTail: string;
+}
+export interface EvFindingFact {
+  type: "FINDING_FACT";
+  findingId: string;
+  candidateSha: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  outputTail: string;
 }
 
 /** Plan 06n (A2/R3): the evaluator's open-finding re-check answered `repaired`
@@ -2730,6 +2857,7 @@ export type Event =
   | EvWorkerResumed
   | EvItemsRegressed
   | EvRoundConsolidated
+  | EvRoundFixed
   | EvFreezeCompleted
   | EvFreezeTimedOut
   | EvFreezeInterrupted
@@ -2750,6 +2878,7 @@ export type Event =
   | EvOverrideCast
   | EvFindingRaised
   | EvFindingConfirmedRepaired
+  | EvFindingFact
   | EvFindingEvaluatorRepaired
   | EvFindingDisproved
   | EvFindingAcceptedByOwner

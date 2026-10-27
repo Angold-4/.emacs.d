@@ -35,6 +35,8 @@ export interface ArchitectureItem {
   tags: string[];
   /** The module/area the item lives in (`:WHERE:`). Optional. */
   where?: string;
+  /** Plan 07a (D1): the declared domain this item serves (`:DOMAIN:`). */
+  domain?: string;
   /** The exact Org body, when the parser recorded it. Lint uses it to prove
    * no text was lost; a hand-written JSON plan may omit it. */
   rawText?: string;
@@ -50,6 +52,8 @@ export interface RequirementItem {
   arch: string[];
   /** The raw `:VERIFY:` strings, in order. Empty = `review`. */
   verify: string[];
+  /** Plan 07a (D1): the declared domain this item serves (`:DOMAIN:`). */
+  domain?: string;
   rawText?: string;
   line?: number;
 }
@@ -59,6 +63,8 @@ export interface ConstraintItem {
   title: string;
   text: string;
   verify: string[];
+  /** Plan 07a (D1): the declared domain this item serves (`:DOMAIN:`). */
+  domain?: string;
   rawText?: string;
   line?: number;
 }
@@ -113,6 +119,8 @@ export interface FlatItem {
   verify: string[];
   where?: string;
   tags: string[];
+  /** Plan 07a (D1): the declared domain this item serves (`:DOMAIN:`). */
+  domain?: string;
 }
 
 /** The old-format `Acceptance:` item that asks the owner for a recording. */
@@ -155,9 +163,9 @@ export function itemsFromPhase(phase: PhaseItemInput): PlanItems {
 /** Every item, architecture first, then requirements, then constraints. */
 export function flatItems(items: PlanItems): FlatItem[] {
   return [
-    ...items.architecture.map((a) => ({ kind: "architecture" as const, id: a.id, title: a.title, text: a.text, arch: [], verify: [], where: a.where, tags: a.tags })),
-    ...items.requirements.map((r) => ({ kind: "requirement" as const, id: r.id, title: r.title, text: r.text, arch: r.arch, verify: r.verify, tags: [] })),
-    ...items.constraints.map((c) => ({ kind: "constraint" as const, id: c.id, title: c.title, text: c.text, arch: [], verify: c.verify, tags: [] })),
+    ...items.architecture.map((a) => ({ kind: "architecture" as const, id: a.id, title: a.title, text: a.text, arch: [], verify: [], where: a.where, tags: a.tags, ...(a.domain ? { domain: a.domain } : {}) })),
+    ...items.requirements.map((r) => ({ kind: "requirement" as const, id: r.id, title: r.title, text: r.text, arch: r.arch, verify: r.verify, tags: [], ...(r.domain ? { domain: r.domain } : {}) })),
+    ...items.constraints.map((c) => ({ kind: "constraint" as const, id: c.id, title: c.title, text: c.text, arch: [], verify: c.verify, tags: [], ...(c.domain ? { domain: c.domain } : {}) })),
   ];
 }
 

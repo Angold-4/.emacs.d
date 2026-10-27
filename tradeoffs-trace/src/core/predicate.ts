@@ -31,6 +31,7 @@
 
 import { leaderOf, seatsOf } from "./seats.ts";
 import { currentBallot, isValidBallot, tally } from "./tally.ts";
+import type { Domain } from "./domains.ts";
 // Plan 06b: the per-item acceptance half — every R and C met by majority with
 // its test verifies passed, every A fitting by majority or its deviation
 // accepted by the owner, and every evidence item recorded.
@@ -62,7 +63,7 @@ export function sameVersion(a: ContractVersion, b: ContractVersion): boolean {
  * is the shared, pure ingestion check used by reduce() for REVIEW_SUBMITTED
  * and by the extension's submit_review validation; returns a
  * human-readable reason, or undefined when the review is well-formed. */
-export function reviewIngestionIssue(review: Review): string | undefined {
+export function reviewIngestionIssue(review: Review, domains?: readonly Domain[]): string | undefined {
   const statements = review?.correctionStatements;
   if (!Array.isArray(statements)) {
     return `review by ${String(review?.reviewer)} has no correctionStatements array`;
@@ -74,6 +75,33 @@ export function reviewIngestionIssue(review: Review): string | undefined {
       return `review by ${String(review?.reviewer)} states a disposition for correction ${String(id)} more than once; a correction must be stated at most once`;
     }
     seen.add(id);
+  }
+  // Plan 07a (D2): in domain mode a reviewer's finding and blocker are one
+  // point: `domain`, `item` and `doneWhen` are required, and the domain must
+  // be one the plan declared. Outside domain mode the fields are optional and
+  // ignored, so a review without them is exactly as today.
+  if (domains && domains.length > 0) {
+    const names = new Set(domains.map((d) => d.name));
+    const pointIssue = (kind: "finding" | "blocker", entry: { domain?: string; item?: string; doneWhen?: string }): string | undefined => {
+      for (const field of ["domain", "item", "doneWhen"] as const) {
+        const value = entry[field];
+        if (typeof value !== "string" || value.trim().length === 0) {
+          return `${kind} by ${String(review?.reviewer)} has no ${field}; in domain mode every ${kind} names domain, item and doneWhen`;
+        }
+      }
+      if (!names.has(entry.domain!)) {
+        return `${kind} by ${String(review?.reviewer)} names the undeclared domain ${entry.domain}; declare it in #+TT_DOMAINS`;
+      }
+      return undefined;
+    };
+    for (const finding of review.findings ?? []) {
+      const issue = pointIssue("finding", finding);
+      if (issue) return issue;
+    }
+    for (const blocker of review.blockers ?? []) {
+      const issue = pointIssue("blocker", blocker);
+      if (issue) return issue;
+    }
   }
   return undefined;
 }

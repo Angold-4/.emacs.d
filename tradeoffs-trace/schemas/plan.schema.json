@@ -128,6 +128,40 @@
       "description": "Lint-only: the 1-based line of #+TT_CONSOLIDATE in the source Org file.",
       "type": "integer"
     },
+    "domains": {
+      "description": "Plan 07a (D1): #+TT_DOMAINS — the plan's declared domains (name=glob[,glob…]), in declaration order. Absent means domain mode is off.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/Domain" }
+    },
+    "domainsLine": {
+      "description": "Lint-only: the 1-based line of #+TT_DOMAINS in the source Org file.",
+      "type": "integer"
+    },
+    "fixRounds": {
+      "description": "Plan 07c (D4): #+TT_FIX_ROUNDS — only `domains`, which switches fix rounds on. Absent means every round is today's. Kept as written so `tt lint` can name a bad value.",
+      "type": "string"
+    },
+    "fixRoundsLine": {
+      "description": "Lint-only: the 1-based line of #+TT_FIX_ROUNDS in the source Org file.",
+      "type": "integer"
+    },
+    "fixers": {
+      "description": "Plan 07c (D4): #+TT_FIXERS — the most fixer tasks (one per domain) one fix round runs. Default 4. A value that is not a whole number is passed through as written so `tt lint` can name it.",
+      "type": ["integer", "string"]
+    },
+    "fixersLine": {
+      "description": "Lint-only: the 1-based line of #+TT_FIXERS in the source Org file.",
+      "type": "integer"
+    },
+    "fixChecks": {
+      "description": "Plan 07c (D4): #+TT_FIX_CHECKS — the fast command every fixer's own commit must pass before it is merged.",
+      "type": "string",
+      "minLength": 1
+    },
+    "fixChecksLine": {
+      "description": "Lint-only: the 1-based line of #+TT_FIX_CHECKS in the source Org file.",
+      "type": "integer"
+    },
     "workerPrompt": {
       "description": "#+TT_WORKER_PROMPT: per lane (a, b, ...), the absolute paths appended to that lane's worker system prompt (--append-system-prompt), in order. An empty list is `none`. A single worker uses lane a's.",
       "type": "object",
@@ -184,6 +218,24 @@
           "description": "tt 09 (change 3): the phase's own :CONSOLIDATE: (overrides #+TT_CONSOLIDATE) — on or off.",
           "type": "string"
         },
+        "domains": {
+          "description": "Plan 07a (D1): the plan's declared domains (#+TT_DOMAINS), carried onto every phase. Absent means domain mode is off.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/Domain" }
+        },
+        "fixRounds": {
+          "description": "Plan 07c (D4): #+TT_FIX_ROUNDS, carried onto every phase. Absent means every round is today's.",
+          "type": "string"
+        },
+        "fixers": {
+          "description": "Plan 07c (D4): #+TT_FIXERS, carried onto every phase. Absent means the default of 4.",
+          "type": ["integer", "string"]
+        },
+        "fixChecks": {
+          "description": "Plan 07c (D4): #+TT_FIX_CHECKS, carried onto every phase.",
+          "type": "string",
+          "minLength": 1
+        },
         "architecture": { "type": "array", "items": { "$ref": "#/$defs/ArchitectureItem" } },
         "requirements": { "type": "array", "items": { "$ref": "#/$defs/RequirementItem" } },
         "constraints": { "type": "array", "items": { "$ref": "#/$defs/ConstraintItem" } }
@@ -202,7 +254,8 @@
         "where": { "type": "string" },
         "whereLine": { "type": "integer" },
         "rawText": { "type": "string" },
-        "line": { "type": "integer" }
+        "line": { "type": "integer" },
+        "domain": { "type": "string", "minLength": 1 }
       }
     },
     "RequirementItem": {
@@ -219,7 +272,8 @@
         "rawText": { "type": "string" },
         "line": { "type": "integer" },
         "archLine": { "type": "integer" },
-        "verifyLine": { "type": "integer" }
+        "verifyLine": { "type": "integer" },
+        "domain": { "type": "string", "minLength": 1 }
       }
     },
     "ConstraintItem": {
@@ -234,7 +288,18 @@
         "verify": { "type": "array", "items": { "type": "string" } },
         "rawText": { "type": "string" },
         "line": { "type": "integer" },
-        "verifyLine": { "type": "integer" }
+        "verifyLine": { "type": "integer" },
+        "domain": { "type": "string", "minLength": 1 }
+      }
+    },
+    "Domain": {
+      "description": "Plan 07a (D1): one declared domain — a name and the repository-relative globs it owns.",
+      "type": "object",
+      "required": ["name", "globs"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "globs": { "type": "array", "items": { "type": "string", "minLength": 1 } }
       }
     },
     "RoleModel": {

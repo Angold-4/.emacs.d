@@ -46,9 +46,38 @@
     "consolidate": {
       "description": "tt 09 (change 3): #+TT_CONSOLIDATE: off frozen into the contract. Present (false) only when the plan turned the combine step off; absent means on whenever the phase runs two or more lanes.",
       "const": false
+    },
+    "domains": {
+      "description": "Plan 07a (D1): the phase's declared domains (#+TT_DOMAINS), frozen into the contract. Absent means domain mode is off, exactly as today.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/Domain" }
+    },
+    "fixRounds": {
+      "description": "Plan 07c (D4): #+TT_FIX_ROUNDS frozen into the contract. Present only when the plan switched fix rounds on; absent means every round is today's.",
+      "const": "domains"
+    },
+    "fixers": {
+      "description": "Plan 07c (D4): #+TT_FIXERS frozen into the contract — the most fixer tasks one fix round runs. Absent means the default of 4.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "fixChecks": {
+      "description": "Plan 07c (D4): #+TT_FIX_CHECKS frozen into the contract — the fast command every fixer's own commit must pass.",
+      "type": "string",
+      "minLength": 1
     }
   },
   "$defs": {
+    "Domain": {
+      "description": "Plan 07a (D1): one declared domain — a name and the repository-relative globs it owns.",
+      "type": "object",
+      "required": ["name", "globs"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "globs": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
     "ContractVersion": {
       "type": "object",
       "required": ["snapshot", "sectionSha256"],

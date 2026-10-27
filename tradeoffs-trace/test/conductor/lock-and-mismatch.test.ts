@@ -1,9 +1,28 @@
 import assert from "node:assert/strict";
+import * as path from "node:path";
 import { test } from "node:test";
 
 import { Conductor } from "../../src/conductor.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import { cleanupDir, defaultWorkerHello, readEvents, setupConductor, waitFor } from "./harness.ts";
+
+test("plan 07a (OD-3): a conductor with a non-default root uses that root's own check lock", async () => {
+  const setup = await setupConductor({
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [{ kind: "hang-forever" }] }),
+    deadlines: { abortGraceMs: 200, termGraceMs: 200 },
+  });
+  try {
+    // No `checkLockPath`: the conductor defaults to its own root's lock. A
+    // run under /tmp must never take the machine-wide
+    // `~/.tradeoffs-trace/check.lock` (and so never see another run's open
+    // check window).
+    const conductor = new Conductor({ runDir: setup.runDir, plan: setup.plan, piCommand: process.execPath });
+    assert.equal(conductor.checkLockPath, path.join(setup.runRoot, "check.lock"));
+  } finally {
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+  }
+});
 
 test("second conductor on the same run fails fast", async () => {
   const setup = await setupConductor({
