@@ -5,7 +5,7 @@
 // open).
 
 import { acceptanceBlockers, decisionStatus, isLiveDecision, itemIsSplit, pointHasProvingFact, pointNeedsEvaluation, shortId } from "./predicate.ts";
-import { isStructured, phaseItemOutcomes, thinMetItems, workerAnchorsOf } from "./items.ts";
+import { isStructured, phaseItemOutcomes } from "./items.ts";
 import { discoveredDecisions, openFindings, recordClassified } from "./triage.ts";
 import { seatsOf } from "./seats.ts";
 import { currentBallot, isValidBallot } from "./tally.ts";
@@ -64,10 +64,11 @@ export function reviewerOutcomes(phase: PhaseState): ReviewerOutcome[] {
 
 /** Why the current candidate is not (or not yet) accepted, one short clause
  * each; empty when nothing stands in the way. Only failures that already
- * happened are listed; a gate still running is not a reason. */
+ * happened are listed; a gate still running is not a reason. The status
+ * view reads `acceptanceBlockers` itself so each line carries its command. */
 export function notAcceptedReasons(phase: PhaseState): string[] {
   if (!phase.candidate?.sha) return [];
-  // Plan 07f (C3): the SAME list `accept` reads. There is no second
+  // Plan 07f (C3/F1): the SAME list `accept` reads. There is no second
   // derivation of "why not accepted" here or in the status view.
   return acceptanceBlockers(phase).map((b) => b.detail);
 }
@@ -76,14 +77,15 @@ export function notAcceptedReasons(phase: PhaseState): string[] {
  * and therefore the only records an evaluator session is started for:
  *
  *   - a raw/owner-refused message awaiting evaluation;
- *   - a plan item the seats split on, or one whose majority is not met/fits
- *     (or is a thin unanimous met that owes an audit);
+ *   - a plan item the seats split on, or one a majority judged unmet/fits;
  *   - an open point with no proving doneWhen fact (a failing fact keeps it
  *     open, whatever an evaluator drop says);
  *   - an open finding or discovered decision whose impact is not classified.
  *
- * Empty ⇒ no evaluator starts; the mechanical verdict stands and an
- * EVALUATION_SKIPPED record is written. */
+ * A unanimous item with resolving anchors is mechanically decided; thin
+ * evidence alone never starts an evaluator session. Empty ⇒ no evaluator
+ * starts; the mechanical verdict stands and an EVALUATION_SKIPPED record is
+ * written. */
 export type EvaluationExceptionKind = "message" | "item" | "point" | "decision";
 
 export interface EvaluationException {
@@ -105,18 +107,16 @@ export function evaluationExceptions(phase: PhaseState): EvaluationException[] {
     });
   }
   if (isStructured(phase.contract)) {
-    const anchors = workerAnchorsOf(phase.coverage);
     for (const outcome of phaseItemOutcomes(phase)) {
       const owed = outcome.outcome !== "met" && outcome.outcome !== "fits";
-      const thin = thinMetItems([outcome], anchors).length > 0;
       const split = itemIsSplit(outcome);
-      if (!owed && !thin && !split) continue;
+      if (!owed && !split) continue;
       out.push({
         kind: "item",
         id: outcome.item.id,
         detail:
           `${outcome.item.id} ${outcome.item.title}: ${outcome.outcome}` +
-          (split ? " (the seats split on it)" : thin ? " (thin unanimous met — audit it)" : " (a majority judged it unmet or deviating)"),
+          (split ? " (the seats split on it)" : " (a majority judged it unmet or deviating)"),
       });
     }
   }
