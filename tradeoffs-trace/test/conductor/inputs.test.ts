@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
-import { rulingLines } from "../../src/conductor.ts";
+import { rulingLines, directiveLines } from "../../src/conductor.ts";
 import { acceptanceBlockers } from "../../src/core/predicate.ts";
 import type { Reviewer } from "../../src/core/types.ts";
 import {
@@ -94,6 +94,9 @@ function reviewWithBallot(id: string, vote: "approve" | "reject", itemsMet = tru
       steps: [
         { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
         { kind: "wait-for-prompt" },
+        // Keep the seats in review long enough that the owner's ruling really
+        // lands while they review (the R4 case), not after their veto.
+        { kind: "sleep", ms: 2_000 },
         { kind: "call-tool", tool: "read", args: { path: "src/core/rounds.ts" } },
         { kind: "call-tool", tool: "read", args: { path: "README.md" } },
         {
@@ -165,7 +168,7 @@ async function sendResolve(runArg: string, runDir: string, requestId: string, op
 
 // -- R4: a ruling during review is applied at once, never queued ------------
 
-test("plan 07f (R4): a ruling during the review settles the decision at once, with no queued correction and no extra round", async () => {
+test("a ruling sent while the seats review is applied at once and forces no extra round", async () => {
   const promptLog = path.join(fs.mkdtempSync("/tmp/tt-07f-rule-prompt-"), "prompts.log");
   const setup = await setupConductor({
     items: { requirements: [ITEM("R1")], finalChecks: ["sleep 2"] } as never,
@@ -223,7 +226,7 @@ test("plan 07f (R4): a ruling during the review settles the decision at once, wi
 
 // -- R5: a contract finding the owner accepts with a ruling no longer blocks -
 
-test("plan 07f (R5): a contract finding the owner accepts with a ruling no longer blocks acceptance", async () => {
+test("the owner accepts a contract finding with one ruling", async () => {
   const setup = await setupConductor({
     checks: ["true"],
     stubReviews: false,
@@ -311,6 +314,207 @@ function workerWithDecisionNoBallot(): { hello: unknown; steps: FakePiStep[] } {
     ],
   };
 }
+
+// -- R7: a withdrawn directive reaches every live fixer at once -------------
+
+const FIX_DOMAINS = [
+  { name: "booking", globs: ["booking/**"] },
+  { name: "gates", globs: ["gates/**"] },
+];
+
+function fixPhase() {
+  return {
+    id: "p1",
+    goal: "fix the points",
+    acceptance: ["it works"],
+    checks: ["true"],
+    boundaries: [],
+    reserved: [],
+    workers: 2,
+    domains: FIX_DOMAINS,
+    fixRounds: "domains",
+    fixers: 4,
+    fixChecks: "true",
+  };
+}
+
+function laneWorker(round: number, lane: string): { hello: unknown; steps: FakePiStep[] } {
+  return {
+    hello: defaultWorkerHello(),
+    steps: [
+      { kind: "call-sh", command: `printf 'lane ${lane} r${round}\\n' > lane-${lane}-r${round}.txt` },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+    ],
+  };
+}
+
+function laneReview(seat: Reviewer, contractVersion: unknown, findings: unknown[] = []): { hello: unknown; steps: FakePiStep[] } {
+  return {
+    hello: defaultReviewerHello(),
+    steps: [
+      { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+      { kind: "wait-for-prompt" },
+      {
+        kind: "call-submit",
+        tool: "submit_review",
+        args: {
+          reviewer: seat,
+          phaseId: "p1",
+          candidateSha: "$TT_CANDIDATE_SHA",
+          contractVersion,
+          correctionStatements: [],
+          findingStatements: [],
+          ballots: [],
+          findings,
+        },
+      },
+    ],
+  };
+}
+
+function reviewerWithFixPoints() {
+  return (seat: Reviewer, _candidate: string, state: { phase: { contract: { contractVersion: unknown }; rounds?: unknown[] } }): { hello: unknown; steps: FakePiStep[] } => {
+    const K = state.phase.contract.contractVersion;
+    const round = state.phase.rounds?.length ?? 1;
+    if (round === 1 && seat === "M") {
+      return laneReview("M", K, [
+        {
+          kind: "defect",
+          severity: "blocking",
+          evidence: "the booking path is wrong",
+          domain: "booking",
+          item: "R1",
+          where: "booking/a.ts:1 fn",
+          expected: "BOOKING_EXPECTED",
+          doneWhen: "test -f booking-fixed.txt",
+        },
+        {
+          kind: "defect",
+          severity: "blocking",
+          evidence: "the gates path is wrong",
+          domain: "gates",
+          item: "R2",
+          where: "gates/b.ts:1 fn",
+          expected: "GATES_EXPECTED",
+          doneWhen: "test -f gates-fixed.txt",
+        },
+      ]);
+    }
+    return laneReview(seat, K);
+  };
+}
+
+function pickVote(seat: Reviewer, state: { phase: { rounds?: unknown[] } }): { hello: unknown; steps: FakePiStep[] } {
+  return {
+    hello: { role: "picker" as const, tools: ROLE_TOOLS.picker },
+    steps: [
+      {
+        kind: "call-submit",
+        tool: "submit_pick_vote",
+        args: {
+          inspected: ["a", "b", "c", "d"],
+          round: state.phase.rounds?.length ?? 1,
+          seat,
+          lane: "a",
+          why: `${seat} picks a`,
+          loserHad: { yes: false, anchors: [] },
+        },
+      },
+    ],
+  };
+}
+
+test("a withdrawn directive is delivered to every live fixer session at once", async () => {
+  const promptDir = fs.mkdtempSync("/tmp/tt-07f-withdraw-prompt-");
+  const promptLog = path.join(promptDir, "prompts.log");
+  const setup = await setupConductor({
+    phase: fixPhase(),
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
+    workerScript: () => laneWorker(1, "a"),
+    laneWorkerScriptFor: (lane: string, round: number) => laneWorker(round, lane),
+    laneReviewerScriptFor: (seat: Reviewer, _candidate: string, state: { phase: { contract: { contractVersion: unknown }; rounds?: unknown[] } }) =>
+      reviewerWithFixPoints()(seat, _candidate, state),
+    pickScriptFor: (seat: string, state: { phase: { rounds?: unknown[] } }) => pickVote(seat as Reviewer, state),
+    fixerScriptFor: (domain: string) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "sleep", ms: 4_000 },
+        { kind: "call-sh", command: `printf '${domain} fixed\\n' > ${domain}-fixed.txt` },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+  } as never);
+  try {
+    await setup.conductor.start();
+    // Both fixers are live and have their own briefs before the owner speaks.
+    await waitFor(() => {
+      try {
+        const prompts = fs.readFileSync(promptLog, "utf8");
+        return prompts.includes("You are fixer fix-booking") && prompts.includes("You are fixer fix-gates");
+      } catch {
+        return false;
+      }
+    }, 180_000, 50, setup.runDir);
+
+    const steerText = "R7: keep the booking and gates fixes scoped to their own files.";
+    const steered = await runCli(["steer", setup.runDir, steerText], "");
+    assert.equal(steered.code, 0, steered.stdout);
+    await waitFor(
+      () => setup.conductor.state.phase.ownerDirectives?.some((d) => d.text === steerText) === true,
+      20_000,
+      20,
+      setup.runDir,
+    );
+    const directive = setup.conductor.state.phase.ownerDirectives!.find((d) => d.text === steerText)!;
+
+    const withdrawn = await runCli(["withdraw", setup.runDir, directive.id], "");
+    assert.equal(withdrawn.code, 0, withdrawn.stdout);
+    await waitFor(
+      () => setup.conductor.state.phase.ownerDirectives?.find((d) => d.id === directive.id)?.status === "withdrawn",
+      20_000,
+      20,
+      setup.runDir,
+    );
+    const atWithdrawal = fs.statSync(promptLog).size;
+
+    // The one withdrawal poll steers every live fixer: two withdraw intents,
+    // one per fixer session, recorded together rather than on later rounds.
+    await waitFor(
+      () =>
+        readEvents(setup.runDir).filter(
+          (r) => r.kind === "intent" && (r.event as { withdrawn?: boolean; directiveId?: string }).withdrawn === true && (r.event as { directiveId?: string }).directiveId === directive.id,
+        ).length === 2,
+      20_000,
+      20,
+      setup.runDir,
+    );
+    const intents = readEvents(setup.runDir).filter(
+      (r) =>
+        r.kind === "intent" &&
+        (r.event as { withdrawn?: boolean; directiveId?: string }).withdrawn === true &&
+        (r.event as { directiveId?: string }).directiveId === directive.id,
+    );
+    const ids = new Set(intents.map((r) => (r.event as { agentId: string }).agentId));
+    assert.equal(ids.size, 2, "one intent per live fixer session");
+    assert.ok([...ids].every((id) => id.startsWith("fix-")), `the targets are the fixers: ${JSON.stringify([...ids])}`);
+    const times = intents.map((r) => Date.parse(r.ts));
+    assert.ok(Math.max(...times) - Math.min(...times) < 1_000, "both withdrawal steers landed in the same poll");
+
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 180_000, 50, setup.runDir);
+    // Every later brief is built from `directiveLines`: the withdrawn one is
+    // no longer in it (and any prompt text written after withdrawal omits it).
+    const later = fs.readFileSync(promptLog, "utf8").slice(atWithdrawal);
+    assert.ok(!directiveLines(setup.conductor.state.phase.ownerDirectives).some((line) => line.includes(steerText)), "a later brief's directive section omits the withdrawn text");
+    assert.ok(!later.includes(steerText), "the withdrawn directive is omitted from every prompt written after withdrawal");
+  } finally {
+    await teardown(setup);
+    cleanupDir(promptDir);
+  }
+});
 
 // -- R7: resolve + ruling together clear the blockers and accept ------------
 

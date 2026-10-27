@@ -9,7 +9,10 @@ import { test } from "node:test";
 
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import type { Reviewer } from "../../src/core/types.ts";
-import { acceptanceBlockers, shortId } from "../../src/core/predicate.ts";
+import { acceptanceBlockers, isLiveDecision, shortId } from "../../src/core/predicate.ts";
+import { reduce } from "../../src/core/reduce.ts";
+import { ownerCommandToEvent } from "../../src/core/owner-inbox.ts";
+import { CV, basePhase, baseState, makeDecision } from "../unit/helpers.ts";
 import type { Domain } from "../../src/core/domains.ts";
 import {
   cleanupDir,
@@ -369,4 +372,143 @@ test("an evaluator ruling cannot close a point whose doneWhen fact fails on the 
   } finally {
     await teardown(setup);
   }
+});
+
+// -- R1: one blocker list; the ruling and resolve commands clear their two ---
+
+test("every acceptance blocker carries its kind detail and next command", () => {
+  const C = "C1";
+  const K = CV();
+  const contract = {
+    ...basePhase().contract,
+    acceptance: ["R1 works"],
+    architecture: [],
+    itemsSynthesized: false,
+    requirements: [{ id: "R1", title: "R1", text: "R1 works", arch: [], verify: ['test "R1 works"'] }],
+    constraints: [],
+  };
+  const review = (seat: string, verdict: string) => ({
+    reviewer: seat,
+    phaseId: "p1",
+    candidateSha: C,
+    contractVersion: K,
+    correctionStatements: [],
+    findingStatements: [],
+    items: [{ id: "R1", verdict, evidence: "README.md:1 README.md:2" }],
+    arch: [],
+  });
+  const point = (id: string) => ({
+    id,
+    version: 1,
+    phaseId: "p1",
+    kind: "defect" as const,
+    severity: "advisory" as const,
+    evidence: "README.md:1",
+    raisedBy: "M" as const,
+    status: "open" as const,
+    boundCandidateSha: C,
+    domain: "booking",
+    doneWhen: "test -f done",
+  });
+  const phase = basePhase({
+    contract,
+    phase: "RESOLVING",
+    candidate: { sha: C, contractVersion: K },
+    integrationHead: "H0",
+    checks: { candidateSha: C, passed: false },
+    probe: { candidateSha: C, head: "H0", probedI: "I1", passed: true },
+    checkResolution: [{ id: "R1", name: "R1 works", outcome: "missing" }],
+    reviews: { M: { review: review("M", "met") }, A: { review: review("A", "met") }, B: { review: review("B", "met") } },
+    decisions: [makeDecision({ id: "D-1", class: "reserved", boundCandidateSha: C, boundContractVersion: K })],
+    findings: [point("F-1"), point("F-2")],
+    doneWhenFacts: [
+      { findingId: "F-1", candidateSha: C, exitCode: 1, timedOut: false, outputTail: "not done" },
+      { findingId: "F-2", candidateSha: C, exitCode: 1, timedOut: false, outputTail: "not done" },
+    ],
+    ownerRequests: [
+      {
+        id: "OR-1",
+        version: 1,
+        phaseId: "p1",
+        reason: "the booking point needs your ruling",
+        origin: "open_finding" as const,
+        linkedFindingId: "F-1",
+        boundCandidateSha: C,
+        boundContractVersion: K,
+        options: [
+          { id: "accept_risk", label: "accept the risk" },
+          { id: "repair", label: "repair it" },
+        ],
+        status: "open" as const,
+      },
+    ],
+  });
+
+  const blockers = acceptanceBlockers(phase);
+  assert.equal(blockers.length, 5, `one blocker for each unmet condition, got ${JSON.stringify(blockers, null, 2)}`);
+  assert.deepEqual(blockers.map((b) => b.kind), ["check", "test-verify", "point", "decision", "owner-request"]);
+  for (const blocker of blockers) {
+    assert.ok(blocker.detail.length > 0, `${blocker.kind} carries its detail`);
+    assert.ok(blocker.command.length > 0, `${blocker.kind} carries the command that clears it`);
+  }
+  assert.match(blockers.find((b) => b.kind === "decision")!.command, /"type":"ruling"/, "a decision is cleared by a tt input ruling");
+  assert.match(blockers.find((b) => b.kind === "owner-request")!.command, /"type":"resolve"/, "a request is cleared by a tt input resolve");
+
+  // The two owner commands clear exactly their own blockers: tt input maps a
+  // `ruling` to RULING_RECORDED and a `resolve` to OWNER_REQUEST_RESOLVED.
+  const ruling = ownerCommandToEvent({ kind: "ruling", text: "rule D-1 as recorded", recordIds: ["D-1"] }, "cmd-rule");
+  assert.ok(ruling, "the ruling command maps to a conductor event");
+  const ruled = reduce(baseState(phase), ruling!);
+  assert.ok(ruled.ok, ruled.ok ? "" : ruled.reason);
+  assert.ok(!acceptanceBlockers(ruled.state.phase).some((b) => b.kind === "decision"), "the ruling clears the decision blocker");
+
+  const resolve = ownerCommandToEvent(
+    { kind: "resolve", requestId: "OR-1", requestVersion: 1, option: "repair", boundCandidateSha: C, boundContractVersion: K },
+    "cmd-resolve",
+  );
+  assert.ok(resolve, "the resolve command maps to a conductor event");
+  const resolved = reduce(ruled.state, resolve!);
+  assert.ok(resolved.ok, resolved.ok ? "" : resolved.reason);
+  const remaining = acceptanceBlockers(resolved.state.phase);
+  assert.ok(!remaining.some((b) => b.kind === "owner-request"), "the resolve clears the owner-request blocker");
+  assert.deepEqual(remaining.map((b) => b.kind), ["check", "test-verify", "point"], "only the non-owner blockers remain");
+});
+
+// -- R3: a stale amendment is closed, and never blocks the new contract -------
+
+test("a decision bound to an older contract version never blocks acceptance", () => {
+  const K1 = CV(1);
+  const K3 = CV(3);
+  const amendment = makeDecision({
+    id: "AM-p1-1",
+    source: "reviewer-discovered",
+    class: "reserved",
+    boundCandidateSha: "C1",
+    boundContractVersion: K1,
+    amendment: {
+      id: "AM-p1-1",
+      criterion: "R1 works",
+      proposedWording: "R1 works, proven",
+      why: "the old wording could not be verified",
+      raisedBy: "M",
+      status: "proposed",
+    },
+  });
+  const phase = basePhase({
+    phase: "RESOLVING",
+    candidate: { sha: "C3", contractVersion: K3 },
+    integrationHead: "H0",
+    decisions: [amendment],
+  });
+  assert.ok(
+    !acceptanceBlockers(phase).some((b) => b.kind === "decision"),
+    "the C1/v1 amendment is not a blocker for C3/v3",
+  );
+  const reason = "the contract moved past version 1";
+  const closed = reduce(baseState(phase), { type: "DECISION_CLOSED", decisionId: amendment.id, reason });
+  assert.ok(closed.ok, closed.ok ? "" : closed.reason);
+  const after = closed.state.phase.decisions.find((d) => d.id === amendment.id)!;
+  assert.equal(after.supersededBy, reason, "the conductor's closure records its reason");
+  assert.equal(isLiveDecision(after), false, "the stale amendment is no longer a live decision");
+  assert.ok(!acceptanceBlockers(closed.state.phase).some((b) => b.kind === "decision"));
 });

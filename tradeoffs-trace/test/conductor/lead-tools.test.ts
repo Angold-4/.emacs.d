@@ -33,6 +33,18 @@ function runCli(args: string[]): Promise<{ stdout: string; code: number }> {
   });
 }
 
+/** Append one event to a stopped run's log, after the conductor has released
+ * it. `tt why` must read this exactly like the conductor's own records. */
+function appendEvent(runDir: string, event: Record<string, unknown>): void {
+  const eventsPath = path.join(runDir, "events.jsonl");
+  const lines = fs.readFileSync(eventsPath, "utf8").split("\n").filter((line) => line.length > 0);
+  const last = lines.length > 0 ? (JSON.parse(lines[lines.length - 1]) as { seq?: number }) : { seq: 0 };
+  fs.appendFileSync(
+    eventsPath,
+    `${JSON.stringify({ seq: (last.seq ?? 0) + 1, ts: new Date().toISOString(), kind: "event", event })}\n`,
+  );
+}
+
 const FAST = {
   abortGraceMs: 300,
   termGraceMs: 300,
@@ -104,7 +116,7 @@ async function teardown(setup: TestConductorSetup): Promise<void> {
   cleanupDir(setup.scriptsDir);
 }
 
-test("plan 07f (R3/R8): tt why prints the blockers with commands from a stopped run, and --json is one object", async () => {
+test("plan 07f (R3/R8): tt why on a stopped run reports three blockers with runner revision and bounds, and --json is one object", async () => {
   const setup = await setupConductor({
     items: { requirements: [ITEM("R1")] } as never,
     checks: ["true"],
@@ -122,14 +134,35 @@ test("plan 07f (R3/R8): tt why prints the blockers with commands from a stopped 
     assert.ok(decision && request);
     await setup.conductor.stop();
 
+    // Make it a three-blocker stopped run: the open item plus the two owner
+    // gates is already three. Also record a runner and a bound, so the read
+    // must show both, not just the blocker list.
+    const candidate = setup.conductor.state.phase.candidate!.sha as string;
+    appendEvent(setup.runDir, {
+      type: "BOUND_REACHED",
+      kind: "check",
+      scope: `runnable:${candidate}`,
+      limitMs: 20_000,
+      elapsedMs: 20_000,
+    });
+    const revision = "f".repeat(40);
+    const metaPath = path.join(setup.runDir, "meta.json");
+    const meta = JSON.parse(fs.readFileSync(metaPath, "utf8")) as Record<string, unknown>;
+    fs.writeFileSync(metaPath, `${JSON.stringify({ ...meta, runnerRevision: revision }, null, 2)}\n`);
+
     const text = await runCli(["why", setup.runDir]);
     assert.equal(text.code, 0, text.stdout);
     assert.match(text.stdout, /accepted: no/);
     assert.match(text.stdout, /\[decision\]/);
     assert.match(text.stdout, /\[owner-request\]/);
+    assert.match(text.stdout, /\[item\]/, "the third blocker is the item without a resolving majority");
     assert.match(text.stdout, /tt input/, "each blocker ends with the command that clears it");
     assert.match(text.stdout, /"type":"ruling"/, "the decision blocker's command is a ruling");
     assert.match(text.stdout, /"type":"resolve"/, "the request blocker's command is a resolve");
+    assert.match(text.stdout, new RegExp(`runner revision: ${revision}`), "the text names the recorded runner");
+    assert.match(text.stdout, /Bounds reached:/, "the text lists the bound reached");
+    assert.match(text.stdout, /check \(runnable:/, "the bound's kind and scope are shown");
+    assert.match(text.stdout, /20000ms of 20000ms/, "the bound's elapsed and limit are shown");
 
     const json = await runCli(["why", setup.runDir, "--json"]);
     assert.equal(json.code, 0, json.stdout);
@@ -139,12 +172,19 @@ test("plan 07f (R3/R8): tt why prints the blockers with commands from a stopped 
       accepted: boolean;
       blockers: Array<{ kind: string; detail: string; command: string }>;
       exceptions: string[];
+      runnerRevision?: string;
+      bounds: Array<{ kind: string; scope: string; limitMs: number; elapsedMs: number }>;
     };
     assert.equal(parsed.runId, path.basename(setup.runDir));
     assert.equal(parsed.phase, "AWAITING_OWNER");
     assert.equal(parsed.accepted, false);
+    assert.equal(parsed.blockers.length, 3, `exactly three blockers, got ${JSON.stringify(parsed.blockers, null, 2)}`);
+    assert.ok(parsed.blockers.every((b) => b.detail.length > 0 && b.command.length > 0), "every blocker carries detail and command");
     assert.ok(parsed.blockers.some((b) => b.kind === "decision" && b.command.includes("ruling")));
     assert.ok(parsed.blockers.some((b) => b.kind === "owner-request" && b.command.includes("resolve")));
+    assert.ok(parsed.blockers.some((b) => b.kind === "item" && b.command.includes("tt resume")));
+    assert.equal(parsed.runnerRevision, revision, "the JSON reports the recorded runner revision");
+    assert.deepEqual(parsed.bounds, [{ kind: "check", scope: `runnable:${candidate}`, limitMs: 20_000, elapsedMs: 20_000 }]);
     assert.ok(Array.isArray(parsed.exceptions));
   } finally {
     await cleanupDir(setup.runRoot);
