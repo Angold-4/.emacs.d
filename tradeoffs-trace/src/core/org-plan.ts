@@ -474,6 +474,7 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
     ...(globalDomainLoopMax !== undefined ? { domainLoopMax: globalDomainLoopMax } : {}),
     ...(globalForbidden && globalForbidden.length > 0 ? { forbidden: globalForbidden } : {}),
     ...(globalTestRemovals && globalTestRemovals.length > 0 ? { testRemovals: globalTestRemovals } : {}),
+    ...(globalTestRemovalsKeyword ? { testRemovalsLine: globalTestRemovalsKeyword.line } : {}),
     ...(Object.keys(bounds).length > 0 ? { bounds, boundLines } : {}),
     ...(checkWindow ? { checkWindow, checkWindowLine: checkWindowKeyword!.line } : {}),
   };

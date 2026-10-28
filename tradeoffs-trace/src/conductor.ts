@@ -176,7 +176,7 @@ import {
   type FixPoint,
   type FixTask,
 } from "./core/fix-rounds.ts";
-import { blockingQualityProblems, runDomainLoop, type DomainLoopHost } from "./fix-loop.ts";
+import { runDomainLoop, type DomainLoopHost } from "./fix-loop.ts";
 import {
   assertToolSet,
   launchArgs,
@@ -9905,6 +9905,13 @@ export class Conductor {
     };
     const host: DomainLoopHost = {
       maxReviews: this.#state.phase.contract.domainLoopMax ?? 3,
+      // The bound is total for the round and domain: a resumed loop counts
+      // the reviews its log already recorded instead of starting again at 0.
+      startReviews: this.#domainLoopReviewsSpent(task, round),
+      // A resumed fix round continues the pass numbers its log recorded, so
+      // its stateless brief keeps every earlier pass instead of overwriting
+      // iteration 1 with a fresh one.
+      startIteration: this.#domainLoopResumeIteration(task, round),
       build: () => buildFixer(),
       facts: (sha, iteration) => this.#domainFacts(task, round, base, sha, iteration),
       review: (sha, iteration, facts) => this.#runDomainReview(task, round, base, sha, iteration, facts, records),
@@ -9925,16 +9932,11 @@ export class Conductor {
     };
     const outcome = await runDomainLoop(task, host);
     const outcomeSha = outcome.sha;
-    // A2: an uncited quality remark is a note on the approval, not a reason
-    // to send the domain back. Keep those remarks (and the reviewer's notes)
-    // on DOMAIN_APPROVED so the record still carries them.
+    // 07g1 (A2): a quality problem already sent the work back to the same
+    // fixer, so an approved domain's review is quality-ok. Keep its notes for
+    // the next fixer on DOMAIN_APPROVED so the record still carries them.
     const lastReview = outcome.status === "approved" ? [...outcome.records].reverse().find((r) => r.review)?.review : undefined;
-    const approvalNotes = lastReview
-      ? [
-          ...(lastReview.notes ?? []),
-          ...(lastReview.quality.ok ? [] : (lastReview.quality.problems ?? []).filter((p) => !blockingQualityProblems(lastReview).includes(p))),
-        ]
-      : [];
+    const approvalNotes = lastReview?.notes ?? [];
     this.#applyEvent({
       type: outcome.status === "approved" ? "DOMAIN_APPROVED" : "DOMAIN_DROPPED",
       round,
@@ -9965,7 +9967,7 @@ export class Conductor {
   }
 
   /** 07g1: the failure text sent to the SAME fixer session after a red fact
-   * or a review that did not fix every point. */
+   * or a review that did not fix every point or reported a quality problem. */
   #fixerFixPrompt(task: FixTask, round: number, sha: string, failure: string, remainingMs: number): string {
     return [
       `Your fixer commit ${sha.slice(0, 7)} is not accepted in domain ${task.domain}, so it cannot be merged yet.`,
@@ -10092,6 +10094,48 @@ export class Conductor {
     } finally {
       this.#agents.delete(agentId);
     }
+  }
+
+  /** 07g1: the pass number a resumed domain loop continues at: one after the
+   * last pass the event log recorded for this round and domain. A first run
+   * (nothing logged) starts at 1. */
+  #domainLoopResumeIteration(task: FixTask, round: number): number {
+    let last = 0;
+    try {
+      for (const rec of readLog(this.#paths.events).records) {
+        if (rec.kind !== "domain_loop_pass") continue;
+        const e = rec.event as { round?: unknown; domain?: unknown; iteration?: unknown };
+        if (e.round !== round || e.domain !== task.domain) continue;
+        if (typeof e.iteration === "number" && e.iteration > last) last = e.iteration;
+      }
+    } catch {
+      // an unreadable log: this loop starts at pass 1
+    }
+    return last + 1;
+  }
+
+  /** 07g1: the domain reviews a resumed loop already spent, read from the
+   * event log. `TT_DOMAIN_LOOP_MAX` bounds the round's whole domain loop, so
+   * a restart must not hand the domain a fresh review budget. A review is
+   * counted from its recorded pass or its `DOMAIN_REVIEWED` event, whichever
+   * landed before the stop. */
+  #domainLoopReviewsSpent(task: FixTask, round: number): number {
+    const reviewed = new Set<number>();
+    try {
+      for (const rec of readLog(this.#paths.events).records) {
+        const e = rec.event as { type?: unknown; round?: unknown; domain?: unknown; iteration?: unknown; review?: unknown };
+        const scoped = e.round === round && e.domain === task.domain && typeof e.iteration === "number";
+        if (!scoped) continue;
+        if (rec.kind === "domain_loop_pass") {
+          if (e.review !== undefined) reviewed.add(e.iteration as number);
+        } else if (rec.kind === "event" && e.type === "DOMAIN_REVIEWED") {
+          reviewed.add(e.iteration as number);
+        }
+      }
+    } catch {
+      // an unreadable log: this loop starts with no spent reviews
+    }
+    return reviewed.size;
   }
 
   /** 07g1: the recorded in-memory loop history, reconciled with the event
@@ -13247,9 +13291,9 @@ export class Conductor {
   }
 
   /** 07g1: a red FINAL check is a point, not just a record. Anchor it to
-   * the first failing file the output names and put it in that file's domain;
-   * if no file can be named, put it in the first domain so the failure still
-   * reaches a domain loop. */
+   * the first failing file the output names and put it in that file's domain.
+   * A failure that names no file of a declared domain is not a point: the
+   * conductor cannot choose a domain for it, so it records LEAD_CALLED. */
   #raiseFinalCheckPoint(candidateSha: string, evidence: string, failingCommands: readonly string[]): void {
     const domains = this.#state.phase.contract.domains ?? [];
     if (domains.length === 0) return;
@@ -13263,10 +13307,16 @@ export class Conductor {
       paths.push(p);
     }
     const path = paths[0];
-    const domain = path ? domainOf(path, domains) : domains[0]?.name;
+    if (!path) {
+      const reason = `the final check failed but its output named no file of a declared domain: ${evidence.split("\n")[0]}`;
+      this.#applyEvent({ type: "LEAD_CALLED", reasons: [reason] });
+      this.#log.append("final_check_point_skipped", { candidateSha, reason });
+      return;
+    }
+    const domain = domainOf(path, domains);
     if (!domain) return;
     const existing = (this.#state.phase.findings ?? []).find(
-      (f) => f.raisedBy === "conductor" && f.status === "open" && f.domain === domain && f.where === `${path ?? domain}:1`,
+      (f) => f.raisedBy === "conductor" && f.status === "open" && f.domain === domain && f.where === `${path}:1`,
     );
     if (existing) return;
     const phase = this.#state.phase;
@@ -13285,12 +13335,12 @@ export class Conductor {
         status: "open",
         boundCandidateSha: candidateSha,
         domain,
-        where: `${path ?? domain}:1`,
+        where: `${path}:1`,
         expected: "the final check passes",
         ...(doneWhen ? { doneWhen } : {}),
       },
     });
-    this.#log.append("final_check_point_raised", { candidateSha, domain, where: `${path ?? domain}:1`, doneWhen });
+    this.#log.append("final_check_point_raised", { candidateSha, domain, where: `${path}:1`, doneWhen });
   }
 
   /** 07g1: when the final check passes on a later candidate, the conductor's

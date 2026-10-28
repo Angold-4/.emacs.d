@@ -1,10 +1,10 @@
 // 07g1: the per-domain loop. One domain with open points runs from a base,
 // establishes its facts (its fix check, every point's doneWhen and the test
 // removal rule), then a fresh stateless review judges every point. A red
-// check or a review that does not fix every point goes back to the SAME
-// fixer session; a review that fixes them all approves the domain. A domain
-// that spends its review bound is dropped, never allowed to hold another
-// domain.
+// check or a review that does not fix every point (or that reports a quality
+// problem) goes back to the SAME fixer session; a review that fixes them all
+// with quality ok approves the domain. A domain that spends its review bound
+// is dropped, never allowed to hold another domain.
 //
 // This module owns only the sequence. Every effect (building the fixer,
 // running the facts, reviewing, fixing, emitting events) is a host callback,
@@ -20,8 +20,17 @@ export interface DomainBuild {
 }
 
 export interface DomainLoopHost {
-  /** How many domain REVIEWS this domain may spend. */
+  /** How many domain REVIEWS this domain may spend in total. A resumed loop
+   * counts the reviews its log already recorded against this bound. */
   readonly maxReviews: number;
+  /** The pass number this loop starts at. A first run starts at 1; a resumed
+   * run continues after the last pass the conductor's log recorded, so the
+   * log-built brief carries every earlier pass instead of overwriting it. */
+  readonly startIteration?: number;
+  /** The reviews this domain already spent before this process started. A
+   * restart continues the same budget instead of handing the domain a fresh
+   * one. */
+  readonly startReviews?: number;
   /** Start the domain from its base. */
   build(): Promise<DomainBuild>;
   /** Establish the check, doneWhen and test-removal facts on `sha`. */
@@ -61,32 +70,13 @@ export function domainFactFailure(facts: DomainFacts): string | undefined {
   return undefined;
 }
 
-/** Whether a quality remark is a cited plan/design violation: only such a
- * remark may send a domain back. A naming preference or another uncited style
- * remark is a note on the approval, never a blocker. */
-export function qualityProblemBlocks(problem: string): boolean {
-  const text = problem.trim();
-  if (text.length === 0) return false;
-  const lower = text.toLowerCase();
-  const citesPlanOrDesign = /\b(plan|design|conceptual integrity|requirement|constraint|architecture|contract)\b/.test(lower);
-  if (citesPlanOrDesign) return true;
-  // A bare item id is a citation only when the remark also says it is violated.
-  const itemId = /\b(?:[ARCF]-?\d+)\b/i.test(text);
-  const violation = /\b(violat(?:e|es|ed|ion)|contradict(?:s|ed|ion)?|breach(?:es|ed)?|deviate(?:s|d)?|unmet|does not meet|fails? to meet|breaks?)\b/.test(lower);
-  return itemId && violation;
-}
-
-/** The quality remarks that may send work back: cited plan/design violations.
- * Uncited remarks remain notes on DOMAIN_APPROVED. */
-export function blockingQualityProblems(review: DomainReview): string[] {
-  if (review.quality.ok) return [];
-  return (review.quality.problems ?? []).filter(qualityProblemBlocks);
-}
-
-/** Whether a review approved every point of the task. A missing point is not
- * fixed; quality blocks only for a cited plan/design violation. */
+/** Whether a review approved every point of the task. 07g1 (A2): a domain
+ * review blocks on its named points and on a quality problem — a point it
+ * judged not fixed (or did not judge), or a quality verdict that is not ok,
+ * sends the work back to the same fixer. A failing machine check is caught by
+ * the facts before any review starts. */
 export function domainReviewApproves(task: FixTask, review: DomainReview): boolean {
-  if (blockingQualityProblems(review).length > 0) return false;
+  if (!review.quality.ok) return false;
   for (const id of task.findingIds) {
     const verdict = review.points.find((p) => p.pointId === id);
     if (!verdict || !verdict.fixed) return false;
@@ -106,8 +96,9 @@ export function domainReviewFailure(task: FixTask, review: DomainReview): string
   }
   const missing = task.findingIds.filter((id) => !review.points.some((p) => p.pointId === id));
   if (missing.length > 0) lines.push(`The review did not judge: ${missing.join(", ")}.`);
-  const blocking = blockingQualityProblems(review);
-  if (blocking.length > 0) lines.push(`Quality (a cited plan/design violation): ${blocking.join("; ")}`);
+  if (!review.quality.ok) {
+    lines.push(`Quality: ${(review.quality.problems ?? []).join("; ") || "the domain review judged the quality not ok"}`);
+  }
   if (review.notes && review.notes.length > 0) lines.push(`Notes: ${review.notes.join("; ")}`);
   return lines.join("\n") || "The domain review did not approve this commit.";
 }
@@ -117,7 +108,7 @@ export async function runDomainLoop(task: FixTask, host: DomainLoopHost): Promis
   const records: DomainLoopRecord[] = [];
   const maxReviews = Number.isFinite(host.maxReviews) && host.maxReviews > 0 ? Math.floor(host.maxReviews) : 1;
   let fixes = 0;
-  let reviews = 0;
+  let reviews = Number.isFinite(host.startReviews) && (host.startReviews as number) > 0 ? Math.floor(host.startReviews as number) : 0;
   const stopped = (): boolean => host.stopRequested?.() === true;
   const finish = (outcome: DomainLoopOutcome): DomainLoopOutcome => {
     if (outcome.status === "approved" && outcome.sha) host.approved?.(outcome.sha, outcome.reviews);
@@ -130,20 +121,26 @@ export async function runDomainLoop(task: FixTask, host: DomainLoopHost): Promis
   };
 
   let build: DomainBuild;
+  const firstIteration = Number.isFinite(host.startIteration) && (host.startIteration as number) > 0 ? Math.floor(host.startIteration as number) : 1;
+  if (reviews >= maxReviews) {
+    const reason = `the domain loop bound was reached after ${reviews} reviews`;
+    record({ iteration: firstIteration, note: reason });
+    return finish({ status: "dropped", reason, reviews, fixes, records });
+  }
   try {
     build = await host.build();
   } catch (err) {
     const reason = `the fixer failed: ${String((err as Error)?.message ?? err)}`;
-    record({ iteration: 1, note: reason });
+    record({ iteration: firstIteration, note: reason });
     return finish({ status: "dropped", reason, reviews, fixes, records });
   }
   if (typeof build.sha !== "string" || build.sha.length === 0) {
     const reason = build.note ?? "the fixer produced no commit";
-    record({ iteration: 1, note: reason });
+    record({ iteration: firstIteration, note: reason });
     return finish({ status: "dropped", reason, reviews, fixes, records });
   }
   let sha = build.sha;
-  let iteration = 1;
+  let iteration = firstIteration;
 
   for (;;) {
     if (stopped()) return finish({ status: "stopped", sha, reason: "the owner stopped the run", reviews, fixes, records });

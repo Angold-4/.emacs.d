@@ -31,11 +31,12 @@ import {
   isProgramInput,
   lintPlan,
   lintProgram,
+  lintTestRemovals,
   type LintFinding,
   type LintPlanInput,
   type LintProgramInput,
 } from "./core/plan-lint.ts";
-import { readRepoFacts, readVerifyReachFacts } from "./core/repo-facts.ts";
+import { readRepoFacts, readTestNamesAtBase, readVerifyReachFacts } from "./core/repo-facts.ts";
 import { PLAN_TEMPLATE, parseOrgPlan } from "./core/org-plan.ts";
 import { EventLog, readLog } from "./effects/log.ts";
 import { acquireLock } from "./effects/lock.ts";
@@ -125,7 +126,27 @@ function coverageFindings(json: unknown): LintFinding[] {
  * repository coverage. `tt lint` and both start commands use this one
  * function, so the warnings they show are the same. */
 function allFindings(json: unknown): LintFinding[] {
-  return [...lintJson(json), ...coverageFindings(json), ...verifyReachFindings(json)];
+  return [...lintJson(json), ...coverageFindings(json), ...verifyReachFindings(json), ...testRemovalFindings(json)];
+}
+
+/** 07g1: every `#+TT_TEST_REMOVALS` entry must name a test the base declares,
+ * so an allowance cannot silently cover a different test. Read per plan like
+ * coverage, and prefixed per program entry the same way. */
+function testRemovalFindings(json: unknown): LintFinding[] {
+  if (isProgramInput(json)) {
+    const out: LintFinding[] = [];
+    for (const entry of (json as LintProgramInput).entries ?? []) {
+      const plan = entry.plan;
+      if (!plan?.repo) continue;
+      for (const f of lintTestRemovals(plan, readTestNamesAtBase(plan.repo))) {
+        out.push({ ...f, phaseId: entry.id ? `${entry.id}/${f.phaseId}` : f.phaseId });
+      }
+    }
+    return out;
+  }
+  const plan = json as LintPlanInput;
+  if (!plan?.repo) return [];
+  return lintTestRemovals(plan, readTestNamesAtBase(plan.repo));
 }
 
 /** 06k1's lesson: a named test the phase's checks never run (an error). Read

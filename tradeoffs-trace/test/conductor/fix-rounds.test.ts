@@ -1031,6 +1031,45 @@ test("fixers launch on the worker model, not the consolidator's", async () => {
   }
 });
 
+test("a failing final check that names no declared domain's file records LEAD_CALLED and makes no point", async () => {
+  const setup = await setupConductor({
+    phase: {
+      id: "p1",
+      goal: "final point without a path",
+      acceptance: ["it works"],
+      checks: ["true"],
+      finalChecks: ["printf 'the final check failed without a path\n'; exit 1"],
+      boundaries: [],
+      reserved: [],
+      workers: 2,
+      domains: [{ name: "core", globs: ["src/core/**"] }],
+      fixRounds: "domains",
+      fixers: 4,
+      fixChecks: "true",
+    },
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: { ...FAST, checkMs: 30_000 },
+    workerScript: () => laneWorker(1, "a"),
+    laneWorkerScriptFor: (lane, round) => laneWorker(round, lane),
+    laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1, "a"),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () => coreEvents(setup.runDir).some((e) => e.type === "LEAD_CALLED"),
+      180_000,
+      50,
+      setup.runDir,
+    );
+    assert.equal((setup.conductor.state.phase.findings ?? []).filter((f) => f.raisedBy === "conductor").length, 0, "no point was made without a file of a declared domain");
+  } finally {
+    await teardown(setup);
+  }
+});
+
 test("a failing final check becomes a point in the failing file's domain", async () => {
   const setup = await setupConductor({
     phase: {

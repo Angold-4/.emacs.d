@@ -1565,8 +1565,9 @@ export interface EvDomainApproved {
   domain: string;
   sha: string;
   reviews: number;
-  /** A2: quality remarks the review did not cite to the plan or design are
-   * kept as notes on the approval, never as a reason to send work back. */
+  /** 07g1 (A2): the review's notes for the next fixer, kept on the approval.
+   * A quality problem goes back to the same fixer instead of being recorded
+   * here, so an approved domain's review has quality ok. */
   notes?: string[];
 }
 export interface EvDomainDropped {

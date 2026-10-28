@@ -73,7 +73,10 @@ export type LintRule =
   | "check-window"
   // Plan 07c (D4): `#+TT_FIX_ROUNDS` needs `#+TT_DOMAINS`; the value is
   // `domains`, and `#+TT_FIXERS` is a positive whole number.
-  | "fix-rounds";
+  | "fix-rounds"
+  // 07g1: every `#+TT_TEST_REMOVALS` entry must name a test that exists on
+  // the base, so an allowance cannot silently cover a different test.
+  | "test-removals";
 
 /** The roles #+TT_MODELS may assign a model to. */
 // tt 09 (change 3): `consolidator` — the model that combines the lanes.
@@ -231,6 +234,9 @@ export interface LintPhaseInput {
   /** Plan 07c (D4): `#+TT_FIX_CHECKS:` — the fast command a fixer's own
    * commit must pass. */
   fixChecks?: unknown;
+  /** 07g1: `#+TT_TEST_REMOVALS` — test files/functions the owner allowed a
+   * mapper to remove. Carried onto every phase by the parser. */
+  testRemovals?: string[];
 }
 
 export interface LintPlanInput {
@@ -327,6 +333,11 @@ export interface LintPlanInput {
   fixChecks?: unknown;
   /** Lint-only: the 1-based line of `#+TT_FIX_CHECKS:`. */
   fixChecksLine?: number;
+  /** 07g1: the plan's `#+TT_TEST_REMOVALS` allowances (`file::name` or a
+   * whole file), carried onto every phase. */
+  testRemovals?: string[];
+  /** Lint-only: the 1-based line of `#+TT_TEST_REMOVALS:`. */
+  testRemovalsLine?: number;
   /** Plan 07e (E3): every bound keyword's raw value, by keyword, and the
    * 1-based line each was written on. */
   bounds?: Record<string, unknown>;
@@ -1239,6 +1250,43 @@ export function lintDomains(plan: LintPlanInput): LintFinding[] {
     problem,
     fix: "write each domain as <name>=<glob>[,<glob>…] with a unique [a-z0-9-]+ name and at least one glob",
   }));
+}
+
+/** 07g1: the base's test names, as the `#+TT_TEST_REMOVALS` lint reads them.
+ * `namesIn` returns undefined when the file cannot be read at the base, so a
+ * missing fact never turns into a false refusal. */
+export interface TestRemovalBaseFacts {
+  namesIn(file: string): readonly string[] | undefined;
+}
+
+/** 07g1: refuse a `#+TT_TEST_REMOVALS` entry that names no test on the base.
+ * An entry is `file::name` (that exact test) or a whole file; an unreadable
+ * base file is left alone because the lint cannot judge it. */
+export function lintTestRemovals(plan: LintPlanInput, base: TestRemovalBaseFacts): LintFinding[] {
+  const entries = plan.testRemovals ?? (plan.phases ?? []).find((p) => p.testRemovals && p.testRemovals.length > 0)?.testRemovals ?? [];
+  const out: LintFinding[] = [];
+  for (const raw of entries) {
+    const entry = raw.trim();
+    if (entry.length === 0) continue;
+    const split = entry.indexOf("::");
+    const file = split === -1 ? entry : entry.slice(0, split);
+    const name = split === -1 ? undefined : entry.slice(split + 2);
+    const names = base.namesIn(file);
+    if (names === undefined) continue;
+    const missing = name === undefined ? names.length === 0 : !names.includes(name);
+    if (!missing) continue;
+    out.push({
+      severity: "error",
+      rule: "test-removals",
+      phaseId: "test-removals",
+      item: `#+TT_TEST_REMOVALS: ${entry}`,
+      line: plan.testRemovalsLine,
+      sourceFile: plan.sourceFile,
+      problem: `#+TT_TEST_REMOVALS names ${entry}, but ${name === undefined ? `${file} declares no test on the base` : `${file} has no test named ${name} on the base`}`,
+      fix: "name a test that exists on the base as file::name, or a file that declares at least one test",
+    });
+  }
+  return out;
 }
 
 /** Plan 07c (D4): lint the fix-round keywords. `#+TT_FIX_ROUNDS` needs

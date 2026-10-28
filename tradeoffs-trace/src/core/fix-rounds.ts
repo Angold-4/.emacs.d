@@ -58,8 +58,11 @@ export function pointDomain(point: FixFinding, domains: readonly Domain[]): stri
 }
 
 /** True when a point becomes fixer work: an OPEN finding triaged `fix` with a
- * domain (its own or the one its cited file belongs to). */
+ * domain (its own or the one its cited file belongs to). A decision-shaped
+ * record is never fixer work, even when a caller hands it a domain, an open
+ * status and a `fix` disposition: it goes to the seats' vote or the owner. */
 function isFixWork(p: FixFinding, domains: readonly Domain[]): boolean {
+  if ((p as { source?: string }).source === "decision") return false;
   return p.status === "open" && p.disposition?.kind === "fix" && pointDomain(p, domains) !== undefined;
 }
 
@@ -157,7 +160,7 @@ export function domainReviewBrief(task: FixTask, records: readonly DomainLoopRec
   }
   lines.push(
     "",
-    "Call submit_domain_review with one entry for EVERY point id above: { pointId, fixed, why, anchors }. Set fixed=false for anything you cannot verify yourself on this commit; name the code anchors you read. Add quality { ok, problems } for anything outside the points that would make this domain's work unsafe; only a problem citing the plan or design can send work back, other remarks become notes on the approval. Add notes for the next fixer.",
+    "Call submit_domain_review with one entry for EVERY point id above: { pointId, fixed, why, anchors }. Set fixed=false for anything you cannot verify yourself on this commit; name the code anchors you read. Add quality { ok, problems } for anything outside the points that would make this domain's work unsafe: a quality problem sends the work back to the same fixer, exactly as an unfixed point does. Add notes for the next fixer.",
   );
   return lines.join("\n");
 }

@@ -8,14 +8,15 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { factKeepsOpen, fixTasks, testRemovalViolations, FIXER_DUTY, type FixFinding } from "../../src/core/fix-rounds.ts";
+import { domainReviewBrief, factKeepsOpen, fixTasks, testRemovalViolations, FIXER_DUTY, type FixFinding, type FixTask } from "../../src/core/fix-rounds.ts";
 import { fixRoundCandidate, isFixRound } from "../../src/core/lanes.ts";
-import { lintPlan } from "../../src/core/plan-lint.ts";
+import { domainFactFailure } from "../../src/fix-loop.ts";
+import { lintPlan, lintTestRemovals } from "../../src/core/plan-lint.ts";
 import { reduce } from "../../src/core/reduce.ts";
 import { validate } from "../../src/core/schema.ts";
 import type { Domain } from "../../src/core/domains.ts";
 import { disposition, evidenceForFinding, recordImpact, type Disposition } from "../../src/core/triage.ts";
-import type { Finding } from "../../src/core/types.ts";
+import type { DomainLoopRecord, Finding } from "../../src/core/types.ts";
 import { basePhase, baseState, makeBallot, makeDecision } from "./helpers.ts";
 
 const DOMAINS: Domain[] = [
@@ -220,15 +221,28 @@ test("tt lint refuses TT_FIX_ROUNDS with fewer than two workers", () => {
 // 07g1 (R5/A3): a decision is never a fixer task
 // ---------------------------------------------------------------------------
 
-/** A decision-shaped object a caller might wrongly hand to `fixTasks`. */
+/** A decision-shaped object a caller might wrongly hand to `fixTasks`.
+ * 07g1 (R5/A3): it carries everything a naive task rule would read — open,
+ * triaged `fix`, a domain and a citing file — so only the source check keeps
+ * it out of fixer work. */
 function decisionPoint(id: string, domain: string | undefined, cls: "delegated" | "reserved" = "delegated"): Record<string, unknown> {
   return {
     source: "decision",
     id,
+    version: 1,
+    phaseId: "p1",
+    kind: "defect",
+    severity: "blocking",
+    evidence: `${id} was vetoed`,
+    raisedBy: "M",
+    status: "open",
+    boundCandidateSha: "C1",
+    disposition: FIX,
     class: cls,
     choice: `${id} choice`,
     outcome: "vetoed",
     ...(domain !== undefined ? { domain } : {}),
+    where: `${domain ?? "src/x.ts"}:1 fn`,
     reasons: [`M: ${id} is wrong`],
     alternative: `${id} alternative`,
     expected: `${id} expected`,
@@ -366,8 +380,37 @@ test("isFixRound marks the round that ran on a fix round's candidate, whose pick
   assert.equal(isFixRound([fixed1, picked(2, "C", ["a"]), picked(3, "P3")] as never, 3), false);
 });
 
+test("a resumed domain review gets the same brief", () => {
+  // The brief is built from the recorded loop history, so a review taken
+  // after a stop/resume sees exactly the text the same log produced live.
+  const task: FixTask = { domain: "booking", findingIds: ["P"], findings: [finding("P", "booking")] };
+  const history: DomainLoopRecord[] = [
+    {
+      iteration: 1,
+      sha: "a".repeat(40),
+      facts: { checkPassed: true, points: [{ id: "P", onBase: false, onHead: true }] },
+      review: { points: [{ pointId: "P", fixed: false, why: "booking/a.ts:1 STILL_WRONG" }], quality: { ok: false, problems: ["QUALITY_GAP booking/a.ts:9"] } },
+      note: "domain review sent work back",
+    },
+    {
+      iteration: 2,
+      sha: "b".repeat(40),
+      facts: { checkPassed: true, points: [{ id: "P", onBase: false, onHead: true }] },
+      note: "domain review could not be taken",
+    },
+  ];
+  const live = domainReviewBrief(task, history);
+  const fromLog = domainReviewBrief(task, JSON.parse(JSON.stringify(history)) as DomainLoopRecord[]);
+  assert.equal(fromLog, live, "the same history produces the same brief after a resume");
+  assert.match(fromLog, /pass 1, commit aaaaaaaaa/);
+  assert.match(fromLog, /review: P NOT fixed: booking\/a\.ts:1 STILL_WRONG/);
+  assert.match(fromLog, /quality: QUALITY_GAP booking\/a\.ts:9/);
+});
+
 test("a vetoed decision makes no fixer task and an unmet item citing src/x.ts becomes a task of x's domain", () => {
   const xs: Domain[] = [{ name: "x", globs: ["src/x.ts"] }];
+  const vetoed = decisionPoint("D-vetoed", "x");
+  const discovered = { ...decisionPoint("D-discovered", "x"), outcome: "failed" };
   const r2: FixFinding = {
     ...finding("R2", undefined),
     item: "R2",
@@ -375,9 +418,48 @@ test("a vetoed decision makes no fixer task and an unmet item citing src/x.ts be
     expected: "right",
     doneWhen: "true",
   };
-  const tasks = fixTasks([r2], xs, 4);
+  const tasks = fixTasks([vetoed, discovered, r2] as unknown as FixFinding[], xs, 4);
   assert.deepEqual(tasks.map((t) => ({ domain: t.domain, ids: t.findingIds })), [{ domain: "x", ids: ["R2"] }]);
-  assert.equal(fixTasks([], xs, 4).length, 0, "a vetoed or discovered decision is never passed to fixTasks");
+  assert.equal(fixTasks([vetoed, discovered] as unknown as FixFinding[], xs, 4).length, 0, "a vetoed or discovered decision is never fixer work");
+});
+
+test("a candidate that deletes a test beyond the plan's list fails its round checks", () => {
+  // exex 01c3a lane b adcc1b2 (2026-10-28): green by deleting T's and C's
+  // test files. Both a deleted file and a removed #[test]/test( function are
+  // red, and the check record's violation list names them.
+  const violations = testRemovalViolations(
+    [
+      { path: "a.test.ts", base: "test('A', () => {});\ntest('B', () => {});\n", candidate: "test('A', () => {});\n" },
+      { path: "b.test.ts", base: "test('C', () => {});\n", candidate: undefined },
+      { path: "c.rs", base: "#[test]\nfn keeps_me() {}\n#[test]\nfn removed_me() {}\n", candidate: "#[test]\nfn keeps_me() {}\n" },
+    ],
+    [],
+  );
+  assert.deepEqual(violations, ["a.test.ts::B", "b.test.ts", "c.rs::removed_me"]);
+  const failure = domainFactFailure({ checkPassed: true, points: [], testRemovals: violations });
+  assert.ok(failure, "a test-removal violation makes the round's facts red");
+  for (const removed of violations) assert.match(failure, new RegExp(removed.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `the check record names ${removed}`);
+  assert.deepEqual(
+    testRemovalViolations(
+      [
+        { path: "a.test.ts", base: "test('A', () => {});\ntest('B', () => {});\n", candidate: "test('A', () => {});\n" },
+        { path: "b.test.ts", base: "test('C', () => {});\n", candidate: undefined },
+        { path: "c.rs", base: "#[test]\nfn keeps_me() {}\n#[test]\nfn removed_me() {}\n", candidate: "#[test]\nfn keeps_me() {}\n" },
+      ],
+      ["a.test.ts::B", "b.test.ts::C", "c.rs::removed_me"],
+    ),
+    [],
+    "the plan's allowance names exactly the removed tests",
+  );
+  // The allowance itself is linted against the base: an entry that names no
+  // test there is refused, never silently ignored.
+  const base = { namesIn: (file: string) => (file === "a.test.ts" ? ["A", "B"] : file === "b.test.ts" ? ["C"] : undefined) };
+  const ok = { phases: [], testRemovals: ["a.test.ts::B", "b.test.ts::C"], repo: "/tmp/x" };
+  assert.deepEqual(lintTestRemovals(ok, base), []);
+  const bad = lintTestRemovals({ ...ok, testRemovals: ["a.test.ts::GONE", "b.test.ts::C"] }, base);
+  assert.equal(bad.length, 1, "an entry naming no test on the base is an error");
+  assert.equal(bad[0].rule, "test-removals");
+  assert.match(bad[0].problem, /a\.test\.ts has no test named GONE/);
 });
 
 test("a candidate that deletes a test beyond the plan's list is red, with the deleted names", () => {
