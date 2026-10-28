@@ -1341,16 +1341,35 @@ addRow({
 // Plan 07f (C2): a passing final check does not clear other acceptance
 // blockers. Repair only when the common predicate still reports a blocker;
 // the presence or delivery of a legacy queued correction is irrelevant.
+// Plan 07f (C2, §3.1): the repair it starts is bounded like every other one —
+// a blocker that survives a spent budget parks on the owner (X:BOUND) instead
+// of starting an unbounded repair loop.
 addRow({
   id: "final-checks-passed-not-accepted",
   axis: "phase",
   from: "FINAL_CHECKING",
   trigger: "FINAL_CHECKS_PASSED",
-  guardName: "acceptDoesNotHoldOnFinalPass",
-  guard: (s) => !acceptHoldsOnFinalPass(s),
+  guardName: "acceptDoesNotHoldOnFinalPassAndBudgetRemains",
+  guard: (s) => !acceptHoldsOnFinalPass(s) && budgetRemains(s),
   to: "REPAIRING",
   actions: REPAIR_ATTEMPT_ACTIONS,
   apply: (s) => withPhase(s, { phase: "REPAIRING", inFlight: clearInFlight(s.phase, "run_final_checks") }),
+});
+
+addRow({
+  id: "final-checks-passed-budget-exhausted",
+  axis: "phase",
+  from: "FINAL_CHECKING",
+  trigger: "FINAL_CHECKS_PASSED",
+  guardName: "acceptDoesNotHoldOnFinalPassAndBudgetExhausted",
+  guard: (s) => !acceptHoldsOnFinalPass(s) && budgetExhausted(s),
+  to: "AWAITING_OWNER",
+  actions: [],
+  apply: (s) =>
+    enterAwaitingOwner(
+      withPhase(s, { inFlight: clearInFlight(s.phase, "run_final_checks") }),
+      "the repair budget ran out",
+    ),
 });
 
 failureRows(

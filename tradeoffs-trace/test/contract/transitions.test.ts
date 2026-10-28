@@ -310,6 +310,23 @@ const BUILD: Record<string, Fixture> = {
     }),
     event: { type: "FINAL_CHECKS_PASSED", candidateSha: "C1" },
   },
+  // Plan 07f (C2, §3.1): a spent repair budget parks the phase for the owner
+  // instead of starting a repair loop with no bound.
+  "final-checks-passed-budget-exhausted": {
+    state: baseState({
+      phase: "FINAL_CHECKING",
+      candidate: C1,
+      integrationHead: "H0",
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: false },
+      reviews: acceptableReviews,
+      inFlight: { run_final_checks: { actionId: "a1" } },
+      repairRoundsUsed: 3,
+      repairRoundsGranted: 3,
+      contract: finalContract(),
+    }),
+    event: { type: "FINAL_CHECKS_PASSED", candidateSha: "C1" },
+  },
   "final-checks-failed-to-repairing": {
     state: baseState({
       phase: "FINAL_CHECKING",

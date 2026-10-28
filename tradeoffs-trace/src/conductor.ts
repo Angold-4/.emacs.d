@@ -168,7 +168,7 @@ import type {
   State,
 } from "./core/types.ts";
 import { computeBoundaryTriggerPaths, computeUnreferencedHunks } from "./core/boundaries.ts";
-import { domainOf, whereKey, type Domain } from "./core/domains.ts";
+import { whereKey, type Domain } from "./core/domains.ts";
 // Plan 07c (D4): the fix-round task rule and the fixer's fixed duty text.
 import {
   decisionFixPoint,
@@ -1499,6 +1499,128 @@ function defaultCheckLockPath(runDir: string): string {
 
 /** Plan 06g2: a lane round's winner awaiting its reviews' promotion. */
 type PendingLaneWinner = { round: number; lane: string; sha: string; build: LaneBuild; reviews: Array<{ seat: string; review: Review }> };
+
+/** Plan 07f (A3/§3.2/§3.3): the fields an owner correction must name for the
+ * conductor to admit it as a point. Nothing is inferred from free text. */
+export interface OwnerPointFields {
+  domain: string;
+  item?: string;
+  where: string;
+  expected: string;
+  doneWhen: string;
+}
+
+/** What an owner correction that arrives mid-state in domain mode does: it is
+ * a point in the domain it names, it is refused for clarification because it
+ * cannot be proved, or (outside domain mode) it rides the note channel. */
+export type OwnerCorrectionDecision =
+  | { kind: "point"; event: Event }
+  | { kind: "refused"; reason: string }
+  | { kind: "note" };
+
+const OWNER_POINT_KEYS: Record<string, keyof OwnerPointFields> = {
+  domain: "domain",
+  item: "item",
+  where: "where",
+  expected: "expected",
+  donewhen: "doneWhen",
+  "done when": "doneWhen",
+};
+
+/** Plan 07f (A3/D-5/D-6): read the fields an owner correction names on its own
+ * lines (`domain: conductor`, `where: src/conductor.ts:1`, `expected: …`,
+ * `doneWhen: node --test test/x.test.ts`, optional `item: A3`). Only explicit
+ * fields count — a path in prose, or a phase with one declared domain, never
+ * routes a correction by itself. `missing` names the fields the input did not
+ * give, in the order the owner has to supply them. */
+export function parseOwnerPointFields(text: string): { fields: Partial<OwnerPointFields>; missing: string[] } {
+  const fields: Partial<OwnerPointFields> = {};
+  for (const line of text.split(/\r?\n/)) {
+    const m = /^\s*([A-Za-z][A-Za-z _-]*?)\s*:\s*(.+?)\s*$/.exec(line);
+    if (!m) continue;
+    const key = OWNER_POINT_KEYS[m[1].trim().toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ")];
+    if (!key) continue;
+    const value = m[2].replace(/^`+|`+$/g, "").trim();
+    if (value.length > 0) fields[key] = value;
+  }
+  const missing = (["domain", "where", "expected", "doneWhen"] as const).filter((k) => !fields[k]);
+  return { fields, missing };
+}
+
+/** Plan 07f (A3/§3.2/§3.3): what an owner correction that arrives mid-state
+ * does. In a domain-mode phase it is a point in the domain the input names —
+ * with `where`, `expected` and a `doneWhen` that can prove it — because a
+ * point without `domain` and `doneWhen` is refused at entry (X:UNPROVABLE,
+ * §3.4): never admitted unprovable, and never silently kept as a note no
+ * domain owns. Nothing is inferred from prose: a path in the text or a phase
+ * with one declared domain routes nothing. Outside domain mode there is no
+ * domain for a fix loop, so the note channel carries the text to the next
+ * brief. */
+export function ownerPointForCorrection(
+  phase: PhaseState,
+  commandId: string,
+  text: string,
+  itemIds: readonly string[],
+): OwnerCorrectionDecision {
+  const domains = phase.contract.domains;
+  if (!domains || domains.length === 0 || !phase.candidate) return { kind: "note" };
+  const { fields, missing } = parseOwnerPointFields(text);
+  if (missing.length > 0) {
+    return {
+      kind: "refused",
+      reason:
+        `an owner correction in a domain-mode phase is a point for its domain's next fix loop, so it needs its own ` +
+        `proving fact; name ${missing.join(", ")} on its own line (for example \`doneWhen: node --test test/x.test.ts\`) ` +
+        `— the conductor infers none of them`,
+    };
+  }
+  const wanted = fields.domain!.trim().toLowerCase();
+  const domain = domains.find((d) => d.name.trim().toLowerCase() === wanted);
+  if (!domain) {
+    return {
+      kind: "refused",
+      reason: `the correction names domain '${fields.domain}', but the plan declares ${domainNames(domains)}`,
+    };
+  }
+  // An `item` is optional, but a named one must exist: a point citing a plan
+  // item that is not there proves nothing.
+  let item: string | undefined;
+  if (fields.item) {
+    if (!itemIds.includes(fields.item)) {
+      return {
+        kind: "refused",
+        reason: `the correction names item '${fields.item}', which is not an item of this plan (${itemIds.join(", ")})`,
+      };
+    }
+    item = fields.item;
+  }
+  return {
+    kind: "point",
+    event: {
+      type: "FINDING_RAISED",
+      finding: {
+        id: `F-${phase.phaseId}-owner-${commandId}`,
+        version: 1,
+        phaseId: phase.phaseId,
+        kind: "defect",
+        severity: "blocking",
+        evidence: text,
+        raisedBy: "owner",
+        status: "open",
+        boundCandidateSha: phase.candidate.sha,
+        domain: domain.name,
+        ...(item ? { item } : {}),
+        where: fields.where!,
+        expected: fields.expected!,
+        doneWhen: fields.doneWhen!,
+      },
+    },
+  };
+}
+
+function domainNames(domains: readonly Domain[]): string {
+  return domains.map((d) => d.name).join(", ");
+}
 
 export class Conductor {
   #runDir: string;
@@ -4059,14 +4181,23 @@ export class Conductor {
       const queueAsNote = outcome.kind === "queued";
       // Plan 07f (A3/§3.3): an input that needs code work is a point for its
       // domain's next session, never a legacy queued correction and never an
-      // acceptance obligation. In domain mode it becomes an owner point with
-      // that domain (and a path, when the text names one); otherwise it rides
-      // the note channel into the next fixer brief. A ruling never enters here
-      // (it is applied at once).
+      // acceptance obligation. In domain mode the correction must name its own
+      // domain, where, expected and doneWhen; without them it is refused for
+      // clarification (a point without a proving fact is X:UNPROVABLE, §3.2),
+      // not admitted unprovable and not silently kept as a note. Outside
+      // domain mode it rides the note channel into the next brief. A ruling
+      // never enters here (it is applied at once).
+      const decision =
+        queueAsNote && inputKind === "correction" ? this.#ownerPointForCorrection(commandId, inputText) : ({ kind: "note" } as const);
+      if (decision.kind === "refused") {
+        this.#recordOwnerInput(commandId, inputKind, inputText, "refused", undefined, decision.reason);
+        this.#rejectInboxFile(file, commandId, decision.reason);
+        return;
+      }
       const event: Event = queueAsNote
         ? { type: "NOTE_ADDED", phaseId: this.#state.phase.phaseId, text: inputText }
         : { type: "OWNER_CORRECTION", correctionId: `C-${commandId}`, text: inputText };
-      const point = queueAsNote && inputKind === "correction" ? this.#ownerPointForCorrection(commandId, inputText) : undefined;
+      const point = decision.kind === "point" ? decision.event : undefined;
       const result = reduce(this.#state, event);
       if (!result.ok) {
         this.#recordOwnerInput(commandId, inputKind, inputText, "refused", undefined, result.reason);
@@ -6379,36 +6510,18 @@ export class Conductor {
     }
   }
 
-  /** Plan 07f (A3): a correction that arrives mid-state in domain mode is
-   * the owner's point for the domain its text touches. It becomes an open
-   * finding (so the next fix loop owns it), not a queued legacy correction.
-   * Outside domain mode there is no domain to route it to, so the note
-   * channel carries it instead. */
-  #ownerPointForCorrection(commandId: string, text: string): Event | undefined {
-    const phase = this.#state.phase;
-    const domains = phase.contract.domains;
-    if (!domains || domains.length === 0 || !phase.candidate) return undefined;
-    const path = /(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]+/.exec(text)?.[0];
-    const domain = path ? domainOf(path, domains) : domains.length === 1 ? domains[0].name : undefined;
-    if (!domain) return undefined;
-    const item = flatItems(this.#planItems()).find((i) => i.domain === domain)?.id;
-    return {
-      type: "FINDING_RAISED",
-      finding: {
-        id: `F-${phase.phaseId}-owner-${commandId}`,
-        version: 1,
-        phaseId: phase.phaseId,
-        kind: "defect",
-        severity: "blocking",
-        evidence: text,
-        raisedBy: "owner",
-        status: "open",
-        boundCandidateSha: phase.candidate.sha,
-        domain,
-        ...(item ? { item } : {}),
-        ...(path ? { where: path, expected: text } : { expected: text }),
-      },
-    };
+  /** Plan 07f (A3/§3.2/§3.3): an owner correction that arrives mid-state in
+   * a domain-mode phase is a point in its domain and goes to that domain's
+   * next fix loop (`ownerPointForCorrection` decides). A refusal is visible:
+   * the input is recorded refused with its reason and the inbox file is
+   * rejected, so the owner is told which fields to send. */
+  #ownerPointForCorrection(commandId: string, text: string): OwnerCorrectionDecision {
+    return ownerPointForCorrection(
+      this.#state.phase,
+      commandId,
+      text,
+      flatItems(this.#planItems()).map((i) => i.id),
+    );
   }
 
   /** Plan 05e (3a/3b): record a finding whose claim the record (or its own
