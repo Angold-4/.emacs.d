@@ -18,14 +18,14 @@ import { parseWorkerPromptRecord, workerPromptLineText } from "./core/worker-pro
 import { modelsCheckStatusText, parseModelsCheck, type ModelsCheck } from "./core/models-check.ts";
 // Plan 01f: the gate stage's own record (the conductor's live proof).
 import { gateOutcomeText, parseGateRecord, type GateRecord } from "./core/gate.ts";
-import { acceptanceBlockers, decisionStatus, isLiveDecision } from "./core/predicate.ts";
+import { acceptanceBlockers, decisionStatus, isLiveDecision, setSeatAnchorResolver } from "./core/predicate.ts";
 import { evaluationExceptions } from "./core/verdict.ts";
 import { recordedRunnerRevision } from "./effects/runner.ts";
 import { baselineCoversCommands, baselineStatusLine, parseBaseline, type Baseline } from "./core/test-failures.ts";
 // Plan 05i: the environment block's one-line reason and the resolved tool rows.
 import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
 import { reviewerOutcomes, tradeoffEntries, type ReviewerOutcome, type TradeoffEntry } from "./core/verdict.ts";
-import { countsLine, isStructured, matrixMarkdown, overturnCounts, phaseItemCounts } from "./core/items.ts";
+import { countsLine, evidenceHasAnchor, isStructured, matrixMarkdown, overturnCounts, phaseItemCounts } from "./core/items.ts";
 // Plan 05c: the status view's `review' row is counted from the same messages
 // the review renderer shows, so the two views never disagree.
 import { reviewSummary } from "./render.ts";
@@ -742,6 +742,19 @@ export function runCost(timeline: Timeline, spans: StageSpan[], now: Date): RunC
   };
 }
 
+/** Plan 07f (A4/A2): the review-lint anchor rule the conductor installs as
+ * `acceptanceBlockers` decides an item's seat majority (see
+ * `setSeatAnchorResolver`). It is stateless, so a process that reads the log
+ * without a conductor — `tt why`, `tt status` — installs the same rule before
+ * reading the ONE blocker list: the default resolver would otherwise resolve a
+ * seat's `file:line` against THIS process's cwd instead of the candidate the
+ * review was ingested against, and report an item the conductor's own accept()
+ * never would. It is installed BEFORE the replay, so the transitions the
+ * replay itself evaluates call `accept()` with the same rule. */
+function installSeatAnchorRule(): void {
+  setSeatAnchorResolver((evidence) => evidenceHasAnchor(evidence));
+}
+
 export interface WhyBlocker {
   kind: string;
   detail: string;
@@ -751,16 +764,7 @@ export interface WhyBlocker {
 /** Plan 07f (R3/A4): the report behind `tt why <run>`. It is built from the
  * log alone (`rebuildTimelineWithEvents`), so it answers a stopped run too and
  * never asks a conductor to speak. Every blocker carries the command that
- * clears it.
- *
- * Plan 07f (A4/A2): this reader stays with `acceptanceBlockers`'s default,
- * caller-relative seat-anchor resolver — it has no candidate tree to resolve
- * against, and only the conductor can install its own rule (see
- * `setSeatAnchorResolver`). A run stopped on an item whose seat evidence anchors
- * only inside the candidate, therefore, may answer differently here than the
- * conductor's `accept()` did. That difference is known and left in place: a
- * resolver installed after the replay is too late for the transitions the
- * replay itself evaluated. */
+ * clears it. */
 export interface WhyReport {
   runId: string;
   phaseId: string;
@@ -774,6 +778,7 @@ export interface WhyReport {
 }
 
 export function whyReport(runDir: string, plan: RunPlanFile): WhyReport {
+  installSeatAnchorRule();
   const { timeline, events } = rebuildTimelineWithEvents(runDir, plan);
   const phase = timeline.state.phase;
   const blockers = acceptanceBlockers(phase);
@@ -823,7 +828,11 @@ export function buildView(
   now = new Date(),
 ): RunView & { timeline: Timeline; tape: string; seatsTable: string; seatTable: SeatTable } {
   // One read of the control log gives both the timeline and the events the
-  // balance metrics need, so nothing here parses the log twice.
+  // balance metrics need, so nothing here parses the log twice. Like `tt why`
+  // (see `installSeatAnchorRule`), it installs the conductor's seat-anchor rule
+  // before the replay, so the status reads the ONE blocker list exactly as the
+  // conductor's own `accept()` did.
+  installSeatAnchorRule();
   const { timeline, events, records } = rebuildTimelineWithEvents(runDir, plan);
   const phase = timeline.state.phase;
   const spans = stageSpans(timeline, now, alive ? undefined : lastEventAt(runDir));
@@ -833,8 +842,7 @@ export function buildView(
   const C = phase.candidate?.sha;
   const reviewers = reviewerOutcomes(phase);
   // Plan 07f (F1/C3): the status reads the ONE blocker list and ends each
-  // blocker line with the command that clears it. Like `tt why` (see
-  // `WhyReport`), it keeps the default caller-relative seat-anchor resolver.
+  // blocker line with the command that clears it.
   const reasons = acceptanceBlockers(phase).map((b) => `${b.detail} — ${b.command}`);
   // Plan 06n (A6): the header's round is the round of the last ROUND_STARTED,
   // so it always equals the events. The old `timeline.rounds.length + 1`
