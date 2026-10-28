@@ -977,10 +977,14 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
     }
 
     case "RULING_RECORDED": {
-      // Plan 07f (A3/§3.2): a ruling is final when recorded. It settles every
-      // record it names at once — a decision by id and unchanged choice, a
-      // finding of ANY kind by acceptance — and answers the open owner
+      // Plan 07f (A3/§3.2): a ruling is final when recorded. It settles a
+      // decision by id and unchanged choice and a trade-off finding (a finding
+      // with no point fields) by acceptance, and answers the open owner
       // requests about those records. It is record-only: no loop, no queue.
+      // Plan 07f (A3): a ruling never closes a POINT. A point closes only by
+      // its doneWhen fact passing on the candidate (or its domain's approved
+      // review, §3.2); a ruling that named one would accept unproved code work,
+      // so it is refused with the input that does close a point (a withdraw).
       const ruling = (event as Extract<Event, { type: "RULING_RECORDED" }>).ruling;
       if (!ruling || typeof ruling.text !== "string" || ruling.text.trim().length === 0) {
         return rejected(state, "a ruling needs non-empty text");
@@ -992,6 +996,17 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         (id) => !p.decisions.some((d) => d.id === id) && !p.findings.some((f) => f.id === id),
       );
       if (unknown.length > 0) return rejected(state, `a ruling names unknown record(s): ${unknown.join(", ")}`);
+      const openPoint = p.findings.find(
+        (f) => ruling.recordIds.includes(f.id) && f.status === "open" && (f.domain !== undefined || f.doneWhen !== undefined),
+      );
+      if (openPoint) {
+        return rejected(
+          state,
+          `a ruling cannot close point ${openPoint.id}: a point closes only by its doneWhen fact on the candidate, ` +
+            `never by a ruling (§3.2). Withdraw the point instead (\`tt verdict <run> ${openPoint.id} refuse --reason "…"\`), ` +
+            `or rule on the trade-off the ruling is for.`,
+        );
+      }
       const decided = new Map(p.decisions.map((d) => [d.id, d]));
       const rulings = [...(p.rulings ?? [])];
       if (!rulings.some((r) => r.id === ruling.id)) rulings.push(ruling);

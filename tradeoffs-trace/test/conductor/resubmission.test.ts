@@ -117,9 +117,12 @@ test("plan 06k2: a resubmission whose tree equals the last reviewed candidate is
     assert.match((refused.event as { reason?: string }).reason ?? "", new RegExp(candidateSha.slice(0, 7)));
 
     // The owner asks for an unchanged resubmission; the next submit is taken.
+    // Plan 07f (A3): the ask is an owner NOTE (a correction is a point or a
+    // refusal, never a queued text), and it is the note/directive the
+    // unchanged-permission check reads.
     fs.writeFileSync(
       path.join(runPaths(setup.runDir).inbox, "cmd-unchanged.json"),
-      JSON.stringify({ type: "correction", text: "resubmit unchanged", binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" } }),
+      JSON.stringify({ type: "note", text: "resubmit unchanged", binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" } }),
     );
     await waitFor(() => (setup.conductor.state.phase.ownerNotes ?? []).some((n) => /unchanged/i.test(n)), 60_000, 20, setup.runDir);
     await waitFor(() => setup.conductor.state.phase.phase === "DONE", 150_000, 50, setup.runDir);
