@@ -180,7 +180,7 @@ test("plan 07f (A3): a point raised at AWAITING_OWNER starts no repair and resol
   assert.equal(point!.status, "open", "and stays open until its doneWhen passes");
 });
 
-test("plan 07f (A3): a ruling applies at once and never closes an open point", () => {
+test("plan 07f (A3/OD-1.3): a ruling settles every record it names at once, points included", () => {
   const point = {
     id: "F-tt-1",
     version: 1,
@@ -196,14 +196,20 @@ test("plan 07f (A3): a ruling applies at once and never closes an open point", (
   };
   const tradeOff = { ...point, id: "F-tt-2", domain: undefined, doneWhen: undefined, kind: "contract" as const };
   const withPoint = baseState(domainPhase({ findings: [point, tradeOff] as never }));
+  const before = acceptanceBlockers(withPoint.phase);
+  assert.ok(
+    before.some((b) => b.kind === "point" && b.detail.includes("conductor")),
+    `the open point blocks acceptance before the ruling: ${JSON.stringify(before)}`,
+  );
   const ruledPoint = reduce(withPoint, {
     type: "RULING_RECORDED",
-    ruling: { id: "RUL-1", text: "accept the trade-off, the point stands", recordIds: ["F-tt-1", "F-tt-2"], by: "owner" },
+    ruling: { id: "RUL-1", text: "settle both records", recordIds: ["F-tt-1", "F-tt-2"], by: "owner" },
   });
   assert.ok(ruledPoint.ok, ruledPoint.ok ? "" : ruledPoint.reason);
   if (!ruledPoint.ok) return;
-  // Plan 07f (A3/§3.3): the ruling is final when recorded and was applied at
-  // once — naming a point never refuses the whole input.
+  // Plan 07f (A3/§3.3, OD-1.3): the ruling is final when recorded and was
+  // applied at once. A named point is settled by the ruling itself — it is
+  // never silently left open, and the ruling queues no correction.
   assert.equal(ruledPoint.state.phase.rulings?.length, 1, "the ruling is recorded");
   assert.equal(
     ruledPoint.state.phase.findings.find((f) => f.id === "F-tt-2")!.status,
@@ -212,8 +218,17 @@ test("plan 07f (A3): a ruling applies at once and never closes an open point", (
   );
   assert.equal(
     ruledPoint.state.phase.findings.find((f) => f.id === "F-tt-1")!.status,
-    "open",
-    "the point stays open until its proving fact passes",
+    "accepted",
+    "a named point is settled by the ruling at once, never left open",
+  );
+  assert.equal(
+    (ruledPoint.state.phase.corrections ?? []).length,
+    0,
+    "a ruling queues no correction",
+  );
+  assert.ok(
+    !acceptanceBlockers(ruledPoint.state.phase).some((b) => b.kind === "point"),
+    "the settled point no longer blocks acceptance",
   );
 });
 

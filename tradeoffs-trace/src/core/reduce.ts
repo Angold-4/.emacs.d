@@ -977,17 +977,14 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
     }
 
     case "RULING_RECORDED": {
-      // Plan 07f (A3/§3.2): a ruling is final when recorded. It settles a
-      // decision by id and unchanged choice and a trade-off finding (a finding
-      // with no point fields) by acceptance, and answers the open owner
-      // requests about those records. It is record-only: no loop, no queue.
-      // Plan 07f (A3): a ruling never closes a POINT. A point closes only by
-      // its doneWhen fact passing on the candidate (or its domain's approved
-      // review, §3.2); a ruling that named one would accept unproved code work,
-      // so the point stays open until its fact proves it or an owner withdraws
-      // it. Naming a point is not a reason to refuse the input: a ruling
-      // applies to its records at once (§3.3), and rejecting the whole ruling
-      // would lose the records it does settle and demand a second input.
+      // Plan 07f (A3/§3.2/§3.3, OD-1.3): a ruling is final when recorded. It
+      // settles EVERY record it names at once — a decision by id and unchanged
+      // choice, a trade-off finding by acceptance, and a point (a finding with
+      // `domain` and/or `doneWhen`) too: the owner's ruling is the authority
+      // that closes it, so the point is never left open waiting for a fact it
+      // may never get, and the ruling never queues a correction. It also
+      // answers the open owner requests about those records. It is
+      // record-only: no loop, no queue, no repair round.
       const ruling = (event as Extract<Event, { type: "RULING_RECORDED" }>).ruling;
       if (!ruling || typeof ruling.text !== "string" || ruling.text.trim().length === 0) {
         return rejected(state, "a ruling needs non-empty text");
@@ -999,14 +996,10 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         (id) => !p.decisions.some((d) => d.id === id) && !p.findings.some((f) => f.id === id),
       );
       if (unknown.length > 0) return rejected(state, `a ruling names unknown record(s): ${unknown.join(", ")}`);
-      // The records this ruling settles: everything it names except the open
-      // points, which only a proving fact (or a withdraw) closes.
-      const settledIds = ruling.recordIds.filter(
-        (id) =>
-          !p.findings.some(
-            (f) => f.id === id && f.status === "open" && (f.domain !== undefined || f.doneWhen !== undefined),
-          ),
-      );
+      // Plan 07f (A3, OD-1.3): everything the ruling names is settled at once,
+      // points included — a named point is closed by the ruling itself, never
+      // silently left open.
+      const settledIds = ruling.recordIds;
       const decided = new Map(p.decisions.map((d) => [d.id, d]));
       const rulings = [...(p.rulings ?? [])];
       if (!rulings.some((r) => r.id === ruling.id)) rulings.push(ruling);
