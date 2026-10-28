@@ -1,10 +1,12 @@
 // Plan 07f (A3/D-5/§3.3): an owner input that needs code work is a POINT in
 // its domain's next fix loop — never a queued correction and never an
-// acceptance obligation. A phase that declares no domain has no loop for a
-// point, so a correction there is refused with the inputs that do apply (a
-// ruling settles a record, a withdraw closes one): it is never acknowledged as
-// a note that could stay undelivered after acceptance. A note stays a note:
-// it is queued for the next attempt's prompt and marked delivered there.
+// acceptance obligation, in every state it arrives in (mid-state, before the
+// first candidate, AWAITING_OWNER) and whatever the phase declares. A phase
+// with no declared domain still admits the point: a ruling applies at once but
+// performs no code work, and a withdraw only closes a record, so a correction
+// is never refused for the shape of the phase (it is refused only when it omits
+// the fields a point needs). A note stays a note: it is queued for the next
+// attempt's prompt and marked delivered there.
 
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -75,11 +77,26 @@ function cleanReviewer(reviewer: Reviewer, state: State): { hello: unknown; step
   };
 }
 
-test("plan 07f (A3): a correction during review or final checks is refused with guidance, never kept as a note", async () => {
+test("plan 07f (A3): a correction during review or final checks is a point, never kept as a note", async () => {
   const dir = fs.mkdtempSync("/tmp/tt-07f-late-correction-");
   const promptLog = path.join(dir, "worker-prompts.log");
-  const correctionReview = "CORRECTION-DURING-REVIEW: cap the retry loop at 64";
-  const correctionFinal = "CORRECTION-DURING-FINAL-CHECK: name the marker final-ok.txt";
+  // Plan 07f (A3/§3.3): a structured correction is a point in the domain it
+  // names, in every state — this phase declares no domain, which no longer
+  // refuses it. Only an input that omits a point's own fields is refused.
+  const correctionReview = [
+    "CORRECTION-DURING-REVIEW: cap the retry loop at 64",
+    "domain: conductor",
+    "where: src/conductor.ts:4066",
+    "expected: the retry loop stops at 64",
+    `doneWhen: node --test test/conductor/late-correction.test.ts`,
+  ].join("\n");
+  const correctionFinal = [
+    "CORRECTION-DURING-FINAL-CHECK: name the marker final-ok.txt",
+    "domain: conductor",
+    "where: src/conductor.ts:4066",
+    "expected: the marker is named final-ok.txt",
+    `doneWhen: node --test test/conductor/late-correction.test.ts`,
+  ].join("\n");
   const setup = await setupConductor({
     phase: {
       id: "p1",
@@ -120,11 +137,27 @@ test("plan 07f (A3): a correction during review or final checks is refused with 
       text: correctionReview,
       binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" },
     });
-    await waitFor(() => recorded("cmd-late-review")?.state === "refused", 30_000, 50, setup.runDir);
-    assert.match(
-      recorded("cmd-late-review")!.reason ?? "",
-      /declares no domain/,
-      `the refusal names the missing domain: ${recorded("cmd-late-review")!.reason}`,
+    await waitFor(() => recorded("cmd-late-review")?.state === "noted", 30_000, 50, setup.runDir);
+    const reviewPoint = (setup.conductor.state.phase.findings ?? []).find((f) => f.id.includes("owner-cmd-late-review"));
+    assert.ok(reviewPoint, "the correction is a point in the record");
+    assert.equal(reviewPoint!.status, "open", "and it stays open until its doneWhen fact passes");
+    assert.equal(reviewPoint!.domain, "conductor", "the domain the input names owns it");
+
+    // The point blocks acceptance until a fact proves it (that is the goal), so
+    // the owner withdraws it here to let the run reach its final checks; the
+    // withdraw closes the record and reaches every live session.
+    writeCommand(setup.runDir, "cmd-withdraw-review-point", {
+      type: "finding-verdict",
+      findingId: reviewPoint!.id,
+      verdict: "refuse",
+      reason: "not the retry cap this phase needed",
+      binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" },
+    });
+    await waitFor(
+      () => setup.conductor.state.phase.findings.find((f) => f.id === reviewPoint!.id)?.status !== "open",
+      30_000,
+      50,
+      setup.runDir,
     );
 
     await waitFor(() => setup.conductor.state.phase.phase === "FINAL_CHECKING", 90_000, 50, setup.runDir);
@@ -133,19 +166,20 @@ test("plan 07f (A3): a correction during review or final checks is refused with 
       text: correctionFinal,
       binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" },
     });
-    await waitFor(() => recorded("cmd-late-final")?.state === "refused", 30_000, 50, setup.runDir);
-    assert.match(recorded("cmd-late-final")!.reason ?? "", /ruling/, "the refusal points at a ruling");
-    assert.match(recorded("cmd-late-final")!.reason ?? "", /withdraw/, "the refusal points at a withdraw");
+    await waitFor(() => recorded("cmd-late-final")?.state === "noted", 30_000, 50, setup.runDir);
+    assert.ok(
+      (setup.conductor.state.phase.findings ?? []).some((f) => f.id.includes("owner-cmd-late-final") && f.status === "open"),
+      "a correction in FINAL_CHECKING is a point too",
+    );
 
-    // Neither correction is kept as a note and neither reaches a prompt: an
-    // acknowledged correction that no domain owns could stay undelivered, so
-    // it is refused instead.
+    // Neither correction is kept as a note and neither reaches a prompt as one:
+    // a correction is the point in its domain, and only a note is queued text.
     const phase = setup.conductor.state.phase;
     assert.ok(!(phase.ownerNotes ?? []).some((n) => n.includes("CORRECTION-DURING")), "no correction is kept as a note");
     assert.equal((phase.queuedCorrections ?? []).length, 0, "and none is a queued correction");
     assert.ok(
       !fs.existsSync(promptLog) || !fs.readFileSync(promptLog, "utf8").includes("CORRECTION-DURING"),
-      "no worker prompt carries a refused correction",
+      "no worker prompt carries a correction as queued note text",
     );
   } finally {
     await teardown(setup);
@@ -184,8 +218,9 @@ test("plan 06k1: a queued correction is not an acceptance obligation and deliver
 
 test("plan 06k1: a correction queued with the budget spent grants its own round", () => {
   // REVIEWING and FINAL_CHECKING still queue a correction RECORD (a legacy
-  // `OWNER_CORRECTION_QUEUED` in an old log); the conductor now records a
-  // point or a refusal instead, and neither gates acceptance.
+  // `OWNER_CORRECTION_QUEUED` in an old log); the conductor now records a point
+  // instead, which gates nothing at acceptance but stays open until its fact
+  // proves it.
   for (const name of ["REVIEWING", "FINAL_CHECKING", "EVALUATING"] as const) {
     const state = baseState({ phase: name });
     const outcome = acceptInput(state, { kind: "correction", text: "x", workerRunning: false });

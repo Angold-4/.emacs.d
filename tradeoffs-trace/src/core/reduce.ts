@@ -984,7 +984,10 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // Plan 07f (A3): a ruling never closes a POINT. A point closes only by
       // its doneWhen fact passing on the candidate (or its domain's approved
       // review, §3.2); a ruling that named one would accept unproved code work,
-      // so it is refused with the input that does close a point (a withdraw).
+      // so the point stays open until its fact proves it or an owner withdraws
+      // it. Naming a point is not a reason to refuse the input: a ruling
+      // applies to its records at once (§3.3), and rejecting the whole ruling
+      // would lose the records it does settle and demand a second input.
       const ruling = (event as Extract<Event, { type: "RULING_RECORDED" }>).ruling;
       if (!ruling || typeof ruling.text !== "string" || ruling.text.trim().length === 0) {
         return rejected(state, "a ruling needs non-empty text");
@@ -996,22 +999,19 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         (id) => !p.decisions.some((d) => d.id === id) && !p.findings.some((f) => f.id === id),
       );
       if (unknown.length > 0) return rejected(state, `a ruling names unknown record(s): ${unknown.join(", ")}`);
-      const openPoint = p.findings.find(
-        (f) => ruling.recordIds.includes(f.id) && f.status === "open" && (f.domain !== undefined || f.doneWhen !== undefined),
+      // The records this ruling settles: everything it names except the open
+      // points, which only a proving fact (or a withdraw) closes.
+      const settledIds = ruling.recordIds.filter(
+        (id) =>
+          !p.findings.some(
+            (f) => f.id === id && f.status === "open" && (f.domain !== undefined || f.doneWhen !== undefined),
+          ),
       );
-      if (openPoint) {
-        return rejected(
-          state,
-          `a ruling cannot close point ${openPoint.id}: a point closes only by its doneWhen fact on the candidate, ` +
-            `never by a ruling (§3.2). Withdraw the point instead (\`tt verdict <run> ${openPoint.id} refuse --reason "…"\`), ` +
-            `or rule on the trade-off the ruling is for.`,
-        );
-      }
       const decided = new Map(p.decisions.map((d) => [d.id, d]));
       const rulings = [...(p.rulings ?? [])];
       if (!rulings.some((r) => r.id === ruling.id)) rulings.push(ruling);
       const ruledDecisions = [...(p.ruledDecisions ?? [])];
-      for (const id of ruling.recordIds) {
+      for (const id of settledIds) {
         const decision = decided.get(id);
         if (!decision) continue;
         const kept = ruledDecisions.filter((r) => r.id !== id);
@@ -1019,12 +1019,12 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         ruledDecisions.push(...kept, { id, choice: decision.choice, by: ruling.id });
       }
       const findings = p.findings.map((f) =>
-        ruling.recordIds.includes(f.id) && f.status === "open"
+        settledIds.includes(f.id) && f.status === "open"
           ? { ...f, status: "accepted" as const, acceptedScope: ruling.text, version: f.version + 1 }
           : f,
       );
       let next: PhaseState = { ...p, rulings, ruledDecisions, findings };
-      for (const id of ruling.recordIds) {
+      for (const id of settledIds) {
         next = autoResolveLinkedRequest(next, id, "ruled", p.candidate?.sha ?? "", p.contract.contractVersion);
       }
       return ok({ ...state, phase: next });

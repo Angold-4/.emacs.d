@@ -89,16 +89,62 @@ test("plan 07f (A3/D-5/D-6): a correction that does not name its own fields is r
   assert.ok(wrongItem.kind === "refused" && wrongItem.reason.includes("Z9"));
 });
 
-test("plan 07f (A3/D-5): outside domain mode a correction is refused with the inputs that do apply", () => {
+test("plan 07f (A3): a correction is a point in every state — no declared domain, no candidate", () => {
+  // Plan 07f (A3/§3.3): an owner input is a ruling, a point or a withdraw, and
+  // neither a ruling nor a withdraw performs the code work a correction asks
+  // for. So the shape of the phase never refuses a correction: with no declared
+  // domain the point names its own domain, and with no candidate yet it is
+  // admitted unbound (the first candidate's doneWhen facts prove it).
   const noDomains = baseState({ phase: "REVIEWING", candidate: C1 }).phase;
   const decision = ownerPointForCorrection(noDomains, "cmd-6", STRUCTURED, ["A3"]);
-  assert.equal(decision.kind, "refused", "no domain could own the point, so nothing is admitted as a note");
-  assert.ok(decision.kind === "refused");
-  assert.match(decision.reason, /ruling/, `the refusal points at a ruling: ${decision.reason}`);
-  assert.match(decision.reason, /withdraw/, `the refusal points at a withdraw: ${decision.reason}`);
-  assert.match(decision.reason, /never kept as a note/, "the refusal says a correction is not a note");
+  assert.equal(decision.kind, "point", JSON.stringify(decision));
+  assert.ok(decision.kind === "point");
+  const finding = (decision.event as Extract<typeof decision.event, { type: "FINDING_RAISED" }>).finding;
+  assert.equal(finding.domain, "conductor", "the domain the input names owns the point");
+  assert.equal(finding.boundCandidateSha, "C1", "a point raised with a candidate is bound to it");
+
+  // Before the first candidate exists the point is kept, unbound: nothing a
+  // point reads goes through that binding.
   const noCandidate = domainPhase({ candidate: undefined });
-  assert.equal(ownerPointForCorrection(noCandidate, "cmd-7", STRUCTURED, ["A3"]).kind, "refused");
+  const early = ownerPointForCorrection(noCandidate, "cmd-7", STRUCTURED, ["A3"]);
+  assert.equal(early.kind, "point", JSON.stringify(early));
+  assert.ok(early.kind === "point");
+  const earlyPoint = (early.event as Extract<typeof early.event, { type: "FINDING_RAISED" }>).finding;
+  assert.equal(earlyPoint.boundCandidateSha, "", "an early point is admitted unbound");
+  assert.equal(earlyPoint.domain, "conductor");
+  assert.equal(earlyPoint.status, "open", "and it is an open point, not a note");
+
+  // Once the first candidate exists the point is what acceptance asks to be
+  // closed, and that candidate's doneWhen fact is what closes it.
+  const later = baseState(domainPhase({ findings: [earlyPoint] as never }));
+  const blockers = acceptanceBlockers(later.phase);
+  assert.ok(
+    blockers.some((b) => b.kind === "point" && b.detail.includes("conductor")),
+    `the early point blocks acceptance: ${JSON.stringify(blockers)}`,
+  );
+  const proved = baseState(
+    domainPhase({
+      findings: [earlyPoint] as never,
+      doneWhenFacts: [{ findingId: earlyPoint.id, candidateSha: "C1", exitCode: 0, timedOut: false, passesOnBase: false }] as never,
+    }),
+  );
+  assert.ok(
+    !acceptanceBlockers(proved.phase).some((b) => b.kind === "point"),
+    "the first candidate's doneWhen fact closes it like any other point",
+  );
+});
+
+test("plan 07f (A3): only an input that omits a point's own fields is refused, and the refusal names them", () => {
+  // The one refusal left: a point needs domain, where, expected and doneWhen
+  // (X:UNPROVABLE otherwise). The owner resends it with those fields.
+  const noDomains = baseState({ phase: "REVIEWING", candidate: C1 }).phase;
+  const prose = ownerPointForCorrection(noDomains, "cmd-9", "CORRECTION: cap the retry loop at 64", ["A3"]);
+  assert.equal(prose.kind, "refused");
+  assert.ok(prose.kind === "refused");
+  for (const field of ["domain", "where", "expected", "doneWhen"]) {
+    assert.match(prose.reason, new RegExp(field), `the refusal names ${field}: ${prose.reason}`);
+  }
+  assert.doesNotMatch(prose.reason, /declares no domain/, "never for the shape of the phase");
 });
 
 test("plan 07f (A3): a point raised at AWAITING_OWNER starts no repair and resolves no request", () => {
@@ -134,7 +180,7 @@ test("plan 07f (A3): a point raised at AWAITING_OWNER starts no repair and resol
   assert.equal(point!.status, "open", "and stays open until its doneWhen passes");
 });
 
-test("plan 07f (A3): a ruling closes a trade-off finding but never an open point", () => {
+test("plan 07f (A3): a ruling applies at once and never closes an open point", () => {
   const point = {
     id: "F-tt-1",
     version: 1,
@@ -148,25 +194,27 @@ test("plan 07f (A3): a ruling closes a trade-off finding but never an open point
     domain: "conductor",
     doneWhen: "node --test test/conductor/owner-point.test.ts",
   };
-  const withPoint = baseState(domainPhase({ findings: [point] as never }));
+  const tradeOff = { ...point, id: "F-tt-2", domain: undefined, doneWhen: undefined, kind: "contract" as const };
+  const withPoint = baseState(domainPhase({ findings: [point, tradeOff] as never }));
   const ruledPoint = reduce(withPoint, {
     type: "RULING_RECORDED",
-    ruling: { id: "RUL-1", text: "accept the point", recordIds: ["F-tt-1"], by: "owner" },
+    ruling: { id: "RUL-1", text: "accept the trade-off, the point stands", recordIds: ["F-tt-1", "F-tt-2"], by: "owner" },
   });
-  assert.equal(ruledPoint.ok, false, "a ruling cannot accept an open point without its proving fact");
-  assert.ok(ruledPoint.ok === false && /doneWhen/.test(ruledPoint.reason), "the refusal names the proving fact");
-  assert.ok(ruledPoint.ok === false && /verdict/.test(ruledPoint.reason), "and the input that does close a point");
-  assert.equal(withPoint.phase.findings[0].status, "open", "the point is untouched");
-
-  // A trade-off finding (no domain, no doneWhen) is what a ruling settles.
-  const tradeOff = { ...point, id: "F-tt-2", domain: undefined, doneWhen: undefined, kind: "contract" as const };
-  const withTradeOff = baseState(domainPhase({ findings: [tradeOff] as never }));
-  const ruled = reduce(withTradeOff, {
-    type: "RULING_RECORDED",
-    ruling: { id: "RUL-2", text: "accept the contract finding", recordIds: ["F-tt-2"], by: "owner" },
-  });
-  assert.ok(ruled.ok, ruled.ok ? "" : ruled.reason);
-  if (ruled.ok) assert.equal(ruled.state.phase.findings[0].status, "accepted", "a ruling applies at once to a trade-off record");
+  assert.ok(ruledPoint.ok, ruledPoint.ok ? "" : ruledPoint.reason);
+  if (!ruledPoint.ok) return;
+  // Plan 07f (A3/§3.3): the ruling is final when recorded and was applied at
+  // once — naming a point never refuses the whole input.
+  assert.equal(ruledPoint.state.phase.rulings?.length, 1, "the ruling is recorded");
+  assert.equal(
+    ruledPoint.state.phase.findings.find((f) => f.id === "F-tt-2")!.status,
+    "accepted",
+    "the trade-off record is settled by the ruling at once",
+  );
+  assert.equal(
+    ruledPoint.state.phase.findings.find((f) => f.id === "F-tt-1")!.status,
+    "open",
+    "the point stays open until its proving fact passes",
+  );
 });
 
 test("plan 07f (A3): the field parser reads only explicit fields, in any Key-Case", () => {

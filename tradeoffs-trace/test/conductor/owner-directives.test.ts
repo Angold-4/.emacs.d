@@ -347,9 +347,10 @@ test("owner-directives: a directive survives a restart, and a note at AWAITING_O
     assert.equal(before.phase, "AWAITING_OWNER", "the resumed run is parked on the owner");
     assert.ok(before.ownerRequests.some((r) => r.status === "open"), "AWAITING_OWNER has open owner requests");
     const grantedBefore = before.repairRoundsGranted;
-    // Plan 07f (A3): a correction at AWAITING_OWNER is a point (or, with no
-    // domain, a refusal) — never the legacy applied correction — so the note
-    // channel is where queued owner text goes now.
+    // Plan 07f (A3/§3.3): a correction at AWAITING_OWNER is a point in the
+    // domain it names — in every phase, with or without a declared domain — so
+    // the note channel is where queued owner text goes now. The note below
+    // proves a note never becomes a correction and grants no round.
     writeCommand(setup.runDir, "cmd-note", {
       type: "note",
       text: note,
