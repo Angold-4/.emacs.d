@@ -134,14 +134,28 @@ test("tt why prints the blockers with commands on a stopped run", async () => {
     assert.ok(decision && request);
     await setup.conductor.stop();
 
-    // Make it a stopped run with the two owner gates as its blockers: the
-    // decision and the request. The item R1 the single seat marked `met` is
-    // NOT a blocker: its `src/core/x.ts:1` anchor lives in the candidate's own
-    // tree, which this CLI process's cwd cannot see, so `tt why` must apply
-    // the same review-lint anchor rule the conductor installs instead of
+    // Make it a stopped run with three owner gates as its blockers, each named
+    // with its own command (plan 07f R8/OD-1.5): the failed decision, the
+    // request that asks about it, and the repair-budget gate the round spent
+    // its rounds on. The item R1 the seats marked `met` is NOT a blocker: its
+    // `src/core/x.ts:1` anchor is one the review lint already resolved against
+    // the candidate, which is the same rule `tt why` must apply instead of
     // reading the anchor caller-relative. Also record a runner and a bound, so
     // the read must show both, not just the blocker list.
     const candidate = setup.conductor.state.phase.candidate!.sha as string;
+    appendEvent(setup.runDir, {
+      type: "OWNER_REQUEST_OPENED",
+      request: {
+        ...request,
+        id: `OR-${path.basename(setup.runDir)}-budget`,
+        version: 1,
+        origin: "repair_budget_exhausted",
+        reason: "the round budget is spent while items remain open",
+        linkedDecisionId: undefined,
+        linkedFindingId: undefined,
+        linkedCorrectionId: undefined,
+      },
+    });
     appendEvent(setup.runDir, {
       type: "BOUND_REACHED",
       kind: "check",
@@ -158,7 +172,7 @@ test("tt why prints the blockers with commands on a stopped run", async () => {
     assert.equal(text.code, 0, text.stdout);
     assert.match(text.stdout, /accepted: no/);
     assert.match(text.stdout, /\[decision\]/);
-    assert.match(text.stdout, /\[owner-request\]/);
+    assert.equal((text.stdout.match(/\[owner-request\]/g) ?? []).length, 2, "both open owner requests are named");
     assert.doesNotMatch(text.stdout, /\[item\]/, "the seat's candidate anchor resolves, so R1 does not block");
     assert.match(text.stdout, /tt input/, "each blocker ends with the command that clears it");
     assert.match(text.stdout, /"type":"ruling"/, "the decision blocker's command is a ruling");
@@ -182,10 +196,14 @@ test("tt why prints the blockers with commands on a stopped run", async () => {
     assert.equal(parsed.runId, path.basename(setup.runDir));
     assert.equal(parsed.phase, "AWAITING_OWNER");
     assert.equal(parsed.accepted, false);
-    assert.equal(parsed.blockers.length, 2, `exactly two blockers, got ${JSON.stringify(parsed.blockers, null, 2)}`);
+    assert.equal(parsed.blockers.length, 3, `exactly three blockers, got ${JSON.stringify(parsed.blockers, null, 2)}`);
     assert.ok(parsed.blockers.every((b) => b.detail.length > 0 && b.command.length > 0), "every blocker carries detail and command");
     assert.ok(parsed.blockers.some((b) => b.kind === "decision" && b.command.includes("ruling")));
-    assert.ok(parsed.blockers.some((b) => b.kind === "owner-request" && b.command.includes("resolve")));
+    assert.equal(
+      parsed.blockers.filter((b) => b.kind === "owner-request" && b.command.includes("resolve")).length,
+      2,
+      "each open request is a blocker of its own, with its own resolve",
+    );
     assert.ok(!parsed.blockers.some((b) => b.kind === "item"), "the seat's candidate anchor resolves, so R1 does not block");
     assert.equal(parsed.runnerRevision, revision, "the JSON reports the recorded runner revision");
     assert.deepEqual(parsed.bounds, [{ kind: "check", scope: `runnable:${candidate}`, limitMs: 20_000, elapsedMs: 20_000 }]);
