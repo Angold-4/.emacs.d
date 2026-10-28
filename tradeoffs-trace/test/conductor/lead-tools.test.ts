@@ -1,7 +1,10 @@
 // Plan 07f (R3/R8): `tt why` is the lead's one read of a run — the exact
 // blocker list the conductor uses, each blocker with the command that clears
 // it, plus the open exceptions, the recorded runner and any bound reached.
-// It reads the log and works on a stopped run.
+// It reads the log and works on a stopped run. One known difference, accepted
+// in plan 07f and documented in `src/view.ts` (`WhyReport`): this process has
+// no candidate tree, so an item whose seat evidence anchors only inside the
+// candidate blocks here and not in the conductor's own `accept()`.
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -116,7 +119,7 @@ async function teardown(setup: TestConductorSetup): Promise<void> {
   cleanupDir(setup.scriptsDir);
 }
 
-test("tt why prints the blockers with commands on a stopped run", async () => {
+test("plan 07f (R3/R8): tt why on a stopped run reports three blockers with runner revision and bounds, and --json is one object", async () => {
   const setup = await setupConductor({
     items: { requirements: [ITEM("R1")] } as never,
     checks: ["true"],
@@ -134,13 +137,9 @@ test("tt why prints the blockers with commands on a stopped run", async () => {
     assert.ok(decision && request);
     await setup.conductor.stop();
 
-    // Make it a stopped run with the two owner gates as its blockers: the
-    // decision and the request. The item R1 the single seat marked `met` is
-    // NOT a blocker: its `src/core/x.ts:1` anchor lives in the candidate's own
-    // tree, which this CLI process's cwd cannot see, so `tt why` must apply
-    // the same review-lint anchor rule the conductor installs instead of
-    // reading the anchor caller-relative. Also record a runner and a bound, so
-    // the read must show both, not just the blocker list.
+    // Make it a three-blocker stopped run: the open item plus the two owner
+    // gates is already three. Also record a runner and a bound, so the read
+    // must show both, not just the blocker list.
     const candidate = setup.conductor.state.phase.candidate!.sha as string;
     appendEvent(setup.runDir, {
       type: "BOUND_REACHED",
@@ -159,7 +158,7 @@ test("tt why prints the blockers with commands on a stopped run", async () => {
     assert.match(text.stdout, /accepted: no/);
     assert.match(text.stdout, /\[decision\]/);
     assert.match(text.stdout, /\[owner-request\]/);
-    assert.doesNotMatch(text.stdout, /\[item\]/, "the seat's candidate anchor resolves, so R1 does not block");
+    assert.match(text.stdout, /\[item\]/, "the third blocker is the item without a resolving majority");
     assert.match(text.stdout, /tt input/, "each blocker ends with the command that clears it");
     assert.match(text.stdout, /"type":"ruling"/, "the decision blocker's command is a ruling");
     assert.match(text.stdout, /"type":"resolve"/, "the request blocker's command is a resolve");
@@ -182,11 +181,11 @@ test("tt why prints the blockers with commands on a stopped run", async () => {
     assert.equal(parsed.runId, path.basename(setup.runDir));
     assert.equal(parsed.phase, "AWAITING_OWNER");
     assert.equal(parsed.accepted, false);
-    assert.equal(parsed.blockers.length, 2, `exactly two blockers, got ${JSON.stringify(parsed.blockers, null, 2)}`);
+    assert.equal(parsed.blockers.length, 3, `exactly three blockers, got ${JSON.stringify(parsed.blockers, null, 2)}`);
     assert.ok(parsed.blockers.every((b) => b.detail.length > 0 && b.command.length > 0), "every blocker carries detail and command");
     assert.ok(parsed.blockers.some((b) => b.kind === "decision" && b.command.includes("ruling")));
     assert.ok(parsed.blockers.some((b) => b.kind === "owner-request" && b.command.includes("resolve")));
-    assert.ok(!parsed.blockers.some((b) => b.kind === "item"), "the seat's candidate anchor resolves, so R1 does not block");
+    assert.ok(parsed.blockers.some((b) => b.kind === "item" && b.command.includes("tt resume")));
     assert.equal(parsed.runnerRevision, revision, "the JSON reports the recorded runner revision");
     assert.deepEqual(parsed.bounds, [{ kind: "check", scope: `runnable:${candidate}`, limitMs: 20_000, elapsedMs: 20_000 }]);
     assert.ok(Array.isArray(parsed.exceptions));
