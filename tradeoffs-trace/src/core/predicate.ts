@@ -737,12 +737,42 @@ function seatAnchorResolves(evidence: string): boolean {
   });
 }
 
+/** Plan 07f1a (A1/R1), finished by 07f1b (A1): the commands a red check's
+ * blockers name — the commands that ACTUALLY FAILED when the caller read the
+ * candidate's check record, never a synthesized `a && b` the owner never ran.
+ * The failing set is passed in by the caller that reads the record (the
+ * conductor's accept() only needs the count; `tt why` and `tt status` pass the
+ * commands they read for the run they print), so the predicate stays pure and
+ * two runs in one process never share a source. Without a per-command result
+ * (an old log, a fixture, an interrupted run) nothing knows which command
+ * failed, so the blocker points at the run itself: it never names a declared
+ * command that may have passed. The owner clears the blocker by inspecting
+ * the run and re-running exactly the command that failed. */
+function failingCheckCommands(phase: PhaseState, failedCommands: readonly string[] | undefined): string[] {
+  if (failedCommands && failedCommands.length > 0) return [...failedCommands];
+  // No per-command result: name only the run to inspect, never a declared
+  // command that may have passed (A1 asks for the failing command itself).
+  return [`tt status ${phase.runId}`];
+}
+
+/** Plan 07f1b (A1/R1): the ONE command a single-command blocker names, taken
+ * from the same list: the failing command when the caller read it, else the
+ * declared (or legacy) command. */
+function singleCheckCommand(phase: PhaseState, failedCommands: readonly string[] | undefined): string {
+  return failingCheckCommands(phase, failedCommands)[0];
+}
+
 /** Plan 07f (F1): every condition `accept` requires, in one list. The
  * mechanical gates come first (they are facts, and an owner carry never
  * waives them); then, when there is no carry, the review items, the points
  * whose doneWhen fact does not prove them, the ledger's blocking records, the
  * decisions, the owner requests and the corrections. */
-function acceptanceBlockersFor(phase: PhaseState, C: string, K: ContractVersion): AcceptanceBlocker[] {
+function acceptanceBlockersFor(
+  phase: PhaseState,
+  C: string,
+  K: ContractVersion,
+  failedCommands?: readonly string[],
+): AcceptanceBlocker[] {
   const blockers: AcceptanceBlocker[] = [];
 
   // Mechanical gates are facts (ODP-1, ODP-2): the checks must have passed
@@ -751,11 +781,11 @@ function acceptanceBlockersFor(phase: PhaseState, C: string, K: ContractVersion)
   // can never accept a failing or stale candidate.
   if (!(phase.checks && phase.checks.candidateSha === C && phase.checks.passed === true)) {
     const failed = phase.checks?.candidateSha === C && phase.checks.passed === false;
-    blockers.push({
-      kind: "check",
-      detail: failed ? "checks failed" : "checks have not passed for the candidate",
-      command: `tt recheck ${phase.runId} --reason ${JSON.stringify("the candidate checks must pass")}`,
-    });
+    const detail = failed ? "checks failed" : "checks have not passed for the candidate";
+    // Plan 07f1b (A1): one blocker per command that FAILED, so every blocker
+    // names the failing check command itself — never a command that passed and
+    // never a synthesized `a && b` (see `failingCheckCommands`).
+    for (const command of failingCheckCommands(phase, failedCommands)) blockers.push({ kind: "check", detail, command });
   }
   // The probe must be onto the CURRENT integration head: a head moved by a
   // stale publish (design §6.4 step 3) must not let a stale probe count.
@@ -791,7 +821,7 @@ function acceptanceBlockersFor(phase: PhaseState, C: string, K: ContractVersion)
       blockers.push({
         kind: "test-verify",
         detail: `named test verify ${problem}`,
-        command: `tt recheck ${phase.runId} --reason ${JSON.stringify(problem)}`,
+        command: singleCheckCommand(phase, failedCommands),
       });
     }
     // An architecture deviation is accepted when the owner accepts the item's
@@ -978,11 +1008,16 @@ function acceptanceBlockersFor(phase: PhaseState, C: string, K: ContractVersion)
 }
 
 /** Plan 07f (F1): every unmet acceptance condition for the phase's current
- * candidate, each with the command that clears it. Empty ⇒ accepted. */
-export function acceptanceBlockers(phase: PhaseState): AcceptanceBlocker[] {
+ * candidate, each with the command that clears it. Empty ⇒ accepted. The
+ * caller that prints a blocker passes the failing check commands it read for
+ * THIS phase (07f1b A1); a caller that only counts them omits it. */
+export function acceptanceBlockers(
+  phase: PhaseState,
+  failedCommands?: readonly string[],
+): AcceptanceBlocker[] {
   const C = phase.candidate?.sha;
   if (!C) return [];
-  return acceptanceBlockersFor(phase, C, phase.contract.contractVersion);
+  return acceptanceBlockersFor(phase, C, phase.contract.contractVersion, failedCommands);
 }
 
 /** accept(C, K): the only way a phase may reach ACCEPTED. Mechanical by

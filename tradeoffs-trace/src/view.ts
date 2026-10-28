@@ -11,7 +11,7 @@ import { DEFAULT_DEADLINES, rebuildTimelineWithEvents, runPaths, type RunPlanFil
 import { boundText, type BoundKind } from "./core/bounds.ts";
 import { loopTapeHead, renderLoopTape, tapeLabel, type ChartModels } from "./charts.ts";
 import { laneRoundPhase } from "./core/loop-view.ts";
-import { effectiveChecks } from "./core/checks.ts";
+import { effectiveChecks, parseCheckRecord } from "./core/checks.ts";
 import { planModelSelector, type PlanModels, type RoleModel } from "./core/roles.ts";
 // 06a finding #24: the `models` line also carries the models check's result.
 import { parseWorkerPromptRecord, workerPromptLineText } from "./core/worker-prompt.ts";
@@ -755,6 +755,30 @@ function installSeatAnchorRule(): void {
   setSeatAnchorResolver((evidence) => evidenceHasAnchor(evidence));
 }
 
+/** Plan 07f1b (A1): the commands a red check's blockers name, read from the
+ * record of the candidate the phase is explaining. The predicate takes them as
+ * an explicit argument, so two runs read in one process never share a source
+ * and no mutable state is installed. */
+function failedCheckCommands(runDir: string, phase: PhaseState): string[] | undefined {
+  const candidateSha = phase.checks?.candidateSha ?? phase.candidate?.sha;
+  if (!candidateSha) return undefined;
+  try {
+    const record = parseCheckRecord(
+      JSON.parse(fs.readFileSync(path.join(runPaths(runDir).checks, candidateSha, "record.json"), "utf8")),
+    );
+    if (!record) return undefined;
+    // Plan 07f1b (B-88): the file is keyed by candidate SHA alone, so a
+    // `final` run overwrites the candidate's `round` record. The evidence must
+    // be the run the phase's check result names: a mismatched tier is another
+    // run's record and names no command here (an old log's absent tier is
+    // `round`).
+    if (record.tier !== (phase.checks?.tier ?? "round")) return undefined;
+    return record.commands.filter((c) => !c.passed).map((c) => c.command);
+  } catch {
+    return undefined;
+  }
+}
+
 export interface WhyBlocker {
   kind: string;
   detail: string;
@@ -781,7 +805,7 @@ export function whyReport(runDir: string, plan: RunPlanFile): WhyReport {
   installSeatAnchorRule();
   const { timeline, events } = rebuildTimelineWithEvents(runDir, plan);
   const phase = timeline.state.phase;
-  const blockers = acceptanceBlockers(phase);
+  const blockers = acceptanceBlockers(phase, failedCheckCommands(runDir, phase));
   const revision = recordedRunnerRevision(runDir);
   const bounds = events
     .filter((e): e is Extract<typeof e, { type: "BOUND_REACHED" }> => e.type === "BOUND_REACHED")
@@ -843,7 +867,7 @@ export function buildView(
   const reviewers = reviewerOutcomes(phase);
   // Plan 07f (F1/C3): the status reads the ONE blocker list and ends each
   // blocker line with the command that clears it.
-  const reasons = acceptanceBlockers(phase).map((b) => `${b.detail} — ${b.command}`);
+  const reasons = acceptanceBlockers(phase, failedCheckCommands(runDir, phase)).map((b) => `${b.detail} — ${b.command}`);
   // Plan 06n (A6): the header's round is the round of the last ROUND_STARTED,
   // so it always equals the events. The old `timeline.rounds.length + 1`
   // inferred it from completed freezes, which drifts when a round was

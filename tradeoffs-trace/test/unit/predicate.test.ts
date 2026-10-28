@@ -111,6 +111,92 @@ test("acceptanceBlockers lists failed checks missing test verifies open points f
   assert.equal(accept(cleared, C, K), true, "with every condition met the same predicate accepts");
 });
 
+test("a red check blocker carries the failing check command", () => {
+  const command = "make -C x check";
+  const phase = basePhase({
+    contract: { ...CONTRACT, checks: [command] },
+    phase: "RESOLVING",
+    candidate: { sha: C, contractVersion: K },
+    integrationHead: "H0",
+    checks: { candidateSha: C, passed: false, tier: "round" },
+    probe: { candidateSha: C, head: "H0", probedI: "I1", passed: true },
+    checkResolution: [{ id: "R1", name: "R1 works", outcome: "passed" }],
+    reviews: {
+      M: { review: REVIEW("M", "met") },
+      A: { review: REVIEW("A", "met") },
+      B: { review: REVIEW("B", "met") },
+    },
+  });
+
+  for (const fixture of [phase, basePhase({
+    contract: { ...basePhase().contract, checks: [command] },
+    phase: "CHECKING",
+    candidate: { sha: C, contractVersion: K },
+    checks: { candidateSha: C, passed: false },
+    probe: { candidateSha: C, head: "H0", probedI: "I1", passed: true },
+    integrationHead: "H0",
+  })]) {
+    // Plan 07f1b (A1): the caller that prints the blocker passes the commands
+    // the candidate's check record names as failed.
+    const blockers = acceptanceBlockers(fixture, [command]);
+    const check = blockers.find((b) => b.kind === "check");
+    assert.ok(check, `the failed check is a blocker: ${JSON.stringify(blockers)}`);
+    assert.equal(check!.command, command, "the blocker names the failing check command tt ran, verbatim");
+    assert.ok(blockers.every((b) => !b.command.includes("tt recheck")), "no blocker clears a red check by asking for a recheck");
+  }
+
+  // Plan 07f1b (A1): with several checks, the blocker names the command that
+  // actually FAILED — never a command that passed, and never a synthesized
+  // `a && b` expression the owner never ran. The failing set is the explicit
+  // argument the caller read from the candidate's check record; no command is
+  // carried in the log and the predicate installs no source of its own.
+  const first = "make -C x check";
+  const second = "make -C x check-e2e";
+  const several = basePhase({
+    contract: { ...CONTRACT, checks: [first, second] },
+    phase: "CHECKING",
+    candidate: { sha: C, contractVersion: K },
+    checks: { candidateSha: C, passed: false },
+    probe: { candidateSha: C, head: "H0", probedI: "I1", passed: true },
+    integrationHead: "H0",
+  });
+  const commands = acceptanceBlockers(several, [second]).filter((b) => b.kind === "check").map((b) => b.command);
+  assert.deepEqual(commands, [second], "the red check names only the command that failed, not the one that passed");
+  assert.ok(commands.every((c) => !c.includes("&&")), "no blocker carries a composite command");
+
+  // A named-test verify problem is one blocker per problem, naming a single
+  // command — never one blocker per declared check.
+  const verifyProblem = basePhase({
+    contract: { ...CONTRACT, checks: [first, second] },
+    phase: "RESOLVING",
+    candidate: { sha: C, contractVersion: K },
+    checks: { candidateSha: C, passed: false },
+    probe: { candidateSha: C, head: "H0", probedI: "I1", passed: true },
+    integrationHead: "H0",
+    checkResolution: [{ id: "R1", name: "R1 works", outcome: "failed" }],
+  });
+  assert.deepEqual(
+    acceptanceBlockers(verifyProblem, [second]).filter((b) => b.kind === "test-verify").map((b) => b.command),
+    [second],
+    "one test-verify blocker per problem, naming the failing command",
+  );
+
+  // Without a per-command result (an old log, a fixture, an interrupted run)
+  // nothing knows which command failed: the blocker points at the run itself
+  // rather than naming a declared command that may have passed.
+  const legacy = basePhase({
+    contract: { ...CONTRACT, checks: [first, second] },
+    phase: "CHECKING",
+    candidate: { sha: C, contractVersion: K },
+    checks: { candidateSha: C, passed: false },
+    probe: { candidateSha: C, head: "H0", probedI: "I1", passed: true },
+    integrationHead: "H0",
+  });
+  const declared = acceptanceBlockers(legacy).filter((b) => b.kind === "check").map((b) => b.command);
+  assert.deepEqual(declared, [`tt status ${legacy.runId}`], "without a per-command result the blocker names the run to inspect");
+  assert.ok(!declared.some((c) => c === first || c === second), "no blocker names a declared command that may have passed");
+});
+
 test("an item met by two of three seats with resolving anchors is met whatever the evaluator's item check", () => {
   const phase = basePhase({
     contract: CONTRACT,

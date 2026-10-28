@@ -1013,7 +1013,16 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       }
       const findings = p.findings.map((f) =>
         settledIds.includes(f.id) && f.status === "open"
-          ? { ...f, status: "accepted" as const, acceptedScope: ruling.text, version: f.version + 1 }
+          ? {
+              ...f,
+              status: "accepted" as const,
+              // Plan 07f1a (A1): a point the ruling names is closed by the
+              // ruling itself, and its reason is the ruling's id. A trade-off
+              // keeps the ruling text as its accepted scope (the owner's
+              // reasoning), exactly as before.
+              acceptedScope: f.domain !== undefined || f.doneWhen !== undefined ? ruling.id : ruling.text,
+              version: f.version + 1,
+            }
           : f,
       );
       let next: PhaseState = { ...p, rulings, ruledDecisions, findings };
@@ -1938,6 +1947,17 @@ export function reduce(state: State, event: unknown): ReduceResult {
     }
 
     const nextState = matching.apply(working, ev);
+    if (ev.type === "FREEZE_COMPLETED") {
+      // Plan 07f1a (R3): applied/reverted amendments stay bound to the
+      // candidate and contract they changed, so the conductor closes them
+      // with its phase-moved reason rather than silently carrying them live.
+      const historical = new Map(working.phase.decisions
+        .filter((d) => d.amendment && d.amendment.status !== "proposed")
+        .map((d) => [d.id, d]));
+      return ok({ ...nextState, phase: { ...nextState.phase,
+        decisions: nextState.phase.decisions.map((d) => historical.get(d.id) ?? d),
+      } });
+    }
     return ok(nextState);
   } catch (err) {
     return rejected(state, `reduce threw and was recovered: ${String((err as Error)?.message ?? err)}`);

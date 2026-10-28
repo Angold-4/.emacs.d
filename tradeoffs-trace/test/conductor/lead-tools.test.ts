@@ -61,30 +61,19 @@ const FAST = {
 
 const ITEM = (id: string) => ({ id, title: `${id} proves it`, text: `${id} proves it`, arch: [], verify: ["review"] });
 
-function disclosure(choice: string) {
-  return {
-    choice,
-    whyItMatters: "The plan left this choice open and callers depend on the answer",
-    alternatives: [{ option: "the other obvious behaviour", consequence: "would surprise callers" }],
-    recommendation: { choice, reason: "keeps the contract's own promise" },
-    classProposal: "delegated",
-  };
-}
-
 function worker(): { hello: unknown; steps: FakePiStep[] } {
   return {
     hello: defaultWorkerHello(),
     steps: [
       { kind: "call-sh", command: "mkdir -p src/core && printf 'export const x = 1;\\n' > src/core/x.ts" },
       { kind: "call-submit", tool: "submit_coverage", args: { items: [{ id: "R1", status: "done", where: ["src/core/x.ts:1"], tests: [] }], arch: [] } },
-      { kind: "call-submit", tool: "submit_phase", args: { decisions: [disclosure("batch cancels per tick")], assumptions: [], deviations: [] } },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
     ],
   };
 }
 
 function reviewers(id: string) {
-  return (reviewer: Reviewer, state: { phase: { phaseId: string; candidate?: { sha: string }; contract: { contractVersion: unknown }; decisions: Array<{ id: string }> } }) => {
-    const decisionId = state.phase.decisions[0]?.id;
+  return (reviewer: Reviewer, state: { phase: { phaseId: string; candidate?: { sha: string }; contract: { contractVersion: unknown } } }) => {
     return {
       hello: defaultReviewerHello(),
       steps: [
@@ -101,7 +90,7 @@ function reviewers(id: string) {
             contractVersion: state.phase.contract.contractVersion,
             correctionStatements: [],
             findingStatements: [],
-            ballots: decisionId ? [{ decisionId, vote: "reject", rationale: "not this way", evidence: ["src/core/x.ts:1"] }] : [],
+            ballots: [],
             items: [{ id, verdict: "met", evidence: "src/core/x.ts:1" }],
           },
         },
@@ -118,7 +107,7 @@ async function teardown(setup: TestConductorSetup): Promise<void> {
 
 test("tt why prints the blockers with commands on a stopped run", async () => {
   const setup = await setupConductor({
-    items: { requirements: [ITEM("R1")] } as never,
+    items: { requirements: [ITEM("R1")], finalChecks: ["false"] } as never,
     checks: ["true"],
     phaseChecks: ["true"],
     stubReviews: false,
@@ -128,32 +117,59 @@ test("tt why prints the blockers with commands on a stopped run", async () => {
   } as never);
   try {
     await setup.conductor.start();
-    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 90_000, 20, setup.runDir);
-    const decision = setup.conductor.state.phase.decisions.find((d) => d.class !== "detail")!;
-    const request = setup.conductor.state.phase.ownerRequests.find((r) => r.status === "open")!;
-    assert.ok(decision && request);
+    // The round's own check, the probe and every reviewed item pass; only the
+    // contract's final check is red. That leaves exactly one check blocker on
+    // a stopped run, and no review/evaluation reason to accept.
+    await waitFor(
+      () => setup.conductor.state.phase.checks?.tier === "final" && setup.conductor.state.phase.checks.passed === false,
+      120_000,
+      20,
+      setup.runDir,
+    );
     await setup.conductor.stop();
 
-    // Make it a stopped run with three owner gates as its blockers, each named
-    // with its own command (plan 07f R8/OD-1.5): the failed decision, the
-    // request that asks about it, and the repair-budget gate the round spent
-    // its rounds on. The item R1 the seats marked `met` is NOT a blocker: its
-    // `src/core/x.ts:1` anchor is one the review lint already resolved against
-    // the candidate, which is the same rule `tt why` must apply instead of
-    // reading the anchor caller-relative. Also record a runner and a bound, so
-    // the read must show both, not just the blocker list.
-    const candidate = setup.conductor.state.phase.candidate!.sha as string;
+    // Add the other two kinds of blocker a stopped run can carry: an open
+    // point and an unsettled trade-off. Both are bound to the candidate and
+    // contract the stopped run stopped on, so `tt why` must read them exactly
+    // like the conductor's own records. The item R1 the seats marked `met` is
+    // NOT a blocker: its `src/core/x.ts:1` anchor is one the review lint
+    // already resolved against the candidate.
+    const phase = setup.conductor.state.phase;
+    const candidate = phase.candidate!.sha as string;
+    const contractVersion = phase.contract.contractVersion;
     appendEvent(setup.runDir, {
-      type: "OWNER_REQUEST_OPENED",
-      request: {
-        ...request,
-        id: `OR-${path.basename(setup.runDir)}-budget`,
+      type: "FINDING_RAISED",
+      finding: {
+        id: "F-tt-why-open",
         version: 1,
-        origin: "repair_budget_exhausted",
-        reason: "the round budget is spent while items remain open",
-        linkedDecisionId: undefined,
-        linkedFindingId: undefined,
-        linkedCorrectionId: undefined,
+        phaseId: phase.phaseId,
+        kind: "defect",
+        severity: "blocking",
+        evidence: "the stopped run still carries this open point",
+        raisedBy: "M",
+        status: "open",
+        boundCandidateSha: candidate,
+        domain: "core",
+        item: "R1",
+        where: "src/core/x.ts:1",
+        expected: "the stopped run's point is settled",
+        doneWhen: "test -f never-settled",
+      },
+    });
+    appendEvent(setup.runDir, {
+      type: "DECISION_ADDED",
+      decision: {
+        id: "D-tt-why-unsettled",
+        version: 1,
+        phaseId: phase.phaseId,
+        source: "worker",
+        class: "delegated",
+        choice: "keep the stopped run's choice",
+        whyItMatters: "the plan left the choice open and the stopped run has not settled it",
+        alternatives: [{ option: "the other behaviour", consequence: "would change the contract's promise" }],
+        recommendation: { choice: "keep the stopped run's choice", reason: "it matches the contract" },
+        boundCandidateSha: candidate,
+        boundContractVersion: contractVersion,
       },
     });
     appendEvent(setup.runDir, {
@@ -171,12 +187,13 @@ test("tt why prints the blockers with commands on a stopped run", async () => {
     const text = await runCli(["why", setup.runDir]);
     assert.equal(text.code, 0, text.stdout);
     assert.match(text.stdout, /accepted: no/);
+    assert.match(text.stdout, /\[check\]/);
+    assert.match(text.stdout, /\[point\]/);
     assert.match(text.stdout, /\[decision\]/);
-    assert.equal((text.stdout.match(/\[owner-request\]/g) ?? []).length, 2, "both open owner requests are named");
     assert.doesNotMatch(text.stdout, /\[item\]/, "the seat's candidate anchor resolves, so R1 does not block");
-    assert.match(text.stdout, /tt input/, "each blocker ends with the command that clears it");
-    assert.match(text.stdout, /"type":"ruling"/, "the decision blocker's command is a ruling");
-    assert.match(text.stdout, /"type":"resolve"/, "the request blocker's command is a resolve");
+    assert.match(text.stdout, /false/, "the red final check's own command is named verbatim");
+    assert.match(text.stdout, /tt why/, "the point blocker names the read that shows its fact");
+    assert.match(text.stdout, /"type":"ruling"/, "the unsettled trade-off's command is a ruling");
     assert.match(text.stdout, new RegExp(`runner revision: ${revision}`), "the text names the recorded runner");
     assert.match(text.stdout, /Bounds reached:/, "the text lists the bound reached");
     assert.match(text.stdout, /check \(runnable:/, "the bound's kind and scope are shown");
@@ -194,16 +211,14 @@ test("tt why prints the blockers with commands on a stopped run", async () => {
       bounds: Array<{ kind: string; scope: string; limitMs: number; elapsedMs: number }>;
     };
     assert.equal(parsed.runId, path.basename(setup.runDir));
-    assert.equal(parsed.phase, "AWAITING_OWNER");
+    assert.ok(["REPAIRING", "IMPLEMENTING"].includes(parsed.phase), `the stopped run is repairing its red check, got ${parsed.phase}`);
     assert.equal(parsed.accepted, false);
     assert.equal(parsed.blockers.length, 3, `exactly three blockers, got ${JSON.stringify(parsed.blockers, null, 2)}`);
+    assert.deepEqual(parsed.blockers.map((b) => b.kind), ["check", "point", "decision"], "the red check, the open point and the unsettled trade-off");
+    assert.equal(parsed.blockers.find((b) => b.kind === "check")!.command, "false", "the failing final check command, verbatim");
+    assert.match(parsed.blockers.find((b) => b.kind === "point")!.command, /tt why/, "the point names its read");
+    assert.match(parsed.blockers.find((b) => b.kind === "decision")!.command, /"type":"ruling"/, "the trade-off names its ruling");
     assert.ok(parsed.blockers.every((b) => b.detail.length > 0 && b.command.length > 0), "every blocker carries detail and command");
-    assert.ok(parsed.blockers.some((b) => b.kind === "decision" && b.command.includes("ruling")));
-    assert.equal(
-      parsed.blockers.filter((b) => b.kind === "owner-request" && b.command.includes("resolve")).length,
-      2,
-      "each open request is a blocker of its own, with its own resolve",
-    );
     assert.ok(!parsed.blockers.some((b) => b.kind === "item"), "the seat's candidate anchor resolves, so R1 does not block");
     assert.equal(parsed.runnerRevision, revision, "the JSON reports the recorded runner revision");
     assert.deepEqual(parsed.bounds, [{ kind: "check", scope: `runnable:${candidate}`, limitMs: 20_000, elapsedMs: 20_000 }]);

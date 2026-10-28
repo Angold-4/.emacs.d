@@ -12,7 +12,7 @@ import { test } from "node:test";
 
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import { rulingLines, directiveLines } from "../../src/conductor.ts";
-import { acceptanceBlockers } from "../../src/core/predicate.ts";
+import { accept, acceptanceBlockers } from "../../src/core/predicate.ts";
 import type { Reviewer } from "../../src/core/types.ts";
 import {
   cleanupDir,
@@ -518,13 +518,101 @@ test("a withdrawn directive is delivered to every live fixer session at once", a
 
 // -- R7: resolve + ruling together clear the blockers and accept ------------
 
-test("plan 07f (R1/R7): tt input resolves an owner request and rules a decision, and with no blocker left accept() is true", async () => {
+test("plan 07f (R1/R7): accepting the failed vote settles it and the phase accepts that round", async () => {
   const setup = await setupConductor({
     items: { requirements: [ITEM("R1")] } as never,
     checks: ["true"],
     stubReviews: false,
     deadlines: FAST,
     workerScript: () => workerWithDecision("R1"),
+    reviewerScriptFor: (reviewer: Reviewer, state: { phase: { phaseId: string; candidate?: { sha: string }; contract: { contractVersion: unknown }; decisions: Array<{ id: string }> } }) => {
+      const decisionId = state.phase.decisions[0]?.id;
+      return {
+        hello: defaultReviewerHello(),
+        steps: [
+          { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+          { kind: "wait-for-prompt" },
+          { kind: "call-tool", tool: "read", args: { path: "src/core/rounds.ts" } },
+          { kind: "call-tool", tool: "read", args: { path: "README.md" } },
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: {
+              reviewer,
+              phaseId: state.phase.phaseId,
+              candidateSha: state.phase.candidate?.sha,
+              contractVersion: state.phase.contract.contractVersion,
+              correctionStatements: [],
+              findingStatements: [],
+              ballots: decisionId ? [{ decisionId, vote: "reject", rationale: "not this way", evidence: ["src/core/rounds.ts:1"] }] : [],
+              items: [{ id: "R1", verdict: "met", evidence: "src/core/rounds.ts:1 README.md:1" }],
+            },
+          },
+        ],
+      };
+    },
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 90_000, 20, setup.runDir);
+    const before = setup.conductor.state.phase;
+    const request = before.ownerRequests.find((r) => r.status === "open")!;
+    const kinds = acceptanceBlockers(before).map((b) => b.kind);
+    assert.ok(kinds.includes("decision"), `the failed vote is a decision blocker: ${JSON.stringify(kinds)}`);
+    assert.ok(kinds.includes("owner-request"), `its request is a blocker too: ${JSON.stringify(kinds)}`);
+
+    // `accept_as_implemented` settles the failed vote on THIS candidate; it
+    // does not ask for a repair. That leaves no blocker and the phase accepts
+    // in the same round.
+    const resolved = await sendResolve(setup.runDir, setup.runDir, request.id, "accept_as_implemented");
+    assert.match(resolved, /resolve applied/, resolved);
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 20, setup.runDir);
+    const after = setup.conductor.state.phase;
+    assert.equal(after.phase, "DONE", "the phase is accepted in that round, not left AWAITING_OWNER");
+    assert.ok(!after.ownerRequests.some((r) => r.id === request.id && r.status === "open"), "the request is resolved");
+    assert.ok(
+      after.ownerRequests.some((r) => r.id === request.id && r.resolution?.option === "accept_as_implemented"),
+      "the owner's accept_as_implemented option settled the decision",
+    );
+    assert.equal(after.repairRoundsUsed, before.repairRoundsUsed, "settling the failed vote started no repair round");
+    assert.deepEqual(acceptanceBlockers(after), [], "no acceptance blocker is left after the resolve");
+  } finally {
+    await teardown(setup);
+  }
+});
+
+// Plan 07f1b (C1): the R7 test above used to prove the other half of the same
+// gate — an owner `resolve` plus an owner `ruling` together clear the failed
+// vote's blockers — and `accept_as_implemented` must not displace that
+// coverage. Both commands are exercised here, in the order the owner sends
+// them: the resolve (which asks for a repair) closes the request, and the
+// ruling settles the decision; the ONE predicate then agrees.
+test("plan 07f (R1/R7): tt input resolves an owner request and rules a decision, and with no blocker left accept() is true", async () => {
+  // The failed vote's retries resubmit the same tree, so the round parks as
+  // today (07f F2). The repair round the owner's `resolve` then grants must
+  // change the tree, or its resubmission is refused and the run parks again.
+  // The decision is disclosed once, on the first attempt, so no repair round
+  // re-discloses it (a new candidate would get a new decision id).
+  const setup = await setupConductor({
+    items: { requirements: [ITEM("R1")] } as never,
+    checks: ["true"],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScriptForAttempt: (attempt, { state }) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: WRITE },
+        ...(state.phase.ownerRequests.some((r) => r.resolution?.option === "reject_and_repair")
+          ? [{ kind: "call-sh" as const, command: `printf 'attempt ${attempt}\\n' > attempt.txt` }]
+          : []),
+        { kind: "call-submit", tool: "submit_coverage", args: COVERAGE("R1") },
+        {
+          kind: "call-submit",
+          tool: "submit_phase",
+          args: { decisions: attempt === 1 ? [disclosure("batch cancels per tick")] : [], assumptions: [], deviations: [] },
+        },
+      ],
+    }),
     reviewerScriptFor: (reviewer: Reviewer, state: { phase: { phaseId: string; candidate?: { sha: string }; contract: { contractVersion: unknown }; decisions: Array<{ id: string }> } }) => {
       const decisionId = state.phase.decisions[0]?.id;
       return {
@@ -566,18 +654,29 @@ test("plan 07f (R1/R7): tt input resolves an owner request and rules a decision,
     assert.match(resolved, /resolve applied/, resolved);
     const ruled = await sendRuling(setup.runDir, setup.runDir, decision.id, "Rule the decision as recorded; the recorded choice stands.");
     assert.match(ruled, /ruling applied/, ruled);
-    await waitFor(
-      () => setup.conductor.state.phase.phase === "DONE" || setup.conductor.state.phase.phase === "AWAITING_OWNER",
-      90_000,
-      20,
-      setup.runDir,
-    );
+    // Plan 07f1b (C1): this test asserts no acceptance blocker is left, so it
+    // must wait for the phase to be DONE — never for DONE *or* AWAITING_OWNER,
+    // which would let a parked run pass the assertion below.
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 20, setup.runDir);
     const after = setup.conductor.state.phase;
-    // The repair started by the resolve may bring a new candidate; either
-    // way the decision is ruled and the request is closed, and the ONE
-    // predicate agrees.
+    assert.equal(after.phase, "DONE", "the resolve and the ruling leave the phase accepted, never parked");
+    // The repair started by the resolve may bring a new candidate; either way
+    // both owner commands are applied, and the ONE predicate ACCEPTS: no
+    // blocker of the failed vote is left and `accept()` is true for the
+    // candidate.
     assert.ok(!after.ownerRequests.some((r) => r.id === request.id && r.status === "open"), "the request is resolved");
     assert.ok(after.rulings?.some((r) => r.recordIds.includes(decision.id)), "the decision is ruled");
+    assert.deepEqual(
+      acceptanceBlockers(after).filter((b) => b.kind === "decision" || b.kind === "owner-request"),
+      [],
+      "neither the failed vote nor its request blocks acceptance any more",
+    );
+    assert.deepEqual(acceptanceBlockers(after), [], "no acceptance blocker is left after the resolve and the ruling");
+    assert.equal(
+      accept(after, after.candidate!.sha, after.contract.contractVersion),
+      true,
+      "with no blocker left accept() is true",
+    );
   } finally {
     await teardown(setup);
   }

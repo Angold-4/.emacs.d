@@ -19,6 +19,7 @@ import {
 } from "./harness.ts";
 import { runPaths } from "../../src/conductor.ts";
 import { parseCheckRecord } from "../../src/core/checks.ts";
+import { acceptanceBlockers } from "../../src/core/predicate.ts";
 import type { Reviewer, State } from "../../src/core/types.ts";
 
 const FAST = {
@@ -170,9 +171,19 @@ test("an exhausted repair budget records BOUND_REACHED rounds and LEAD_CALLED an
     assert.equal(roundBound!.elapsedMs, setup.conductor.state.phase.repairRoundsUsed);
     const lead = readEvents(setup.runDir).find((r) => r.kind === "event" && (r.event as { type?: string }).type === "LEAD_CALLED");
     assert.ok(lead, "the lead is called when the rounds are exhausted");
-    // Today's not-accepted reasons, unchanged: the checks failed on the
-    // candidate and nothing else stands in the way.
-    assert.deepEqual(((lead!.event as { reasons?: string[] }).reasons ?? []), ["checks failed"]);
+    // Plan 07f (F1/C3), finished by 07f1b (C1): LEAD_CALLED carries the ONE
+    // acceptance list the same predicate reads — not a second derivation and
+    // not the pre-07f `["checks failed"]` expectation this gate replaces.
+    // The red check is named, and so is every other condition still standing
+    // when the bound parks the phase (this fixture stops before the probe and
+    // the seats run).
+    const reasons = (lead!.event as { reasons?: string[] }).reasons ?? [];
+    assert.deepEqual(
+      reasons,
+      acceptanceBlockers(setup.conductor.state.phase).map((b) => b.detail),
+      "the bound records the one acceptance list, checks failed among them",
+    );
+    assert.ok(reasons.includes("checks failed"), "the failed check is named");
     // The park is today's repair-budget owner request, still open, so the
     // owner is the one who decides (the bound never does).
     const open = setup.conductor.state.phase.ownerRequests.filter((r) => r.status === "open");

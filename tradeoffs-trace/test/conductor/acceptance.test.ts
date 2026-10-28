@@ -9,9 +9,10 @@ import { test } from "node:test";
 
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import type { Reviewer } from "../../src/core/types.ts";
-import { acceptanceBlockers, isLiveDecision, shortId } from "../../src/core/predicate.ts";
+import { accept, acceptanceBlockers, shortId } from "../../src/core/predicate.ts";
 import { reduce } from "../../src/core/reduce.ts";
 import { ownerCommandToEvent } from "../../src/core/owner-inbox.ts";
+import { runPaths } from "../../src/conductor.ts";
 import { CV, basePhase, baseState, makeDecision } from "../unit/helpers.ts";
 import type { Domain } from "../../src/core/domains.ts";
 import {
@@ -474,41 +475,225 @@ test("every acceptance blocker carries its kind detail and next command", () => 
   assert.deepEqual(remaining.map((b) => b.kind), ["check", "test-verify", "point"], "only the non-owner blockers remain");
 });
 
-// -- R3: a stale amendment is closed, and never blocks the new contract -------
+// -- R2: the owner's ruling closes the open point, and the phase accepts ------
 
-test("a decision bound to an older contract version never blocks acceptance", () => {
-  const K1 = CV(1);
-  const K3 = CV(3);
-  const amendment = makeDecision({
-    id: "AM-p1-1",
-    source: "reviewer-discovered",
-    class: "reserved",
-    boundCandidateSha: "C1",
-    boundContractVersion: K1,
-    amendment: {
-      id: "AM-p1-1",
-      criterion: "R1 works",
-      proposedWording: "R1 works, proven",
-      why: "the old wording could not be verified",
-      raisedBy: "M",
-      status: "proposed",
+/** Writes an owner ruling to the live run's inbox. This is owner input, not a
+ * hand-injected core event: the conductor polls the inbox and applies the
+ * RULING_RECORDED itself. */
+function sendRulingFile(setup: TestConductorSetup, recordIds: string[], text: string): void {
+  const phase = setup.conductor.state.phase;
+  const file = path.join(runPaths(setup.runDir).inbox, `test-ruling-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
+  fs.writeFileSync(file, JSON.stringify({ type: "ruling", text, recordIds, binding: { runId: phase.runId, phaseId: phase.phaseId } }));
+}
+
+test("a ruling that names an open point closes it and the phase accepts", async () => {
+  const evidence = "P-OPEN: the open point the owner rules on";
+  const setup = await setupConductor({
+    items: { requirements: [ITEM("R1")] } as never,
+    domains: DOMAINS,
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript: () => workerFor("R1"),
+    reviewerScriptFor: (reviewer: Reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+        { kind: "wait-for-prompt" },
+        // M publishes the point first; A and B stay in review long enough for
+        // the owner's ruling to land before triage. Every seat still meets
+        // the phase's one item, so the majority is not in question.
+        ...(reviewer === "M" ? [] : [{ kind: "sleep" as const, ms: 2_500 }]),
+        { kind: "call-tool", tool: "read", args: { path: "src/core/rounds.ts" } },
+        { kind: "call-tool", tool: "read", args: { path: "README.md" } },
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer,
+            phaseId: "p1",
+            candidateSha: state.phase.candidate?.sha,
+            contractVersion: state.phase.contract.contractVersion,
+            correctionStatements: [],
+            findingStatements: [],
+            items: [{ id: "R1", verdict: "met", evidence: "src/core/rounds.ts:1 README.md:1" }],
+            arch: [],
+            findings:
+              reviewer === "M"
+                ? [
+                    {
+                      kind: "defect",
+                      severity: "blocking",
+                      evidence,
+                      domain: "booking",
+                      item: "R1",
+                      where: "src/core/rounds.ts:1 fn",
+                      expected: "the open point is settled",
+                      doneWhen: "test -f never-settled",
+                    },
+                  ]
+                : [],
+          },
+        },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () => setup.conductor.state.phase.findings.some((f) => f.evidence === evidence && f.status === "open"),
+      90_000,
+      20,
+      setup.runDir,
+    );
+    const point = setup.conductor.state.phase.findings.find((f) => f.evidence === evidence)!;
+    const beforeBlockers = acceptanceBlockers(setup.conductor.state.phase);
+    assert.ok(
+      beforeBlockers.some((b) => b.kind === "point" && b.detail.includes(shortId(point.id))),
+      `the open point is an acceptance blocker before the ruling; point=${JSON.stringify(point)} phase=${setup.conductor.state.phase.phase} blockers=${JSON.stringify(beforeBlockers)}`,
+    );
+
+    const rulingText = `Rule ${point.id} settled: the point is accepted as ruled.`;
+    sendRulingFile(setup, [point.id], rulingText);
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 20, setup.runDir);
+
+    const phase = setup.conductor.state.phase;
+    const closed = phase.findings.find((f) => f.id === point.id)!;
+    assert.notEqual(closed.status, "open", "the point the ruling names is no longer open");
+    assert.equal(closed.status, "accepted", "a ruled point is settled, not left as a repair point");
+    const ruling = phase.rulings?.find((r) => r.text === rulingText && r.recordIds.includes(point.id));
+    assert.ok(ruling, "the ruling is on the record");
+    assert.equal(closed.acceptedScope, ruling!.id, "the ruling id is the point's recorded reason");
+    assert.equal(phase.round, 1, "the phase accepted in the round the ruling arrived, not after another one");
+    assert.equal(phase.phase, "DONE");
+    for (const seat of ["M", "A", "B"]) {
+      const item = phase.reviews[seat]?.review?.items?.find((i) => i.id === "R1");
+      assert.equal(item?.verdict, "met", `seat ${seat} meets R1; the only block was the ruled point`);
+    }
+    assert.equal(phase.findings.filter((f) => f.evidence === evidence).length, 1, "the fixture had exactly one open point P");
+    assert.equal(accept(phase, phase.candidate!.sha, phase.contract.contractVersion), true, "every item is met and no blocker remains");
+    assert.ok(!acceptanceBlockers(phase).some((b) => b.kind === "point"), "the ruled point is not an acceptance blocker");
+    assert.equal(
+      readEvents(setup.runDir).filter((r) => r.kind === "event" && (r.event as { type?: string }).type === "REPAIR_ATTEMPT_STARTED").length,
+      0,
+      "no repair round was started for a ruled point",
+    );
+    assert.equal(
+      readEvents(setup.runDir).filter((r) => r.kind === "event" && (r.event as { type?: string }).type === "DECISION_CLOSED").length,
+      0,
+      "no DECISION_CLOSED event was needed or injected",
+    );
+  } finally {
+    await teardown(setup);
+  }
+});
+
+// -- R3: C1/v1's amendment is closed by the conductor before C3/v3 accepts ---
+
+test("a decision bound to an older contract version never blocks acceptance", async () => {
+  const setup = await setupConductor({
+    items: { requirements: [ITEM("R1")] } as never,
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScriptForAttempt: (attempt, { state }) => {
+      const criterion = state.phase.contract.requirements?.find((r) => r.id === "R1")?.text ?? "R1 proves it";
+      return {
+        hello: defaultWorkerHello(),
+        steps: [
+          { kind: "call-sh", command: `printf 'attempt ${attempt}\\n' > attempt.txt` },
+          { kind: "call-submit", tool: "submit_coverage", args: { items: [{ id: "R1", status: "done", where: ["attempt.txt:1"], tests: [] }], arch: [] } },
+          {
+            kind: "call-submit",
+            tool: "submit_phase",
+            args: {
+              decisions: [],
+              assumptions: [],
+              deviations: [],
+              ...(attempt <= 2
+                ? {
+                    criterionDispute: {
+                      criterion,
+                      why: `the wording under v${attempt} cannot be proven mechanically`,
+                      proposedWording: `R1 proves it v${attempt + 1}`,
+                    },
+                  }
+                : {}),
+            },
+          },
+        ],
+      };
+    },
+    reviewerScriptFor: (reviewer: Reviewer, state) => {
+      const votable = state.phase.decisions.filter(
+        (d) => d.amendment?.status === "proposed" && d.supersededBy === undefined,
+      );
+      return {
+        hello: defaultReviewerHello(),
+        steps: [
+          { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+          { kind: "wait-for-prompt" },
+          { kind: "call-tool", tool: "read", args: { path: "attempt.txt" } },
+          { kind: "call-tool", tool: "read", args: { path: "README.md" } },
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: {
+              reviewer,
+              phaseId: "p1",
+              candidateSha: state.phase.candidate?.sha,
+              contractVersion: state.phase.contract.contractVersion,
+              correctionStatements: [],
+              findingStatements: [],
+              ballots: votable.map((d) => ({
+                decisionId: d.id,
+                vote: "approve",
+                rationale: "the new wording is satisfiable and still meaningful",
+                evidence: ["attempt.txt:1"],
+              })),
+              items: [{ id: "R1", verdict: "met", evidence: "attempt.txt:1 README.md:1" }],
+              arch: [],
+            },
+          },
+        ],
+      };
     },
   });
-  const phase = basePhase({
-    phase: "RESOLVING",
-    candidate: { sha: "C3", contractVersion: K3 },
-    integrationHead: "H0",
-    decisions: [amendment],
-  });
-  assert.ok(
-    !acceptanceBlockers(phase).some((b) => b.kind === "decision"),
-    "the C1/v1 amendment is not a blocker for C3/v3",
-  );
-  const reason = "the contract moved past version 1";
-  const closed = reduce(baseState(phase), { type: "DECISION_CLOSED", decisionId: amendment.id, reason });
-  assert.ok(closed.ok, closed.ok ? "" : closed.reason);
-  const after = closed.state.phase.decisions.find((d) => d.id === amendment.id)!;
-  assert.equal(after.supersededBy, reason, "the conductor's closure records its reason");
-  assert.equal(isLiveDecision(after), false, "the stale amendment is no longer a live decision");
-  assert.ok(!acceptanceBlockers(closed.state.phase).some((b) => b.kind === "decision"));
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 180_000, 20, setup.runDir);
+
+    const phase = setup.conductor.state.phase;
+    const events = readEvents(setup.runDir)
+      .filter((r) => r.kind === "event")
+      .map((r) => r.event as { type?: string; candidateSha?: string; decisionId?: string; reason?: string; decisions?: Array<{ id: string; boundCandidateSha: string; boundContractVersion: { snapshot: number }; amendment?: { status: string } }> });
+    const freezes = events.filter((e) => e.type === "FREEZE_COMPLETED");
+    assert.equal(freezes.length, 3, "C1/v1, C2/v2 and C3/v3 each freezed once");
+    const first = freezes[0];
+    const c1 = first.candidateSha!;
+    const firstAmendment = first.decisions!.find((d) => d.amendment !== undefined)!;
+    assert.equal(firstAmendment.boundCandidateSha, c1, "the amendment was raised on candidate C1");
+    assert.equal(firstAmendment.boundContractVersion.snapshot, 1, "under contract v1");
+    assert.notEqual(phase.candidate!.sha, c1, "the accepted candidate is a later one");
+    assert.equal(phase.candidate!.contractVersion.snapshot, 3, "the accepted candidate is judged under v3");
+
+    const amendment = phase.decisions.find((d) => d.id === firstAmendment.id)!;
+    const reason = `the phase moved past candidate ${c1.slice(0, 8)}`;
+    assert.equal(amendment.supersededBy, reason, "the conductor closed it with its reason");
+    assert.ok(
+      events.some((e) => e.type === "DECISION_CLOSED" && e.decisionId === firstAmendment.id && e.reason === reason),
+      "the closure is a conductor-recorded DECISION_CLOSED event, not a hand-injected one",
+    );
+    for (const seat of ["M", "A", "B"]) {
+      const item = phase.reviews[seat]?.review?.items?.find((i) => i.id === "R1");
+      assert.equal(item?.verdict, "met", `seat ${seat} meets R1 under v3`);
+    }
+    assert.equal(phase.contract.requirements?.find((r) => r.id === "R1")?.text, "R1 proves it v3", "the accepted contract is the twice-amended v3 wording");
+    assert.equal(accept(phase, phase.candidate!.sha, phase.contract.contractVersion), true, "C3/v3 is fully accepted");
+    assert.ok(!acceptanceBlockers(phase).some((b) => b.kind === "decision"), "the closed amendment is not a blocker");
+  } finally {
+    await teardown(setup);
+  }
 });

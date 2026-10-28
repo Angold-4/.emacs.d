@@ -1116,7 +1116,7 @@ test("plan 06i: a discovered decision justified only by a drafting decision that
   }
 });
 
-test("plan 07f (R6): a discovered decision without an impact class is settled by the seats' vote, not an owner request", async () => {
+test("a discovered decision the evaluator leaves unclassified goes to the seats' vote not to an owner request", async () => {
   // Exex 01b3p2 B-9/B-11: an unclassified discovered decision used to become
   // an owner request. Plan 07f makes it a trade-off with its own choice,
   // alternative and why; the seats' ballots settle it.
