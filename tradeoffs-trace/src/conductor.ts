@@ -1510,10 +1510,10 @@ export interface OwnerPointFields {
   doneWhen: string;
 }
 
-/** What an owner correction does: in domain mode it is a point in the domain
- * it names, and it is refused for clarification when it cannot be proved.
- * Outside domain mode no domain could own a point, so it is refused with
- * guidance to the inputs that do apply (§3.3) — it is never kept as a note. */
+/** What an owner correction does: it is a point in the domain it names, in
+ * every phase state, and it is refused for clarification only when the input
+ * omits what a point needs or names records the plan does not declare. It is
+ * never kept as a note (§3.3). */
 export type OwnerCorrectionDecision =
   | { kind: "point"; event: Event }
   | { kind: "refused"; reason: string };
@@ -1548,46 +1548,45 @@ export function parseOwnerPointFields(text: string): { fields: Partial<OwnerPoin
 }
 
 /** Plan 07f (A3/§3.2/§3.3): what an owner correction does, whichever state it
- * arrives in (mid-state or AWAITING_OWNER). In a domain-mode phase it is a
- * point in the domain the input names — with `where`, `expected` and a
+ * arrives in (mid-state, before the first candidate, or AWAITING_OWNER). It is
+ * a point in the domain the input names — with `where`, `expected` and a
  * `doneWhen` that can prove it — because a point without `domain` and
  * `doneWhen` is refused at entry (X:UNPROVABLE, §3.4): never admitted
  * unprovable, and never silently kept as a note no domain owns. Nothing is
  * inferred from prose: a path in the text or a phase with one declared domain
- * routes nothing. Outside domain mode there is no domain for a fix loop to
- * own a point, so a correction is refused with the inputs that do apply: a
- * ruling settles a record and a withdraw closes it. A correction is never
- * acknowledged as a note — that could leave code work undelivered after
- * acceptance with no executable obligation. */
+ * routes nothing.
+ *
+ * The shape of the phase never refuses it: a correction that arrives before
+ * the first candidate exists is admitted unbound (the first candidate's
+ * `doneWhen` facts prove it, and `accept()` has no candidate to judge), and in
+ * a phase that declares no domain the domain the input names owns the point —
+ * an owner input is a ruling, a point or a withdraw (§3.3), and neither a
+ * ruling nor a withdraw performs the code work. The only refusal left is an
+ * input that omits what a point needs, or names a domain or item the plan does
+ * not declare: the owner can resend it with those fields. */
 export function ownerPointForCorrection(
   phase: PhaseState,
   commandId: string,
   text: string,
   itemIds: readonly string[],
 ): OwnerCorrectionDecision {
-  const domains = phase.contract.domains;
-  if (!domains || domains.length === 0 || !phase.candidate) {
-    return {
-      kind: "refused",
-      reason:
-        `a correction is code work, and phase ${phase.phaseId} declares no domain for a fix loop, so no domain can own ` +
-        `a point here; send a ruling (\`tt input <run>\` with \`type: ruling\`, \`text\` and \`recordIds\`) to settle a ` +
-        `record, or withdraw the record (\`tt verdict <run> <record> refuse\`). A correction is never kept as a note.`,
-    };
-  }
+  const domains = phase.contract.domains ?? [];
   const { fields, missing } = parseOwnerPointFields(text);
   if (missing.length > 0) {
     return {
       kind: "refused",
       reason:
-        `an owner correction in a domain-mode phase is a point for its domain's next fix loop, so it needs its own ` +
-        `proving fact; name ${missing.join(", ")} on its own line (for example \`doneWhen: node --test test/x.test.ts\`) ` +
+        `an owner correction is a point for its domain's next fix loop, so it needs its own proving fact; ` +
+        `name ${missing.join(", ")} on its own line (for example \`doneWhen: node --test test/x.test.ts\`) ` +
         `— the conductor infers none of them`,
     };
   }
   const wanted = fields.domain!.trim().toLowerCase();
   const domain = domains.find((d) => d.name.trim().toLowerCase() === wanted);
-  if (!domain) {
+  // A phase with no declared domain has no list to check against: the domain
+  // the input names owns the point (§3.3: a correction is a point, never a
+  // refusal the owner can only answer with a ruling or a withdraw).
+  if (domains.length > 0 && !domain) {
     return {
       kind: "refused",
       reason: `the correction names domain '${fields.domain}', but the plan declares ${domainNames(domains)}`,
@@ -1618,8 +1617,13 @@ export function ownerPointForCorrection(
         evidence: text,
         raisedBy: "owner",
         status: "open",
-        boundCandidateSha: phase.candidate.sha,
-        domain: domain.name,
+        // Plan 07f (A3): a correction that arrives before the first candidate
+        // is admitted unbound rather than refused. Nothing that a point reads
+        // goes through this field (its doneWhen fact is keyed by the point id
+        // and the phase's candidate), so the first candidate's facts prove it
+        // exactly like any other point.
+        boundCandidateSha: phase.candidate?.sha ?? "",
+        domain: domain?.name ?? fields.domain!.trim(),
         ...(item ? { item } : {}),
         where: fields.where!,
         expected: fields.expected!,
@@ -4188,18 +4192,20 @@ export class Conductor {
       }
       // Plan 07f (A3/§3.3): a note is carried as a note so it reaches the next
       // worker attempt's prompt verbatim. A correction never takes this path:
-      // it is a point in its domain, or it is refused (below).
+      // it is a point in its domain, or it is refused for the fields it omits
+      // (below).
       // Plan 07f (A3/§3.3): an input that needs code work is a point for its
-      // domain's next session in every state it arrives in — mid-state or
-      // AWAITING_OWNER — never a legacy queued correction, never an
-      // OWNER_CORRECTION that starts a repair, and never an acceptance
-      // obligation. In domain mode the correction must name its own domain,
+      // domain's next session in every state it arrives in — mid-state, before
+      // the first candidate, or AWAITING_OWNER — never a legacy queued
+      // correction, never an OWNER_CORRECTION that starts a repair, and never
+      // an acceptance obligation. The correction must name its own domain,
       // where, expected and doneWhen; without them it is refused for
       // clarification (a point without a proving fact is X:UNPROVABLE, §3.2),
-      // not admitted unprovable and not silently kept as a note. Outside
-      // domain mode it is refused with the inputs that do apply (a ruling or a
-      // withdraw), so code work is never acknowledged as a note that could
-      // stay undelivered. A ruling never enters here (it is applied at once).
+      // not admitted unprovable and not silently kept as a note. No other
+      // refusal exists: a ruling or a withdraw cannot do the code work, so a
+      // correction in a phase with no declared domain (or with no candidate
+      // yet) is still a point. A ruling never enters here (it is applied at
+      // once).
       const decision =
         inputKind === "correction" ? this.#ownerPointForCorrection(commandId, inputText) : ({ kind: "note" } as const);
       if (decision.kind === "refused") {
@@ -4227,9 +4233,8 @@ export class Conductor {
       if (programWide) this.#forwardProgramDirective(commandId, inputText);
       else this.#addDirective(inputText, effectiveScope, commandId);
       // The recorded effect the status view reads, never an inference: a queued
-      // note or steer is `noted`; a correction is `noted` too — in domain mode
-      // it is now a point in the record, and a phase with no domain refuses it
-      // above rather than keeping it as a note.
+      // note or steer is `noted`; a correction is `noted` too — it is a point
+      // in the record, never a note and never an acceptance gate.
       this.#recordOwnerInput(commandId, inputKind === "correction" ? "correction" : "note", inputText, "noted");
       crashAt("before_inbox_move");
       this.#moveInboxFile(file, this.#paths.inboxApplied);
@@ -6515,10 +6520,10 @@ export class Conductor {
 
   /** Plan 07f (A3/§3.2/§3.3): an owner correction is a point in its domain,
    * whichever state it arrives in, and goes to that domain's next fix loop
-   * (`ownerPointForCorrection` decides). Outside domain mode there is no
-   * domain to own it, so it is refused. A refusal is visible: the input is
-   * recorded refused with its reason and the inbox file is rejected, so the
-   * owner is told which input (or which fields) to send. */
+   * (`ownerPointForCorrection` decides). The phase's shape never refuses it: no
+   * candidate yet, or no declared domain, still admits the point. A refusal is
+   * visible: the input is recorded refused with its reason and the inbox file
+   * is rejected, so the owner is told which fields to add. */
   #ownerPointForCorrection(commandId: string, text: string): OwnerCorrectionDecision {
     return ownerPointForCorrection(
       this.#state.phase,
