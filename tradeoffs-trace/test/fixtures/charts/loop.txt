@@ -158,7 +158,8 @@ phase states:
   +----------------+
       +- FINAL_CHECKS_PASSED (acceptHoldsAndNoGate) -> ACCEPTED        [final-checks-passed-accepted]
       +- FINAL_CHECKS_PASSED (acceptHoldsAndGateDeclared) -> GATING          [final-checks-passed-gated]
-      +- FINAL_CHECKS_PASSED (acceptDoesNotHoldOnFinalPass) -> REPAIRING       [final-checks-passed-not-accepted]
+      +- FINAL_CHECKS_PASSED (acceptDoesNotHoldOnFinalPassAndBudgetRemains) -> REPAIRING       [final-checks-passed-not-accepted]
+      +- FINAL_CHECKS_PASSED (acceptDoesNotHoldOnFinalPassAndBudgetExhausted) -> AWAITING_OWNER  [final-checks-passed-budget-exhausted]
       +- FINAL_CHECKS_FAILED (budgetRemains) -> REPAIRING       [final-checks-failed-to-repairing]
       +- FINAL_CHECKS_FAILED (budgetExhausted) -> AWAITING_OWNER  [final-checks-failed-budget-exhausted]
 

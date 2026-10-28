@@ -484,7 +484,7 @@ test("plan 06d: a correction written as an inbox file during REVIEWING and a ste
       binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" },
     });
     await waitFor(
-      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.id === "cmd-06d-correction" && i.state === "queued"),
+      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.id === "cmd-06d-correction" && i.state === "noted"),
       30_000,
       50,
       setup.runDir,
@@ -502,13 +502,16 @@ test("plan 06d: a correction written as an inbox file during REVIEWING and a ste
       30_000,
     );
 
-    // Both are shown queued in views/status.txt (Emacs reads this, not state).
+    // Both are shown as recorded in views/status.txt (Emacs reads this, not
+    // state): plan 07f (A3) records a queued correction as `noted` — its text
+    // rides the note channel and it is never an acceptance obligation — while
+    // a steer with no live worker stays `queued`.
     // The view is refreshed on its own beat, so wait for the file to catch up.
     await waitFor(
       () => {
         const file = runPaths(setup.runDir).status;
         const status = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
-        return status.includes(correctionText) && status.includes(steerText) && (status.match(/ — queued /g) ?? []).length >= 2;
+        return status.includes(correctionText) && status.includes(steerText) && (status.match(/ — (queued|noted) /g) ?? []).length >= 2;
       },
       30_000,
       100,
@@ -566,7 +569,7 @@ test("plan 06d: corrections bound with the run directory id and with the readabl
       30_000,
     );
     await waitFor(
-      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.id === "cmd-bbb-readable" && i.state === "queued"),
+      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.id === "cmd-bbb-readable" && i.state === "noted"),
       30_000,
     );
     await waitFor(
@@ -581,8 +584,8 @@ test("plan 06d: corrections bound with the run directory id and with the readabl
     );
     assert.equal(
       (setup.conductor.state.phase.ownerInputs ?? []).find((i) => i.id === "cmd-bbb-readable")!.state,
-      "queued",
-      "the readable id bound the correction and it was accepted (queued)",
+      "noted",
+      "the readable id bound the correction and it was accepted (noted, plan 07f A3)",
     );
     const refused = (setup.conductor.state.phase.ownerInputs ?? []).find((i) => i.id === "cmd-ccc-unknown")!;
     assert.equal(refused.state, "refused");
