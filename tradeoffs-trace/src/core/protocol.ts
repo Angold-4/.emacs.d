@@ -171,7 +171,7 @@ export type PiRpcEvent =
 export interface HelloMessage {
   type: "hello";
   agentId: string;
-  role: "worker" | "reviewer" | "evaluator" | "panel";
+  role: "worker" | "reviewer" | "evaluator" | "panel" | "curator" | "picker" | "domain-review";
   tools: string[];
   piVersion?: string;
 }
@@ -193,7 +193,12 @@ export interface SubmitMessage {
     | "submit_coverage"
     | "raise_tradeoff"
     | "submit_evaluation"
-    | "submit_panel_vote";
+    | "submit_panel_vote"
+    | "submit_round_panel_votes"
+    | "submit_brief"
+    | "submit_pick_vote"
+    | "curate_entries"
+    | "submit_domain_review";
   args: unknown;
 }
 

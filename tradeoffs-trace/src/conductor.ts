@@ -38,22 +38,14 @@ import { advisoryReason, bestCandidate, blocksAcceptance, candidateLabel, carryB
 // implements its `LaneHost` with the worktree, agent, check, review and vote
 // machinery below and calls it; it decides nothing about lanes itself.
 import {
-  consolidatedBase,
   consolidatedLabel,
-  consolidationEnabled,
   consolidationLine,
-  consolidationPlan,
   isLaneRound,
-  itemEvidence,
   laneFailureLines,
   lanesOfContract,
-  repeatLaneBases,
-  runConsolidation,
   runRound,
   fixRoundCandidate,
   isFixRound,
-  type ConsolidationOutcome,
-  type ConsolidationPlan,
   type LaneBuild,
   type LaneCheck,
   type LaneHost,
@@ -141,6 +133,9 @@ import type {
   Decision,
   DecisionBrief,
   DecisionDisclosure,
+  DomainFacts,
+  DomainLoopRecord,
+  DomainReview,
   EvFlakeObserved,
   DirectiveAnswer,
   DirectiveScope,
@@ -168,20 +163,20 @@ import type {
   State,
 } from "./core/types.ts";
 import { computeBoundaryTriggerPaths, computeUnreferencedHunks } from "./core/boundaries.ts";
-import { whereKey, type Domain } from "./core/domains.ts";
+import { domainOf, whereKey, type Domain } from "./core/domains.ts";
 // Plan 07c (D4): the fix-round task rule and the fixer's fixed duty text.
 import {
-  decisionFixPoint,
+  domainReviewBrief,
   factKeepsOpen,
   DEFAULT_FIXERS,
   FIXER_DUTY,
   fixTasks,
-  otherTaskIndexLines,
-  type DecisionFixPoint,
+  testRemovalViolations,
   type FixFinding,
   type FixPoint,
   type FixTask,
 } from "./core/fix-rounds.ts";
+import { blockingQualityProblems, runDomainLoop, type DomainLoopHost } from "./fix-loop.ts";
 import {
   assertToolSet,
   launchArgs,
@@ -282,7 +277,7 @@ import {
   removeWorktree,
   candidateTree,
   saveUnsubmittedWork as gitSaveUnsubmittedWork,
-  verifyIntegrity, removedTestsBetween, headOf, type DisposableCheckout } from "./effects/git.ts";
+  verifyIntegrity, removedTestsBetween, testRemovalViolationsBetween, headOf, type DisposableCheckout } from "./effects/git.ts";
 import { RunSocketServer, type HelloResult, type SubmitResult } from "./effects/socket.ts";
 import { PiAgent, spawnPiAgent } from "./effects/pi-rpc.ts";
 import { redactBytes, redactRecord, redactText, resolveSecrets, secretNames, secretPromptLines, utf16Kind, type Secret } from "./effects/secrets.ts";
@@ -512,6 +507,12 @@ export interface RunPlanPhase {
   /** Plan 07c (D4): `#+TT_FIX_CHECKS` — the fast command every fixer's own
    * commit must pass before it is merged. */
   fixChecks?: string;
+  /** 07g1: how many reviews one domain may spend before it is dropped. */
+  domainLoopMax?: number;
+  /** 07g1: shell patterns a mapper must never run. */
+  forbidden?: string[];
+  /** 07g1: test files/functions the owner allowed a mapper to remove. */
+  testRemovals?: string[];
   /** Plan 06i (A3): the phase's golden note (`#+TT_GOLDEN:`, overridden by
    * the phase's `:GOLDEN:`). A choice justified only by an earlier drafting
    * decision is re-checked against it; a `contract` classification must cite
@@ -549,6 +550,10 @@ export interface RunPlanFile {
   seats?: string[];
   /** Plan 06h (A1): the plan's `#+TT_LEADER:`. Absent means the first seat. */
   leader?: string;
+  /** 07g1: plan-wide domain-loop bound, forbidden patterns and test removals. */
+  domainLoopMax?: number;
+  forbidden?: string[];
+  testRemovals?: string[];
   /** Plan 01c: the Org file this JSON plan was parsed from, recorded by Emacs
    * so `tt lint` can name the file the owner edited rather than its temporary
    * JSON copy. Never read by the conductor. */
@@ -946,6 +951,9 @@ export function buildContract(phase: RunPlanPhase): PhaseContract {
     ...(typeof phase.fixRounds === "string" && phase.fixRounds.trim().toLowerCase() === "domains" ? { fixRounds: "domains" as const } : {}),
     ...(typeof phase.fixers === "number" && Number.isFinite(phase.fixers) && phase.fixers > 0 ? { fixers: Math.floor(phase.fixers) } : {}),
     ...(typeof phase.fixChecks === "string" && phase.fixChecks.trim().length > 0 ? { fixChecks: phase.fixChecks.trim() } : {}),
+    ...(typeof phase.domainLoopMax === "number" && Number.isFinite(phase.domainLoopMax) && phase.domainLoopMax > 0 ? { domainLoopMax: Math.floor(phase.domainLoopMax) } : {}),
+    ...(phase.forbidden && phase.forbidden.length > 0 ? { forbidden: phase.forbidden.map((p) => p.trim()).filter((p) => p.length > 0) } : {}),
+    ...(phase.testRemovals && phase.testRemovals.length > 0 ? { testRemovals: phase.testRemovals.map((p) => p.trim()).filter((p) => p.length > 0) } : {}),
     acceptance,
     checks: phase.checks,
     boundaries: phase.boundaries,
@@ -996,8 +1004,16 @@ export function initialState(
    * its own seats even if the plan changed. Absent (an old log) means the
    * plan's own seats, and `M A B` when it declares none. */
   initSeats?: Seats,
+  /** 07g1: plan-level defaults for the phase-level domain-loop fields. */
+  planDefaults?: Pick<RunPlanFile, "domainLoopMax" | "forbidden" | "testRemovals">,
 ): State {
-  const built = buildContract(phase);
+  const effectivePhase: RunPlanPhase = {
+    ...phase,
+    ...(phase.domainLoopMax === undefined && planDefaults?.domainLoopMax !== undefined ? { domainLoopMax: planDefaults.domainLoopMax } : {}),
+    ...(phase.forbidden === undefined && planDefaults?.forbidden !== undefined ? { forbidden: planDefaults.forbidden } : {}),
+    ...(phase.testRemovals === undefined && planDefaults?.testRemovals !== undefined ? { testRemovals: planDefaults.testRemovals } : {}),
+  };
+  const built = buildContract(effectivePhase);
   const contract: PhaseContract = initSeats
     ? {
         ...built,
@@ -1191,7 +1207,7 @@ export function rebuildState(runDir: string, plan: RunPlanFile, opts: { lenient?
     integrationHead = currentHead(plan.repo, plan.integrationBranch);
   }
   return foldEvents(
-    initialState(runId, plan.phases[0], integrationHead, plan.ownerDirectives ?? [], initSeats),
+    initialState(runId, plan.phases[0], integrationHead, plan.ownerDirectives ?? [], initSeats, plan),
     records,
     opts.lenient === true,
   );
@@ -1250,7 +1266,7 @@ export function restartInstants(records: readonly LogRecord[]): string[] {
 
 function timelineFromRecords(records: readonly LogRecord[], plan: RunPlanFile): Timeline {
   const init = records.find((r) => r.kind === "init")?.event as { runId: string; integrationHead: string; seats?: Seats } | undefined;
-  let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "", plan.ownerDirectives ?? [], init?.seats);
+  let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "", plan.ownerDirectives ?? [], init?.seats, plan);
   const phases: Timeline["phases"] = [];
   const rounds: Timeline["rounds"] = [];
   const restarts = restartInstants(records);
@@ -1405,16 +1421,15 @@ interface AgentHandle {
   /** Plan 06g2: a lane worker's `submit_coverage` payload, kept for the
    * winner's hand-off. */
   laneCoverage?: unknown;
-  /** tt 09 (change 3): set on the consolidator — the round it combines and
-   * its own worktree. Its submissions belong to the combine step, never to a
-   * lane or the phase. */
-  consolidation?: { round: number; worktree: string };
-  /** tt 09 (change 3): the consolidator's `submit_phase` report of what it
-   * changed beyond the taken work (its `deviations` and `assumptions`). */
-  consolidationAdded?: string[];
-  /** Plan 07c (C3): the consolidator's/fixer's own `decisions` disclosures,
-   * kept so a fix round can carry them onto the merged candidate. */
-  consolidationDisclosures?: DecisionDisclosure[];
+  /** tt 09 (change 3): set on a mapper that submits its own commit (a fixer).
+   * Its submissions belong to its task, never to a lane or the phase. */
+  mapper?: { round: number; worktree: string };
+  /** The mapper's `submit_phase` report of what it changed (its
+   * `deviations` and `assumptions`). */
+  submissionAdded?: string[];
+  /** Plan 07c (C3): the mapper's own `decisions` disclosures, kept so a fix
+   * round can carry them onto the merged candidate. */
+  submissionDisclosures?: DecisionDisclosure[];
   /** Plan 06g2: the seat this agent votes as, in the round's pick turn. */
   pickSeat?: string;
   /** Plan 06h (A3): true when this pick turn is the top-two revote. */
@@ -1422,6 +1437,11 @@ interface AgentHandle {
   /** Plan 06g2: the (round, lane, candidate, seat) a lane review records its
    * `submit_review` against. */
   laneReview?: { round: number; lane: string; sha: string; seat: string };
+  /** 07g1: the domain loop a stateless domain-review agent belongs to. Its
+   * submit_domain_review is accepted only for these points and this commit. */
+  domainReview?: { round: number; domain: string; sha: string; iteration: number; pointIds: string[]; result?: DomainReview };
+  domainReviewResolve?: (review: DomainReview) => void;
+  domainReviewPromise?: Promise<DomainReview>;
   /** Plan 06g2: a lane reviewer's turn-1 discoveries, kept per lane until the
    * winner's hand-off applies them (the phase has no candidate to bind them to
    * while the round runs). */
@@ -2046,7 +2066,7 @@ export class Conductor {
           `run was started under runner ${init.runnerRevision}; this conductor is ${mine} — refusing to resume (reinstall that runner, or start a new run)`,
         );
       }
-      this.#state = initialState(init.runId, this.#plan.phases[0], init.integrationHead, this.#plan.ownerDirectives ?? [], init.seats);
+      this.#state = initialState(init.runId, this.#plan.phases[0], init.integrationHead, this.#plan.ownerDirectives ?? [], init.seats, this.#plan);
       // `#+TT_WORKER_PROMPT`: a resumed run keeps the copies its first start
       // made. A copy that is gone would reach Pi as literal prompt text, so
       // the resume refuses instead.
@@ -2080,7 +2100,7 @@ export class Conductor {
         seats: effectiveSeats,
         ...(this.#workerPrompts ? { workerPrompts: this.#workerPrompts } : {}),
       });
-      this.#state = initialState(runId, phase0, head, this.#plan.ownerDirectives ?? [], effectiveSeats);
+      this.#state = initialState(runId, phase0, head, this.#plan.ownerDirectives ?? [], effectiveSeats, this.#plan);
     }
     this.#state = foldEvents(this.#state, records);
     // Plan 06c (A5/OD-3): a conductor that starts on an existing, non-terminal
@@ -2159,7 +2179,25 @@ export class Conductor {
       // Plan 01a: a command carrying a secret's literal value is refused
       // here as well as in the agent's extension guard — a scripted agent
       // (fake-pi) sends its `sh` messages straight to this socket.
-      refuseSh: (_agentId, command) => secretUseInCommand(command, this.#secretNames),
+      refuseSh: (agentId, command) => {
+        const leak = secretUseInCommand(command, this.#secretNames);
+        if (leak !== undefined) return leak;
+        // 07g1: `#+TT_FORBIDDEN` patterns are refused for every mapper's
+        // shell tool and recorded, never run.
+        const handle = this.#agents.get(agentId);
+        if (handle?.role !== "worker") return undefined;
+        const pattern = this.#forbiddenPattern(command);
+        if (pattern === undefined) return undefined;
+        this.#applyEvent({
+          type: "FORBIDDEN_REFUSED",
+          agentId,
+          pattern,
+          command: redactText(command, this.#secretMaskable),
+          at: new Date().toISOString(),
+        });
+        this.#log.append("forbidden_refused", { agentId, pattern, command: redactText(command, this.#secretMaskable) });
+        return `refused: the command matches the phase's forbidden pattern ${JSON.stringify(pattern)} (#+TT_FORBIDDEN)`;
+      },
       // Plan 06l (A2): `tt test --changed` gets its own budget (20 min),
       // never the conductor's shell cap; every other command keeps the cap.
       shDeadline: (command: string) => ({
@@ -5041,26 +5079,54 @@ export class Conductor {
   async #onSubmitChecked(agentId: string, msg: SubmitMessage): Promise<SubmitResult> {
     const handle = this.#agents.get(agentId);
     if (!handle) return { ok: false, reason: "unknown agent" };
-    // tt 09 (change 3): the consolidator's submissions belong to the combine
-    // step, not to a lane or the phase. Its commit is judged by the round
-    // checks and then by the next round's reviews of the lanes built on it,
-    // so no coverage, finding-answer or directive gate applies to it.
-    if (handle.consolidation) {
+    // 07g1: a domain review may submit only its one review, for exactly the
+    // points and commit it was dispatched on. It never commits or edits.
+    if (handle.domainReview) {
+      if (msg.tool !== "submit_domain_review") {
+        return { ok: false, reason: "a domain review submits only submit_domain_review" };
+      }
+      const review = msg.args as DomainReview;
+      if (!review || !Array.isArray(review.points) || !review.quality || typeof review.quality.ok !== "boolean") {
+        return { ok: false, reason: "submit_domain_review needs points[] and quality { ok }" };
+      }
+      const seen = new Set<string>();
+      for (const p of review.points) {
+        if (!p || typeof p.pointId !== "string" || typeof p.fixed !== "boolean" || typeof p.why !== "string" || p.why.trim().length === 0) {
+          return { ok: false, reason: "every domain verdict needs pointId, fixed and a non-empty why" };
+        }
+        if (!handle.domainReview.pointIds.includes(p.pointId)) {
+          return { ok: false, reason: `${p.pointId} is not a point of domain ${handle.domainReview.domain}` };
+        }
+        if (seen.has(p.pointId)) return { ok: false, reason: `the domain review judged ${p.pointId} twice` };
+        seen.add(p.pointId);
+      }
+      const missing = handle.domainReview.pointIds.filter((id) => !seen.has(id));
+      if (missing.length > 0) return { ok: false, reason: `the domain review did not judge: ${missing.join(", ")}` };
+      handle.domainReview.result = review;
+      handle.domainReviewResolve?.(review);
+      handle.doneResolve();
+      return { ok: true };
+    }
+    // A mapper (a fixer) submits its own commit; its submissions belong to
+    // its task, not to a lane or the phase. Its commit is judged by the
+    // domain facts and review, so no coverage, finding-answer or directive
+    // gate applies to it.
+    if (handle.mapper) {
       if (msg.tool === "submit_coverage") return { ok: true };
       if (msg.tool === "submit_phase") {
         const args = msg.args as SubmitPhaseArgs;
         // Plan 07c (C3): a fixer's out-of-task trade-off is a `decisions`
         // disclosure; keep it (and its assumptions and deviations) so the
         // merged candidate's hand-off can record it.
-        handle.consolidationDisclosures = Array.isArray(args.decisions) ? args.decisions : [];
-        handle.consolidationAdded = [...(args.assumptions ?? []), ...(args.deviations ?? [])].filter(
+        handle.submissionDisclosures = Array.isArray(args.decisions) ? args.decisions : [];
+        handle.submissionAdded = [...(args.assumptions ?? []), ...(args.deviations ?? [])].filter(
           (d) => typeof d === "string" && d.trim().length > 0,
         );
         handle.doneResolve();
         return { ok: true };
       }
       if (msg.tool === "raise_tradeoff") {
-        return { ok: false, reason: "the consolidator raises no trade-off: take the listed lane's work, and name anything you changed beyond it in submit_phase's deviations" };
+        return { ok: false, reason: "a fixer raises no trade-off: fix its points, and name anything it changed beyond them in submit_phase's deviations" };
       }
     }
     if (msg.tool === "submit_coverage") {
@@ -7420,6 +7486,22 @@ export class Conductor {
     );
   }
 
+  /** 07g1: the first `#+TT_FORBIDDEN` pattern a mapper's command matches. A
+   * pattern is a regular expression; a pattern that is not a valid regular
+   * expression is matched literally, so a plan can forbid `rm -rf` without
+   * escaping it. */
+  #forbiddenPattern(command: string): string | undefined {
+    for (const pattern of this.#state.phase.contract.forbidden ?? []) {
+      if (!pattern) continue;
+      try {
+        if (new RegExp(pattern).test(command)) return pattern;
+      } catch {
+        if (command.includes(pattern)) return pattern;
+      }
+    }
+    return undefined;
+  }
+
   #onShIntent(agentId: string, _commandId: string, pgid: number): void {
     if (this.#stopRequested) {
       // runCommand resumes the group (SIGCONT) right after this returns;
@@ -7482,8 +7564,8 @@ export class Conductor {
     // worker) or in the candidate it reviews — never in another lane's tree.
     if (handle.laneReview) return path.join(this.#paths.candidates, handle.laneReview.sha);
     if (handle.lane !== undefined) return this.#laneWorktree(handle.lane);
-    // tt 09 (change 3): the consolidator works in its own worktree.
-    if (handle.consolidation) return handle.consolidation.worktree;
+    // A mapper works in its own worktree.
+    if (handle.mapper) return handle.mapper.worktree;
     return handle.role === "worker" ? this.#paths.worktree : this.#candidateDir();
   }
 
@@ -8739,24 +8821,38 @@ export class Conductor {
     return path.join(this.#runDir, "worktrees", `lane-${lane}`);
   }
 
+  /** A repeat of a round that failed only for a missing review or vote: each
+   * lane that passed its checks restarts from its own candidate, and a lane
+   * whose candidate was still red continues from that red candidate. Derived
+   * from the round record, so it survives a conductor restart. */
+  #continuedLaneStarts(last: RoundRecord | undefined, guard?: PickGuard): Record<string, string> | undefined {
+    if (!last || last.picked) return undefined;
+    if (everyLaneLost(last, guard)) return Object.fromEntries(last.lanes.map((lane) => [lane, guard!.best.sha]));
+    const out: Record<string, string> = {};
+    for (const c of last.candidates) {
+      if (c.ok !== false && typeof c.sha === "string" && c.sha.length > 0) out[c.lane] = c.sha;
+    }
+    for (const c of last.candidates) {
+      if (out[c.lane] === undefined && c.ok === false && typeof c.sha === "string" && c.sha.length > 0) out[c.lane] = c.sha;
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
   /** Plan 06k3 (A4): the candidate a lane's submission started from — its
-   * per-lane base. A lane restarted from its own losing candidate (02k's
-   * `repeatLaneBases`) compares against that candidate, not the phase's own. */
+   * per-lane base. */
   #laneStartSha(lane: string, round: number | undefined): string | undefined {
     if (round === undefined) return this.#state.phase.candidate?.sha;
     const rounds = this.#state.phase.rounds ?? [];
     const prev = rounds.find((x) => x.round === round - 1);
-    // A lane restarted from its own previous candidate (02k's per-lane base)
-    // compares against THAT candidate.
-    const repeated = repeatLaneBases(prev)?.[lane];
-    if (repeated) return repeated;
-    // tt 09 (change 3): a round after a consolidation starts every lane from
-    // the consolidated commit.
-    const consolidated = consolidatedBase(rounds, round);
-    if (consolidated) return consolidated;
-    // Otherwise the lane started from the phase's own candidate (a repair
-    // round). Round 1 starts from the integration head, which is not a
-    // candidate: an unchanged submission there is not a resubmission.
+    // A lane restarted from its own previous candidate (a round that failed
+    // only for a missing review or vote) compares against THAT candidate.
+    if (prev && !prev.picked) {
+      const own = prev.candidates.find((c) => c.lane === lane && typeof c.sha === "string" && c.sha.length > 0);
+      if (own) return own.sha;
+    }
+    // Round 1 starts from the integration head, which is not a candidate: an
+    // unchanged submission there is not a resubmission. A later round starts
+    // from the phase's own candidate (a repair round).
     return this.#state.phase.candidate?.sha;
   }
 
@@ -8845,16 +8941,16 @@ export class Conductor {
     lane?: string;
     laneRound?: number;
     laneReview?: { round: number; lane: string; sha: string; seat: string };
+    /** 07g1: a fresh domain review's loop identity. */
+    domainReview?: { round: number; domain: string; sha: string; iteration: number; pointIds: string[] };
     pickSeat?: string;
     pickRevote?: boolean;
     /** Plan 06n (A1): start a lane worker in a FRESH session even when one
      * exists — the losing lane after the other lane won must not continue
      * from its own lost edits. */
     freshSession?: boolean;
-    /** tt 09 (change 3): the consolidator — a worker by its tools, on the
-     * `consolidator` model (`#+TT_MODELS consolidator=…`, else the leader
-     * seat's). */
-    consolidation?: { round: number; worktree: string; fixer?: boolean };
+    /** tt 09 (change 3): a mapper that submits its own commit (a fixer). */
+    mapper?: { round: number; worktree: string; fixer?: boolean };
   }): AgentHandle {
     let helloResolve!: (r: HelloResult) => void;
     const helloPromise = new Promise<HelloResult>((resolve) => {
@@ -8868,10 +8964,14 @@ export class Conductor {
     const discoveryPromise = new Promise<void>((resolve) => {
       discoveryResolve = resolve;
     });
+    let domainReviewResolve!: (review: DomainReview) => void;
+    const domainReviewPromise = new Promise<DomainReview>((resolve) => {
+      domainReviewResolve = resolve;
+    });
     fs.mkdirSync(opts.sessionDir, { recursive: true });
     // A fixer (07c) is a mapper: it runs on the worker model, like a lane.
     // Only the consolidator that combines the lanes runs on the leader's.
-    const providerModel = opts.consolidation && !opts.consolidation.fixer
+    const providerModel = opts.mapper && !opts.mapper.fixer
       ? this.#providerModelFor?.("consolidator", this.#laneLeader())
       : opts.role === "worker"
         ? // Plan 06g2: `worker.1`/`worker.2` name a lane by its 1-based
@@ -8934,9 +9034,12 @@ export class Conductor {
       ...(opts.lane !== undefined ? { lane: opts.lane } : {}),
       ...(opts.laneRound !== undefined ? { laneRound: opts.laneRound } : {}),
       ...(opts.laneReview ? { laneReview: opts.laneReview } : {}),
+      ...(opts.domainReview
+        ? { domainReview: opts.domainReview, domainReviewResolve, domainReviewPromise }
+        : {}),
       ...(opts.pickSeat !== undefined ? { pickSeat: opts.pickSeat } : {}),
       ...(opts.pickRevote ? { pickRevote: true } : {}),
-      ...(opts.consolidation ? { consolidation: opts.consolidation } : {}),
+      ...(opts.mapper ? { mapper: opts.mapper } : {}),
     };
     this.#agents.set(opts.agentId, handle);
     // Plan 06g2: record the lane agent's own process group, so a crashed
@@ -9003,17 +9106,6 @@ export class Conductor {
         `Round ${previous!.round} picked no lane: every lane lost a plan item that the best candidate ${best.sha.slice(0, 7)} (round ${best.round}, lane ${best.lane}) met — ${Object.entries(lostByLane)
           .map(([l, ids]) => `lane ${l} lost ${ids.join(", ")}`)
           .join("; ")}. Every lane's worktree was reset to the best candidate ${best.sha.slice(0, 7)}, so no lane's previous candidate is in the worktree. Keep what the best candidate met.`,
-      );
-    }
-    // 02k: a lane whose candidate passed in a round that could not complete
-    // restarts from that candidate (repeatLaneBases); say so, so the worker
-    // continues from its own work instead of rebuilding it.
-    const restarted = lostByLane ? undefined : repeatLaneBases(previous);
-    if (restarted) {
-      lines.push(
-        `Round ${previous!.round} could not complete (a review or pick vote was missing), not because of your code. A lane whose candidate passed its checks (${Object.entries(restarted)
-          .map(([l, sha]) => `lane ${l}: ${sha.slice(0, 7)}`)
-          .join(", ")}) starts this round from that candidate, so your worktree already holds your previous work: continue from it and fix what the reviews found.`,
       );
     }
     // Plan 06k3 (A2): a lane whose previous attempt missed its deadline starts
@@ -9283,8 +9375,7 @@ export class Conductor {
   /** exex 01a2: a lane never hands in a red tree. Its worker gets the
    * failing checks back on its own candidate, continuing its own session, with
    * the attempt time it has left, and submits again. A lane with almost no
-   * time left keeps its red candidate for this round (the next round starts
-   * from it, `repeatLaneBases`). */
+   * time left keeps its red candidate for this round. */
   async #fixLane(lane: string, round: number, sha: string, failure: string): Promise<LaneBuild> {
     const started = this.#laneStartedAt.get(`${round}-${lane}`) ?? Date.now();
     const remainingMs = this.#deadlines.workerAttemptMs - (Date.now() - started);
@@ -9377,165 +9468,11 @@ export class Conductor {
     return path.join(this.#runDir, "worktrees", "consolidator");
   }
 
-  /** tt 09 (change 3): the combine step after round `roundNo`, whose pick the
-   * phase evaluated and did not accept. When another passing lane met plan
-   * items the winner did not (`consolidationPlan`, the seats' per-item
-   * verdicts), a consolidator starts from the winner in its own worktree,
-   * takes that lane's work for exactly those items, and its commit goes
-   * through the round checks with the lane fix loop (`runConsolidation`).
-   * ROUND_CONSOLIDATED records the result either way: a green commit is the
-   * next round's base for every lane; a failure keeps today's base (the
-   * winner) and says why. Returns "stopped" when the owner's stop or a
-   * recheck ended it mid-way — nothing is recorded then. */
-  async #consolidateRound(roundNo: number): Promise<"stopped" | undefined> {
-    const record = (this.#state.phase.rounds ?? []).find((r) => r.round === roundNo);
-    if (!record?.picked || record.consolidated || record.regressed) return undefined;
-    if (!consolidationEnabled(this.#state.phase.contract) || !this.#itemsEnforced()) return undefined;
-    // Only a pick the phase adopted and evaluated is combined (a round that
-    // was handed off and then not accepted).
-    if (this.#state.phase.candidate?.sha !== record.picked.sha) return undefined;
-    const itemIds = flatItems(this.#planItems()).map((i) => i.id);
-    const plan = consolidationPlan(record, itemIds, this.#laneSeats().length);
-    if (!plan) return undefined;
-    this.#log.append("consolidation_started", { round: roundNo, from: plan.winner.sha, lane: plan.winner.lane, took: plan.takes });
-    const startedAt = Date.now();
-    const stopped = (): boolean => this.#stopRequested || this.#recheckCancelledLaneRound;
-    const outcome = await runConsolidation({
-      build: () => this.#buildConsolidation(plan, this.#consolidationPrompt(plan)),
-      check: (sha) => this.#checkConsolidation(plan, sha),
-      fix: async (sha, failure) => {
-        const remainingMs = this.#deadlines.workerAttemptMs - (Date.now() - startedAt);
-        // The lane rule: too little time left to fix anything keeps the red
-        // commit, and the next round starts from the winner.
-        if (remainingMs < Math.min(60_000, this.#deadlines.workerAttemptMs / 10)) {
-          this.#log.append("consolidation_fix_skipped", { round: roundNo, sha, reason: "no attempt time left" });
-          return { lane: "consolidator", note: "its attempt time is spent" };
-        }
-        this.#log.append("consolidation_fix_started", { round: roundNo, sha, remainingMs });
-        const digest = this.#laneCheckFailureDigest(sha);
-        const prompt = [
-          `Your consolidated commit ${sha.slice(0, 7)} FAILED the round checks, so it cannot be the next round's base.`,
-          "",
-          "Fix exactly what fails, in this worktree (it holds your commit). Keep the winner's work and the work you took; do not delete, skip or #[ignore] a test, weaken an assertion, or drop a taken item to make a check pass.",
-          "Run the failing command until it passes, then call submit_phase again (decisions [], assumptions [], and in deviations every change you made beyond the taken work).",
-          `You have about ${Math.max(1, Math.floor(remainingMs / 60_000))} minutes left.`,
-          "",
-          `The failure: ${failure}`,
-          ...(digest ? ["", "Its output (errors first):", "```", digest, "```"] : []),
-        ].join("\n");
-        const fixed = await this.#buildConsolidation(plan, prompt, { of: sha, timeoutMs: remainingMs });
-        if (fixed.sha && treeOf(this.#plan.repo, fixed.sha) === treeOf(this.#plan.repo, sha)) {
-          this.#log.append("consolidation_fix_unchanged", { round: roundNo, sha, fixedSha: fixed.sha });
-          return { lane: "consolidator", note: `its fix of ${sha.slice(0, 7)} changed nothing` };
-        }
-        return fixed;
-      },
-      stopRequested: stopped,
-    });
-    if (outcome.stopped || stopped()) {
-      this.#log.append("consolidation_stopped", { round: roundNo, reason: this.#stopRequested ? "the owner stopped the run" : "a recheck stopped it" });
-      return "stopped";
-    }
-    // The consolidator's own diff beyond the taken lanes' files, measured
-    // (07: its extra diff must be small and reported, not just requested).
-    let extraFiles: string[] | undefined;
-    if (outcome.ok && outcome.sha) {
-      try {
-        const taken = new Set(plan.takes.flatMap((t) => diffNameOnly(this.#plan.repo, plan.winner.sha, t.sha)));
-        extraFiles = diffNameOnly(this.#plan.repo, plan.winner.sha, outcome.sha).filter((f) => !taken.has(f));
-      } catch {
-        extraFiles = undefined;
-      }
-    }
-    this.#log.append(outcome.ok ? "consolidation_passed" : "consolidation_failed", {
-      round: roundNo,
-      from: plan.winner.sha,
-      took: plan.takes,
-      ...(outcome.sha ? { sha: outcome.sha } : {}),
-      ...(outcome.note ? { note: outcome.note } : {}),
-      ...(outcome.added ? { added: outcome.added } : {}),
-      ...(extraFiles ? { extraFiles } : {}),
-      fixes: outcome.fixes,
-      ms: Date.now() - startedAt,
-    });
-    this.#applyEvent({
-      type: "ROUND_CONSOLIDATED",
-      round: roundNo,
-      from: plan.winner.sha,
-      lane: plan.winner.lane,
-      took: plan.takes,
-      ok: outcome.ok,
-      ...(outcome.ok && outcome.sha ? { sha: outcome.sha } : {}),
-      ...(outcome.note ? { note: outcome.note } : {}),
-      ...(outcome.added && outcome.added.length > 0 ? { added: outcome.added } : {}),
-      fixes: outcome.fixes,
-    });
-    return undefined;
-  }
-
-  /** tt 09 (change 3): the consolidator's prompt — the winner and the other
-   * lanes' commits, the exact items to take (id, text and the seats' evidence
-   * anchors), and 07's constraints on a consolidator. */
-  #consolidationPrompt(plan: ConsolidationPlan): string {
-    const record = (this.#state.phase.rounds ?? []).find((r) => r.round === plan.round);
-    const items = flatItems(this.#planItems());
-    const winner = candidateLabel(plan.round, plan.winner.lane);
-    const lines: string[] = [
-      `You are the CONSOLIDATOR of round ${plan.round} of phase ${this.#state.phase.phaseId}. Goal of the phase: ${this.#state.phase.contract.goal}`,
-      "",
-      `Round ${plan.round} ran ${record?.lanes.length ?? 2} lanes from one base. The seats picked lane ${plan.winner.lane} (${winner}, commit ${plan.winner.sha}), and its evaluation did not accept the phase. Another lane met plan items the winner did not (a strict majority of the seats said so). Your worktree holds the winner's commit ${plan.winner.sha}. Your one job: take the other lane's work for EXACTLY these items onto it, so the next round starts from both lanes' strengths.`,
-      "",
-    ];
-    for (const take of plan.takes) {
-      const candidate = record?.candidates.find((c) => c.lane === take.lane && c.sha === take.sha);
-      lines.push(`From lane ${take.lane} (${candidateLabel(plan.round, take.lane)}, commit ${take.sha}):`);
-      for (const id of take.items) {
-        const item = items.find((i) => i.id === id);
-        lines.push(`- ${id}${item ? ` ${oneLine(item.title)}: ${oneLine(item.text, 600)}` : ""}`);
-        const evidence = candidate ? itemEvidence(candidate, id, this.#laneSeats()) : [];
-        if (evidence.length > 0) lines.push(`  the seats' evidence it is met: ${evidence.map((e) => oneLine(e, 300)).join(" | ")}`);
-      }
-      lines.push("");
-    }
-    lines.push(
-      "How:",
-      `- Read the other lane's work with git (both commits are in this repository): \`git diff ${plan.winner.sha.slice(0, 12)} <lane commit>\`, \`git show <lane commit>:<path>\`, and \`git checkout <lane commit> -- <path>\` for a file only that lane changed.`,
-      "- Keep everything the winner already meets. Never rewrite the winner's work wholesale and never revert it; take the other lane's work only for the listed items.",
-      "- Do not weaken, skip, #[ignore] or delete a test, and do not drop a test either lane wrote for these items.",
-      "- Keep your own extra diff small: change only what integrating the two needs (a conflict, a call site, an import).",
-      "- Do not commit; tt commits your worktree when you submit. tt runs the round checks on your commit and sends any failure back to you, so run only a fast compile and the targeted tests of the items you took.",
-      "- Then call submit_phase with decisions [] and assumptions [], and in deviations one line per change you made beyond the taken work (path — why), or none.",
-      `- You have about ${Math.max(1, Math.floor(this.#deadlines.workerAttemptMs / 60_000))} minutes.`,
-    );
-    return lines.join("\n");
-  }
-
-  /** tt 09 (change 3): one consolidator run in its own worktree at the
-   * winner (or, for a fix, on its own red commit, continuing its session),
-   * frozen to a commit. Plan 07c (D4.3): generalized so a fixer uses the
-   * same machinery with its own worktree, agent id, session dir and base. */
-  async #buildConsolidation(plan: ConsolidationPlan, prompt: string, fix?: { of: string; timeoutMs: number }): Promise<LaneBuild> {
-    return this.#buildConsolidationAgent({
-      round: plan.round,
-      worktree: this.#consolidationWorktree(),
-      base: plan.winner.sha,
-      prompt,
-      sessionDir: path.join(this.#paths.sessions, `consolidator-${plan.round}`),
-      actionKind: `consolidate_${plan.round}`,
-      agentIdPrefix: `consolidate-${plan.round}`,
-      lane: "consolidator",
-      logPrefix: "consolidation",
-      roleWord: "consolidator",
-      changedNothingNote: "the consolidator changed nothing on the winner",
-      ...(fix ? { fix } : {}),
-    });
-  }
-
   /** Plan 07c (D4.3): one mapper in consolidator mode — its own worktree at
    * `base` (or, for a fix, on its own red commit, continuing its session),
    * frozen to a commit. Mirrors `#buildLane` without the lane-only parts (no
    * owner-note delivery, no saved unsubmitted work). */
-  async #buildConsolidationAgent(opts: {
+  async #buildFixerAgent(opts: {
     round: number;
     worktree: string;
     base: string;
@@ -9577,7 +9514,7 @@ export class Conductor {
       sessionDir: opts.sessionDir,
       // It owes submit_phase only: no coverage turn (TT_ITEMS=0).
       env: { ...this.#laneEnv(worktree, this.#piEnvFor?.("worker", agentId) ?? {}), TT_ITEMS: "0" },
-      consolidation: { round: opts.round, worktree, ...(opts.fixer ? { fixer: true } : {}) },
+      mapper: { round: opts.round, worktree, ...(opts.fixer ? { fixer: true } : {}) },
       // A fix continues the session that holds the work; a first build (or a
       // restart's re-run) starts fresh.
       ...(fix ? {} : { freshSession: true }),
@@ -9606,7 +9543,7 @@ export class Conductor {
       await handle.agent.terminate();
       // A settle with no submission also resolves `donePromise`
       // (`#onNoSubmission`); only a recorded submit_phase is a submission.
-      if (outcome !== "submitted" || handle.consolidationAdded === undefined) {
+      if (outcome !== "submitted" || handle.submissionAdded === undefined) {
         // Plan 07e (E2/A2): every timed-out attempt names its bound — the
         // fixer's own, or the worker attempt a consolidator runs under. The
         // fixer's is also named in its task note, so a skipped fixer is never
@@ -9636,7 +9573,7 @@ export class Conductor {
       });
       this.#log.append("sweep", { ...sweepResult, fixer: opts.lane });
       const sha = freezeCommit(worktree, actionId, `phase ${this.#state.phase.phaseId} round ${opts.round} ${opts.roleWord}`);
-      const disclosures = handle.consolidationDisclosures ?? [];
+      const disclosures = handle.submissionDisclosures ?? [];
       // A commit with the base's own tree changed nothing: it is no work.
       if (!fix && treeOf(this.#plan.repo, sha) === treeOf(this.#plan.repo, base)) {
         this.#log.completion(actionId, { round: opts.round, outcome: "unchanged", sha });
@@ -9646,31 +9583,14 @@ export class Conductor {
           lane: opts.lane,
           unchanged: true,
           note: opts.changedNothingNote ?? `the ${opts.roleWord} changed nothing on the base`,
-          ...(handle.consolidationAdded && handle.consolidationAdded.length > 0 ? { added: handle.consolidationAdded } : {}),
+          ...(handle.submissionAdded && handle.submissionAdded.length > 0 ? { added: handle.submissionAdded } : {}),
           ...(disclosures.length > 0 ? { disclosures } : {}),
         };
       }
-      this.#log.completion(actionId, { round: opts.round, sha, added: handle.consolidationAdded });
-      return { lane: opts.lane, sha, added: handle.consolidationAdded, ...(disclosures.length > 0 ? { disclosures } : {}) };
+      this.#log.completion(actionId, { round: opts.round, sha, added: handle.submissionAdded });
+      return { lane: opts.lane, sha, added: handle.submissionAdded, ...(disclosures.length > 0 ? { disclosures } : {}) };
     } finally {
       this.#agents.delete(agentId);
-    }
-  }
-
-  /** tt 09 (change 3): the round checks on a consolidated commit, under the
-   * machine-wide lock, exactly as a lane candidate's (the winner is its base
-   * for the wide-path tier). */
-  async #checkConsolidation(plan: ConsolidationPlan, sha: string): Promise<LaneCheck> {
-    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
-    const window = this.#openCheckWindow();
-    try {
-      this.#log.append("consolidation_check_started", { round: plan.round, sha });
-      const result = await this.#runLaneChecks("consolidator", sha, plan.winner.sha);
-      this.#log.append("consolidation_check_finished", { round: plan.round, sha, passed: result.ok, ...(result.note ? { note: result.note } : {}) });
-      return result;
-    } finally {
-      window.release();
-      await lock.release();
     }
   }
 
@@ -9695,39 +9615,32 @@ export class Conductor {
     if (this.#state.phase.candidate?.sha !== record.picked.sha) return undefined;
     const domains = this.#state.phase.contract.domains ?? [];
     if (domains.length === 0) return undefined;
-    const findings: FixFinding[] = this.#state.phase.findings.map((f) => ({
-      ...f,
-      disposition: triageRecordFor(this.#state.phase.triage, f.id)?.disposition,
-    }));
-    // Fix packet Z: a decision of the pick the seats voted down or vetoed is
-    // fixer work too (the seats decided; the fixer applies their alternative).
-    const points: FixPoint[] = [...findings, ...this.#decisionFixPoints(record.picked.sha, domains)];
+    const findings: FixFinding[] = this.#state.phase.findings.map((f) => {
+      const path = f.where ? whereKey(f.where).split(" ")[0] : "";
+      const inferred = f.domain ? undefined : domainOf(path, domains);
+      return {
+        ...f,
+        ...(inferred ? { domain: inferred } : {}),
+        disposition: triageRecordFor(this.#state.phase.triage, f.id)?.disposition ??
+          (f.raisedBy === "conductor" ? { kind: "fix" as const, reason: "a final check failure is fixed in its file's domain" } : undefined),
+      };
+    });
+    // 07g1: only points are fixer work. A voted-down or vetoed decision goes
+    // to the seats (or the owner), never to a fixer.
+    const points: FixTask["findings"] = findings;
     const cap = this.#state.phase.contract.fixers ?? DEFAULT_FIXERS;
     const tasks = fixTasks(points, domains, cap);
     if (tasks.length === 0) return undefined;
-    const base = consolidatedBase(this.#state.phase.rounds, roundNo + 1) ?? record.picked.sha;
+    const base = record.picked.sha;
     const stopped = (): boolean => this.#stopRequested || this.#recheckCancelledLaneRound;
     this.#log.append("fix_round_started", { round: roundNo, base, tasks: tasks.map((t) => ({ domain: t.domain, findingIds: t.findingIds })) });
-    const results = await Promise.all(
-      tasks.map((task) =>
-        this.#runFixer(task, roundNo, base, tasks).catch((err): ConsolidationOutcome => ({
-          ok: false,
-          fixes: 0,
-          note: `the fixer failed: ${String((err as Error)?.message ?? err)}`,
-        })),
-      ),
-    );
-    if (stopped()) {
-      this.#log.append("fix_round_stopped", { round: roundNo, reason: this.#stopRequested ? "the owner stopped the run" : "a recheck stopped it" });
-      return "stopped";
-    }
-    // Merge the green fixer commits, in task order, into one fresh worktree at
-    // B. A conflict aborts that merge and skips the fixer; the sequence goes on.
-    const mergeWorktree = path.join(this.#runDir, "worktrees", `fix-merge-${roundNo}`);
     const taskRecords: FixTaskRecord[] = tasks.map((t) => ({ domain: t.domain, findingIds: [...t.findingIds] }));
-    const merges: { sha: string }[] = [];
+    const mergeWorktree = path.join(this.#runDir, "worktrees", `fix-merge-${roundNo}`);
+    const mergesByIndex = new Map<number, { sha: string }>();
+    const results: Array<LaneBuild & { ok: boolean; fixes: number; domainRecords?: DomainLoopRecord[] }> = new Array(tasks.length);
     let candidate: string | undefined;
     let mergeWorktreeReady = false;
+    let mergeBoundReached = false;
     try {
       if (fs.existsSync(mergeWorktree)) removeWorktree(this.#plan.repo, mergeWorktree);
       createWorktree(this.#plan.repo, mergeWorktree, base);
@@ -9736,44 +9649,70 @@ export class Conductor {
       const error = String((err as Error)?.message ?? err);
       this.#log.append("fix_merge_worktree_failed", { round: roundNo, error });
     }
-    for (let i = 0; i < tasks.length; i += 1) {
-      const result = results[i];
-      if (typeof result.sha === "string" && result.sha.length > 0) taskRecords[i].sha = result.sha;
+    // R3: every domain runs concurrently and the merge stream starts as soon
+    // as ANY domain is green, so a slow domain never holds the others. Only
+    // one merge runs at a time (the merge worktree is shared); the record is
+    // kept in task order below.
+    const mergeResult = async (index: number, result: (typeof results)[number]): Promise<void> => {
+      if (typeof result.sha === "string" && result.sha.length > 0) taskRecords[index].sha = result.sha;
+      if (mergeBoundReached) {
+        taskRecords[index].note = "not merged: the merge bound was reached on an earlier fixer (bound: merge)";
+        return;
+      }
       if (!mergeWorktreeReady) {
-        taskRecords[i].note = `the merge worktree could not be created`;
-        continue;
+        taskRecords[index].note = `the merge worktree could not be created`;
+        return;
       }
       if (!result.ok || typeof result.sha !== "string" || result.sha.length === 0) {
-        taskRecords[i].note = result.note ?? "the fixer produced no commit";
-        continue;
+        taskRecords[index].note = result.note ?? "the fixer produced no commit";
+        return;
       }
-      const merge = await this.#mergeFixerBounded(mergeWorktree, result.sha, tasks[i].domain, roundNo);
+      const merge = await this.#mergeFixerBounded(mergeWorktree, result.sha, tasks[index].domain, roundNo);
       // Keep the commits merged so far as the candidate; do not risk another
       // hung merge after this round has reached the merge bound.
       if (!merge.ok && merge.timedOut) {
-        this.#log.append("fix_merge_timed_out", { round: roundNo, domain: tasks[i].domain, sha: result.sha });
-        taskRecords[i].note = `its commit ${result.sha.slice(0, 7)} could not be merged within the merge bound (bound: merge)`;
-        for (let j = i + 1; j < tasks.length; j += 1) {
-          if (typeof results[j].sha === "string" && results[j].sha!.length > 0) {
-            taskRecords[j].sha = results[j].sha;
-            taskRecords[j].note = "not merged: the merge bound was reached on an earlier fixer (bound: merge)";
-          }
-        }
-        break;
+        mergeBoundReached = true;
+        this.#log.append("fix_merge_timed_out", { round: roundNo, domain: tasks[index].domain, sha: result.sha });
+        taskRecords[index].note = `its commit ${result.sha.slice(0, 7)} could not be merged within the merge bound (bound: merge)`;
+        return;
       }
       if (!merge.ok) {
-        taskRecords[i].note = merge.timedOut
+        taskRecords[index].note = merge.timedOut
           ? `its merge timed out and was skipped (bound: merge)`
           : `its commit ${result.sha.slice(0, 7)} conflicted and was skipped`;
         this.#log.append(merge.timedOut ? "fix_merge_timed_out" : "fix_merge_conflict", {
           round: roundNo,
-          domain: tasks[i].domain,
+          domain: tasks[index].domain,
           sha: result.sha,
         });
-        continue;
+        return;
       }
-      merges.push({ sha: result.sha });
+      mergesByIndex.set(index, { sha: result.sha });
+    };
+    const pending = new Map<number, Promise<{ index: number; result: (typeof results)[number] }>>();
+    for (let i = 0; i < tasks.length; i += 1) {
+      const task = tasks[i];
+      pending.set(
+        i,
+        this.#runFixer(task, roundNo, base)
+          .then((result) => ({ index: i, result }))
+          .catch((err): { index: number; result: (typeof results)[number] } => ({
+            index: i,
+            result: { lane: `fix-${task.domain}`, ok: false, fixes: 0, note: `the fixer failed: ${String((err as Error)?.message ?? err)}` },
+          })),
+      );
     }
+    while (pending.size > 0) {
+      const settled = await Promise.race([...pending.values()]);
+      pending.delete(settled.index);
+      results[settled.index] = settled.result;
+      await mergeResult(settled.index, settled.result);
+    }
+    if (stopped()) {
+      this.#log.append("fix_round_stopped", { round: roundNo, reason: this.#stopRequested ? "the owner stopped the run" : "a recheck stopped it" });
+      return "stopped";
+    }
+    const merges = tasks.flatMap((_, i) => (mergesByIndex.has(i) ? [mergesByIndex.get(i)!] : []));
     if (mergeWorktreeReady && merges.length > 0) candidate = headOf(mergeWorktree);
     // Packet X: a merge whose tree is B's own changed nothing (e.g. a fixer
     // whose fix undid its own commit): there is no candidate, and the next
@@ -9792,6 +9731,7 @@ export class Conductor {
     const speaking = results.filter((r) => r.unchanged === true || (typeof r.sha === "string" && merged.has(r.sha)));
     const disclosures = speaking.flatMap((r) => r.disclosures ?? []);
     const added = speaking.flatMap((r) => r.added ?? []);
+    const domainRecords = results.flatMap((r) => r.domainRecords ?? []);
     // The merged candidate is the next round's candidate: materialize its
     // read-only checkout now, before the next round's lane reviews (which run
     // in it) start.
@@ -9807,6 +9747,7 @@ export class Conductor {
       ...(candidate ? { candidate } : {}),
       ...(disclosures.length > 0 ? { disclosures } : {}),
       ...(added.length > 0 ? { added } : {}),
+      ...(domainRecords.length > 0 ? { domains: domainRecords } : {}),
     });
     this.#applyEvent({
       type: "ROUND_FIXED",
@@ -9817,6 +9758,7 @@ export class Conductor {
       ...(candidate ? { candidate } : {}),
       ...(disclosures.length > 0 ? { disclosures } : {}),
       ...(added.length > 0 ? { added } : {}),
+      ...(domainRecords.length > 0 ? { domains: domainRecords } : {}),
     });
     // Packet X: once ROUND_FIXED records every fixer's outcome and the merged
     // candidate has its own checkout, the fix worktrees are spent. Only the
@@ -9921,99 +9863,254 @@ export class Conductor {
   }
 
 
-  /** Fix packet Z: the fixer points of the decisions bound to `sha` (the
-   * round's pick) — `decisionFixPoint` decides which (a non-reserved decision
-   * whose vote failed or that the leader vetoed) and their domain; this only
-   * gathers the facts it reads: the vote outcome, the item's `:DOMAIN:` and
-   * the evaluator's alternative. */
-  #decisionFixPoints(sha: string, domains: readonly Domain[]): DecisionFixPoint[] {
-    const phase = this.#state.phase;
-    const K = phase.contract.contractVersion;
-    const items = this.#planItems();
-    const itemDomain = (id: string | undefined): string | undefined =>
-      id ? [...items.requirements, ...items.architecture, ...items.constraints].find((i) => i.id === id)?.domain : undefined;
-    const points: DecisionFixPoint[] = [];
-    for (const decision of phase.decisions) {
-      if (decision.boundCandidateSha !== sha || !isLiveDecision(decision)) continue;
-      const point = decisionFixPoint(decision, {
-        ballots: phase.ballots ?? [],
-        seats: this.#laneSeats(),
-        leader: this.#laneLeader(),
-        settled: decisionSettled(decision, phase, sha, K),
-        itemDomain: itemDomain(decision.itemId),
-        domains,
-        evaluatorAlternative: (phase.itemChecks ?? []).find((c) => c.itemId === decision.id)?.alternative,
-      });
-      if (point) points.push(point);
-    }
-    return points;
-  }
-
-  /** Plan 07c (D4.3): one fixer — its own worktree at B, its own session, and
-   * `runConsolidation` with `#+TT_FIX_CHECKS` as its gate. The fixer's handle
-   * is a consolidation handle: it owes `submit_phase` only. */
-  async #runFixer(task: FixTask, round: number, base: string, allTasks: readonly FixTask[]): Promise<ConsolidationOutcome> {
+  /** 07g1: one domain's loop. The domain gets its own worktree at B and its
+   * own fixer session; every red check, failing doneWhen or unfixed review
+   * verdict goes back to that same session. A fresh stateless domain review
+   * judges the points only after every fact is green; a domain that spends its
+   * review bound is dropped and never holds another domain. */
+  async #runFixer(task: FixTask, round: number, base: string): Promise<LaneBuild & { ok: boolean; fixes: number; domainRecords?: DomainLoopRecord[] }> {
     const worktree = this.#fixerWorktree(task.domain);
     const sessionDir = path.join(this.#paths.sessions, `fix-${round}-${task.domain}`);
-    const prompt = this.#fixerPrompt(task, round, base, allTasks);
-    const startedAt = Date.now();
     const lane = `fix-${task.domain}`;
-    return runConsolidation({
-      build: () =>
-        this.#buildConsolidationAgent({
-          round,
-          worktree,
-          base,
-          prompt,
-          sessionDir,
-          actionKind: "fixer",
-          agentIdPrefix: `fix-${round}-${task.domain}`,
-          lane,
-          logPrefix: "fixer",
-          roleWord: `fixer ${task.domain}`,
-          fixer: true,
-        }),
-      check: (sha) => this.#checkFixer(task, round, sha),
+    const startedAt = Date.now();
+    const records: DomainLoopRecord[] = [];
+    const allDisclosures: DecisionDisclosure[] = [];
+    const allAdded: string[] = [];
+    const remaining = (): number => this.#deadlines.fixerAttemptMs - (Date.now() - startedAt);
+    const buildFixer = async (fix?: { of: string; feedback: string }): Promise<LaneBuild> => {
+      const prompt = fix
+        ? this.#fixerFixPrompt(task, round, fix.of, fix.feedback, remaining())
+        : this.#fixerPrompt(task, round, base);
+      const built = await this.#buildFixerAgent({
+        round,
+        worktree,
+        base,
+        prompt,
+        sessionDir,
+        actionKind: "fixer",
+        agentIdPrefix: `fix-${round}-${task.domain}`,
+        lane,
+        logPrefix: "fixer",
+        roleWord: `fixer ${task.domain}`,
+        fixer: true,
+        ...(fix ? { fix: { of: fix.of, timeoutMs: Math.max(1, remaining()) } } : {}),
+      });
+      if (built.sha && fix && treeOf(this.#plan.repo, built.sha) === treeOf(this.#plan.repo, fix.of)) {
+        this.#log.append("fixer_fix_unchanged", { round, domain: task.domain, sha: fix.of, fixedSha: built.sha });
+        return { lane, unchanged: true, note: `its fix of ${fix.of.slice(0, 7)} changed nothing`, ...(built.disclosures ? { disclosures: built.disclosures } : {}) };
+      }
+      if (built.disclosures) allDisclosures.push(...built.disclosures);
+      if (built.added) allAdded.push(...built.added);
+      return built;
+    };
+    const host: DomainLoopHost = {
+      maxReviews: this.#state.phase.contract.domainLoopMax ?? 3,
+      build: () => buildFixer(),
+      facts: (sha, iteration) => this.#domainFacts(task, round, base, sha, iteration),
+      review: (sha, iteration, facts) => this.#runDomainReview(task, round, base, sha, iteration, facts, records),
       fix: async (sha, failure) => {
-        const remainingMs = this.#deadlines.fixerAttemptMs - (Date.now() - startedAt);
-        if (remainingMs < Math.min(60_000, this.#deadlines.fixerAttemptMs / 10)) {
+        const ms = remaining();
+        if (ms < Math.min(60_000, this.#deadlines.fixerAttemptMs / 10)) {
           this.#log.append("fixer_fix_skipped", { round, domain: task.domain, sha, reason: "no attempt time left" });
           return { lane, note: "its attempt time is spent" };
         }
-        this.#log.append("fixer_fix_started", { round, domain: task.domain, sha, remainingMs });
-        const digest = this.#laneCheckFailureDigest(sha);
-        const fixPrompt = [
-          `Your fixer commit ${sha.slice(0, 7)} FAILED the fix check (${this.#state.phase.contract.fixChecks ?? "none"}), so it cannot be merged.`,
-          "",
-          "Fix exactly what fails, in this worktree (it holds your commit). Change only what your findings need; do not delete, skip or #[ignore] a test to make the check pass.",
-          `Run \`${this.#state.phase.contract.fixChecks ?? "none"}\` until it passes, then call submit_phase again with all your disclosures: in decisions every trade-off you met beyond your findings (reported, not decided), in assumptions what you assumed, and in deviations anything you changed beyond your findings.`,
-          `You have about ${Math.max(1, Math.floor(remainingMs / 60_000))} minutes left.`,
-          "",
-          `The failure: ${failure}`,
-          ...(digest ? ["", "Its output (errors first):", "```", digest, "```"] : []),
-        ].join("\n");
-        const fixed = await this.#buildConsolidationAgent({
-          round,
-          worktree,
-          base,
-          prompt: fixPrompt,
-          sessionDir,
-          actionKind: "fixer",
-          agentIdPrefix: `fix-${round}-${task.domain}`,
-          lane,
-          logPrefix: "fixer",
-          roleWord: `fixer ${task.domain}`,
-          fix: { of: sha, timeoutMs: remainingMs },
-        });
-        if (fixed.sha && treeOf(this.#plan.repo, fixed.sha) === treeOf(this.#plan.repo, sha)) {
-          this.#log.append("fixer_fix_unchanged", { round, domain: task.domain, sha, fixedSha: fixed.sha });
-          // Plan 07c (C3): the fix's own submission is kept with the note.
-          return { lane, note: `its fix of ${sha.slice(0, 7)} changed nothing`, ...(fixed.disclosures ? { disclosures: fixed.disclosures } : {}) };
-        }
-        return fixed;
+        this.#log.append("fixer_fix_started", { round, domain: task.domain, sha, remainingMs: ms });
+        return buildFixer({ of: sha, feedback: failure });
       },
       stopRequested: () => this.#stopRequested || this.#recheckCancelledLaneRound,
+      record: (r) => {
+        records.push(r);
+        this.#log.append("domain_loop_pass", { round, domain: task.domain, ...r });
+      },
+    };
+    const outcome = await runDomainLoop(task, host);
+    const outcomeSha = outcome.sha;
+    // A2: an uncited quality remark is a note on the approval, not a reason
+    // to send the domain back. Keep those remarks (and the reviewer's notes)
+    // on DOMAIN_APPROVED so the record still carries them.
+    const lastReview = outcome.status === "approved" ? [...outcome.records].reverse().find((r) => r.review)?.review : undefined;
+    const approvalNotes = lastReview
+      ? [
+          ...(lastReview.notes ?? []),
+          ...(lastReview.quality.ok ? [] : (lastReview.quality.problems ?? []).filter((p) => !blockingQualityProblems(lastReview).includes(p))),
+        ]
+      : [];
+    this.#applyEvent({
+      type: outcome.status === "approved" ? "DOMAIN_APPROVED" : "DOMAIN_DROPPED",
+      round,
+      domain: task.domain,
+      ...(outcome.status === "dropped" ? { reason: outcome.reason ?? "the domain loop ended" } : { sha: outcomeSha!, ...(approvalNotes.length > 0 ? { notes: approvalNotes } : {}) }),
+      reviews: outcome.reviews,
+    } as Event);
+    this.#log.append("domain_loop_finished", {
+      round,
+      domain: task.domain,
+      status: outcome.status,
+      ...(outcomeSha ? { sha: outcomeSha } : {}),
+      ...(outcome.reason ? { reason: outcome.reason } : {}),
+      reviews: outcome.reviews,
+      fixes: outcome.fixes,
     });
+    if (outcome.status === "approved" && outcomeSha) return { lane, ok: true, sha: outcomeSha, fixes: outcome.fixes, domainRecords: outcome.records, ...(allDisclosures.length > 0 ? { disclosures: allDisclosures } : {}), ...(allAdded.length > 0 ? { added: allAdded } : {}) };
+    return {
+      lane,
+      ok: false,
+      fixes: outcome.fixes,
+      note: outcome.status === "stopped" ? "the run was stopped" : (outcome.reason ?? "the domain was dropped"),
+      ...(outcomeSha ? { sha: outcomeSha } : {}),
+      domainRecords: outcome.records,
+      ...(allDisclosures.length > 0 ? { disclosures: allDisclosures } : {}),
+      ...(allAdded.length > 0 ? { added: allAdded } : {}),
+    };
+  }
+
+  /** 07g1: the failure text sent to the SAME fixer session after a red fact
+   * or a review that did not fix every point. */
+  #fixerFixPrompt(task: FixTask, round: number, sha: string, failure: string, remainingMs: number): string {
+    return [
+      `Your fixer commit ${sha.slice(0, 7)} is not accepted in domain ${task.domain}, so it cannot be merged yet.`,
+      "",
+      "Fix exactly what fails, in this worktree (it holds your commit). Change only what your points need; do not delete, skip or #[ignore] a test to make a check pass.",
+      "Run every failing command until it passes, then call submit_phase again with all your disclosures: in decisions every trade-off you met beyond your findings (reported, not decided), in assumptions what you assumed, and in deviations anything you changed beyond your findings.",
+      `You have about ${Math.max(1, Math.floor(remainingMs / 60_000))} minutes left.`,
+      "",
+      "The failure:",
+      failure,
+      "",
+      `Points of domain ${task.domain}: ${task.findingIds.join(", ")}.`,
+      `Round ${round}; fix check: ${this.#state.phase.contract.fixChecks ?? "(none)"}.`,
+    ].join("\n");
+  }
+
+  /** 07g1: establish every fact a domain review needs before it may start:
+   * the fast fix check, each point's doneWhen on the head (and on B, so a
+   * command that already passed before the fix proves nothing), and the test
+   * removal rule. Emits DOMAIN_CHECKED for the pass. */
+  async #domainFacts(task: FixTask, round: number, base: string, sha: string, iteration: number): Promise<DomainFacts> {
+    let testRemovals: string[] = [];
+    try {
+      testRemovals = testRemovalViolationsBetween(this.#plan.repo, base, sha, this.#state.phase.contract.testRemovals ?? []);
+    } catch (err) {
+      testRemovals = [`the test removal check could not run: ${String((err as Error)?.message ?? err)}`];
+    }
+    const check = await this.#checkFixer(task, round, sha);
+    let facts: FindingFact[] = [];
+    let checkout: DisposableCheckout | undefined;
+    try {
+      checkout = disposableCheckout(this.#plan.repo, sha);
+      facts = task.findings.some((f) => typeof f.doneWhen === "string" && f.doneWhen.trim().length > 0)
+        ? await this.#runDoneWhenFacts(`fix-${task.domain}`, sha, checkout.dir, base)
+        : [];
+    } catch (err) {
+      this.#log.append("domain_fact_failed", { round, domain: task.domain, sha, error: String((err as Error)?.message ?? err) });
+    } finally {
+      checkout?.dispose();
+    }
+    const points = task.findingIds.map((id) => {
+      const f = task.findings.find((x) => x.id === id);
+      const fact = facts.find((x) => x.findingId === id);
+      const hasDoneWhen = typeof f?.doneWhen === "string" && f.doneWhen.trim().length > 0;
+      return {
+        id,
+        onBase: fact?.passesOnBase === true,
+        // R1: a point with a doneWhen whose fact is missing did not pass. An
+        // absent fact must never be read as green.
+        onHead: hasDoneWhen ? fact !== undefined && !fact.timedOut && fact.exitCode === 0 : true,
+        ...(f?.doneWhen ? { doneWhen: f.doneWhen } : {}),
+        ...(fact?.outputTail ? { outputTail: fact.outputTail } : {}),
+      };
+    });
+    const domainFacts: DomainFacts = {
+      checkPassed: check.ok,
+      ...(check.note ? { checkNote: check.note } : {}),
+      points,
+      ...(testRemovals.length > 0 ? { testRemovals } : {}),
+    };
+    this.#applyEvent({ type: "DOMAIN_CHECKED", round, domain: task.domain, iteration, sha, base, facts: domainFacts });
+    return domainFacts;
+  }
+
+  /** 07g1: one fresh, stateless domain review. Its brief is built from the
+   * recorded loop history (never live memory), its tools are read-only, and
+   * it never commits. */
+  async #runDomainReview(task: FixTask, round: number, base: string, sha: string, iteration: number, facts: DomainFacts, records: readonly DomainLoopRecord[]): Promise<DomainReview | undefined> {
+    if (this.#stopRequested) return undefined;
+    const candidateDir = path.join(this.#paths.candidates, sha);
+    if (!fs.existsSync(candidateDir)) {
+      try {
+        materializeCandidate(this.#plan.repo, sha, candidateDir);
+      } catch (err) {
+        this.#log.append("domain_review_checkout_failed", { round, domain: task.domain, sha, error: String((err as Error)?.message ?? err) });
+        return undefined;
+      }
+    }
+    const brief = domainReviewBrief(task, this.#domainLoopHistory(task, round, records));
+    let change = "";
+    try {
+      change = execFileSync("git", ["-C", this.#plan.repo, "diff", `${base}..${sha}`], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 }).trim();
+    } catch {
+      // A diff that cannot be produced is not a fact; the reviewer still sees
+      // the recorded loop history and the facts below.
+    }
+    const actionId = this.#log.actionId(`domain_review_${round}_${task.domain}_${iteration}`);
+    this.#log.intent(actionId, { round, domain: task.domain, candidateSha: sha, iteration });
+    const agentId = `domain-review-${round}-${task.domain}-${iteration}-${actionId}`;
+    const handle = this.#spawnLaneAgent({
+      role: "domain-review",
+      agentId,
+      cwd: candidateDir,
+      sessionDir: path.join(this.#paths.sessions, `domain-review-${round}-${task.domain}-${iteration}-${sha.slice(0, 12)}`),
+      env: this.#laneEnv(candidateDir, { ...(this.#piEnvFor?.("domain-review", agentId) ?? {}), TT_CANDIDATE_SHA: sha }),
+      domainReview: { round, domain: task.domain, sha, iteration, pointIds: [...task.findingIds] },
+    });
+    try {
+      const hello = await raceTimeout(handle.helloPromise, this.#deadlines.helloTimeoutMs, "hello");
+      if (hello === "timeout" || !hello.ok) {
+        await handle.agent.terminate();
+        this.#log.completion(actionId, { round, domain: task.domain, ok: false, reason: "the domain reviewer did not start" });
+        return undefined;
+      }
+      await handle.agent.prompt(this.#agentPrompt(`${brief}\n\nThe commit under review is ${sha}, on base ${base}. Its change from that base:\n${change || "(no diff could be produced)"}\n\nFacts recorded for this pass:\n${JSON.stringify(facts, null, 2)}`));
+      const timeout = cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const);
+      const raced = await Promise.race([
+        handle.domainReviewPromise!.then((r) => ({ kind: "reviewed" as const, review: r })),
+        handle.agent.waitSettled().then(() => ({ kind: "settled" as const })),
+        handle.agent.waitExit().then(() => ({ kind: "exited" as const })),
+        handle.agent.waitModelFailed().then(() => ({ kind: "failed" as const })),
+        timeout.promise.then(() => ({ kind: "timeout" as const })),
+      ]);
+      timeout.cancel();
+      await handle.agent.terminate();
+      if (raced.kind === "reviewed") {
+        this.#applyEvent({ type: "DOMAIN_REVIEWED", round, domain: task.domain, iteration, sha, brief, review: raced.review });
+        this.#log.completion(actionId, { round, domain: task.domain, ok: true, sha });
+        return raced.review;
+      }
+      if (raced.kind === "timeout") this.#recordBound("review", `${round}:${task.domain}`, this.#deadlines.reviewMs, this.#deadlines.reviewMs);
+      this.#log.completion(actionId, { round, domain: task.domain, ok: false, reason: `the domain review ended without submit_domain_review (${raced.kind})` });
+      return undefined;
+    } finally {
+      this.#agents.delete(agentId);
+    }
+  }
+
+  /** 07g1: the recorded in-memory loop history, reconciled with the event
+   * log so a restarted conductor gives the stateless reviewer the same
+   * history. A live record for an iteration wins over the logged one. */
+  #domainLoopHistory(task: FixTask, round: number, records: readonly DomainLoopRecord[]): DomainLoopRecord[] {
+    const byIteration = new Map();
+    try {
+      for (const rec of readLog(this.#paths.events).records) {
+        if (rec.kind !== "domain_loop_pass") continue;
+        const e = rec.event as { round?: unknown; domain?: unknown; iteration?: unknown };
+        if (e.round !== round || e.domain !== task.domain || typeof e.iteration !== "number") continue;
+        byIteration.set(e.iteration, rec.event as DomainLoopRecord);
+      }
+    } catch {
+      // an unreadable log: the live records below are still the best history
+    }
+    for (const r of records) byIteration.set(r.iteration, r);
+    return [...byIteration.values()].sort((a, b) => a.iteration - b.iteration);
   }
 
   /** Plan 07c (D4.3): run one fixer's own `#+TT_FIX_CHECKS` command in a
@@ -10049,7 +10146,14 @@ export class Conductor {
         this.#recordCheck(path.join(this.#paths.checks, sha), this.#withValues(command), result);
         const ok = result.exitCode === 0 && !result.timedOut;
         this.#log.append("fixer_check_finished", { round, domain: task.domain, sha, passed: ok, exitCode: result.exitCode, timedOut: result.timedOut });
-        return ok ? { ok: true } : { ok: false, note: `the fixer check \`${command}\` ${result.timedOut ? "timed out" : `exited ${result.exitCode}`}` };
+        if (ok) return { ok: true };
+        // R1: the failure goes back to the same fixer with the check's own
+        // output, exactly as a lane's red check does.
+        const output = this.#laneCheckFailureDigest(sha);
+        return {
+          ok: false,
+          note: `the fixer check \`${command}\` ${result.timedOut ? "timed out" : `exited ${result.exitCode}`}${output ? `:\n${output}` : ""}`,
+        };
       } finally {
         checkout.dispose();
       }
@@ -10062,7 +10166,7 @@ export class Conductor {
   /** Plan 07c (D4.4): the fixer's brief, in the fixed order: the duty
    * paragraph, the phase goal, `TT_REFS`, its own findings with every field
    * (and each `from`'s `git show`), and a one-line index of the other tasks. */
-  #fixerPrompt(task: FixTask, round: number, base: string, allTasks: readonly FixTask[]): string {
+  #fixerPrompt(task: FixTask, round: number, base: string): string {
     const lines: string[] = [
       FIXER_DUTY,
       "",
@@ -10086,26 +10190,6 @@ export class Conductor {
         const show = this.#gitShow(finding.from.sha, finding.from.paths);
         if (show) lines.push("  ```", ...show.split("\n").map((l) => `  ${l}`), "  ```");
       }
-    }
-    // Fix packet Z: the decisions the seats voted down or vetoed. The seats
-    // decided; the fixer applies their alternative or removes the change.
-    if (task.decisions.length > 0) {
-      lines.push(
-        "",
-        `Your decision points (domain ${task.domain}) — the seats did not approve these choices; apply the alternative they recommend, or remove the vetoed change:`,
-      );
-      for (const point of task.decisions) {
-        lines.push(
-          `- ${point.id} [decision/${point.outcome}] item ${point.item ?? "?"} where ${point.where ?? "?"}`,
-          `  choice: ${point.choice}`,
-          `  expected: ${point.expected}`,
-          "  doneWhen: (none — the seats re-vote on the next candidate)",
-        );
-      }
-    }
-    const others = otherTaskIndexLines(allTasks, task);
-    if (others.length > 0) {
-      lines.push("", "The other fixers' tasks (their findings are not yours; do not fix them):", ...others);
     }
     lines.push(
       "",
@@ -11270,20 +11354,6 @@ export class Conductor {
       // pick is adopted as the base or, when it lost a met item in code it
       // changed, recorded as a regression (ITEMS_REGRESSED).
       if (!unfinished) this.#recordRegression(last);
-      // tt 09 (change 3): a pick the phase did not accept is combined with
-      // the plan items another lane met and it did not, before the next
-      // round starts; a green consolidation is that round's base for every
-      // lane. Recorded as ROUND_CONSOLIDATED, so a restart never redoes it.
-      if (!unfinished && last?.picked) {
-        const consolidated = await this.#consolidateRound(last.round);
-        if (consolidated === "stopped") {
-          // A recheck stopped the consolidator (the phase is CHECKING again),
-          // or the owner stopped the run: nothing was recorded, and the next
-          // start consolidates again.
-          this.#recheckCancelledLaneRound = false;
-          return;
-        }
-      }
       // Plan 07c (D4): the fix step for a pick the phase did not accept. One
       // fixer per domain runs from the same base; a merged candidate makes
       // this round a single-lane round on it. Recorded as ROUND_FIXED, so a
@@ -11300,14 +11370,22 @@ export class Conductor {
       // Plan 07c (D4.7): the fix candidate is read for an unfinished round
       // too, so a resumed synthetic lane still knows its base and disclosures.
       const fix = fixRoundCandidate(this.#state.phase.rounds, round);
-      lanes = unfinished ? last!.lanes : fix ? ["a"] : this.#lanes();
+      // 07g1: lanes run only in round 1. After a pick is adopted, exactly one
+      // lane runs on that pick (or on the fix round's merged candidate); the
+      // old combine/consolidation step is gone.
+      lanes = unfinished
+        ? last!.lanes
+        : round === 1
+          ? this.#lanes()
+          : last && !last.picked
+            ? last.lanes
+            : ["a"];
       const previous = last ? (this.#state.phase.rounds ?? []).find((r) => r.round === last.round) : undefined;
       const previousGuard = previous ? this.#pickGuard(previous.round) : undefined;
       const restartGuard = this.#pickGuard(round);
       // An unfinished round resumes from its own base. A new round starts from
       // the phase's candidate (the last adopted pick) — or, when that pick
-      // regressed, from the best candidate; tt 09 (change 3): or, when that
-      // pick was consolidated, from the consolidated commit.
+      // regressed, from the best candidate.
       const base = unfinished
         ? last!.base
         : fix
@@ -11316,12 +11394,12 @@ export class Conductor {
             ? restartGuard.best.sha
             : round === 1
               ? this.#state.phase.integrationHead
-              : (consolidatedBase(this.#state.phase.rounds, round) ?? this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
+              : (this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
       // 02k: a repeat of a round that failed only for a missing review or vote
       // restarts each lane that passed its checks from its own candidate.
       // Plan 06n (A7/R9b): a round where every lane lost an item restarts
       // every lane from the best candidate.
-      const passingBases = previous && previous.round === round - 1 ? repeatLaneBases(previous, previousGuard) : undefined;
+      const continuedStarts = previous && previous.round === round - 1 ? this.#continuedLaneStarts(previous, previousGuard) : undefined;
       this.#laneRoundRestartFromBest =
         !unfinished && previous && ((previous.regressed && restartGuard) || everyLaneLost(previous, previousGuard))
           ? (restartGuard ?? previousGuard)!.best.sha
@@ -11330,12 +11408,12 @@ export class Conductor {
       // its own saved unsubmitted work (never discarded at its deadline).
       const saved = this.#savedLaneWork();
       const prevCandidate = new Map((last?.candidates ?? []).map((c) => [c.lane, c.sha]));
-      const mergedLaneBases: Record<string, string> = {};
+      const savedStarts: Record<string, string> = {};
       const usedSaved: Array<{ lane: string; ref: string; sha: string }> = [];
       for (const lane of lanes) {
-        const passing = passingBases?.[lane];
-        if (passing) {
-          mergedLaneBases[lane] = passing;
+        const continued = continuedStarts?.[lane];
+        if (continued) {
+          savedStarts[lane] = continued;
           continue;
         }
         // Plan 06k3 (A2, finding A-2): only a lane that produced NO candidate
@@ -11345,12 +11423,12 @@ export class Conductor {
         if (last && prevCandidate.get(lane)) continue;
         const work = saved.get(lane);
         if (work) {
-          mergedLaneBases[lane] = work.sha;
+          savedStarts[lane] = work.sha;
           usedSaved.push({ lane, ref: work.ref, sha: work.sha });
         }
       }
       this.#laneSavedWorkForRound = usedSaved;
-      const laneBases = Object.keys(mergedLaneBases).length > 0 ? mergedLaneBases : undefined;
+      const laneBases = Object.keys(savedStarts).length > 0 ? savedStarts : undefined;
       if (!loggedIntent) {
         this.#log.intent(actionId, { round, base, lanes, ...(laneBases ? { laneBases } : {}) });
         loggedIntent = true;
@@ -13168,6 +13246,62 @@ export class Conductor {
     }
   }
 
+  /** 07g1: a red FINAL check is a point, not just a record. Anchor it to
+   * the first failing file the output names and put it in that file's domain;
+   * if no file can be named, put it in the first domain so the failure still
+   * reaches a domain loop. */
+  #raiseFinalCheckPoint(candidateSha: string, evidence: string, failingCommands: readonly string[]): void {
+    const domains = this.#state.phase.contract.domains ?? [];
+    if (domains.length === 0) return;
+    const seen = new Set<string>();
+    const paths: string[] = [];
+    for (const m of evidence.matchAll(/(?:^|[\s(`'"])((?:[\w.@+-]+\/)+[\w.@+-]+\.[A-Za-z0-9]+)(?::\d+)?/gm)) {
+      const p = m[1];
+      const domain = domainOf(p, domains);
+      if (!domain || seen.has(`${domain}:${p}`)) continue;
+      seen.add(`${domain}:${p}`);
+      paths.push(p);
+    }
+    const path = paths[0];
+    const domain = path ? domainOf(path, domains) : domains[0]?.name;
+    if (!domain) return;
+    const existing = (this.#state.phase.findings ?? []).find(
+      (f) => f.raisedBy === "conductor" && f.status === "open" && f.domain === domain && f.where === `${path ?? domain}:1`,
+    );
+    if (existing) return;
+    const phase = this.#state.phase;
+    const n = (phase.findings ?? []).filter((f) => f.raisedBy === "conductor").length + 1;
+    const doneWhen = failingCommands[0] ?? phase.contract.finalChecks ?? phase.contract.fixChecks;
+    this.#applyEvent({
+      type: "FINDING_RAISED",
+      finding: {
+        id: `F-${phase.phaseId}-final-${n}`,
+        version: 1,
+        phaseId: phase.phaseId,
+        kind: "defect",
+        severity: "blocking",
+        evidence: evidence.slice(0, 4000),
+        raisedBy: "conductor",
+        status: "open",
+        boundCandidateSha: candidateSha,
+        domain,
+        where: `${path ?? domain}:1`,
+        expected: "the final check passes",
+        ...(doneWhen ? { doneWhen } : {}),
+      },
+    });
+    this.#log.append("final_check_point_raised", { candidateSha, domain, where: `${path ?? domain}:1`, doneWhen });
+  }
+
+  /** 07g1: when the final check passes on a later candidate, the conductor's
+   * own final-check points no longer hold. */
+  #closeFinalCheckPoints(candidateSha: string): void {
+    for (const finding of this.#state.phase.findings ?? []) {
+      if (finding.raisedBy !== "conductor" || finding.status !== "open" || !finding.id.includes("-final-")) continue;
+      this.#applyEvent({ type: "FINDING_DISPROVED", findingId: finding.id, byReviewer: "conductor", evidence: `the final check passed on candidate ${candidateSha}` });
+    }
+  }
+
   async #runChecks(actionId: string, candidateSha: string): Promise<void> {
     // Plan 06k1 (A4): every check run on the host — phase or final tier —
     // holds one of the machine-wide check slots (at most `#checkSlots` checks
@@ -13486,13 +13620,18 @@ export class Conductor {
             );
             this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: [...kept, ...finalVerifies] });
           }
+          this.#closeFinalCheckPoints(candidateSha);
           this.#applyEvent({ type: "FINAL_CHECKS_PASSED", candidateSha });
         } else if (passed) {
           // Every command exited 0, but a final-only test did not pass in the
           // output: the repair prompt names each one as a failure to fix.
+          // 07g1: the missing final-only test is a point in the failing
+          // file's domain (or the first domain when no file is named).
+          const finalOnlyEvidence = `the final check on candidate ${candidateSha.slice(0, 9)} did not pass every final-only test: ${finalVerifyLines.join("; ")}`;
+          this.#raiseFinalCheckPoint(candidateSha, finalOnlyEvidence, [this.#state.phase.contract.finalChecks ?? this.#state.phase.contract.fixChecks ?? ""]);
           this.#applyEvent({
             type: "FINAL_CHECKS_FAILED",
-            evidence: `the final check on candidate ${candidateSha.slice(0, 9)} did not pass every final-only test: ${finalVerifyLines.join("; ")}`,
+            evidence: finalOnlyEvidence,
             failures: finalVerifies
               .filter((r) => r.outcome !== "passed")
               .map((r) => ({ name: r.name, reproducesAlone: true, loadOnly: false, failingExitCode: null, rerunExitCodes: [] })),
@@ -13516,9 +13655,11 @@ export class Conductor {
                   failingExitCode,
                   rerunExitCodes: [],
                 }));
+          const finalEvidence = `the final check failed on candidate ${candidateSha.slice(0, 9)}: ${failing.join(", ") || "(a check command exited non-zero)"}${finalVerifyLines.length > 0 ? `; ${finalVerifyLines.join("; ")}` : ""}${tail ? `\n${tail}` : ""}`;
+          this.#raiseFinalCheckPoint(candidateSha, finalEvidence, failing);
           this.#applyEvent({
             type: "FINAL_CHECKS_FAILED",
-            evidence: `the final check failed on candidate ${candidateSha.slice(0, 9)}: ${failing.join(", ") || "(a check command exited non-zero)"}${finalVerifyLines.length > 0 ? `; ${finalVerifyLines.join("; ")}` : ""}${tail ? `\n${tail}` : ""}`,
+            evidence: finalEvidence,
             ...(finalFailures.length > 0 ? { failures: finalFailures } : {}),
           });
         }

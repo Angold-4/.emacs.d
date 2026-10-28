@@ -383,14 +383,12 @@ test("a doneWhen that passes only on the lane that is not picked repairs nothing
     );
     const round2 = setup.conductor.state.phase.rounds!.find((r) => r.round === 2)!;
     const laneASha = round2.candidates.find((c) => c.lane === "a")!.sha;
-    const laneBSha = round2.candidates.find((c) => c.lane === "b")!.sha;
+    // 07g1: after the pick only one lane runs, so there is no losing lane's
+    // fact to inspect; the picked candidate's fact is the only one.
+    assert.deepEqual(round2.lanes, ["a"], "round 2 is one lane on the pick");
     await waitFor(() => coreEvents(setup.runDir).some((e) => e.type === "FINDING_FACT" && e.candidateSha === laneASha), 150_000, 50, setup.runDir);
     const events = coreEvents(setup.runDir);
-    assert.ok(
-      !events.some((e) => e.type === "FINDING_FACT" && e.candidateSha === laneBSha),
-      "no FINDING_FACT names the losing lane's sha",
-    );
-    assert.ok(!events.some((e) => e.type === "FINDING_CONFIRMED_REPAIRED"), "a losing lane's passing fact repairs nothing");
+    assert.ok(!events.some((e) => e.type === "FINDING_CONFIRMED_REPAIRED"), "a passing fact alone repairs nothing");
     assert.equal(setup.conductor.state.phase.findings.find((f) => f.doneWhen === doneWhen)!.status, "open");
   } finally {
     await teardown(setup);

@@ -31,6 +31,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { removedTests } from "../core/test-names.ts";
+import { testRemovalViolations } from "../core/fix-rounds.ts";
 
 const IDENTITY_ARGS = ["-c", "user.name=tradeoffs-trace", "-c", "user.email=tradeoffs-trace@localhost"];
 const NO_HOOKS_ARGS = ["-c", "core.hooksPath=/dev/null"];
@@ -629,6 +630,25 @@ export function removedTestsBetween(repo: string, base: string, candidateSha: st
     candidate: show(candidateSha, path),
   }));
   return removedTests(files);
+}
+
+/** 07g1: test files/functions removed between `base` and `candidateSha`
+ * without a `#+TT_TEST_REMOVALS` allowance. Unlike `removedTestsBetween`, a
+ * deleted test FILE is a violation too. */
+export function testRemovalViolationsBetween(repo: string, base: string, candidateSha: string, allowed: readonly string[] = []): string[] {
+  const show = (rev: string, file: string): string | undefined => {
+    try {
+      return execFileSync("git", ["-C", repo, "show", `${rev}:${file}`], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] });
+    } catch {
+      return undefined;
+    }
+  };
+  const files = diffNameOnly(repo, base, candidateSha).map((path) => ({
+    path,
+    base: show(base, path),
+    candidate: show(candidateSha, path),
+  }));
+  return testRemovalViolations(files, allowed);
 }
 
 /** exex 01a2: the commit a worktree's HEAD is at, or undefined when it cannot

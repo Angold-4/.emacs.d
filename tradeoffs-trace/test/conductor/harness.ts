@@ -89,6 +89,10 @@ export function defaultReviewerHello() {
   return { role: "reviewer" as const, tools: ROLE_TOOLS.reviewer };
 }
 
+export function defaultDomainReviewHello() {
+  return { role: "domain-review" as const, tools: ROLE_TOOLS["domain-review"] };
+}
+
 export interface TestConductorSetup {
   repo: TestRepo;
   runRoot: string;
@@ -140,6 +144,9 @@ export async function setupConductor(opts: {
    * counting this round's runs for that domain from 1 (the build, then each
    * fix). Absent: the worker script. */
   fixerScriptFor?: (domain: string, round: number, n: number, state: State) => { hello?: unknown; steps: FakePiStep[] };
+  /** 07g1: a fresh stateless domain review's own script. Absent: the default
+   * review approves every open point of that domain. */
+  domainReviewScriptFor?: (domain: string, round: number, iteration: number, state: State) => { hello?: unknown; steps: FakePiStep[] };
   reviewerScriptFor?: (reviewer: Reviewer, state: State) => { hello?: unknown; steps: FakePiStep[] };
   /** Plan 04a: the EVALUATING stage's fresh evaluator, ONE PER MESSAGE TYPE.
    * The default script returns an empty `submit_evaluation`, which the
@@ -310,6 +317,7 @@ export async function setupConductor(opts: {
   const pickScriptPaths = new Map<string, string>();
   const consolidatorScriptPaths = new Map<string, string>();
   const fixerScriptPaths = new Map<string, string>();
+  const domainReviewScriptPaths = new Map<string, string>();
   const evaluatorScriptPaths = new Map<string, string>();
   const briefScriptPaths = new Map<string, string>();
   const curatorScriptPaths = new Map<string, string>();
@@ -406,6 +414,25 @@ export async function setupConductor(opts: {
     };
   };
 
+  const defaultDomainReviewScript = (domain: string, state: State) => {
+    const points = (state.phase.findings ?? []).filter(
+      (f) => f.status === "open" && (!f.domain || f.domain === domain),
+    );
+    return {
+      hello: defaultDomainReviewHello(),
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_domain_review",
+          args: {
+            points: points.map((p) => ({ pointId: p.id, fixed: true, why: `README.md:1 the point is fixed on the reviewed commit (${p.id})` })),
+            quality: { ok: true },
+          },
+        },
+      ],
+    };
+  };
+
   const conductor = new Conductor({
     runDir,
     plan,
@@ -451,6 +478,21 @@ export async function setupConductor(opts: {
           fixerScriptPaths.set(agentId, writeScript(scriptsDir, agentId, opts.fixerScriptFor(domain, round, n, conductor.state)));
         }
         return { FAKE_PI_SCRIPT: fixerScriptPaths.get(agentId)!, ...(opts.extraWorkerEnv ?? {}) };
+      }
+      // 07g1: a fresh domain review, keyed by round/domain/iteration.
+      const domainReview = agentId.match(/^domain-review-(\d+)-(.+?)-(\d+)-/);
+      if (role === "domain-review" && domainReview) {
+        const round = Number(domainReview[1]);
+        const domain = domainReview[2];
+        const iteration = Number(domainReview[3]);
+        const key = `${round}-${domain}-${iteration}-${agentId}`;
+        if (!domainReviewScriptPaths.has(key)) {
+          const script = opts.domainReviewScriptFor
+            ? opts.domainReviewScriptFor(domain, round, iteration, conductor.state)
+            : defaultDomainReviewScript(domain, conductor.state);
+          domainReviewScriptPaths.set(key, writeScript(scriptsDir, key, script));
+        }
+        return { FAKE_PI_SCRIPT: domainReviewScriptPaths.get(key)! };
       }
       // Plan 06g2: a lane agent's own script, keyed by its lane/round/seat.
       const laneWorker = agentId.match(/^lane-(\d+)-([a-z])-/);

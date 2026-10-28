@@ -127,6 +127,14 @@ export interface PhaseContract {
   /** Plan 07c (D4): `#+TT_FIX_CHECKS` — the fast command every fixer's own
    * commit must pass before it is merged. */
   fixChecks?: string;
+  /** 07g1: how many domain-loop reviews one domain may spend before it is
+   * dropped. Absent means 3. */
+  domainLoopMax?: number;
+  /** 07g1: `#+TT_FORBIDDEN` — shell patterns a mapper must never run. */
+  forbidden?: string[];
+  /** 07g1: `#+TT_TEST_REMOVALS` — test files/functions the owner allowed a
+   * mapper to remove. */
+  testRemovals?: string[];
   /** Plan 06g: `#+TT_WORKERS:` frozen into the contract — how many lanes one
    * round runs. Absent (or 1) is today's single-candidate loop. */
   workers?: number;
@@ -1513,7 +1521,8 @@ export interface RoundRecord {
   /** Plan 06h (A3): present only when 3+ candidates split with no strict
    * majority and the top two went to a revote. */
   revote?: RoundRevote;
-  picked?: { lane: string; sha: string; votes: number };
+  /** 07g1: `ruling` names the owner/lead ruling that replaced the vote pick. */
+  picked?: { lane: string; sha: string; votes: number; ruling?: string };
   /** Plan 06n (A7): set by ITEMS_REGRESSED when the evaluated pick lost items
    * the phase's best candidate met, in code it changed. The pick is not
    * adopted as the next round's base; the next round restarts from the best
@@ -1529,6 +1538,50 @@ export interface RoundRecord {
    * With a `candidate`, the next round is a single-lane round on that merged
    * commit; without one it is today's two-lane round. */
   fixed?: RoundFixed;
+}
+
+/** 07g1: one domain loop's outcome, recorded with the fix round. */
+export interface EvDomainChecked {
+  type: "DOMAIN_CHECKED";
+  round: number;
+  domain: string;
+  iteration: number;
+  sha: string;
+  base: string;
+  facts: DomainFacts;
+}
+export interface EvDomainReviewed {
+  type: "DOMAIN_REVIEWED";
+  round: number;
+  domain: string;
+  iteration: number;
+  sha: string;
+  brief: string;
+  review: DomainReview;
+}
+export interface EvDomainApproved {
+  type: "DOMAIN_APPROVED";
+  round: number;
+  domain: string;
+  sha: string;
+  reviews: number;
+  /** A2: quality remarks the review did not cite to the plan or design are
+   * kept as notes on the approval, never as a reason to send work back. */
+  notes?: string[];
+}
+export interface EvDomainDropped {
+  type: "DOMAIN_DROPPED";
+  round: number;
+  domain: string;
+  reason: string;
+  reviews: number;
+}
+export interface EvForbiddenRefused {
+  type: "FORBIDDEN_REFUSED";
+  agentId: string;
+  pattern: string;
+  command: string;
+  at?: string;
 }
 
 /** tt 09 (change 3): one lane's work a consolidation takes onto the winner —
@@ -1587,6 +1640,8 @@ export interface RoundFixed {
   /** Plan 07c (C3): the fixers' own assumptions and deviations, unioned, so
    * their free-form notes are kept rather than discarded. */
   added?: string[];
+  /** 07g1: every domain loop's history, in task order. */
+  domains?: DomainLoopRecord[];
 }
 
 export interface FlakeObservation {
@@ -1941,6 +1996,8 @@ export interface EvRoundFixed {
   tasks: FixTaskRecord[];
   merges: { sha: string }[];
   candidate?: string;
+  /** 07g1: every domain loop's history, in task order. */
+  domains?: DomainLoopRecord[];
   /** Plan 07c (C3): the fixers' unioned decision disclosures, replayed into
    * the merged candidate's synthetic lane build at the hand-off. */
   disclosures?: DecisionDisclosure[];
@@ -2165,6 +2222,48 @@ export interface FindingFact {
    * repairs. Absent when the base run could not be made. */
   passesOnBase?: boolean;
 }
+export interface DomainPointVerdict {
+  pointId: string;
+  fixed: boolean;
+  why: string;
+  anchors?: string[];
+}
+
+/** 07g1: one fresh, stateless domain review's judgement. */
+export interface DomainReview {
+  points: DomainPointVerdict[];
+  quality: { ok: boolean; problems?: string[] };
+  notes?: string[];
+}
+
+/** 07g1: one point's facts on one domain-loop commit. */
+export interface DomainPointFact {
+  id: string;
+  onBase: boolean;
+  onHead: boolean;
+  doneWhen?: string;
+  outputTail?: string;
+}
+
+/** 07g1: the facts a domain loop establishes before it may start a review. */
+export interface DomainFacts {
+  checkPassed: boolean;
+  checkNote?: string;
+  points: DomainPointFact[];
+  /** Test files/functions removed without a `#+TT_TEST_REMOVALS` allowance. */
+  testRemovals?: string[];
+}
+
+/** 07g1: one domain loop's history, recorded on every pass so a resumed
+ * conductor builds the same review brief from the log alone. */
+export interface DomainLoopRecord {
+  iteration: number;
+  sha?: string;
+  facts?: DomainFacts;
+  review?: DomainReview;
+  note?: string;
+}
+
 export interface EvFindingFact {
   type: "FINDING_FACT";
   findingId: string;
@@ -2880,6 +2979,8 @@ export interface EvCandidatePicked {
   lane: string;
   sha: string;
   votes: number;
+  /** 07g1: set when an owner/lead ruling replaced the vote pick. */
+  ruling?: string;
 }
 
 /** Plan 06g2: one seat's review of one lane candidate, recorded while the
@@ -2950,6 +3051,11 @@ export type Event =
   | EvItemsRegressed
   | EvRoundConsolidated
   | EvRoundFixed
+  | EvDomainChecked
+  | EvDomainReviewed
+  | EvDomainApproved
+  | EvDomainDropped
+  | EvForbiddenRefused
   | EvFreezeCompleted
   | EvFreezeTimedOut
   | EvFreezeInterrupted

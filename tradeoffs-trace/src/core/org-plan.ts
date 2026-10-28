@@ -170,6 +170,9 @@ function parsePhaseNode(
   globalFixRounds?: string,
   globalFixers?: number,
   globalFixChecks?: string,
+  globalDomainLoopMax?: number,
+  globalForbidden?: string[],
+  globalTestRemovals?: string[],
 ): LintPhaseInput {
   const byTitle = (name: string) => node.children.find((c) => c.title === name);
   const goalNode = byTitle("Goal");
@@ -231,6 +234,9 @@ function parsePhaseNode(
     ...(globalFixRounds ? { fixRounds: globalFixRounds } : {}),
     ...(globalFixers !== undefined ? { fixers: globalFixers } : {}),
     ...(globalFixChecks ? { fixChecks: globalFixChecks } : {}),
+    ...(globalDomainLoopMax !== undefined ? { domainLoopMax: globalDomainLoopMax } : {}),
+    ...(globalForbidden && globalForbidden.length > 0 ? { forbidden: globalForbidden } : {}),
+    ...(globalTestRemovals && globalTestRemovals.length > 0 ? { testRemovals: globalTestRemovals } : {}),
   };
   if (structured) {
     phase.architecture = (architecture?.children ?? []).map((c) => itemInput(c, "architecture"));
@@ -399,10 +405,18 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   const globalFixers = globalFixersKeyword ? parseCount(globalFixersKeyword) : undefined;
   const globalFixChecksKeyword = first("TT_FIX_CHECKS");
   const globalFixChecks = globalFixChecksKeyword ? globalFixChecksKeyword.value.trim() : undefined;
+  // 07g1: the domain-loop bound, forbidden shell patterns and test-removal
+  // allowances are per-plan switches, carried onto every phase.
+  const globalDomainLoopMaxKeyword = first("TT_DOMAIN_LOOP_MAX");
+  const globalDomainLoopMax = globalDomainLoopMaxKeyword ? parseCount(globalDomainLoopMaxKeyword) : undefined;
+  const globalForbiddenKeyword = first("TT_FORBIDDEN");
+  const globalForbidden = globalForbiddenKeyword ? splitCommands(globalForbiddenKeyword.value) : undefined;
+  const globalTestRemovalsKeyword = first("TT_TEST_REMOVALS");
+  const globalTestRemovals = globalTestRemovalsKeyword ? splitCommands(globalTestRemovalsKeyword.value) : undefined;
   const phases = roots
     .filter((r) => r.level === 1)
     .map((r) =>
-      parsePhaseNode(r, [], globalFinalChecks, globalGenerated, globalRegen, globalWidePaths, globalDomains, globalFixRounds, globalFixers, globalFixChecks),
+      parsePhaseNode(r, [], globalFinalChecks, globalGenerated, globalRegen, globalWidePaths, globalDomains, globalFixRounds, globalFixers, globalFixChecks, globalDomainLoopMax, globalForbidden, globalTestRemovals),
     );
   const rerun = first("TT_RERUN");
   const envFile = first("TT_ENV_FILE")?.value;
@@ -457,6 +471,9 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
     ...(globalFixRounds ? { fixRounds: globalFixRounds, fixRoundsLine: globalFixRoundsKeyword!.line } : {}),
     ...(globalFixers !== undefined ? { fixers: globalFixers, fixersLine: globalFixersKeyword!.line } : {}),
     ...(globalFixChecks ? { fixChecks: globalFixChecks, fixChecksLine: globalFixChecksKeyword!.line } : {}),
+    ...(globalDomainLoopMax !== undefined ? { domainLoopMax: globalDomainLoopMax } : {}),
+    ...(globalForbidden && globalForbidden.length > 0 ? { forbidden: globalForbidden } : {}),
+    ...(globalTestRemovals && globalTestRemovals.length > 0 ? { testRemovals: globalTestRemovals } : {}),
     ...(Object.keys(bounds).length > 0 ? { bounds, boundLines } : {}),
     ...(checkWindow ? { checkWindow, checkWindowLine: checkWindowKeyword!.line } : {}),
   };

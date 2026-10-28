@@ -149,6 +149,11 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "ITEMS_REGRESSED",
   "ROUND_CONSOLIDATED",
   "ROUND_FIXED",
+  "DOMAIN_CHECKED",
+  "DOMAIN_REVIEWED",
+  "DOMAIN_APPROVED",
+  "DOMAIN_DROPPED",
+  "FORBIDDEN_REFUSED",
   "ROUND_REVIEW_SUBMITTED",
   "ITEM_CARRIED",
   "DECISION_ADDED",
@@ -657,7 +662,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       }
       return ok({
         ...state,
-        phase: { ...p, rounds: replaceRound(p.rounds, { ...round, picked: { lane: event.lane, sha: event.sha, votes: event.votes } }) },
+        phase: { ...p, rounds: replaceRound(p.rounds, { ...round, picked: { lane: event.lane, sha: event.sha, votes: event.votes, ...(event.ruling ? { ruling: event.ruling } : {}) } }) },
       });
     }
 
@@ -725,9 +730,19 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         ...(event.candidate ? { candidate: event.candidate } : {}),
         ...(event.disclosures && event.disclosures.length > 0 ? { disclosures: event.disclosures } : {}),
         ...(event.added && event.added.length > 0 ? { added: event.added } : {}),
+        ...(event.domains && event.domains.length > 0 ? { domains: event.domains } : {}),
       };
       return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, fixed }) } });
     }
+
+    case "DOMAIN_CHECKED":
+    case "DOMAIN_REVIEWED":
+    case "DOMAIN_APPROVED":
+    case "DOMAIN_DROPPED":
+    case "FORBIDDEN_REFUSED":
+      // 07g1: record-only. The domain loop's history is replayed from the log
+      // by the fix round; no acceptance, rejection or phase-name change moves.
+      return ok(state);
 
     case "DECISION_ADDED": {
       // Work packet 2a: a reviewer-discovered decision or a conductor

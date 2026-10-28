@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { decisionFixPoint, factKeepsOpen, fixTasks, FIXER_DUTY, otherTaskIndexLines, type DecisionFixPoint, type FixFinding } from "../../src/core/fix-rounds.ts";
+import { factKeepsOpen, fixTasks, testRemovalViolations, FIXER_DUTY, type FixFinding } from "../../src/core/fix-rounds.ts";
 import { fixRoundCandidate, isFixRound } from "../../src/core/lanes.ts";
 import { lintPlan } from "../../src/core/plan-lint.ts";
 import { reduce } from "../../src/core/reduce.ts";
@@ -89,17 +89,10 @@ test("fixTasks leaves out trade-off, escalated, closed and domainless findings",
 });
 
 test("the fixer duty paragraph says the fixer decides no trade-off and reports anything else", () => {
-  assert.match(FIXER_DUTY, /fix exactly the findings below/i);
+  assert.match(FIXER_DUTY, /fix exactly the points below/i);
   assert.match(FIXER_DUTY, /change only what they need/i);
   assert.match(FIXER_DUTY, /decide no trade-off/i);
   assert.match(FIXER_DUTY, /disclosure/i);
-});
-
-test("the other-task index names the other tasks' finding ids and nothing else", () => {
-  const tasks = fixTasks([finding("F-1", "booking"), finding("F-2", "gates"), finding("F-3", "matching")], DOMAINS, 3);
-  const lines = otherTaskIndexLines(tasks, tasks[0]);
-  assert.deepEqual(lines, ["- fix-gates: F-2 (domain gates)", "- fix-matching: F-3 (domain matching)"]);
-  assert.ok(lines.every((l) => !l.includes("expected")), "the index never carries the other findings' fields");
 });
 
 test("the plan schema accepts the fix-round keywords on a phase", () => {
@@ -224,13 +217,11 @@ test("tt lint refuses TT_FIX_ROUNDS with fewer than two workers", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Fix packet Z: voted-down and vetoed decisions are fix points
+// 07g1 (R5/A3): a decision is never a fixer task
 // ---------------------------------------------------------------------------
 
-const SEATS = ["M", "A", "B"];
-
-/** A decision point as `decisionFixPoint` builds it, for `fixTasks` tests. */
-function decisionPoint(id: string, domain: string | undefined, cls: DecisionFixPoint["class"] = "delegated"): DecisionFixPoint {
+/** A decision-shaped object a caller might wrongly hand to `fixTasks`. */
+function decisionPoint(id: string, domain: string | undefined, cls: "delegated" | "reserved" = "delegated"): Record<string, unknown> {
   return {
     source: "decision",
     id,
@@ -245,109 +236,49 @@ function decisionPoint(id: string, domain: string | undefined, cls: DecisionFixP
 }
 
 test("fixTasks groups mixed finding and decision points by domain in declaration order", () => {
-  const points = [
+  // 07g1 (R5): only findings are points. A mixed list keeps the findings and
+  // never turns a decision into a task, whatever domain it carries.
+  const mixed = [
     decisionPoint("D-1", "gates"),
     finding("F-1", "matching"),
     finding("F-2", "gates"),
     decisionPoint("D-2", "booking"),
     decisionPoint("D-3", undefined),
     finding("F-3", "booking"),
-  ];
-  const tasks = fixTasks(points, DOMAINS, 4);
+  ] as unknown as FixFinding[];
+  const tasks = fixTasks(mixed, DOMAINS, 4);
   assert.deepEqual(
-    tasks.map((t) => ({ domain: t.domain, ids: t.findingIds, findings: t.findings.map((f) => f.id), decisions: t.decisions.map((d) => d.id) })),
+    tasks.map((t) => ({ domain: t.domain, ids: t.findingIds, findings: t.findings.map((f) => f.id) })),
     [
-      { domain: "booking", ids: ["D-2", "F-3"], findings: ["F-3"], decisions: ["D-2"] },
-      { domain: "gates", ids: ["D-1", "F-2"], findings: ["F-2"], decisions: ["D-1"] },
-      { domain: "matching", ids: ["F-1"], findings: ["F-1"], decisions: [] },
+      { domain: "booking", ids: ["F-3"], findings: ["F-3"] },
+      { domain: "gates", ids: ["F-2"], findings: ["F-2"] },
+      { domain: "matching", ids: ["F-1"], findings: ["F-1"] },
     ],
-    "domains in declaration order, points in input order within a domain; a domainless decision is in no task",
+    "domains in declaration order, findings in input order within a domain; a decision is in no task",
   );
-  // The cap still counts tasks, decisions included.
-  assert.deepEqual(fixTasks(points, DOMAINS, 1).map((t) => t.findingIds), [["D-2", "F-3"]]);
+  assert.deepEqual(fixTasks(mixed, DOMAINS, 1).map((t) => t.findingIds), [["F-3"]]);
 });
 
-test("a reserved (owner) decision is never a fixer task", () => {
-  // fixTasks refuses a reserved decision point even when handed one ...
-  assert.deepEqual(fixTasks([decisionPoint("D-R", "booking", "reserved")], DOMAINS, 4), []);
-  // ... and decisionFixPoint never builds one: the owner rules on it.
-  const reserved = makeDecision({ id: "D-R", class: "reserved" });
-  const facts = {
-    ballots: [makeBallot({ decisionId: "D-R", reviewer: "M", vote: "reject", evidence: ["booking/a.ts:3"] })],
-    seats: SEATS,
-    leader: "M",
-    settled: false,
-    domains: DOMAINS,
-  };
-  assert.equal(decisionFixPoint(reserved, facts), undefined);
-  // A delegated decision with the same ballots is a point.
-  assert.ok(decisionFixPoint(makeDecision({ id: "D-R" }), facts));
+test("a reserved (owner) decision is never a fixer task", async () => {
+  // 07g1 (R5): a vetoed/triaged decision goes to the seats' vote or the
+  // owner; fixTasks refuses every decision shape, reserved included.
+  assert.deepEqual(fixTasks([decisionPoint("D-R", "booking", "reserved")] as unknown as FixFinding[], DOMAINS, 4), []);
+  assert.equal((await import("../../src/core/fix-rounds.ts")).decisionFixPoint, undefined);
 });
 
-test("decisionFixPoint: a vetoed or failed delegated decision carries the dissent reasons, the alternative and a domain", () => {
-  const decision = makeDecision({
-    id: "D1",
-    choice: "skip the overlay gate",
-    alternatives: [{ option: "keep the overlay gate", consequence: "one more check per batch" }],
-  });
-  const veto = makeBallot({ reviewer: "M", vote: "reject", rationale: "VETO: the gate is required", evidence: ["the plan", "gates/g.ts:10 check"] });
-  const approve = makeBallot({ reviewer: "A", vote: "approve", evidence: ["booking/b.ts:1"] });
-  const point = decisionFixPoint(decision, { ballots: [approve, veto], seats: SEATS, leader: "M", settled: false, domains: DOMAINS });
-  assert.ok(point);
-  assert.equal(point!.outcome, "vetoed");
-  assert.equal(point!.domain, "gates", "the first dissent evidence path a domain owns names the domain");
-  assert.equal(point!.where, "gates/g.ts:10 check");
-  assert.deepEqual(point!.reasons, ["M: VETO: the gate is required (evidence: the plan, gates/g.ts:10 check)"]);
-  assert.match(point!.alternative, /keep the overlay gate/);
-  assert.match(point!.expected, /VETO: the gate is required/);
-  assert.match(point!.expected, /keep the overlay gate/);
-  // The item's :DOMAIN: wins over the evidence path.
-  const itemPoint = decisionFixPoint(makeDecision({ itemId: "R1" }), { ballots: [veto], seats: SEATS, leader: "M", settled: false, itemDomain: "booking", domains: DOMAINS });
-  assert.equal(itemPoint!.domain, "booking");
-  assert.equal(itemPoint!.item, "R1");
-  // The evaluator's alternative, when it gave one, is the one the fixer applies.
-  const evalPoint = decisionFixPoint(decision, { ballots: [veto], seats: SEATS, leader: "M", settled: false, domains: DOMAINS, evaluatorAlternative: "EVAL_ALT" });
-  assert.equal(evalPoint!.alternative, "EVAL_ALT");
-  // M approved, A and B rejected: a failed vote, not a veto.
-  const failed = decisionFixPoint(decision, {
-    ballots: [
-      makeBallot({ reviewer: "M", vote: "approve" }),
-      makeBallot({ reviewer: "A", vote: "reject", rationale: "A dissents", evidence: ["matching/m.ts:2"] }),
-      makeBallot({ reviewer: "B", vote: "reject", rationale: "B dissents", evidence: ["booking/b.ts:2"] }),
-    ],
-    seats: SEATS,
-    leader: "M",
-    settled: false,
-    domains: DOMAINS,
-  });
-  assert.equal(failed!.outcome, "failed");
-  assert.equal(failed!.domain, "matching", "the first dissenting seat's path, in seat order");
-  // Without a domain-owned path it is returned domainless and no task takes it.
-  const noDomain = decisionFixPoint(decision, {
-    ballots: [makeBallot({ reviewer: "M", vote: "reject", evidence: ["the plan says so"] })],
-    seats: SEATS,
-    leader: "M",
-    settled: false,
-    domains: DOMAINS,
-  });
-  assert.equal(noDomain!.domain, undefined);
-  assert.deepEqual(fixTasks([noDomain!], DOMAINS, 4), []);
-  // A settled, unballoted, detail or superseded decision is no point; a
-  // ballot bound to another candidate does not count.
-  assert.equal(decisionFixPoint(decision, { ballots: [veto], seats: SEATS, leader: "M", settled: true, domains: DOMAINS }), undefined);
-  assert.equal(decisionFixPoint(decision, { ballots: [], seats: SEATS, leader: "M", settled: false, domains: DOMAINS }), undefined);
-  assert.equal(decisionFixPoint(makeDecision({ class: "detail" }), { ballots: [veto], seats: SEATS, leader: "M", settled: false, domains: DOMAINS }), undefined);
-  assert.equal(decisionFixPoint(makeDecision({ supersededBy: "x" }), { ballots: [veto], seats: SEATS, leader: "M", settled: false, domains: DOMAINS }), undefined);
-  assert.equal(
-    decisionFixPoint(decision, { ballots: [{ ...veto, boundCandidateSha: "OLD" }], seats: SEATS, leader: "M", settled: false, domains: DOMAINS }),
-    undefined,
-  );
+test("decisionFixPoint: a vetoed or failed delegated decision carries the dissent reasons, the alternative and a domain", async () => {
+  // 07g1 (R5/A3): decisionFixPoint is removed. A decision-shaped object with a
+  // domain and a doneWhen is still not fixer work; the seats' vote or the
+  // owner decides it, so no task is built from it.
+  const vetoed = { ...decisionPoint("D1", "gates"), where: "gates/g.ts:10 check", doneWhen: "test gate" } as unknown as FixFinding;
+  assert.deepEqual(fixTasks([vetoed], DOMAINS, 4), []);
+  assert.equal((await import("../../src/core/fix-rounds.ts")).decisionFixPoint, undefined);
 });
 
 test("the fixer duty tells a fixer to apply the seats' alternative and never to take an owner decision", () => {
-  assert.match(FIXER_DUTY, /apply the alternative the seats chose/i);
-  assert.match(FIXER_DUTY, /remove the vetoed change/i);
-  assert.match(FIXER_DUTY, /reserved\) decision is never your task/i);
+  assert.match(FIXER_DUTY, /voted-down or vetoed decision is never your task/i);
+  assert.match(FIXER_DUTY, /goes to the seats or the owner/i);
+  assert.match(FIXER_DUTY, /decide no trade-off/i);
 });
 
 test("an unclassified domain-mode point with a doneWhen is triaged fix (contract), not escalated", () => {
@@ -433,4 +364,40 @@ test("isFixRound marks the round that ran on a fix round's candidate, whose pick
   assert.equal(isFixRound([noCandidate, picked(2, "P2")] as never, 2), false);
   // Round 3, after the fix round, is ordinary again.
   assert.equal(isFixRound([fixed1, picked(2, "C", ["a"]), picked(3, "P3")] as never, 3), false);
+});
+
+test("a vetoed decision makes no fixer task and an unmet item citing src/x.ts becomes a task of x's domain", () => {
+  const xs: Domain[] = [{ name: "x", globs: ["src/x.ts"] }];
+  const r2: FixFinding = {
+    ...finding("R2", undefined),
+    item: "R2",
+    where: "src/x.ts:10 fn",
+    expected: "right",
+    doneWhen: "true",
+  };
+  const tasks = fixTasks([r2], xs, 4);
+  assert.deepEqual(tasks.map((t) => ({ domain: t.domain, ids: t.findingIds })), [{ domain: "x", ids: ["R2"] }]);
+  assert.equal(fixTasks([], xs, 4).length, 0, "a vetoed or discovered decision is never passed to fixTasks");
+});
+
+test("a candidate that deletes a test beyond the plan's list is red, with the deleted names", () => {
+  const base = "test('A', () => {});\ntest('B', () => {});\n";
+  assert.deepEqual(
+    testRemovalViolations(
+      [{ path: "t.test.ts", base, candidate: "test('A', () => {});\n" }],
+      [],
+    ),
+    ["t.test.ts::B"],
+  );
+  assert.deepEqual(
+    testRemovalViolations(
+      [
+        { path: "t.test.ts", base, candidate: "test('A', () => {});\n" },
+        { path: "gone.test.ts", base: "test('C', () => {});\n", candidate: undefined },
+      ],
+      ["t.test.ts::B", "gone.test.ts::C"],
+    ),
+    [],
+    "#+TT_TEST_REMOVALS names the deleted function and the deleted file's test",
+  );
 });

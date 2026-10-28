@@ -9,7 +9,7 @@ import { test } from "node:test";
 
 import { reduce } from "../../src/core/reduce.ts";
 import { planModelSelector } from "../../src/core/roles.ts";
-import { isLaneRound, laneFailureLines, lanesOfContract, repeatLaneBases, runRound, type LaneHost } from "../../src/core/lanes.ts";
+import { isLaneRound, laneFailureLines, lanesOfContract, runRound, type LaneHost } from "../../src/core/lanes.ts";
 import type { Event, RoundRecord } from "../../src/core/types.ts";
 import { baseState, CV } from "./helpers.ts";
 
@@ -258,40 +258,22 @@ test("plan 06g: laneFailureLines names every lane's own failure, so a repeated r
 // review timed out, and both lanes then restarted from the phase base,
 // rebuilding 50 minutes of work. A lane whose candidate passed now restarts
 // from it.
-test("02k: a round that could not complete restarts each passing lane from its own candidate", async () => {
-  const first = new FakeHost({ a: "C1a", b: "C1b" });
-  first.silentReviewSeat = "A";
-  const failed = await runRound(first, { round: 1, base: "B0", lanes: ["a", "b"] });
-  assert.ok(failed.failure, "a missing review fails the round");
-  assert.deepEqual(repeatLaneBases(first.rounds()[0]), { a: "C1a", b: "C1b" });
-
-  // runRound builds each lane from its own base when the context names one.
-  const bases: Record<string, string> = {};
-  const second = new FakeHost({ a: "C1a", b: "C1b" });
-  second.buildLane = async (lane: string, _round: number, base: string) => {
-    bases[lane] = base;
-    return { lane, sha: lane === "a" ? "C1a" : "C1b", disclosures: [] };
-  };
-  await runRound(second, { round: 2, base: "B0", lanes: ["a", "b"], laneBases: { a: "C1a" } });
-  assert.deepEqual(bases, { a: "C1a", b: "B0" }, "a lane without a passing candidate keeps the round's base");
-});
-
 test("02k: a round with a winner, or with no passing candidate, keeps the round's base for every lane", async () => {
   const picked = new FakeHost({ a: "C1a", b: "C1b" });
   await runRound(picked, { round: 1, base: "B0", lanes: ["a", "b"] });
   assert.ok(picked.rounds()[0].picked, "a complete round picks");
-  assert.equal(repeatLaneBases(picked.rounds()[0]), undefined);
 
   const nothing = new FakeHost({ a: { note: "crashed" }, b: { note: "no candidate" } });
   await runRound(nothing, { round: 1, base: "B0", lanes: ["a", "b"] });
-  assert.equal(repeatLaneBases(nothing.rounds()[0]), undefined, "lanes with no candidate repeat from the same base");
-  assert.equal(repeatLaneBases(undefined), undefined);
+  assert.equal(nothing.rounds()[0].picked, undefined, "lanes with no candidate pick no winner");
 });
 
 test("exex 01a2: a lane whose candidate is still red when its time runs out continues from that candidate next round", async () => {
   const host = new FakeHost({ a: "Xa", b: { note: "no candidate" } });
   await runRound(host, { round: 1, base: "B0", lanes: ["a", "b"] });
-  assert.deepEqual(repeatLaneBases(host.rounds()[0]), { a: "Xa" }, "lane a keeps its own work; lane b, with none, starts from the base");
+  const a = host.rounds()[0].candidates.find((c) => c.lane === "a");
+  assert.equal(a?.sha, "Xa", "lane a keeps its own work in the round record");
+  assert.equal(a?.ok, false, "lane a's candidate is recorded red");
 });
 
 test("exex 01a2: a lane never hands in a red tree — a failed check goes back to the same lane, which fixes it and submits again", async () => {

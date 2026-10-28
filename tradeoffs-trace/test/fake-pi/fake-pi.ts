@@ -43,7 +43,7 @@ import { randomUUID } from "node:crypto";
 import { JSONLDecoder, encodeLine, type RunSocketMessage } from "../../src/core/protocol.ts";
 
 interface HelloSpec {
-  role: "worker" | "reviewer" | "evaluator" | "picker";
+  role: "worker" | "reviewer" | "evaluator" | "picker" | "domain-review";
   tools: string[];
   agentId?: string;
   piVersion?: string;
@@ -51,7 +51,7 @@ interface HelloSpec {
 
 type Step =
   | { kind: "emit"; event: Record<string, unknown> }
-  | { kind: "call-submit"; tool: "submit_phase" | "submit_discovery" | "submit_review" | "raise_tradeoff" | "submit_evaluation" | "submit_brief" | "submit_coverage" | "submit_pick_vote"; args: unknown }
+  | { kind: "call-submit"; tool: "submit_phase" | "submit_discovery" | "submit_review" | "raise_tradeoff" | "submit_evaluation" | "submit_brief" | "submit_coverage" | "submit_pick_vote" | "submit_domain_review"; args: unknown }
   | { kind: "call-sh"; command: string; cwd?: string }
   // Plan 01a: report one environment variable of THIS agent process as a tool
   // result, so a test can assert what the conductor put in an agent's
@@ -217,7 +217,8 @@ class RunSocket {
       | "submit_evaluation"
       | "submit_brief"
       | "submit_coverage"
-      | "submit_pick_vote",
+      | "submit_pick_vote"
+      | "submit_domain_review",
     args: unknown,
   ): Promise<RunSocketMessage> {
     const id = randomUUID();

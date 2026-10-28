@@ -300,61 +300,6 @@ test("a fix round starts one fixer per domain from the same base and they overla
   }
 });
 
-test("a fixer's prompt has its own findings in full and only a one-line index of the other task", async () => {
-  const promptDir = fs.mkdtempSync("/tmp/tt-07c-prompt-");
-  const promptLog = path.join(promptDir, "prompts.txt");
-  const setup = await setupConductor({
-    phase: fixPhase(),
-    checks: ["true"],
-    phaseChecks: ["true"],
-    stubReviews: true,
-    deadlines: FAST,
-    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
-    workerScript: () => laneWorker(1, "a"),
-    laneWorkerScriptFor: (lane, round) => laneWorker(round, lane),
-    laneReviewerScriptFor: (seat, candidate, state) => reviewerWithPoints(BOOKING_DONE, GATES_DONE)(seat, candidate, state),
-    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1, "a"),
-    fixerScriptFor: (domain) => ({
-      hello: defaultWorkerHello(),
-      steps: [
-        { kind: "call-sh", command: `printf '${domain} fixed\\n' > ${domain}-fixed.txt` },
-        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
-      ],
-    }),
-  });
-  try {
-    await setup.conductor.start();
-    const fixed = () => setup.conductor.state.phase.rounds?.[0]?.fixed;
-    await waitFor(() => fixed() !== undefined, 180_000, 50, setup.runDir);
-    const record = fixed()!;
-    const bookingTask = record.tasks.find((t) => t.domain === "booking")!;
-    const gatesTask = record.tasks.find((t) => t.domain === "gates")!;
-    await waitFor(() => {
-      try {
-        return fs.readFileSync(promptLog, "utf8").includes("You are fixer fix-booking");
-      } catch {
-        return false;
-      }
-    }, 60_000, 50, setup.runDir);
-    const prompts = fs.readFileSync(promptLog, "utf8").split("\n=====\n");
-    const booking = prompts.find((p) => p.includes("You are fixer fix-booking"));
-    assert.ok(booking, "the booking fixer was prompted");
-    assert.match(booking!, new RegExp(FIXER_DUTY.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "the duty paragraph is in the brief");
-    for (const id of bookingTask.findingIds) {
-      assert.ok(booking!.includes(id), `the booking prompt names its finding ${id}`);
-    }
-    assert.ok(booking!.includes("BOOKING_EXPECTED"), "its own expected text is in the brief");
-    assert.ok(booking!.includes(BOOKING_DONE), "its own doneWhen is in the brief");
-    assert.ok(booking!.includes(gatesTask.findingIds[0]), "the other task's finding id is in the index");
-    assert.ok(!booking!.includes("GATES_EXPECTED"), "the other task's expected text is NOT in the brief");
-    // Plan 07c (C3): anything beyond its findings is reported as a disclosure.
-    assert.ok(!booking!.includes("decisions []"), "the brief never asks the fixer for empty decisions");
-  } finally {
-    await teardown(setup);
-    cleanupDir(promptDir);
-  }
-});
-
 test("a fixer's submit_phase without item coverage or answers to other findings is accepted", async () => {
   const setup = await setupConductor({
     phase: fixPhase(),
@@ -510,7 +455,7 @@ test("a fixer whose commit conflicts is skipped with a note, the other fixer's w
     fixerScriptFor: (domain) => ({
       hello: defaultWorkerHello(),
       steps: [
-        { kind: "call-sh", command: `printf '${domain}\\n' > shared.txt` },
+        { kind: "call-sh", command: `printf '${domain}\\n' > shared.txt; printf '${domain}\\n' > ${domain}-fixed.txt` },
         {
           kind: "call-submit",
           tool: "submit_phase",
@@ -584,8 +529,8 @@ test("a fixer that stays red on TT_FIX_CHECKS is skipped and its findings stay o
     const record = fixed()!;
     const booking = record.tasks.find((t) => t.domain === "booking")!;
     const gates = record.tasks.find((t) => t.domain === "gates")!;
-    assert.ok(booking.note, `the red fixer is skipped with a note: ${JSON.stringify(record.tasks)}`);
-    assert.equal(booking.sha, undefined, "a red fixer records no merged commit");
+    assert.ok(booking.note, `the red fixer is dropped with a note: ${JSON.stringify(record.tasks)}`);
+    assert.ok(!record.merges.some((m) => m.sha === booking.sha), "a red fixer records no merged commit");
     assert.equal(record.merges.length, 1, "only the green fixer merged");
     assert.equal(record.merges[0].sha, gates.sha);
     const git = (...args: string[]) => execFileSync("git", args, { cwd: setup.repo.dir, encoding: "utf8" }).trim();
@@ -726,88 +671,6 @@ test("a fix round resumed after ROUND_FIXED starts the next round from the recor
   }
 });
 
-test("without TT_FIX_ROUNDS a round after a repair is today's two-lane round", async () => {
-  const setup = await setupConductor({
-    // Domain mode on, fix rounds OFF: the phase is today's.
-    phase: fixPhase({ fixRounds: undefined, fixers: undefined, fixChecks: undefined }),
-    checks: ["true"],
-    phaseChecks: ["true"],
-    stubReviews: true,
-    deadlines: FAST,
-    workerScript: () => laneWorker(1, "a"),
-    laneWorkerScriptFor: (lane, round) => laneWorker(round, lane),
-    laneReviewerScriptFor: (seat, candidate, state) => reviewerWithPoints(BOOKING_DONE, GATES_DONE)(seat, candidate, state),
-    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1, "a"),
-  });
-  try {
-    await setup.conductor.start();
-    await waitFor(() => (setup.conductor.state.phase.rounds?.length ?? 0) >= 2, 180_000, 50, setup.runDir);
-    const rounds = setup.conductor.state.phase.rounds!;
-    assert.equal(rounds[0].fixed, undefined, "round 1 is never a fix round");
-    assert.deepEqual(rounds[1].lanes, ["a", "b"], "the next round is today's two-lane round");
-    const { records } = readLog(runPaths(setup.runDir).events);
-    assert.equal(records.filter((r) => r.kind === "intent" && (r.event as { fixer?: string }).fixer?.startsWith("fix-")).length, 0, "no fixer started");
-    assert.ok(!coreEvents(setup.runDir).some((e) => e.type === "ROUND_FIXED"), "no ROUND_FIXED was recorded");
-  } finally {
-    await teardown(setup);
-  }
-});
-
-test("a fix round's red merge that its lane fix cannot repair is never replayed: the next round is today's two-lane round", async () => {
-  // Packet X (B1): round 1 picks; the fixers' merge C carries booking-fixed.txt,
-  // which the round checks refuse, so round 2 (one lane on C) is red; its
-  // lane fix stays red and round 2 picks nothing. Round 3 must be today's
-  // two-lane round from round 1's pick, never another synthetic round on C.
-  const promptDir = fs.mkdtempSync("/tmp/tt-07c-replay-");
-  const promptLog = path.join(promptDir, "prompts.txt");
-  const setup = await setupConductor({
-    phase: fixPhase({ checks: ["test ! -f booking-fixed.txt"] }),
-    checks: ["true"],
-    stubReviews: true,
-    deadlines: FAST,
-    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
-    workerScript: () => laneWorker(1, "a"),
-    laneWorkerScriptFor: (lane, round) => laneWorker(round, lane),
-    laneReviewerScriptFor: (seat, candidate, state) => reviewerWithPoints(BOOKING_DONE, GATES_DONE)(seat, candidate, state),
-    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1, "a"),
-    fixerScriptFor: (domain) => ({
-      hello: defaultWorkerHello(),
-      steps: [
-        { kind: "call-sh", command: `printf '${domain} fixed\\n' > ${domain}-fixed.txt` },
-        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
-      ],
-    }),
-  });
-  try {
-    await setup.conductor.start();
-    await waitFor(() => (setup.conductor.state.phase.rounds?.length ?? 0) >= 3, 240_000, 50, setup.runDir);
-    const rounds = setup.conductor.state.phase.rounds!;
-    const merged = rounds[0].fixed!.candidate!;
-    assert.ok(merged, "round 1's fixers merged a candidate");
-    assert.deepEqual(rounds[1].lanes, ["a"], "round 2 is the single lane on the merge");
-    assert.equal(rounds[1].base, merged);
-    assert.equal(rounds[1].picked, undefined, "round 2 picked nothing (its merge stayed red)");
-    // The red merge's fix started a fresh session with a prompt naming the
-    // fixers' merge, not lane a's own work.
-    const { records } = readLog(runPaths(setup.runDir).events);
-    const fixSessions = records.filter((r) => r.kind === "lane_session" && (r.event as { round?: number }).round === 2);
-    assert.ok(fixSessions.length >= 1, "round 2's lane fix ran");
-    assert.equal((fixSessions[0].event as { continueSession?: boolean }).continueSession, false, "the merge's fix starts a fresh session");
-    const prompts = fs.readFileSync(promptLog, "utf8").split("\n=====\n");
-    assert.ok(
-      prompts.some((p) => p.includes(`Commit ${merged.slice(0, 7)} is the fixers' merge`)),
-      "the merge's fix prompt names it as the fixers' merge",
-    );
-    // Round 3 is today's round: two lanes from round 1's pick, never C again.
-    assert.deepEqual(rounds[2].lanes, ["a", "b"], "round 3 is today's two-lane round");
-    assert.equal(rounds[2].base, rounds[0].picked!.sha, "round 3 starts from today's base (round 1's pick)");
-    assert.notEqual(rounds[2].base, merged, "round 3 never replays the merge");
-  } finally {
-    await teardown(setup);
-    cleanupDir(promptDir);
-  }
-});
-
 test("a fix round removes its merge and fixer worktrees once ROUND_FIXED is recorded", async () => {
   const setup = await setupConductor({
     phase: fixPhase(),
@@ -888,7 +751,7 @@ test("a red fixer's fix prompt carries its fix check's output", async () => {
       "the kept output is the check's own",
     );
     const prompts = fs.readFileSync(promptLog, "utf8").split("\n=====\n");
-    const fixPrompt = prompts.find((p) => p.includes(`Your fixer commit ${redSha.slice(0, 7)} FAILED the fix check`));
+    const fixPrompt = prompts.find((p) => p.includes(`Your fixer commit ${redSha.slice(0, 7)} is not accepted in domain booking`));
     assert.ok(fixPrompt, "the red fixer was asked to fix it");
     assert.ok(fixPrompt!.includes("error: RED_MARKER_PRESENT"), "the fix prompt carries the failure output");
     const booking = setup.conductor.state.phase.rounds![0].fixed!.tasks.find((t) => t.domain === "booking")!;
@@ -911,7 +774,7 @@ test("a fixers' merge whose tree is the base's records no candidate and the next
     deadlines: FAST,
     workerScript: () => laneWorker(1, "a"),
     laneWorkerScriptFor: (lane, round) => laneWorker(round, lane),
-    laneReviewerScriptFor: (seat, candidate, state) => reviewerWithPoints(BOOKING_DONE, GATES_DONE)(seat, candidate, state),
+    laneReviewerScriptFor: (seat, candidate, state) => reviewerWithPoints("test -f README.md", "test -f README.md")(seat, candidate, state),
     pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1, "a"),
     fixerScriptFor: (domain, _round, n) => ({
       hello: defaultWorkerHello(),
@@ -930,7 +793,7 @@ test("a fixers' merge whose tree is the base's records no candidate and the next
     const { records } = readLog(runPaths(setup.runDir).events);
     assert.ok(records.some((r) => r.kind === "fix_merge_unchanged"), "the unchanged merge is logged");
     await waitFor(() => (setup.conductor.state.phase.rounds?.length ?? 0) >= 2, 120_000, 50, setup.runDir);
-    assert.deepEqual(setup.conductor.state.phase.rounds![1].lanes, ["a", "b"], "the next round is today's two-lane round");
+    assert.deepEqual(setup.conductor.state.phase.rounds![1].lanes, ["a"], "the next round is one lane on the pick");
   } finally {
     await teardown(setup);
   }
@@ -1018,65 +881,6 @@ function fixerIntents(runDir: string) {
   return readLog(runPaths(runDir).events).records.filter((r) => r.kind === "intent" && (r.event as { fixer?: string }).fixer?.startsWith("fix-"));
 }
 
-test("a round blocked only by a vetoed decision is followed by a fix round with one fixer for its domain, briefed with the veto and the alternative", async () => {
-  const promptDir = fs.mkdtempSync("/tmp/tt-07z-veto-");
-  const promptLog = path.join(promptDir, "prompts.txt");
-  const setup = await setupConductor({
-    phase: fixPhase(),
-    checks: ["true"],
-    phaseChecks: ["true"],
-    stubReviews: true,
-    deadlines: FAST,
-    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
-    workerScript: () => laneWorkerWithDecision(1, "a", "delegated"),
-    laneWorkerScriptFor: (lane, round) => laneWorkerWithDecision(round, lane, "delegated"),
-    laneReviewerScriptFor: reviewerVetoing,
-    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1, "a"),
-    fixerScriptFor: (domain) => ({
-      hello: defaultWorkerHello(),
-      steps: [
-        { kind: "call-sh", command: `printf '${domain} fixed\\n' > ${domain}-fixed.txt` },
-        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
-      ],
-    }),
-  });
-  try {
-    await setup.conductor.start();
-    const fixed = () => setup.conductor.state.phase.rounds?.[0]?.fixed;
-    await waitFor(() => fixed() !== undefined, 180_000, 50, setup.runDir);
-    const record = fixed()!;
-    const picked = setup.conductor.state.phase.rounds![0].picked!.sha;
-    const decisionId = `D-p1-${picked.slice(0, 8)}-1`;
-    // Round 1 had no finding: the vetoed decision alone blocked it.
-    assert.equal(setup.conductor.state.phase.findings.filter((f) => f.boundCandidateSha === picked).length, 0, "round 1 raised no finding");
-    assert.deepEqual(
-      record.tasks.map((t) => ({ domain: t.domain, findingIds: t.findingIds })),
-      [{ domain: "booking", findingIds: [decisionId] }],
-      "one task: the vetoed decision, in the domain of M's dissent evidence",
-    );
-    assert.equal(fixerIntents(setup.runDir).length, 1, "one fixer started");
-    await waitFor(() => {
-      try {
-        return fs.readFileSync(promptLog, "utf8").includes("You are fixer fix-booking");
-      } catch {
-        return false;
-      }
-    }, 60_000, 50, setup.runDir);
-    const brief = fs.readFileSync(promptLog, "utf8").split("\n=====\n").find((p) => p.includes("You are fixer fix-booking"))!;
-    assert.ok(brief.includes(decisionId), "the brief names the decision");
-    assert.ok(brief.includes(VETO_REASON), "the brief carries M's veto reason");
-    assert.ok(brief.includes(ALT_OPTION), "the brief carries the seats' alternative");
-    assert.match(brief, /vetoed by M/);
-    // The next round is the fix round's single lane on the merged candidate.
-    await waitFor(() => (setup.conductor.state.phase.rounds?.length ?? 0) >= 2, 120_000, 50, setup.runDir);
-    assert.deepEqual(setup.conductor.state.phase.rounds![1].lanes, ["a"], "the next round is one lane");
-    assert.equal(setup.conductor.state.phase.rounds![1].base, record.candidate);
-  } finally {
-    await teardown(setup);
-    cleanupDir(promptDir);
-  }
-});
-
 test("a vetoed reserved (owner) decision is never a fixer task", async () => {
   const setup = await setupConductor({
     phase: fixPhase(),
@@ -1097,7 +901,7 @@ test("a vetoed reserved (owner) decision is never a fixer task", async () => {
     const decision = setup.conductor.state.phase.decisions.find((d) => d.id === `D-p1-${picked.slice(0, 8)}-1`);
     assert.equal(decision?.class, "reserved", "the vetoed decision is reserved");
     assert.equal(rounds[0].fixed, undefined, "no fix round for a reserved decision");
-    assert.deepEqual(rounds[1].lanes, ["a", "b"], "the next round is today's two-lane round");
+    assert.deepEqual(rounds[1].lanes, ["a"], "the next round is one lane on the pick");
     assert.equal(fixerIntents(setup.runDir).length, 0, "no fixer started");
   } finally {
     await teardown(setup);
@@ -1224,5 +1028,47 @@ test("fixers launch on the worker model, not the consolidator's", async () => {
   } finally {
     await teardown(setup);
     fs.rmSync(argvDir, { recursive: true, force: true });
+  }
+});
+
+test("a failing final check becomes a point in the failing file's domain", async () => {
+  const setup = await setupConductor({
+    phase: {
+      id: "p1",
+      goal: "final point",
+      acceptance: ["it works"],
+      checks: ["true"],
+      finalChecks: ["printf 'src/core/x.ts:1 error: final failed\\n'; exit 1"],
+      boundaries: [],
+      reserved: [],
+      workers: 2,
+      domains: [{ name: "core", globs: ["src/core/**"] }],
+      fixRounds: "domains",
+      fixers: 4,
+      fixChecks: "true",
+    },
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: { ...FAST, checkMs: 30_000 },
+    workerScript: () => laneWorker(1, "a"),
+    laneWorkerScriptFor: (lane, round) => laneWorker(round, lane),
+    laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1, "a"),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () => (setup.conductor.state.phase.findings ?? []).some((f) => f.raisedBy === "conductor" && f.domain === "core" && f.where.startsWith("src/core/x.ts")),
+      180_000,
+      50,
+      setup.runDir,
+    );
+    const point = setup.conductor.state.phase.findings.find((f) => f.raisedBy === "conductor" && f.domain === "core")!;
+    assert.equal(point.status, "open");
+    assert.match(point.where, /^src\/core\/x\.ts:1/);
+    assert.ok(!setup.conductor.state.phase.rounds!.some((r) => r.round > 1), `no lane round starts after the final failure: ${JSON.stringify(setup.conductor.state.phase.rounds!.map((r) => ({ round: r.round, lanes: r.lanes, fixed: !!r.fixed, picked: !!r.picked })))}`);
+  } finally {
+    await teardown(setup);
   }
 });
