@@ -1,7 +1,10 @@
-// Plan 06k1 (A5): a correction that arrives while the phase is reviewing or
-// final-checking is queued for the next attempt's prompt, and grants its own
-// round even when the budget is spent. Nothing an owner sends is applied to a
-// stage that can no longer use it, or dropped.
+// Plan 07f (A3/D-5/§3.3): an owner input that needs code work is a POINT in
+// its domain's next fix loop — never a queued correction and never an
+// acceptance obligation. A phase that declares no domain has no loop for a
+// point, so a correction there is refused with the inputs that do apply (a
+// ruling settles a record, a withdraw closes one): it is never acknowledged as
+// a note that could stay undelivered after acceptance. A note stays a note:
+// it is queued for the next attempt's prompt and marked delivered there.
 
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -49,24 +52,47 @@ async function teardown(setup: TestConductorSetup): Promise<void> {
   cleanupDir(setup.scriptsDir);
 }
 
-test("plan 06k1: a correction sent during review or final checks becomes the next attempt's correction", async () => {
-  const dir = fs.mkdtempSync("/tmp/tt-06k1-late-");
+function cleanReviewer(reviewer: Reviewer, state: State): { hello: unknown; steps: FakePiStep[] } {
+  return {
+    hello: defaultReviewerHello(),
+    steps: [
+      { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+      { kind: "wait-for-prompt" },
+      {
+        kind: "call-submit",
+        tool: "submit_review",
+        args: {
+          reviewer,
+          phaseId: "p1",
+          candidateSha: state.phase.candidate?.sha,
+          contractVersion: state.phase.contract.contractVersion,
+          correctionStatements: [],
+          findingStatements: [],
+          findings: [],
+        },
+      },
+    ],
+  };
+}
+
+test("plan 07f (A3): a correction during review or final checks is refused with guidance, never kept as a note", async () => {
+  const dir = fs.mkdtempSync("/tmp/tt-07f-late-correction-");
   const promptLog = path.join(dir, "worker-prompts.log");
   const correctionReview = "CORRECTION-DURING-REVIEW: cap the retry loop at 64";
   const correctionFinal = "CORRECTION-DURING-FINAL-CHECK: name the marker final-ok.txt";
-  const phase = {
-    id: "p1",
-    goal: "do the thing",
-    acceptance: ["it works"],
-    checks: ["true"],
-    boundaries: [],
-    reserved: [],
-    // The final check fails until attempt 3 writes the file it looks for, so
-    // the phase reaches FINAL_CHECKING twice and DONE on the third candidate.
-    finalChecks: ["sleep 2; test -f final-ok.txt"],
-  };
   const setup = await setupConductor({
-    phase,
+    phase: {
+      id: "p1",
+      goal: "do the thing",
+      acceptance: ["it works"],
+      checks: ["true"],
+      boundaries: [],
+      reserved: [],
+      // The final check fails until a later attempt writes the marker, so the
+      // phase reaches FINAL_CHECKING while the test still has a state to send
+      // a correction to.
+      finalChecks: ["sleep 2; test -f final-ok.txt"],
+    },
     checks: ["true"],
     phaseChecks: ["true"],
     stubReviews: false,
@@ -76,82 +102,50 @@ test("plan 06k1: a correction sent during review or final checks becomes the nex
       steps: [
         {
           kind: "call-sh",
-          command: attempt === 3 ? "printf 'ok\\n' > final-ok.txt" : `printf 'attempt ${attempt}\\n' > attempt-${attempt}.txt`,
+          command: attempt >= 2 ? "printf 'ok\\n' > final-ok.txt" : `printf 'attempt ${attempt}\\n' > attempt-${attempt}.txt`,
         },
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
       ],
     }),
-    reviewerScriptFor: (reviewer: Reviewer, state: State): { hello: unknown; steps: FakePiStep[] } => {
-      const round = state.phase.round ?? 1;
-      const open = state.phase.findings.filter((f) => f.status === "open");
-      const findings =
-        round === 1 && reviewer === "M"
-          ? [{ kind: "defect", severity: "blocking", evidence: "README.md:1 the thing is not done" }]
-          : [];
-      const findingStatements = round >= 2 ? open.map((f) => ({ findingId: f.id, status: "withdraw", evidence: "fixed in this candidate" })) : [];
-      return {
-        hello: defaultReviewerHello(),
-        steps: [
-          { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
-          { kind: "wait-for-prompt" },
-          {
-            kind: "call-submit",
-            tool: "submit_review",
-            args: {
-              reviewer,
-              phaseId: "p1",
-              candidateSha: "$TT_CANDIDATE_SHA",
-              contractVersion: state.phase.contract.contractVersion,
-              correctionStatements: [],
-              findingStatements,
-              findings,
-            },
-          },
-        ],
-      };
-    },
+    reviewerScriptFor: (reviewer: Reviewer, state: State) => cleanReviewer(reviewer, state),
     deadlines: FAST,
   });
   await setup.conductor.start();
   try {
-    // A correction written while the phase is REVIEWING.
+    const recorded = (id: string) => (setup.conductor.state.phase.ownerInputs ?? []).find((i) => i.id === id);
+
     await waitFor(() => setup.conductor.state.phase.phase === "REVIEWING", 60_000, 50, setup.runDir);
     writeCommand(setup.runDir, "cmd-late-review", {
       type: "correction",
       text: correctionReview,
       binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" },
     });
-    await waitFor(
-      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.id === "cmd-late-review" && i.state === "noted"),
-      30_000,
-      50,
-      setup.runDir,
+    await waitFor(() => recorded("cmd-late-review")?.state === "refused", 30_000, 50, setup.runDir);
+    assert.match(
+      recorded("cmd-late-review")!.reason ?? "",
+      /declares no domain/,
+      `the refusal names the missing domain: ${recorded("cmd-late-review")!.reason}`,
     );
 
-    // A correction written while the phase is FINAL_CHECKING.
     await waitFor(() => setup.conductor.state.phase.phase === "FINAL_CHECKING", 90_000, 50, setup.runDir);
     writeCommand(setup.runDir, "cmd-late-final", {
       type: "correction",
       text: correctionFinal,
       binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" },
     });
-    await waitFor(
-      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.id === "cmd-late-final" && i.state === "noted"),
-      30_000,
-      50,
-      setup.runDir,
-    );
+    await waitFor(() => recorded("cmd-late-final")?.state === "refused", 30_000, 50, setup.runDir);
+    assert.match(recorded("cmd-late-final")!.reason ?? "", /ruling/, "the refusal points at a ruling");
+    assert.match(recorded("cmd-late-final")!.reason ?? "", /withdraw/, "the refusal points at a withdraw");
 
-    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
-
-    // Both corrections reached a worker attempt's prompt, verbatim.
-    const prompts = fs.readFileSync(promptLog, "utf8");
-    assert.match(prompts, new RegExp(correctionReview));
-    assert.match(prompts, new RegExp(correctionFinal));
-    // Neither was refused.
+    // Neither correction is kept as a note and neither reaches a prompt: an
+    // acknowledged correction that no domain owns could stay undelivered, so
+    // it is refused instead.
+    const phase = setup.conductor.state.phase;
+    assert.ok(!(phase.ownerNotes ?? []).some((n) => n.includes("CORRECTION-DURING")), "no correction is kept as a note");
+    assert.equal((phase.queuedCorrections ?? []).length, 0, "and none is a queued correction");
     assert.ok(
-      (setup.conductor.state.phase.ownerInputs ?? []).every((i) => i.state !== "refused"),
-      "a queued correction is never refused",
+      !fs.existsSync(promptLog) || !fs.readFileSync(promptLog, "utf8").includes("CORRECTION-DURING"),
+      "no worker prompt carries a refused correction",
     );
   } finally {
     await teardown(setup);
@@ -176,8 +170,8 @@ test("plan 06k1: a queued correction is not an acceptance obligation and deliver
   assert.equal(accept(ready, "C1", K), true, "the candidate is otherwise acceptable");
   const queued = { ...ready, queuedCorrections: [{ id: "C-1", text: "use UTC everywhere" }] };
   // Design draft 7 §3.3 (A3): acceptance never waits for a correction to reach
-  // a worker. The correction is still recorded and still delivered; it just
-  // does not gate the candidate.
+  // a worker. A stale record never written by this conductor still cannot gate
+  // the candidate.
   assert.equal(accept(queued, "C1", K), true, "a queued correction is not an acceptance obligation");
   const delivered = reduce(
     baseState(queued),
@@ -188,203 +182,18 @@ test("plan 06k1: a queued correction is not an acceptance obligation and deliver
   assert.equal(accept(delivered.state.phase, "C1", K), true, "and the candidate stays acceptable");
 });
 
-/** One clean reviewer, no findings: the phase would accept as soon as its
- * checks and probe pass, unless a queued correction obliges a repair. */
-function cleanReviewer(reviewer: Reviewer, state: State): { hello: unknown; steps: FakePiStep[] } {
-  return {
-    hello: defaultReviewerHello(),
-    steps: [
-      { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
-      { kind: "wait-for-prompt" },
-      {
-        kind: "call-submit",
-        tool: "submit_review",
-        args: {
-          reviewer,
-          phaseId: "p1",
-          candidateSha: state.phase.candidate?.sha,
-          contractVersion: state.phase.contract.contractVersion,
-          correctionStatements: [],
-          findingStatements: [],
-          findings: [],
-        },
-      },
-    ],
-  };
-}
-
-test("plan 06k1: a correction queued during REVIEWING never blocks acceptance and stays recorded", async () => {
-  const dir = fs.mkdtempSync("/tmp/tt-06k1-review-");
-  const promptLog = path.join(dir, "prompts.log");
-  const correction = "CORRECTION-BEFORE-DONE-REVIEW: cap the retry loop at 64";
-  const setup = await setupConductor({
-    phase: { id: "p1", goal: "do the thing", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [] },
-    checks: ["true"],
-    phaseChecks: ["true"],
-    stubReviews: false,
-    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
-    workerScriptForAttempt: (attempt) => ({
-      hello: defaultWorkerHello(),
-      steps: [
-        { kind: "call-sh", command: `printf 'attempt ${attempt}\n' > attempt-${attempt}.txt` },
-        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
-      ],
-    }),
-    reviewerScriptFor: (reviewer, state) => cleanReviewer(reviewer, state),
-    deadlines: FAST,
-  });
-  await setup.conductor.start();
-  try {
-    await waitFor(() => setup.conductor.state.phase.phase === "REVIEWING", 60_000, 20, setup.runDir);
-    writeCommand(setup.runDir, "cmd-review-correction", {
-      type: "correction",
-      text: correction,
-      binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" },
-    });
-    // The correction never blocks acceptance (design draft 7 §3.3), so the
-    // phase accepts this candidate; the correction stays in the record for the
-    // next fix of its domain and is not silently dropped.
-    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
-    const phase = setup.conductor.state.phase;
-    assert.ok(
-      (phase.ownerNotes ?? []).some((n) => n.includes(correction)),
-      "the correction is still in the record after acceptance",
-    );
-  } finally {
-    await teardown(setup);
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("plan 06k1: a correction queued during FINAL_CHECKING obliges a repair before DONE", async () => {
-  const dir = fs.mkdtempSync("/tmp/tt-06k1-final-");
-  const promptLog = path.join(dir, "prompts.log");
-  const correction = "CORRECTION-BEFORE-DONE-FINAL: name the marker final-ok.txt";
-  const setup = await setupConductor({
-    phase: { id: "p1", goal: "do the thing", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [], finalChecks: ["sleep 2"] },
-    checks: ["true"],
-    phaseChecks: ["true"],
-    stubReviews: false,
-    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
-    workerScriptForAttempt: (attempt) => ({
-      hello: defaultWorkerHello(),
-      steps: [
-        { kind: "call-sh", command: `printf 'attempt ${attempt}\n' > attempt-${attempt}.txt` },
-        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
-      ],
-    }),
-    reviewerScriptFor: (reviewer, state) => cleanReviewer(reviewer, state),
-    deadlines: FAST,
-  });
-  await setup.conductor.start();
-  try {
-    await waitFor(() => setup.conductor.state.phase.phase === "FINAL_CHECKING", 90_000, 20, setup.runDir);
-    writeCommand(setup.runDir, "cmd-final-correction", {
-      type: "correction",
-      text: correction,
-      binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" },
-    });
-    // The final check passes and the correction is a note for the next fix
-    // session; it never obliges a repair before DONE.
-    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
-    assert.ok(
-      (setup.conductor.state.phase.ownerNotes ?? []).some((n) => n.includes(correction)),
-      "the correction is still recorded for a later session",
-    );
-  } finally {
-    await teardown(setup);
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("plan 06k1: a correction queued for a lane round stays queued when both lanes fail to start", async () => {
-  const dir = fs.mkdtempSync("/tmp/tt-06k1-lane-delivery-");
-  const promptLog = path.join(dir, "prompts.log");
-  const correction = "CORRECTION-LANE-DELIVERY: keep the marker file";
-  const laneWorker = (lane: string): { hello: unknown; steps: FakePiStep[] } => ({
-    hello: defaultWorkerHello(),
-    steps: [
-      { kind: "call-sh", command: `printf 'lane ${lane}\n' > lane-${lane}.txt` },
-      { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
-    ],
-  });
-  const laneReview = (seat: Reviewer, state: State): { hello: unknown; steps: FakePiStep[] } => ({
-    hello: defaultReviewerHello(),
-    steps: [
-      { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
-      { kind: "wait-for-prompt" },
-      {
-        kind: "call-submit",
-        tool: "submit_review",
-        args: {
-          reviewer: seat,
-          phaseId: "p1",
-          candidateSha: "$TT_CANDIDATE_SHA",
-          contractVersion: state.phase.contract.contractVersion,
-          correctionStatements: [],
-          findingStatements: [],
-          ballots: [],
-          findings: [],
-        },
-      },
-    ],
-  });
-  const setup = await setupConductor({
-    phase: { id: "p1", goal: "build two candidates from one base", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [], workers: 2 },
-    checks: ["true"],
-    phaseChecks: ["true"],
-    stubReviews: true,
-    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
-    deadlines: { ...FAST, helloTimeoutMs: 1_000, workerAttemptMs: 30_000 },
-    workerScript: () => laneWorker("a"),
-    // Round 1: BOTH lanes miss hello, so no lane worker ever receives the
-    // prompt. Round 2: lane a starts and delivers it.
-    laneWorkerScriptFor: (lane, round) =>
-      round === 1
-        ? { hello: defaultWorkerHello(), helloDelayMs: 30_000, steps: [] }
-        : lane === "a"
-          ? laneWorker("a")
-          : { hello: defaultWorkerHello(), helloDelayMs: 30_000, steps: [] },
-    laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state),
-  });
-  // The correction is queued BEFORE the run starts, so round 1's lane prompt
-  // carries it. Both round-1 lanes then miss hello, so no worker ever
-  // receives that prompt; the obligation must stay until round 2 actually
-  // sends the prompt to a started lane worker.
-  writeCommand(setup.runDir, "cmd-lane-correction", {
-    type: "correction",
-    text: correction,
-    binding: { runId: path.basename(setup.runDir), phaseId: "p1" },
-  });
-  await setup.conductor.start();
-  try {
-    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
-    assert.equal(setup.conductor.state.phase.phase, "DONE");
-    // Round 1's prompt was never sent (both lanes missed hello), so the
-    // correction reached a worker only in round 2; the prompt log proves it.
-    assert.match(fs.readFileSync(promptLog, "utf8"), new RegExp(correction), "a started lane worker's prompt carried the correction");
-    assert.ok(
-      readEvents(setup.runDir).some((r) => r.kind === "event" && (r.event as { type?: string }).type === "NOTES_DELIVERED"),
-      "delivery was recorded when a lane worker actually received the prompt",
-    );
-    assert.deepEqual(setup.conductor.state.phase.queuedCorrections ?? [], [], "the delivered correction is cleared");
-  } finally {
-    await teardown(setup);
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
-
 test("plan 06k1: a correction queued with the budget spent grants its own round", () => {
-  // REVIEWING and FINAL_CHECKING both queue a correction rather than applying
-  // or refusing it.
+  // REVIEWING and FINAL_CHECKING still queue a correction RECORD (a legacy
+  // `OWNER_CORRECTION_QUEUED` in an old log); the conductor now records a
+  // point or a refusal instead, and neither gates acceptance.
   for (const name of ["REVIEWING", "FINAL_CHECKING", "EVALUATING"] as const) {
     const state = baseState({ phase: name });
     const outcome = acceptInput(state, { kind: "correction", text: "x", workerRunning: false });
-    assert.equal(outcome.kind, "queued", `a correction during ${name} is queued`);
+    assert.equal(outcome.kind, "queued", `a correction during ${name} is queued by the input map`);
   }
 
-  // With the budget spent (used == granted), the queued correction grants a
-  // fresh round and queues its text for the next attempt.
+  // With the budget spent (used == granted), the recorded queued correction
+  // grants a fresh round and queues its text for the next attempt.
   const spent = baseState({ phase: "FINAL_CHECKING", repairRoundsUsed: 3, repairRoundsGranted: 3 });
   const result = reduce(spent, {
     type: "OWNER_CORRECTION_QUEUED",
@@ -401,12 +210,12 @@ test("plan 06k1: a correction queued with the budget spent grants its own round"
 test("plan 06k2: a note queued after the lane prompt is built never enters that prompt and stays recorded", async () => {
   const dir = fs.mkdtempSync("/tmp/tt-06k2-lane-late-");
   const promptLog = path.join(dir, "prompts.log");
-  const before = "CORRECTION-BEFORE-LANE-PROMPT: keep the marker file";
-  const late = "CORRECTION-AFTER-LANE-PROMPT: cap the retry loop at 64";
+  const before = "NOTE-BEFORE-LANE-PROMPT: keep the marker file";
+  const late = "NOTE-AFTER-LANE-PROMPT: cap the retry loop at 64";
   const laneWorker = (lane: string): { hello: unknown; steps: FakePiStep[] } => ({
     hello: defaultWorkerHello(),
     steps: [
-      { kind: "call-sh", command: `mkdir -p src && printf 'lane ${lane}\n' > src/lane-${lane}.txt` },
+      { kind: "call-sh", command: `mkdir -p src && printf 'lane ${lane}\\n' > src/lane-${lane}.txt` },
       { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
     ],
   });
@@ -440,7 +249,7 @@ test("plan 06k2: a note queued after the lane prompt is built never enters that 
     deadlines: { ...FAST, helloTimeoutMs: 10_000 },
     workerScript: () => laneWorker("a"),
     // Both lanes take a while to answer hello, so the test can queue the
-    // second correction AFTER the round's prompt was built.
+    // second note AFTER the round's prompt was built.
     laneWorkerScriptFor: (lane) => ({ ...laneWorker(lane), helloDelayMs: 3_000 } as { hello: unknown; steps: FakePiStep[]; helloDelayMs: number }),
     laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state),
     pickScriptFor: (seat, state) => ({
@@ -454,17 +263,17 @@ test("plan 06k2: a note queued after the lane prompt is built never enters that 
       ],
     }),
   });
-  // The first correction is queued BEFORE the run: round 1's lane prompt
-  // carries it. The second is queued during the hello wait, after that prompt
-  // was built, so it must stay queued for the next attempt.
+  // The first note is queued BEFORE the run: round 1's lane prompt carries it.
+  // The second is queued during the hello wait, after that prompt was built,
+  // so it must stay queued for the next attempt.
   writeCommand(setup.runDir, "cmd-lane-before", {
-    type: "correction",
+    type: "note",
     text: before,
     binding: { runId: path.basename(setup.runDir), phaseId: "p1" },
   });
   await setup.conductor.start();
   // Wait until the round's lane agents are dispatched: that proves the shared
-  // lane prompt was already built, so the late correction is not in it.
+  // lane prompt was already built, so the late note is not in it.
   await waitFor(
     () => readEvents(setup.runDir).some((r) => r.kind === "intent" && typeof r.actionId === "string" && r.actionId.startsWith("lane-agent-")),
     60_000,
@@ -472,25 +281,25 @@ test("plan 06k2: a note queued after the lane prompt is built never enters that 
     setup.runDir,
   );
   writeCommand(setup.runDir, "cmd-lane-late", {
-    type: "correction",
+    type: "note",
     text: late,
     binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" },
   });
   try {
     await waitFor(() => (setup.conductor.state.phase.ownerNotes ?? []).some((n) => n.includes(late)), 60_000, 20, setup.runDir);
     await waitFor(() => setup.conductor.state.phase.phase === "DONE", 180_000, 50, setup.runDir);
-    // The first NOTES_DELIVERED delivered only the pre-prompt correction; the
-    // late one was never injected into the prompt that was already built. It
-    // stays queued (design draft 7 §3.3: acceptance never waits for it), so a
-    // later session is the only place it may appear.
+    // The first NOTES_DELIVERED delivered only the pre-prompt note; the late
+    // one was never injected into the prompt that was already built. It stays
+    // queued (design draft 7 §3.3: acceptance never waits for it), so a later
+    // session is the only place it may appear.
     const delivered = readEvents(setup.runDir).filter((r) => r.kind === "event" && (r.event as { type?: string }).type === "NOTES_DELIVERED");
-    assert.ok(delivered.length >= 1, "the round's prompt delivered its correction");
+    assert.ok(delivered.length >= 1, "the round's prompt delivered its note");
     assert.equal((delivered[0].event as { count?: number }).count, 1, "the round-1 lane prompt delivered only the note it carried");
-    assert.doesNotMatch(fs.readFileSync(promptLog, "utf8"), new RegExp(late), "the late correction never entered the already-built prompt");
+    assert.doesNotMatch(fs.readFileSync(promptLog, "utf8"), new RegExp(late), "the late note never entered the already-built prompt");
     const phase = setup.conductor.state.phase;
     assert.ok(
       (phase.ownerNotes ?? []).some((n) => n.includes(late)),
-      "the late correction is still recorded for a later session",
+      "the late note is still recorded for a later session",
     );
     assert.equal(phase.phase, "DONE");
   } finally {

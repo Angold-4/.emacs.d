@@ -1510,13 +1510,13 @@ export interface OwnerPointFields {
   doneWhen: string;
 }
 
-/** What an owner correction that arrives mid-state in domain mode does: it is
- * a point in the domain it names, it is refused for clarification because it
- * cannot be proved, or (outside domain mode) it rides the note channel. */
+/** What an owner correction does: in domain mode it is a point in the domain
+ * it names, and it is refused for clarification when it cannot be proved.
+ * Outside domain mode no domain could own a point, so it is refused with
+ * guidance to the inputs that do apply (§3.3) — it is never kept as a note. */
 export type OwnerCorrectionDecision =
   | { kind: "point"; event: Event }
-  | { kind: "refused"; reason: string }
-  | { kind: "note" };
+  | { kind: "refused"; reason: string };
 
 const OWNER_POINT_KEYS: Record<string, keyof OwnerPointFields> = {
   domain: "domain",
@@ -1547,15 +1547,18 @@ export function parseOwnerPointFields(text: string): { fields: Partial<OwnerPoin
   return { fields, missing };
 }
 
-/** Plan 07f (A3/§3.2/§3.3): what an owner correction that arrives mid-state
- * does. In a domain-mode phase it is a point in the domain the input names —
- * with `where`, `expected` and a `doneWhen` that can prove it — because a
- * point without `domain` and `doneWhen` is refused at entry (X:UNPROVABLE,
- * §3.4): never admitted unprovable, and never silently kept as a note no
- * domain owns. Nothing is inferred from prose: a path in the text or a phase
- * with one declared domain routes nothing. Outside domain mode there is no
- * domain for a fix loop, so the note channel carries the text to the next
- * brief. */
+/** Plan 07f (A3/§3.2/§3.3): what an owner correction does, whichever state it
+ * arrives in (mid-state or AWAITING_OWNER). In a domain-mode phase it is a
+ * point in the domain the input names — with `where`, `expected` and a
+ * `doneWhen` that can prove it — because a point without `domain` and
+ * `doneWhen` is refused at entry (X:UNPROVABLE, §3.4): never admitted
+ * unprovable, and never silently kept as a note no domain owns. Nothing is
+ * inferred from prose: a path in the text or a phase with one declared domain
+ * routes nothing. Outside domain mode there is no domain for a fix loop to
+ * own a point, so a correction is refused with the inputs that do apply: a
+ * ruling settles a record and a withdraw closes it. A correction is never
+ * acknowledged as a note — that could leave code work undelivered after
+ * acceptance with no executable obligation. */
 export function ownerPointForCorrection(
   phase: PhaseState,
   commandId: string,
@@ -1563,7 +1566,15 @@ export function ownerPointForCorrection(
   itemIds: readonly string[],
 ): OwnerCorrectionDecision {
   const domains = phase.contract.domains;
-  if (!domains || domains.length === 0 || !phase.candidate) return { kind: "note" };
+  if (!domains || domains.length === 0 || !phase.candidate) {
+    return {
+      kind: "refused",
+      reason:
+        `a correction is code work, and phase ${phase.phaseId} declares no domain for a fix loop, so no domain can own ` +
+        `a point here; send a ruling (\`tt input <run>\` with \`type: ruling\`, \`text\` and \`recordIds\`) to settle a ` +
+        `record, or withdraw the record (\`tt verdict <run> <record> refuse\`). A correction is never kept as a note.`,
+    };
+  }
   const { fields, missing } = parseOwnerPointFields(text);
   if (missing.length > 0) {
     return {
@@ -4175,59 +4186,51 @@ export class Conductor {
         this.#processSteerCommand(file, commandId, raw, inputText, effectiveScope);
         return;
       }
-      // A queued note or correction is carried as a note so it reaches the
-      // next worker attempt's prompt verbatim; an applied correction at
-      // AWAITING_OWNER resolves the open requests and starts a repair.
-      const queueAsNote = outcome.kind === "queued";
+      // Plan 07f (A3/§3.3): a note is carried as a note so it reaches the next
+      // worker attempt's prompt verbatim. A correction never takes this path:
+      // it is a point in its domain, or it is refused (below).
       // Plan 07f (A3/§3.3): an input that needs code work is a point for its
-      // domain's next session, never a legacy queued correction and never an
-      // acceptance obligation. In domain mode the correction must name its own
-      // domain, where, expected and doneWhen; without them it is refused for
+      // domain's next session in every state it arrives in — mid-state or
+      // AWAITING_OWNER — never a legacy queued correction, never an
+      // OWNER_CORRECTION that starts a repair, and never an acceptance
+      // obligation. In domain mode the correction must name its own domain,
+      // where, expected and doneWhen; without them it is refused for
       // clarification (a point without a proving fact is X:UNPROVABLE, §3.2),
       // not admitted unprovable and not silently kept as a note. Outside
-      // domain mode it rides the note channel into the next brief. A ruling
-      // never enters here (it is applied at once).
+      // domain mode it is refused with the inputs that do apply (a ruling or a
+      // withdraw), so code work is never acknowledged as a note that could
+      // stay undelivered. A ruling never enters here (it is applied at once).
       const decision =
-        queueAsNote && inputKind === "correction" ? this.#ownerPointForCorrection(commandId, inputText) : ({ kind: "note" } as const);
+        inputKind === "correction" ? this.#ownerPointForCorrection(commandId, inputText) : ({ kind: "note" } as const);
       if (decision.kind === "refused") {
         this.#recordOwnerInput(commandId, inputKind, inputText, "refused", undefined, decision.reason);
         this.#rejectInboxFile(file, commandId, decision.reason);
         return;
       }
-      const event: Event = queueAsNote
-        ? { type: "NOTE_ADDED", phaseId: this.#state.phase.phaseId, text: inputText }
-        : { type: "OWNER_CORRECTION", correctionId: `C-${commandId}`, text: inputText };
+      // A point is the correction's whole effect. Every other input here is a
+      // note for the next worker attempt (a steer with a live worker was
+      // handled above).
       const point = decision.kind === "point" ? decision.event : undefined;
+      const event: Event =
+        point ?? { type: "NOTE_ADDED", phaseId: this.#state.phase.phaseId, text: inputText };
       const result = reduce(this.#state, event);
       if (!result.ok) {
         this.#recordOwnerInput(commandId, inputKind, inputText, "refused", undefined, result.reason);
         this.#rejectInboxFile(file, commandId, result.reason);
         return;
       }
-      if (point) {
-        const pointResult = reduce(result.state, point);
-        if (!pointResult.ok) {
-          this.#recordOwnerInput(commandId, inputKind, inputText, "refused", undefined, pointResult.reason);
-          this.#rejectInboxFile(file, commandId, pointResult.reason);
-          return;
-        }
-      }
       this.#appliedCommandIds.add(commandId);
       this.#applyEvent(event, commandId);
-      if (point) this.#applyEvent(point, commandId);
       // Plan 01i: every input is also an owner directive — recorded here, on
       // top of the event above, so it is steered to every live agent now and
       // quoted in every later prompt.
       if (programWide) this.#forwardProgramDirective(commandId, inputText);
       else this.#addDirective(inputText, effectiveScope, commandId);
-      // The recorded effect the status view reads, never an inference: a
-      // queued correction or steer is `queued`; a note is `noted`; a
-      // correction applied at AWAITING_OWNER started a repair.
-      if (queueAsNote) {
-        this.#recordOwnerInput(commandId, inputKind === "correction" ? "correction" : "note", inputText, "noted");
-      } else {
-        this.#recordOwnerInput(commandId, "correction", inputText, "correction-started");
-      }
+      // The recorded effect the status view reads, never an inference: a queued
+      // note or steer is `noted`; a correction is `noted` too — in domain mode
+      // it is now a point in the record, and a phase with no domain refuses it
+      // above rather than keeping it as a note.
+      this.#recordOwnerInput(commandId, inputKind === "correction" ? "correction" : "note", inputText, "noted");
       crashAt("before_inbox_move");
       this.#moveInboxFile(file, this.#paths.inboxApplied);
       return;
@@ -6510,11 +6513,12 @@ export class Conductor {
     }
   }
 
-  /** Plan 07f (A3/§3.2/§3.3): an owner correction that arrives mid-state in
-   * a domain-mode phase is a point in its domain and goes to that domain's
-   * next fix loop (`ownerPointForCorrection` decides). A refusal is visible:
-   * the input is recorded refused with its reason and the inbox file is
-   * rejected, so the owner is told which fields to send. */
+  /** Plan 07f (A3/§3.2/§3.3): an owner correction is a point in its domain,
+   * whichever state it arrives in, and goes to that domain's next fix loop
+   * (`ownerPointForCorrection` decides). Outside domain mode there is no
+   * domain to own it, so it is refused. A refusal is visible: the input is
+   * recorded refused with its reason and the inbox file is rejected, so the
+   * owner is told which input (or which fields) to send. */
   #ownerPointForCorrection(commandId: string, text: string): OwnerCorrectionDecision {
     return ownerPointForCorrection(
       this.#state.phase,

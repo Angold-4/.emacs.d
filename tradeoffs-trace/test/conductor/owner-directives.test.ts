@@ -291,11 +291,11 @@ test("owner-directives: an input while the reviewers are mid-turn is steered to 
   }
 });
 
-test("owner-directives: a directive survives a restart, and a correction at AWAITING_OWNER is a directive too", async () => {
+test("owner-directives: a directive survives a restart, and a note at AWAITING_OWNER is a directive too", async () => {
   const dir = shortTmp("tt-dir-restart");
   const promptLog = path.join(dir, "worker-prompts.log");
   const text = "hold the lock under 50us";
-  const correction = "CORRECTION: a lone cancellation must not wait for the next tick";
+  const note = "NOTE: a lone cancellation must not wait for the next tick";
   const setup = await setupConductor({
     checks: ["false"],
     workerScriptForAttempt: (attempt) => ({
@@ -347,27 +347,35 @@ test("owner-directives: a directive survives a restart, and a correction at AWAI
     assert.equal(before.phase, "AWAITING_OWNER", "the resumed run is parked on the owner");
     assert.ok(before.ownerRequests.some((r) => r.status === "open"), "AWAITING_OWNER has open owner requests");
     const grantedBefore = before.repairRoundsGranted;
-    writeCommand(setup.runDir, "cmd-corr", {
-      type: "correction",
-      text: correction,
+    // Plan 07f (A3): a correction at AWAITING_OWNER is a point (or, with no
+    // domain, a refusal) — never the legacy applied correction — so the note
+    // channel is where queued owner text goes now.
+    writeCommand(setup.runDir, "cmd-note", {
+      type: "note",
+      text: note,
       binding: { runId: before.runId, phaseId: before.phaseId },
     });
 
-    await waitFor(() => stateJson(setup.runDir, setup.runRoot).phase.phase !== "AWAITING_OWNER", 60_000);
+    await waitFor(
+      () => stateJson(setup.runDir, setup.runRoot).phase.ownerDirectives?.some((d) => d.commandId === "cmd-note"),
+      60_000,
+    );
     const after = stateJson(setup.runDir, setup.runRoot).phase;
-    assert.equal(after.ownerRequests.filter((r) => r.status === "open").length, 0, "the correction resolves every request");
-    assert.equal(after.repairRoundsGranted, grantedBefore + 3, "a correction grants 3 fresh rounds");
-    const corrDirective = (after.ownerDirectives ?? []).find((d) => d.commandId === "cmd-corr");
-    assert.ok(corrDirective, "the correction is also an owner directive");
-    assert.equal(corrDirective!.id, "OD-2", "directives are numbered OD-1, OD-2, …");
-
-    await waitFor(() => {
-      const log = fs.existsSync(promptLog) ? fs.readFileSync(promptLog, "utf8") : "";
-      return log.includes(correction) && log.includes(`OD-1: ${text}`) && log.includes(`OD-2: ${correction}`);
-    }, 90_000);
-    const finalLog = fs.readFileSync(promptLog, "utf8");
-    assert.ok(finalLog.includes(`OD-1: ${text}`), "the resumed run still quotes OD-1");
-    assert.ok(finalLog.includes(`OD-2: ${correction}`), "the correction is quoted as OD-2");
+    assert.equal(after.phase, "AWAITING_OWNER", "a note moves no phase");
+    assert.equal(
+      after.ownerRequests.filter((r) => r.status === "open").length,
+      before.ownerRequests.filter((r) => r.status === "open").length,
+      "a note resolves no owner request",
+    );
+    assert.equal(after.repairRoundsGranted, grantedBefore, "a note grants no round");
+    const noteDirective = (after.ownerDirectives ?? []).find((d) => d.commandId === "cmd-note");
+    assert.ok(noteDirective, "the note is also an owner directive");
+    assert.equal(noteDirective!.id, "OD-2", "directives are numbered OD-1, OD-2, …");
+    assert.ok((after.ownerNotes ?? []).some((n) => n === note), "the note is queued for the next attempt's prompt");
+    assert.ok(
+      fs.existsSync(promptLog) && fs.readFileSync(promptLog, "utf8").includes(`OD-1: ${text}`),
+      "the resumed run still quotes OD-1",
+    );
   } finally {
     try {
       execFileSync(process.execPath, [CLI_PATH, "stop", setup.runDir, "--root", setup.runRoot], {
