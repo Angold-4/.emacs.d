@@ -120,6 +120,8 @@ export async function setupConductor(opts: {
   /** The phase contract's own `:CHECKS:` list. Defaults to `checks`, then
    * `["true"]`. */
   phaseChecks?: string[];
+  /** The plan's `#+TT_RERUN:` single-test template. Absent: none. */
+  rerun?: string;
   workerScript: (setup: { repo: TestRepo }) => { hello?: unknown; steps: FakePiStep[] };
   /** Work packet 2a: an attempt-aware alternative to the static
    * `workerScript` — needed by tests where a repair round's second attempt
@@ -287,6 +289,7 @@ export async function setupConductor(opts: {
     ...(opts.models ? { models: opts.models } : {}),
     ...(opts.workerPrompt ? { workerPrompt: opts.workerPrompt } : {}),
     ...(opts.rounds !== undefined ? { rounds: opts.rounds } : {}),
+    ...(opts.rerun ? { rerun: opts.rerun } : {}),
     phases: [
       opts.phase ?? {
         id: "p1",

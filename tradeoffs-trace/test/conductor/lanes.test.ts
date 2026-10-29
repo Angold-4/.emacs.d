@@ -1123,10 +1123,11 @@ function laneItems() {
   };
 }
 
-test("another lane's met item arrives as a point with from and no consolidation agent starts", async () => {
+/** 07g1b (R7): lane a meets review-only R1, lane b meets test-verified R3
+ * (by its seats); the pick is lane a. `gate` is the round's one declared check. */
+function lostLaneSetup(gate: string, rerun?: string): Promise<TestConductorSetup> {
   const items = laneItems();
-  const gate = `sh -c 'if [ -f only-b.txt ]; then printf "ok 1 - R3 a\\nok 2 - R3 b\\n"; fi; exit 0'`;
-  const setup = await setupConductor({
+  return setupConductor({
     phase: lanePhase({ requirements: items.requirements, constraints: [], checks: [gate] }),
     items,
     checks: [gate],
@@ -1190,7 +1191,13 @@ test("another lane's met item arrives as a point with from and no consolidation 
               ],
       }),
     pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", `${seat} picks a`),
+    ...(rerun ? { rerun } : {}),
   });
+}
+
+test("another lane's met item arrives as a point with from and no consolidation agent starts", async () => {
+  const gate = `sh -c 'if [ -f only-b.txt ]; then printf "ok 1 - R3 a\\nok 2 - R3 b\\n"; fi; exit 0'`;
+  const setup = await lostLaneSetup(gate);
   try {
     await setup.conductor.start();
     await waitFor(
@@ -1209,14 +1216,12 @@ test("another lane's met item arrives as a point with from and no consolidation 
     assert.equal(point.status, "open");
     assert.equal(point.from?.sha, b.sha, "the point names lane b's commit");
     assert.deepEqual(point.from?.paths, ["lane-b.txt", "only-b.txt"], "and the paths that commit added");
-    assert.ok(point.doneWhen, "R3 has tests, so its point carries a doneWhen");
-    assert.match(point.doneWhen!, /test-name-pattern/);
-    assert.match(point.doneWhen!, /R3 a/);
-    assert.match(point.doneWhen!, /test\/r3\.test\.ts/);
-    // A4/R7: the item's SECOND test verify counts too — the lane landed both,
-    // the pick neither, so the one fact proves both.
-    assert.match(point.doneWhen!, /R3 b/);
-    assert.match(point.doneWhen!, /test\/r3b\.test\.ts/);
+    // A4/R7: R3 has tests, so its point carries a doneWhen: the plan declares
+    // no #+TT_RERUN, so it is the phase's declared check command verbatim (it
+    // runs both lost tests, R3 a and R3 b) — never a command guessed from the
+    // tests' file extension.
+    assert.equal(point.doneWhen, gate, "the doneWhen is the declared check command");
+    assert.doesNotMatch(point.doneWhen!, /node --test|cargo test/, "no command is guessed from the file extension");
     // R1 was the pick's own: no point for it.
     assert.equal(
       setup.conductor.state.phase.findings.some((f) => f.itemId === "R1"),
@@ -1232,6 +1237,45 @@ test("another lane's met item arrives as a point with from and no consolidation 
     assert.ok(
       records.some((r) => r.kind === "lost_lane_point"),
       "the lost item is recorded as a point with from",
+    );
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("07g1b R7: another lane's seat-met test-verified item is a point with from and the declared doneWhen, even with no test loss in the outputs", async () => {
+  // Lane b's seats met R3 and lane a's (the pick's) did not, but the round's
+  // check prints no test line at all, so no test loss is detectable. R7 says
+  // "lane b met an item lane a missed: a point with from" and "its doneWhen is
+  // the item's :VERIFY: test when it has one": the point is raised, and its
+  // doneWhen is the plan's #+TT_RERUN template filled for EVERY test R3 names.
+  const rerun = "./run-one {file} -- {name}";
+  const setup = await lostLaneSetup("true", rerun);
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () => (setup.conductor.state.phase.findings ?? []).some((f) => f.item === "R3" && f.from),
+      120_000,
+      50,
+      setup.runDir,
+    );
+    const round = setup.conductor.state.phase.rounds![0];
+    const b = round.candidates.find((c) => c.lane === "b")!;
+    assert.equal(round.picked?.lane, "a", "the round picked lane a");
+    const point = setup.conductor.state.phase.findings.find((f) => f.item === "R3" && f.from)!;
+    assert.equal(point.from?.sha, b.sha, "the point names lane b's commit");
+    assert.equal(
+      point.doneWhen,
+      "./run-one 'test/r3.test.ts' -- 'R3 a' && ./run-one 'test/r3b.test.ts' -- 'R3 b'",
+      "the doneWhen is the declared template for each of R3's tests",
+    );
+    const { records } = readLog(runPaths(setup.runDir).events);
+    const lost = records.find((r) => r.kind === "lost_lane_point" && (r.event as { item?: string }).item === "R3");
+    assert.equal((lost?.event as { via?: string } | undefined)?.via, "seats", "raised on the seats' evidence");
+    assert.equal(
+      setup.conductor.state.phase.findings.some((f) => f.item === "R1" && f.from),
+      false,
+      "the pick's own met item makes no point",
     );
   } finally {
     await teardown(setup);
@@ -1525,13 +1569,16 @@ test("a lead ruling makes the next repair build on the named candidate", async (
   }
 });
 
-test("a review-only item that flips between candidates makes no regression point", async () => {
-  // Round 1 picks lane a, which meets R1's two tests and review-only C2. Round
-  // 2 (one lane on the pick) drops R1's SECOND test (the first still passes)
-  // and C2's seats flip to unmet. Round 3 therefore starts with exactly one
-  // point — R1's, whose doneWhen is the lost second test — and never a restart
-  // (A4/R13: a lost second verification is a regression even while the first
-  // still passes).
+/** The #+TT_RERUN template the regression tests declare: a point's doneWhen
+ * must be exactly this, filled from the lost verify's own name and file. */
+const REGRESSION_RERUN = "./run-one {file} -- {name}";
+
+/** 07g1b (R13/A4): round 1 picks lane a, which passes R1's two tests and
+ * meets review-only C2. Round 2 (one lane on the pick) drops R1's SECOND test
+ * (the first still passes) and C2's seats flip to unmet; R1's round-2 seat
+ * verdict is `r1Round2`. M always sends a round back, so round 3 evaluates
+ * round 2's pick against round 1's. */
+function regressionSetup(r1Round2: "met" | "unmet"): Promise<TestConductorSetup> {
   const gate = `sh -c 'if [ -f r1.txt ]; then printf "ok 1 - R1 one\\n"; else printf "not ok 1 - R1 one\\n"; fi; if [ -f r1b.txt ]; then printf "ok 2 - R1 two\\n"; else printf "not ok 2 - R1 two\\n"; fi; exit 0'`;
   const items = {
     requirements: [
@@ -1546,7 +1593,7 @@ test("a review-only item that flips between candidates makes no regression point
     architecture: [],
     constraints: [{ id: "C2", title: "C2 is kept", text: "C2 is kept", arch: [], verify: ["review"] }],
   };
-  const setup = await setupConductor({
+  return setupConductor({
     phase: lanePhase({ requirements: items.requirements, constraints: items.constraints, checks: [gate] }),
     items,
     checks: [gate],
@@ -1594,7 +1641,7 @@ test("a review-only item that flips between candidates makes no regression point
               { id: "C2", verdict: "met", evidence: `${read}:1 C2 is kept` },
             ]
           : [
-              { id: "R1", verdict: "unmet", evidence: `${read}:1 R1 is gone` },
+              { id: "R1", verdict: r1Round2, evidence: `${read}:1 ${r1Round2 === "met" ? "R1 holds" : "R1 is gone"}` },
               { id: "C2", verdict: "unmet", evidence: `${read}:1 C2 is broken` },
             ];
       // M always sends the round back with one blocking point, so the phase
@@ -1613,7 +1660,18 @@ test("a review-only item that flips between candidates makes no regression point
       return laneReview(seat as Reviewer, state.phase.contract.contractVersion, { read, items: verdicts, ...extra });
     },
     pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", `${seat} picks a`),
+    rerun: REGRESSION_RERUN,
   });
+}
+
+test("a review-only item that flips between candidates makes no regression point", async () => {
+  // Round 1 picks lane a, which meets R1's two tests and review-only C2. Round
+  // 2 (one lane on the pick) drops R1's SECOND test (the first still passes)
+  // and C2's seats flip to unmet. Round 3 therefore starts with exactly one
+  // point — R1's, whose doneWhen is the lost second test — and never a restart
+  // (A4/R13: a lost second verification is a regression even while the first
+  // still passes).
+  const setup = await regressionSetup("unmet");
   try {
     await setup.conductor.start();
     await waitFor(() => (setup.conductor.state.phase.rounds?.length ?? 0) >= 3, 150_000, 50, setup.runDir);
@@ -1625,10 +1683,9 @@ test("a review-only item that flips between candidates makes no regression point
     const r1 = points.filter((f) => f.itemId === "R1");
     assert.equal(r1.length, 1, "exactly one point for the test-verified item");
     assert.equal(r1[0].from?.sha, best.sha, "it names the candidate whose test passed");
-    assert.ok(r1[0].doneWhen, "and carries the LOST test as doneWhen");
-    assert.match(r1[0].doneWhen!, /R1 two/, "the second verification the pick lost is the fact");
-    assert.doesNotMatch(r1[0].doneWhen!, /R1 one/, "the first verification still passes, so it is no part of the fact");
-    assert.match(r1[0].doneWhen!, /test\/r1b\.test\.ts/);
+    // The second verification the pick lost is the fact, by the plan's own
+    // declared command; the first still passes, so it is no part of it.
+    assert.equal(r1[0].doneWhen, "./run-one 'test/r1b.test.ts' -- 'R1 two'", "the LOST test's declared command is the doneWhen");
     assert.equal(
       points.some((f) => f.itemId === "C2"),
       false,
@@ -1640,6 +1697,28 @@ test("a review-only item that flips between candidates makes no regression point
       records.filter((r) => r.kind === "event" && (r.event as { type?: string }).type === "ITEMS_REGRESSED").length,
       0,
     );
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("07g1b R13: a test-verified item the seats rate met on the pick still regresses when it lost a test", async () => {
+  // D-B-44 (rejected by M and A): a test that passed on the best candidate
+  // and fails on the pick is a recovery point whatever the seats voted.
+  const setup = await regressionSetup("met");
+  try {
+    await setup.conductor.start();
+    await waitFor(() => (setup.conductor.state.phase.rounds?.length ?? 0) >= 3, 150_000, 50, setup.runDir);
+    const rounds = setup.conductor.state.phase.rounds!;
+    const best = rounds[0].picked!;
+    assert.notEqual(rounds[1].picked!.sha, best.sha, "round 2's pick is a different candidate");
+    const r1 = setup.conductor.state.phase.findings.filter(
+      (f) => f.status === "open" && f.severity === "blocking" && f.from && f.item === "R1",
+    );
+    assert.equal(r1.length, 1, "the seats' met does not hide the lost test: one point for R1");
+    assert.equal(r1[0].from?.sha, best.sha);
+    assert.equal(r1[0].doneWhen, "./run-one 'test/r1b.test.ts' -- 'R1 two'", "its doneWhen is the lost test's declared command");
+    assert.equal(rounds[2].base, rounds[1].picked!.sha, "no restart: the next round still builds on the pick");
   } finally {
     await teardown(setup);
   }
