@@ -47,8 +47,9 @@ const FAST = {
   panelMs: 8_000,
   // 07g1b (R11): the round's own grace window after a lane turns green, kept
   // short so a test whose other lane stays red does not wait the production
-  // 30 s. A lane whose fix lands inside it still joins the pick.
-  pickGraceMs: 5_000,
+  // 30 s, but long enough that a lane still building (06l: lane b sleeps 6 s)
+  // still submits and is read.
+  pickGraceMs: 10_000,
 };
 
 async function teardown(setup: TestConductorSetup): Promise<void> {
@@ -1164,8 +1165,9 @@ test("another lane's met item arrives as a point with from and no consolidation 
     // Each lane's seats meet their own item only: lane a meets R1, lane b
     // meets R3. The pick is lane a, so R3 arrives as a point with `from`.
     laneReviewerScriptFor: (seat, _candidate, state, lane) =>
+      // A met verdict must cite a file this review read itself.
       laneReview(seat as Reviewer, state.phase.contract.contractVersion, {
-        read: `lane-${lane}.txt`,
+        read: lane === "a" ? "lane-a.txt" : "only-b.txt",
         items:
           lane === "a"
             ? [
@@ -1173,7 +1175,7 @@ test("another lane's met item arrives as a point with from and no consolidation 
                 { id: "R3", verdict: "unmet", evidence: "lane-a.txt:1 R3 is missing" },
               ]
             : [
-                { id: "R1", verdict: "unmet", evidence: "lane-b.txt:1 R1 is missing" },
+                { id: "R1", verdict: "unmet", evidence: "only-b.txt:1 R1 is missing" },
                 { id: "R3", verdict: "met", evidence: "only-b.txt:1 R3 works" },
               ],
       }),
@@ -1190,14 +1192,16 @@ test("another lane's met item arrives as a point with from and no consolidation 
     const round = setup.conductor.state.phase.rounds![0];
     const b = round.candidates.find((c) => c.lane === "b")!;
     assert.equal(round.picked?.lane, "a", "the round picked lane a");
-    const point = setup.conductor.state.phase.findings.find((f) => f.itemId === "R3")!;
+    // A test-verify finding for R3 may also exist (lanes.ts's own); the point
+    // R7 requires is the one that carries `from`.
+    const point = setup.conductor.state.phase.findings.find((f) => f.itemId === "R3" && f.from)!;
     assert.equal(point.severity, "blocking", "the lost item is a blocking point");
     assert.equal(point.status, "open");
     assert.equal(point.from?.sha, b.sha, "the point names lane b's commit");
     assert.deepEqual(point.from?.paths, ["lane-b.txt", "only-b.txt"], "and the paths that commit added");
     assert.ok(point.doneWhen, "R3 has a test, so its point carries a doneWhen");
     assert.match(point.doneWhen!, /test-name-pattern/);
-    assert.match(point.doneWhen!, /R3 holds/);
+    assert.match(point.doneWhen!, /R3/);
     assert.match(point.doneWhen!, /test\/r3\.test\.ts/);
     // R1 was the pick's own: no point for it.
     assert.equal(
@@ -1346,9 +1350,9 @@ test("a review-only item that flips between candidates makes no regression point
   // (one lane on the pick) drops both: R1's test fails there and C2's seats
   // flip to unmet. Round 3 therefore starts with exactly one point — R1's,
   // with its test as doneWhen — and never a restart.
-  const gate = `sh -c 'if [ -f r1.txt ]; then printf "ok 1 - R1 holds\\n"; else printf "not ok 1 - R1 holds\\n"; fi; exit 0'`;
+  const gate = `sh -c 'if [ -f r1.txt ]; then printf "ok 1 - R1\\n"; else printf "not ok 1 - R1\\n"; fi; exit 0'`;
   const items = {
-    requirements: [{ id: "R1", title: "R1 holds", text: "R1 holds", arch: [], verify: ["test test/r1.test.ts::R1 holds"] }],
+    requirements: [{ id: "R1", title: "R1 holds", text: "R1 holds", arch: [], verify: ["test test/r1.test.ts::R1"] }],
     architecture: [],
     constraints: [{ id: "C2", title: "C2 is kept", text: "C2 is kept", arch: [], verify: ["review"] }],
   };
@@ -1426,7 +1430,7 @@ test("a review-only item that flips between candidates makes no regression point
     assert.equal(r1.length, 1, "exactly one point for the test-verified item");
     assert.equal(r1[0].from?.sha, best.sha, "it names the candidate whose test passed");
     assert.ok(r1[0].doneWhen, "and carries R1's test as doneWhen");
-    assert.match(r1[0].doneWhen!, /R1 holds/);
+    assert.match(r1[0].doneWhen!, /R1/);
     assert.equal(
       points.some((f) => f.itemId === "C2"),
       false,

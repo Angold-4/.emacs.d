@@ -11678,7 +11678,15 @@ export class Conductor {
     doneWhen?: string;
   }): void {
     const phase = this.#state.phase;
-    if (phase.findings.some((f) => f.status === "open" && f.severity === "blocking" && f.itemId === opts.item.id)) return;
+    // Dedupe per source candidate: the pick's own test-verify point for the
+    // same item (no `from`) is a different record and stays.
+    if (
+      phase.findings.some(
+        (f) => f.status === "open" && f.severity === "blocking" && f.itemId === opts.item.id && f.from?.sha === opts.sha,
+      )
+    ) {
+      return;
+    }
     const finding: Finding = {
       id: `F-${phase.phaseId}-from-${opts.item.id}-${phase.findings.length + 1}`,
       version: 1,
