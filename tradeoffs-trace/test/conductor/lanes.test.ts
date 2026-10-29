@@ -1384,7 +1384,10 @@ test("a review-only item that flips between candidates makes no regression point
                     { id: "R1", status: "done", where: [`lane-${lane}.txt:1`], tests: [] },
                     { id: "C2", status: "done", where: [`lane-${lane}.txt:1`], tests: [] },
                   ]
-                : [{ id: "R1", status: "not_done", note: "this round drops R1", where: ["round2.txt:1"], tests: [] }],
+                : [
+                    { id: "R1", status: "not_done", note: "this round drops R1", where: ["round2.txt:1"], tests: [] },
+                    { id: "C2", status: "not_done", note: "this round drops C2", where: ["round2.txt:1"], tests: [] },
+                  ],
             arch: [],
           },
         },
@@ -1404,16 +1407,19 @@ test("a review-only item that flips between candidates makes no regression point
               { id: "R1", verdict: "unmet", evidence: `${read}:1 R1 is gone` },
               { id: "C2", verdict: "unmet", evidence: `${read}:1 C2 is broken` },
             ];
-      if (round === 1) return laneReview(seat as Reviewer, state.phase.contract.contractVersion, { read, items: verdicts });
-      // Round 2's own point: M sends it back once, so round 3 starts and
-      // evaluates round 2's pick.
+      // M always sends the round back with one blocking point, so the phase
+      // never accepts a pick and the next round starts (round 3 is the round
+      // that evaluates round 2's pick against round 1's).
       const open = (state.phase.findings ?? []).filter((f) => f.status === "open" && f.raisedBy === "M");
       const extra =
         seat !== "M"
           ? {}
-          : open.length === 0
-            ? { findings: [{ kind: "defect", severity: "blocking", evidence: "round2.txt:1 it works is unmet" }] }
-            : { findingStatements: open.map((f) => ({ findingId: f.id, status: "withdraw", evidence: "fixed" })) };
+          : {
+              findings: [{ kind: "defect", severity: "blocking", evidence: `${read}:1 it works is unmet` }],
+              ...(open.length > 0
+                ? { findingStatements: open.map((f) => ({ findingId: f.id, status: "withdraw", evidence: "fixed" })) }
+                : {}),
+            };
       return laneReview(seat as Reviewer, state.phase.contract.contractVersion, { read, items: verdicts, ...extra });
     },
     pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", `${seat} picks a`),
