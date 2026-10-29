@@ -475,18 +475,28 @@ test("a resumed domain loop counts the reviews its log already spent against the
 
 test("a quality problem goes back to the same fixer like an unfixed point", async () => {
   // 07g1 (A2): the domain review answers quality too. A point not fixed and a
-  // quality problem both send the verdicts back to the same fixer; only a
-  // review with every point fixed and quality ok approves the domain.
+  // quality problem that CITES a plan item or a design line both send the
+  // verdicts back to the same fixer; only a review with every point fixed and
+  // no citing quality problem approves the domain. 07g1b (A2): a quality
+  // remark that cites neither is a note on the approval, not a fixer round.
+  const itemIds = ["R1", "C1"];
   const remarks: DomainReview = {
     points: [{ pointId: "P", fixed: true, why: "README.md:1 it is fixed" }],
-    quality: { ok: false, problems: ["src/x.ts:9 the helper bypasses the design's gate"] },
+    quality: { ok: false, problems: ["R1: src/x.ts:9 the helper bypasses the design's gate"] },
     notes: ["the naming of P's helper could be better"],
   };
-  assert.equal(domainReviewApproves(task, remarks), false, "a quality problem blocks a fully fixed domain");
+  assert.equal(domainReviewApproves(task, remarks, itemIds), false, "a quality problem that cites an item blocks a fully fixed domain");
+  const uncited: DomainReview = {
+    points: [{ pointId: "P", fixed: true, why: "README.md:1 it is fixed" }],
+    quality: { ok: false, problems: ["the naming of P's helper could be better"] },
+  };
+  assert.equal(domainReviewApproves(task, uncited, itemIds), true, "an uncited quality remark never blocks");
+  assert.equal(domainReviewApproves(task, uncited), true, "with no plan items in the loop an uncited remark never blocks either");
   const sent: string[] = [];
   let reviews = 0;
   const outcome = await runDomainLoop(task, {
     maxReviews: 3,
+    itemIds,
     build: async () => ({ sha: "a" }),
     facts: async () => clean,
     review: async () => {
@@ -502,10 +512,25 @@ test("a quality problem goes back to the same fixer like an unfixed point", asyn
   assert.equal(reviews, 2, "the quality problem cost the same fixer a second round");
   assert.equal(outcome.fixes, 1, "the quality problem sent the work back");
   assert.equal(sent.length, 1, "the fixer is sent the review's verdict");
-  assert.match(sent[0], /Quality: src\/x\.ts:9 the helper bypasses the design's gate/, "the fixer sees the quality problem");
+  assert.match(sent[0], /Quality: R1: src\/x\.ts:9 the helper bypasses the design's gate/, "the fixer sees the citing quality problem");
   const brief = domainReviewBrief(task, []);
-  assert.match(brief, /a quality problem sends the work back to the same fixer/, "the brief tells the reviewer that quality blocks");
+  assert.match(brief, /a quality problem that names a plan item id or a design line/, "the brief tells the reviewer what a citing quality problem does");
   assert.doesNotMatch(brief, /never sends work back/);
+  // The uncited remark alone: approved at the first review, kept as a note.
+  const noted = await runDomainLoop(task, {
+    maxReviews: 3,
+    itemIds,
+    build: async () => ({ sha: "a" }),
+    facts: async () => clean,
+    review: async () => uncited,
+    fix: async () => ({ sha: "b" }),
+  });
+  assert.equal(noted.status, "approved", "an uncited quality remark does not hold the domain");
+  assert.equal(noted.fixes, 0, "and costs no fixer round");
+  assert.ok(
+    noted.records.some((r) => (r.review?.notes ?? []).some((n) => /quality note/.test(n))),
+    "the uncited remark is kept as a note of the approval",
+  );
 });
 
 test("a resumed conductor rebuilds the domain brief from its log and continues the pass numbering", async () => {

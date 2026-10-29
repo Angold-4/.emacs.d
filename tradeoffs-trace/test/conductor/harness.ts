@@ -136,10 +136,6 @@ export async function setupConductor(opts: {
   laneReviewerScriptFor?: (seat: string, candidate: string, state: State, lane?: string) => { hello?: unknown; steps: FakePiStep[] };
   /** Plan 06g2: one script per pick seat (`pick-<round>-<seat>-…`). */
   pickScriptFor?: (seat: string, state: State) => { hello?: unknown; steps: FakePiStep[] };
-  /** tt 09 (change 3): one script per consolidator run
-   * (`consolidate-<round>-…`), `n` counting this round's runs from 1 (the
-   * build, then each fix). Absent: the worker script. */
-  consolidatorScriptFor?: (round: number, n: number, state: State) => { hello?: unknown; steps: FakePiStep[] };
   /** Plan 07c (D4): one script per fixer run (`fix-<round>-<domain>-…`), `n`
    * counting this round's runs for that domain from 1 (the build, then each
    * fix). Absent: the worker script. */
@@ -315,7 +311,6 @@ export async function setupConductor(opts: {
   const laneWorkerScriptPaths = new Map<string, string>();
   const laneReviewerScriptPaths = new Map<string, string>();
   const pickScriptPaths = new Map<string, string>();
-  const consolidatorScriptPaths = new Map<string, string>();
   const fixerScriptPaths = new Map<string, string>();
   const domainReviewScriptPaths = new Map<string, string>();
   const evaluatorScriptPaths = new Map<string, string>();
@@ -457,16 +452,6 @@ export async function setupConductor(opts: {
     checkLockPath: opts.checkLockPath ?? path.join(runRoot, "check.lock"),
     ...(opts.checkSlots !== undefined ? { checkSlots: opts.checkSlots } : {}),
     piEnvFor: (role, agentId) => {
-      // tt 09 (change 3): the consolidator's own script, one per run.
-      const consolidate = agentId.match(/^consolidate-(\d+)-/);
-      if (role === "worker" && consolidate && opts.consolidatorScriptFor) {
-        const round = Number(consolidate[1]);
-        if (!consolidatorScriptPaths.has(agentId)) {
-          const n = [...consolidatorScriptPaths.keys()].filter((k) => k.startsWith(`consolidate-${round}-`)).length + 1;
-          consolidatorScriptPaths.set(agentId, writeScript(scriptsDir, agentId, opts.consolidatorScriptFor(round, n, conductor.state)));
-        }
-        return { FAKE_PI_SCRIPT: consolidatorScriptPaths.get(agentId)!, ...(opts.extraWorkerEnv ?? {}) };
-      }
       // Plan 07c (D4): a fixer's own script, one per run, keyed by round and
       // domain (`fix-<round>-<domain>-fixer-<seq>-<rand>`).
       const fixer = agentId.match(/^fix-(\d+)-(.+?)-fixer-\d+-[0-9a-f]+$/);

@@ -160,7 +160,7 @@ export function domainReviewBrief(task: FixTask, records: readonly DomainLoopRec
   }
   lines.push(
     "",
-    "Call submit_domain_review with one entry for EVERY point id above: { pointId, fixed, why, anchors }. Set fixed=false for anything you cannot verify yourself on this commit; name the code anchors you read. Add quality { ok, problems } for anything outside the points that would make this domain's work unsafe: a quality problem sends the work back to the same fixer, exactly as an unfixed point does. Add notes for the next fixer.",
+    "Call submit_domain_review with one entry for EVERY point id above: { pointId, fixed, why, anchors }. Set fixed=false for anything you cannot verify yourself on this commit; name the code anchors you read. Add quality { ok, problems } for anything outside the points that would make this domain's work unsafe: a quality problem that names a plan item id or a design line (§N, file.md:line) it breaks sends the work back to the same fixer, exactly as an unfixed point does; any other quality remark is recorded as a note on this domain's approval and costs no fixer round. Add notes for the next fixer.",
   );
   return lines.join("\n");
 }

@@ -27,6 +27,9 @@ export interface DomainLoopHost {
    * run continues after the last pass the conductor's log recorded, so the
    * log-built brief carries every earlier pass instead of overwriting it. */
   readonly startIteration?: number;
+  /** 07g1b (A2): the plan's item ids, so a quality problem may be checked
+   * against the item it names. Absent: only a design-line citation blocks. */
+  readonly itemIds?: readonly string[];
   /** The reviews this domain already spent before this process started. A
    * restart continues the same budget instead of handing the domain a fresh
    * one. */
@@ -70,13 +73,38 @@ export function domainFactFailure(facts: DomainFacts): string | undefined {
   return undefined;
 }
 
+/** 07g1b (A2): whether one quality problem names something the seats and the
+ * design can be held to — a plan item id (as its own token: `R2`, `C1`, `A4`,
+ * never part of a longer word) or a design line (`§3.2`, `07_full.design.md:56`).
+ * A remark that cites neither is a follow-up note, not work for the same
+ * fixer: the fixer's task is the points, and an uncited quality wish would let
+ * a review re-open settled scope (exex 01's r1 incident, 07e r4). */
+export function qualityProblemCites(problem: string, itemIds: readonly string[] = []): boolean {
+  const text = problem.trim();
+  if (text.length === 0) return false;
+  for (const id of itemIds) {
+    const escaped = id.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (escaped.length === 0) continue;
+    if (new RegExp(`(^|[^A-Za-z0-9_])${escaped}(?![A-Za-z0-9_])`).test(text)) return true;
+  }
+  return /§\s*\d/.test(text) || /[\w./-]+\.md:\d+/.test(text);
+}
+
+/** The quality problems of a review that cite a plan item or a design line —
+ * the only ones that send the work back (A2). */
+export function blockingQualityProblems(review: DomainReview, itemIds: readonly string[] = []): string[] {
+  if (review.quality.ok) return [];
+  return (review.quality.problems ?? []).filter((p) => qualityProblemCites(p, itemIds));
+}
+
 /** Whether a review approved every point of the task. 07g1 (A2): a domain
  * review blocks on its named points and on a quality problem — a point it
- * judged not fixed (or did not judge), or a quality verdict that is not ok,
- * sends the work back to the same fixer. A failing machine check is caught by
- * the facts before any review starts. */
-export function domainReviewApproves(task: FixTask, review: DomainReview): boolean {
-  if (!review.quality.ok) return false;
+ * judged not fixed (or did not judge), or a quality problem that cites a plan
+ * item or a design line, sends the work back to the same fixer. A quality
+ * remark that cites neither is a note on the approval (07g1b A2). A failing
+ * machine check is caught by the facts before any review starts. */
+export function domainReviewApproves(task: FixTask, review: DomainReview, itemIds: readonly string[] = []): boolean {
+  if (blockingQualityProblems(review, itemIds).length > 0) return false;
   for (const id of task.findingIds) {
     const verdict = review.points.find((p) => p.pointId === id);
     if (!verdict || !verdict.fixed) return false;
@@ -85,7 +113,7 @@ export function domainReviewApproves(task: FixTask, review: DomainReview): boole
 }
 
 /** The failure text sent back to the same fixer session after a review. */
-export function domainReviewFailure(task: FixTask, review: DomainReview): string {
+export function domainReviewFailure(task: FixTask, review: DomainReview, itemIds: readonly string[] = []): string {
   const lines: string[] = [];
   const bad = review.points.filter((p) => !p.fixed);
   if (bad.length > 0) {
@@ -96,9 +124,8 @@ export function domainReviewFailure(task: FixTask, review: DomainReview): string
   }
   const missing = task.findingIds.filter((id) => !review.points.some((p) => p.pointId === id));
   if (missing.length > 0) lines.push(`The review did not judge: ${missing.join(", ")}.`);
-  if (!review.quality.ok) {
-    lines.push(`Quality: ${(review.quality.problems ?? []).join("; ") || "the domain review judged the quality not ok"}`);
-  }
+  const quality = blockingQualityProblems(review, itemIds);
+  if (quality.length > 0) lines.push(`Quality: ${quality.join("; ")}`);
   if (review.notes && review.notes.length > 0) lines.push(`Notes: ${review.notes.join("; ")}`);
   return lines.join("\n") || "The domain review did not approve this commit.";
 }
@@ -118,6 +145,16 @@ export async function runDomainLoop(task: FixTask, host: DomainLoopHost): Promis
   const record = (r: DomainLoopRecord): void => {
     records.push(r);
     host.record?.(r);
+  };
+  // 07g1b (A2): a quality remark that cites neither a plan item nor a design
+  // line never sends work back; it is kept as a note of the approval instead.
+  const itemIds = host.itemIds ?? [];
+  const qualityNote = (review: DomainReview): string[] =>
+    (review.quality.ok ? [] : (review.quality.problems ?? []).filter((p) => !qualityProblemCites(p, itemIds)));
+  const notedReview = (review: DomainReview): DomainReview => {
+    const extra = qualityNote(review);
+    if (extra.length === 0) return review;
+    return { ...review, notes: [...(review.notes ?? []), ...extra.map((p) => `quality note (no plan item or design line cited): ${p}`)] };
   };
 
   let build: DomainBuild;
@@ -162,6 +199,21 @@ export async function runDomainLoop(task: FixTask, host: DomainLoopHost): Promis
       }
       fixes += 1;
       if (typeof fixed.sha !== "string" || fixed.sha.length === 0 || fixed.sha === sha) {
+        // 07g1b (R14): a fixer that reports it changed nothing has nothing to
+        // repair here, and its check is green. The domain is approved with its
+        // head as the commit rather than dropped: dropping it threw away the
+        // first commit's real work and every other domain still merged without
+        // it (the 07g1a bounds regressions). Its points stay open — the facts
+        // say so — and the next round's map (or acceptance) judges them.
+        if (fixed.unchanged === true && facts.checkPassed && (facts.testRemovals?.length ?? 0) === 0) {
+          record({
+            iteration,
+            sha,
+            facts,
+            note: "the fixer changed nothing and the fix check is green: the domain is approved with its point open",
+          });
+          return finish({ status: "approved", sha, reviews, fixes, records });
+        }
         const reason = fixed.note ?? `the fix of ${sha.slice(0, 9)} changed nothing`;
         record({ iteration, sha, facts, note: reason });
         return finish({ status: "dropped", sha, reason, reviews, fixes, records });
@@ -186,17 +238,23 @@ export async function runDomainLoop(task: FixTask, host: DomainLoopHost): Promis
       return finish({ status: "dropped", sha, reason, reviews, fixes, records });
     }
     reviews += 1;
-    const approved = domainReviewApproves(task, review);
-    record({ iteration, sha, facts, review, note: approved ? "domain review approved" : "domain review sent work back" });
-    if (reviewApproved(task, review)) return finish({ status: "approved", sha, reviews, fixes, records });
+    const approved = domainReviewApproves(task, review, itemIds);
+    record({
+      iteration,
+      sha,
+      facts,
+      review: notedReview(review),
+      note: approved ? "domain review approved" : "domain review sent work back",
+    });
+    if (reviewApproved(task, review, itemIds)) return finish({ status: "approved", sha, reviews, fixes, records });
     if (reviews >= maxReviews) {
-      const reason = `the domain loop bound was reached after ${reviews} reviews: ${domainReviewFailure(task, review).split("\n")[0]}`;
+      const reason = `the domain loop bound was reached after ${reviews} reviews: ${domainReviewFailure(task, review, itemIds).split("\n")[0]}`;
       return finish({ status: "dropped", sha, reason, reviews, fixes, records });
     }
     if (stopped()) return finish({ status: "stopped", sha, reason: "the owner stopped the run", reviews, fixes, records });
     let fixed: DomainBuild;
     try {
-      fixed = await host.fix(sha, domainReviewFailure(task, review), iteration);
+      fixed = await host.fix(sha, domainReviewFailure(task, review, itemIds), iteration);
     } catch (err) {
       fixed = { note: `the fix failed: ${String((err as Error)?.message ?? err)}` };
     }
@@ -212,6 +270,6 @@ export async function runDomainLoop(task: FixTask, host: DomainLoopHost): Promis
 }
 
 /** Small wrapper so the approval rule is one function, not two copies. */
-function reviewApproved(task: FixTask, review: DomainReview): boolean {
-  return domainReviewApproves(task, review);
+function reviewApproved(task: FixTask, review: DomainReview, itemIds: readonly string[] = []): boolean {
+  return domainReviewApproves(task, review, itemIds);
 }

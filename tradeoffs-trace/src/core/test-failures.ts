@@ -361,8 +361,7 @@ export function singleTestCommand(name: string, output: string, template?: strin
 /** The single-test commands for every name in `names`, in order. A name whose
  * command cannot be built stays in the list with `command: undefined`, so the
  * caller records it as `reproduces alone` (unproven flake = real failure)
- * instead of silently dropping it. */
-export function rerunCommandsFor(
+ * instead of silently dropping it. */export function rerunCommandsFor(
   output: string,
   names: readonly string[],
   template?: string,
@@ -371,6 +370,24 @@ export function rerunCommandsFor(
     const command = singleTestCommand(name, output, template);
     return command === undefined ? { name } : { name, command };
   });
+}
+
+/** 07g1b (A4): the command that runs ONE plan item's test verify alone, for a
+ * point made from a lost item. `singleTestCommand` reads the runner from a
+ * FAILING test's line; a test that PASSED writes none, so a point made from
+ * work another candidate landed carries the verify's own file instead (the
+ * plan's `test file::name` form). The plan's `#+TT_RERUN:` template wins when
+ * it has one. Undefined means no command is known, and the point then carries
+ * no doneWhen: it is closed by its domain review, never by a fact. */
+export function testVerifyCommand(name: string, file: string | undefined, output: string, template?: string): string | undefined {
+  const known = singleTestCommand(name, output, template);
+  if (known !== undefined) return known;
+  if (template !== undefined && template.trim().length > 0) return undefined;
+  if (file === undefined || file.trim().length === 0) return undefined;
+  if (/\.rs$/.test(file)) return `cargo test -- --exact ${shellQuote(name)} --test-threads=1`;
+  // ERT names have no built-in re-run, exactly as `singleTestCommand` says.
+  if (/\.el$/.test(file)) return undefined;
+  return `node --test --test-name-pattern ${shellQuote(escapeRegExp(name))} ${shellQuote(file)}`;
 }
 
 /** One re-run's outcome, as the caller observed it. */

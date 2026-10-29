@@ -133,6 +133,16 @@ export interface LaneHost {
   ): Promise<void>;
   /** Record one round event. */
   emit(event: Event): void;
+  /** 07g1b (R11): terminate a lane the round has stopped waiting for. Called
+   * once the round's pick is adopted: the lane's worker (or fixer) and its
+   * shell commands are killed, and nothing it does afterwards is read.
+   * Absent leaves the lane running to its own bound (its events are still
+   * ignored). */
+  stopLane?(round: number, lane: string): void;
+  /** 07g1b (R11): how long a round that already has a passing candidate waits
+   * for the other lanes before freezing the passing set and adopting it
+   * (`PICK_GRACE_MS` when unset, so the tests can shorten it). */
+  pickGraceMs?: number;
   /** Plan 06n (A7): the phase's best candidate and the plan items the pick
    * compares each lane's reviews against. Undefined (no best candidate yet,
    * or an unstructured plan) keeps the old pick. */
@@ -175,7 +185,19 @@ export interface RoundOutcome {
    * stop was recorded, and the partial round is left in place for the next
    * start to finish. */
   stopped?: boolean;
+  /** 07g1b (R11): the lanes the round stopped waiting for once its pick was
+   * adopted. Their later submissions are never read; the work they landed
+   * green before the stop is the conductor's to turn into points. */
+  stoppedLanes?: readonly string[];
 }
+
+/** 07g1b (R11): how long a round that already has a passing candidate waits
+ * for the other lanes before it adopts that candidate and stops them. A red
+ * lane keeps a short window to land its own green commit (a lane's fix that
+ * succeeds in seconds still counts); after it, the pick never waits for a
+ * fixer or a worker again (exex 01c3a: the pick sat reading for a red lane's
+ * 75-minute attempt). */
+export const PICK_GRACE_MS = 30_000;
 
 /** exex 01a2: at most this many fixes of a red candidate per lane per round;
  * past it the red candidate is the lane's record and the next round starts
@@ -258,104 +280,199 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
   // takes the machine-wide lock, so the two checks still never overlap; only
   // the wait for a slow sibling is removed. A lane that produced no candidate
   // records no candidate at all: its note is what the status shows.
-  const builds = await Promise.all(
-    lanes.map(async (lane): Promise<LaneBuild> => {
-      const prior = existing?.candidates.find((c) => c.lane === lane);
-      if (prior && typeof prior.sha === "string" && prior.sha.length > 0) {
-        // Plan 06n (A3): a kept candidate brings back its recorded build, so
-        // its reviews and the hand-off see the lane's own payload; only an
-        // unchecked one is checked.
-        const sha = prior.sha;
-        const kept: LaneBuild = host.resumeLane?.(ctx.round, lane, sha) ?? { lane, sha };
-        if (prior.ok === false || host.stopRequested?.()) return kept;
-        // 09-2: a kept candidate that is not red is reviewed from now on —
-        // while its check runs, when it still needs one.
-        startReviews(lane, sha);
-        if (prior.ok === undefined) {
-          const check = await checkWithReviews(lane, sha);
-          if (host.stopRequested?.()) return kept;
-          host.emit({
-            type: "CANDIDATE_CHECKED",
-            round: ctx.round,
-            lane,
-            ok: check.ok,
-            ...(check.note ? { note: check.note } : {}),
-          });
+  //
+  // 07g1b (R11): each lane's latest check is tracked as it lands, so the round
+  // can adopt a passing candidate without waiting for another lane's fix — or
+  // for a lane that never submitted.
+  interface LaneState {
+    ok?: boolean;
+    done: boolean;
+    build?: LaneBuild;
+  }
+  const laneState = new Map<string, LaneState>(lanes.map((lane) => [lane, { done: false }]));
+  let wake: (() => void) | undefined;
+  const bump = (): void => {
+    const woken = wake;
+    wake = undefined;
+    woken?.();
+  };
+  const waitChange = (): Promise<void> =>
+    new Promise<void>((resolve) => {
+      wake = resolve;
+    });
+  const noteCheck = (lane: string, check: LaneCheck): void => {
+    laneState.get(lane)!.ok = check.ok;
+    bump();
+  };
+  const markDone = (lane: string, build: LaneBuild): LaneBuild => {
+    const s = laneState.get(lane)!;
+    s.done = true;
+    s.build = build;
+    bump();
+    return build;
+  };
+  // A lane the round stopped waiting for may not write into the round record.
+  const stopped = new Set<string>();
+  const emit = (lane: string, event: Event): void => {
+    if (!stopped.has(lane)) host.emit(event);
+  };
+  const tasks = lanes.map(async (lane): Promise<LaneBuild> => {
+    const prior = existing?.candidates.find((c) => c.lane === lane);
+    if (prior && typeof prior.sha === "string" && prior.sha.length > 0) {
+      // Plan 06n (A3): a kept candidate brings back its recorded build, so
+      // its reviews and the hand-off see the lane's own payload; only an
+      // unchecked one is checked.
+      const sha = prior.sha;
+      const kept: LaneBuild = host.resumeLane?.(ctx.round, lane, sha) ?? { lane, sha };
+      if (prior.ok !== undefined) noteCheck(lane, { ok: prior.ok, ...(prior.note ? { note: prior.note } : {}) });
+      if (prior.ok === false || host.stopRequested?.()) return markDone(lane, kept);
+      // 09-2: a kept candidate that is not red is reviewed from now on —
+      // while its check runs, when it still needs one.
+      startReviews(lane, sha);
+      if (prior.ok === undefined) {
+        const check = await checkWithReviews(lane, sha);
+        noteCheck(lane, check);
+        if (host.stopRequested?.()) return markDone(lane, kept);
+        emit(lane, {
+          type: "CANDIDATE_CHECKED",
+          round: ctx.round,
+          lane,
+          ok: check.ok,
+          ...(check.note ? { note: check.note } : {}),
+        });
+      }
+      return markDone(lane, kept);
+    }
+    // Plan 06n (A3): nothing new starts after a requested stop.
+    if (host.stopRequested?.()) return markDone(lane, { lane, note: "the run was stopped" });
+    let build: LaneBuild;
+    try {
+      build = await host.buildLane(lane, ctx.round, ctx.laneBases?.[lane] ?? ctx.base, prompt);
+    } catch (err) {
+      build = { lane, note: `the lane failed: ${errorNote(err)}` };
+    }
+    if (typeof build.sha === "string" && build.sha.length > 0) {
+      if (host.stopRequested?.()) return markDone(lane, build);
+      emit(build.lane, { type: "CANDIDATE_SUBMITTED", round: ctx.round, lane: build.lane, sha: build.sha });
+      startReviews(build.lane, build.sha);
+      let check = await checkWithReviews(build.lane, build.sha);
+      noteCheck(build.lane, check);
+      if (host.stopRequested?.()) return markDone(lane, build);
+      emit(build.lane, {
+        type: "CANDIDATE_CHECKED",
+        round: ctx.round,
+        lane: build.lane,
+        ok: check.ok,
+        ...(check.note ? { note: check.note } : {}),
+      });
+      // exex 01a2: a red tree is never the lane's hand-in while it still
+      // has time. Its worker fixes the failure on its own candidate and
+      // submits again; each new commit is submitted, reviewed (09-2) and
+      // checked like the first. Only a green candidate, or a lane out of
+      // time, ends the loop.
+      let fixes = 0;
+      while (!check.ok && host.fixLane && fixes < MAX_LANE_FIXES && !host.stopRequested?.()) {
+        fixes += 1;
+        let fixed: LaneBuild;
+        try {
+          fixed = await host.fixLane(build.lane, ctx.round, build.sha!, check.note ?? "the checks failed");
+        } catch (err) {
+          fixed = { lane: build.lane, note: `the fix attempt failed: ${errorNote(err)}` };
         }
-        return kept;
-      }
-      // Plan 06n (A3): nothing new starts after a requested stop.
-      if (host.stopRequested?.()) return { lane, note: "the run was stopped" };
-      let build: LaneBuild;
-      try {
-        build = await host.buildLane(lane, ctx.round, ctx.laneBases?.[lane] ?? ctx.base, prompt);
-      } catch (err) {
-        build = { lane, note: `the lane failed: ${errorNote(err)}` };
-      }
-      if (typeof build.sha === "string" && build.sha.length > 0) {
-        if (host.stopRequested?.()) return build;
-        host.emit({ type: "CANDIDATE_SUBMITTED", round: ctx.round, lane: build.lane, sha: build.sha });
-        startReviews(build.lane, build.sha);
-        let check = await checkWithReviews(build.lane, build.sha);
-        if (host.stopRequested?.()) return build;
-        host.emit({
+        // 07g1b (R11): a lane the round stopped waiting for keeps fixing in
+        // its own worktree (its work is saved to a ref), but nothing it
+        // submits from now on is read.
+        if (stopped.has(build.lane)) break;
+        if (typeof fixed.sha !== "string" || fixed.sha.length === 0 || fixed.sha === build.sha) break;
+        build = fixed;
+        if (host.stopRequested?.()) return markDone(lane, build);
+        emit(build.lane, { type: "CANDIDATE_SUBMITTED", round: ctx.round, lane: build.lane, sha: build.sha! });
+        startReviews(build.lane, build.sha!);
+        check = await checkWithReviews(build.lane, build.sha!);
+        noteCheck(build.lane, check);
+        if (host.stopRequested?.()) return markDone(lane, build);
+        emit(build.lane, {
           type: "CANDIDATE_CHECKED",
           round: ctx.round,
           lane: build.lane,
           ok: check.ok,
           ...(check.note ? { note: check.note } : {}),
         });
-        // exex 01a2: a red tree is never the lane's hand-in while it still
-        // has time. Its worker fixes the failure on its own candidate and
-        // submits again; each new commit is submitted, reviewed (09-2) and
-        // checked like the first. Only a green candidate, or a lane out of
-        // time, ends the loop.
-        let fixes = 0;
-        while (!check.ok && host.fixLane && fixes < MAX_LANE_FIXES && !host.stopRequested?.()) {
-          fixes += 1;
-          let fixed: LaneBuild;
-          try {
-            fixed = await host.fixLane(build.lane, ctx.round, build.sha!, check.note ?? "the checks failed");
-          } catch (err) {
-            fixed = { lane: build.lane, note: `the fix attempt failed: ${errorNote(err)}` };
-          }
-          if (typeof fixed.sha !== "string" || fixed.sha.length === 0 || fixed.sha === build.sha) break;
-          build = fixed;
-          if (host.stopRequested?.()) return build;
-          host.emit({ type: "CANDIDATE_SUBMITTED", round: ctx.round, lane: build.lane, sha: build.sha! });
-          startReviews(build.lane, build.sha!);
-          check = await checkWithReviews(build.lane, build.sha!);
-          if (host.stopRequested?.()) return build;
-          host.emit({
-            type: "CANDIDATE_CHECKED",
-            round: ctx.round,
-            lane: build.lane,
-            ok: check.ok,
-            ...(check.note ? { note: check.note } : {}),
-          });
-        }
-      } else {
-        if (host.stopRequested?.()) return build;
-        host.emit({
-          type: "CANDIDATE_CHECKED",
-          round: ctx.round,
-          lane: build.lane,
-          ok: false,
-          note: build.note ?? "the lane produced no candidate",
-        });
       }
-      return build;
-    }),
-  );
+    } else {
+      if (host.stopRequested?.()) return markDone(lane, build);
+      noteCheck(lane, { ok: false });
+      emit(lane, {
+        type: "CANDIDATE_CHECKED",
+        round: ctx.round,
+        lane: build.lane,
+        ok: false,
+        note: build.note ?? "the lane produced no candidate",
+      });
+    }
+    return markDone(lane, build);
+  });
+
+  // 07g1b (R11): once a lane has a passing candidate, the round gives the
+  // other lanes a short grace window to land their own green commit, then
+  // stops waiting for them. The passing set is frozen here: a lane that turns
+  // green afterwards is stopped at the pick, and the work it landed before
+  // then arrives as points (R7), never as a late candidate.
+  const pickGraceMs = host.pickGraceMs ?? PICK_GRACE_MS;
+  let greenAt: number | undefined;
+  for (;;) {
+    const states = lanes.map((lane) => laneState.get(lane)!);
+    if (states.every((s) => s.done) || host.stopRequested?.()) break;
+    if (states.some((s) => s.ok === true)) {
+      if (greenAt === undefined) greenAt = Date.now();
+      if (Date.now() - greenAt >= pickGraceMs) break;
+    } else {
+      greenAt = undefined;
+    }
+    const deadline = greenAt === undefined ? undefined : greenAt + pickGraceMs;
+    const change = waitChange();
+    if (deadline === undefined) {
+      await change;
+    } else {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([change, new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
+      })]);
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+  const settled = (lane: string): boolean => laneState.get(lane)!.done;
+  const frozen = new Set(lanes.filter((lane) => laneState.get(lane)!.ok === true));
+  const stoppedLanes: string[] = [];
+  const stopLane = (lane: string): void => {
+    if (frozen.has(lane) || stopped.has(lane)) return;
+    stopped.add(lane);
+    if (!settled(lane)) stoppedLanes.push(lane);
+    cancelReviews(lane);
+    try {
+      host.stopLane?.(ctx.round, lane);
+    } catch {
+      // A lane that cannot be stopped ends on its own bound; its events are
+      // ignored either way.
+    }
+  };
+  /** The round's outcome: every lane the pick does not need is stopped (the
+   * pick was adopted, or the round failed), and the lanes' own builds are
+   * waited for, so no round leaves a live lane behind. */
+  const finish = async (out: Omit<RoundOutcome, "builds" | "stoppedLanes">): Promise<RoundOutcome> => {
+    for (const lane of lanes) if (!settled(lane)) stopLane(lane);
+    const builds = await Promise.all(tasks);
+    return { ...out, builds, ...(stoppedLanes.length > 0 ? { stoppedLanes } : {}) };
+  };
   // Plan 06n (A3): nothing after a requested stop is recorded, so the
   // reviews still in flight are ended too.
   if (host.stopRequested?.()) {
     for (const lane of [...reviewSets.keys()]) cancelReviews(lane);
-    return { round: ctx.round, base: ctx.base, lanes, builds, stopped: true };
+    return await finish({ round: ctx.round, base: ctx.base, lanes, stopped: true });
   }
 
   const record = host.rounds().find((r) => r.round === ctx.round);
-  const passing = record ? passingCandidates(record) : [];
+  const passing = (record ? passingCandidates(record) : []).filter((candidate) => frozen.has(candidate.lane));
 
   // 3. M, A and B each review every passing candidate — K × N reviews. A
   //    review that cannot be taken is NOT a candidate with fewer reviews: the
@@ -378,7 +495,7 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
   let failure = reviewFailures.find((r): r is string => r !== undefined);
   if (!failure) {
     const reviewed = host.rounds().find((r) => r.round === ctx.round);
-    for (const candidate of reviewed ? passingCandidates(reviewed) : []) {
+    for (const candidate of (reviewed ? passingCandidates(reviewed) : []).filter((c) => frozen.has(c.lane))) {
       const count = (candidate.reviews ?? []).length;
       if (count < host.seats.length) {
         failure = `${candidateLabel(ctx.round, candidate.lane)} was reviewed by ${count} of ${host.seats.length} seats`;
@@ -392,7 +509,7 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
   //    seat must vote before a winner is picked.
   let missingVotes: string[] | undefined;
   if (!failure && passing.length > 1 && host.stopRequested?.()) {
-    return { round: ctx.round, base: ctx.base, lanes, builds, stopped: true };
+    return await finish({ round: ctx.round, base: ctx.base, lanes, stopped: true });
   }
   if (!failure && passing.length > 1) {
     // Every seat gets its pick turn; one seat's failure no longer stops the
@@ -452,14 +569,14 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
       }
     }
   }
-  if (failure) return { round: ctx.round, base: ctx.base, lanes, builds, failure };
+  if (failure) return await finish({ round: ctx.round, base: ctx.base, lanes, failure });
 
   // 5. `pickWinner` — code, never a model — decides the round.
   const winner = finalRecord ? pickWinner(finalRecord, host.seats, host.leader, host.pickGuard?.()) : undefined;
   if (winner) {
     host.emit({ type: "CANDIDATE_PICKED", round: ctx.round, lane: winner.lane, sha: winner.sha, votes: winner.votes });
   }
-  return { round: ctx.round, base: ctx.base, lanes, winner, builds, ...(missingVotes ? { missingVotes } : {}) };
+  return await finish({ round: ctx.round, base: ctx.base, lanes, ...(winner ? { winner } : {}), ...(missingVotes ? { missingVotes } : {}) });
 }
 
 /** The lanes a plan's frozen contract runs. A plan without `#+TT_WORKERS`

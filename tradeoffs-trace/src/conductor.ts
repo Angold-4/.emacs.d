@@ -33,13 +33,12 @@ import { unchangedResubmissionRequesters } from "./core/owner-commands.ts";
 // Plan 06g: the round's only decision points — `pickWinner`, `blocksAcceptance`
 // and `roundBudget` (architecture A3 and A6). Nothing in this file decides a
 // winner or whether a finding blocks by itself.
-import { advisoryReason, bestCandidate, blocksAcceptance, candidateLabel, carryBallotsForward, carryDecisionsForward, everyLaneLost, losingLanes, loserAnchors, regressedItems, roundBudget, type AcceptanceGate, type FindingGround, type PickGuard } from "./core/rounds.ts";
+import { advisoryReason, bestCandidate, blocksAcceptance, candidateLabel, carryBallotsForward, carryDecisionsForward, laneMetItems, losingLanes, loserAnchors, roundBudget, type AcceptanceGate, type FindingGround, type PickGuard } from "./core/rounds.ts";
 // Plan 06g2 (A1): `runRound` is the round's only orchestrator. The conductor
 // implements its `LaneHost` with the worktree, agent, check, review and vote
 // machinery below and calls it; it decides nothing about lanes itself.
 import {
-  consolidatedLabel,
-  consolidationLine,
+  PICK_GRACE_MS,
   isLaneRound,
   laneFailureLines,
   lanesOfContract,
@@ -117,6 +116,7 @@ import {
   rerunCommandsFor,
   shellQuote,
   rerunProvesTheTestRan,
+  testVerifyCommand,
   baselineHasEnvironmentFailure,
   type Baseline,
   type BaselineCommand,
@@ -230,6 +230,7 @@ import {
   evidenceFileAnchors,
   evidenceHasAnchor,
   itemsFromPhase,
+  itemTestVerifies,
   requirementAndConstraintItems,
   phaseItemOutcomes,
   repairItemLines,
@@ -242,6 +243,7 @@ import {
   reverify,
   symbolPresent,
   tallyItems,
+  testOutcomeIn,
   testResultLines,
   testVerifyProblems,
   thinMetItems,
@@ -363,6 +365,12 @@ export interface Deadlines {
   ownerWaitMs: number;
   abortGraceMs: number;
   termGraceMs: number;
+  /** 07g1b (R11): after one lane's candidate passes its checks, how long the
+   * round keeps waiting for another lane's fix before it freezes the passing
+   * set and adopts the pick. A short grace, so the pick never waits out a red
+   * lane's whole attempt (exex 01c3a: 75 minutes), but long enough that a lane
+   * whose fix lands within a second or two still joins the pick. */
+  pickGraceMs: number;
   /** Plan 2d: how long `stop()` waits for an agent to exit after abort before
    * escalating to SIGTERM. Much shorter than `abortGraceMs` (design §8.2's
    * mid-run cancellation grace): `tt stop` must release the run within 15 s,
@@ -421,6 +429,7 @@ export const DEFAULT_DEADLINES: Deadlines = {
   ownerWaitMs: boundDefaultMs("owner-wait"),
   abortGraceMs: 30_000,
   termGraceMs: 10_000,
+  pickGraceMs: PICK_GRACE_MS,
   stopAbortGraceMs: 2_000,
   stallMs: 3 * 60_000,
   inboxPollMs: 1_000,
@@ -1891,7 +1900,6 @@ export class Conductor {
    * restarts every lane from it (the previous pick regressed, or every lane
    * lost an item), so a lane whose own candidate is not that base starts a
    * fresh session. Set by `#runLaneRound` before the round's lanes start. */
-  #laneRoundRestartFromBest: string | undefined;
   #integrationBranch: string;
   /** The worker handle a `submit_phase` was just accepted from — set by
    * #onSubmit, consumed by #runFreeze (the "freeze" action's dispatch runs
@@ -8825,9 +8833,8 @@ export class Conductor {
    * lane that passed its checks restarts from its own candidate, and a lane
    * whose candidate was still red continues from that red candidate. Derived
    * from the round record, so it survives a conductor restart. */
-  #continuedLaneStarts(last: RoundRecord | undefined, guard?: PickGuard): Record<string, string> | undefined {
+  #continuedLaneStarts(last: RoundRecord | undefined): Record<string, string> | undefined {
     if (!last || last.picked) return undefined;
-    if (everyLaneLost(last, guard)) return Object.fromEntries(last.lanes.map((lane) => [lane, guard!.best.sha]));
     const out: Record<string, string> = {};
     for (const c of last.candidates) {
       if (c.ok !== false && typeof c.sha === "string" && c.sha.length > 0) out[c.lane] = c.sha;
@@ -9056,56 +9063,31 @@ export class Conductor {
   #laneWorkerPrompt(round: number, base: string): string {
     const previous = (this.#state.phase.rounds ?? []).find((r) => r.round === round - 1);
     const failures = laneFailureLines(previous);
+    const laneCount = this.#lanes().length;
     const lines: string[] = [
-      `Round ${round} of this phase starts from ${base.slice(0, 7)} and runs ${this.#lanes().length} lanes. You are the worker of one lane; another worker builds a second candidate from the same base with this same prompt, in its own worktree. Do not touch another lane's worktree.`,
+      // 07g1b (A4/R6): lanes exist only in round 1. Every later round runs on
+      // the adopted pick, in one worktree.
+      laneCount > 1 && !previous?.picked
+        ? `Round ${round} of this phase starts from ${base.slice(0, 7)} and runs ${laneCount} lanes. You are the worker of one lane; another worker builds a second candidate from the same base with this same prompt, in its own worktree. Do not touch another lane's worktree.`
+        : `Round ${round} of this phase starts from ${base.slice(0, 7)} and runs one worker in one worktree.`,
     ];
     if (failures.length > 0) {
       lines.push(`The previous round's lanes (round ${previous!.round}):`, ...failures.map((f) => `- ${f}`));
     }
-    // Plan 06n (A1): name the winning lane and its candidate as the base, and
-    // tell the losing lane its own previous candidate is not in the worktree.
-    // Plan 06n (A7/R9c): a pick that regressed was not adopted; every lane
-    // restarts from the best candidate.
-    if (previous?.picked && previous.regressed) {
-      const winner = previous.picked;
+    // 07g1b (A4/R7): the other lanes' work the pick did not carry is a point
+    // with `from`, named here so the worker builds on it instead of redoing it.
+    const fromPoints = this.#state.phase.findings.filter((f) => f.status === "open" && f.from);
+    if (fromPoints.length > 0) {
       lines.push(
-        `Round ${previous.round} picked lane ${winner.lane} (candidate ${winner.sha.slice(0, 7)}), but its evaluation lost ${previous.regressed.items.join(", ")}, which the best candidate ${base.slice(0, 7)} met, in code it changed. It was not adopted: every lane's worktree was reset to the best candidate ${base.slice(0, 7)}, so no lane's previous candidate is in the worktree. Keep what the best candidate met; ${winner.sha.slice(0, 7)} is for reference only.`,
+        "Another lane's work that the pick does not carry arrived as points, each naming the commit it is in:",
+        ...fromPoints.map((f) => `- ${f.itemId ?? f.id}: from ${f.from!.sha.slice(0, 7)} (${f.from!.paths.join(", ") || "no paths recorded"})${f.doneWhen ? `, doneWhen \`${f.doneWhen}\`` : ""}`),
       );
-    } else if (previous?.picked && previous.consolidated?.ok && previous.consolidated.sha === base) {
-      // tt 09 (change 3): the winner was combined with what the other lanes
-      // met; every lane starts from the consolidated commit and is told which
-      // items it carries, so no lane redoes them or drops them.
-      const winner = previous.picked;
-      const c = previous.consolidated;
-      const label = consolidatedLabel(previous.round, winner.lane, c.took);
-      lines.push(
-        `Round ${previous.round} picked lane ${winner.lane} (candidate ${winner.sha.slice(0, 7)}), and a consolidator combined it with the plan items another lane met and it did not: ${c.took.map((t) => `lane ${t.lane}'s ${t.items.join(", ")} (from ${t.sha.slice(0, 7)})`).join("; ")}. Every lane's worktree was reset to that consolidated commit ${label} ${base.slice(0, 7)} — this round's base — so no lane's own previous candidate is in the worktree. Keep everything it meets, including ${c.took.flatMap((t) => t.items).join(", ")}; build on it, do not redo or drop that work.`,
-      );
-    } else if (previous?.picked) {
+    }
+    if (previous?.picked) {
       const winner = previous.picked;
       const losers = previous.lanes.filter((l) => l !== winner.lane);
       lines.push(
-        `Round ${previous.round} picked lane ${winner.lane} (candidate ${winner.sha.slice(0, 7)}). Every lane's worktree was reset to that candidate, so the losing lane${losers.length === 1 ? "" : "s"} (${losers.join(", ")}) ${losers.length === 1 ? "has" : "have"} its own previous candidate no longer in the worktree.`,
-      );
-      // tt 09 (change 3): a consolidation that failed leaves the round on the
-      // winner; the items the other lane met are named with where they are.
-      if (previous.consolidated && !previous.consolidated.ok) {
-        lines.push(
-          `Combining it with what the other lane met failed (${previous.consolidated.note ?? "no reason recorded"}). These plan items were met by another lane and not by the winner — take that work from its candidate: ${previous.consolidated.took.map((t) => `lane ${t.lane} ${t.sha.slice(0, 7)}: ${t.items.join(", ")}`).join("; ")}.`,
-        );
-      }
-    }
-    // Plan 06n (A7/R9b): every lane lost an item the best candidate met, so
-    // the round picked no lane and every lane restarts from the best
-    // candidate, each told which items it lost.
-    const previousGuard = previous ? this.#pickGuard(previous.round) : undefined;
-    const lostByLane = previous ? everyLaneLost(previous, previousGuard) : undefined;
-    if (lostByLane) {
-      const best = previousGuard!.best;
-      lines.push(
-        `Round ${previous!.round} picked no lane: every lane lost a plan item that the best candidate ${best.sha.slice(0, 7)} (round ${best.round}, lane ${best.lane}) met — ${Object.entries(lostByLane)
-          .map(([l, ids]) => `lane ${l} lost ${ids.join(", ")}`)
-          .join("; ")}. Every lane's worktree was reset to the best candidate ${best.sha.slice(0, 7)}, so no lane's previous candidate is in the worktree. Keep what the best candidate met.`,
+        `Round ${previous.round} picked lane ${winner.lane} (candidate ${winner.sha.slice(0, 7)}). This round's worktree holds that pick${losers.length > 0 ? `; the losing lane${losers.length === 1 ? "" : "s"} (${losers.join(", ")}) ${losers.length === 1 ? "has" : "have"} its own previous candidate no longer in the worktree` : ""}.`,
       );
     }
     // Plan 06k3 (A2): a lane whose previous attempt missed its deadline starts
@@ -9189,10 +9171,7 @@ export class Conductor {
     // it is fixing — except a fix of the fixers' merge (packet X), which this
     // lane's session never saw.
     const freshSession =
-      fix?.freshSession === true ||
-      (!fix &&
-        ((previous?.picked !== undefined && previous.picked.lane !== lane) ||
-          (this.#laneRoundRestartFromBest === base && own !== undefined && own !== base)));
+      fix?.freshSession === true || (!fix && previous?.picked !== undefined && previous.picked.lane !== lane);
     // Recorded so a test (and the owner) can see the session decision; the
     // production session dir still exists, the fresh start just skips
     // `--continue`.
@@ -9905,6 +9884,9 @@ export class Conductor {
     };
     const host: DomainLoopHost = {
       maxReviews: this.#state.phase.contract.domainLoopMax ?? 3,
+      // 07g1b (A2): a quality problem blocks only when it names a plan item or
+      // a design line; the plan's own item ids are what the review may cite.
+      itemIds: flatItems(this.#planItems()).map((i) => i.id),
       // The bound is total for the round and domain: a resumed loop counts
       // the reviews its log already recorded instead of starting again at 0.
       startReviews: this.#domainLoopReviewsSpent(task, round),
@@ -9922,7 +9904,11 @@ export class Conductor {
           return { lane, note: "its attempt time is spent" };
         }
         this.#log.append("fixer_fix_started", { round, domain: task.domain, sha, remainingMs: ms });
-        return buildFixer({ of: sha, feedback: failure });
+        const fixedBuild = await buildFixer({ of: sha, feedback: failure });
+        // 07g1b (R14): a fix that changed nothing still made its disclosures;
+        // an approved domain keeps them like any other fix.
+        if (fixedBuild.unchanged && fixedBuild.disclosures) allDisclosures.push(...fixedBuild.disclosures);
+        return fixedBuild;
       },
       stopRequested: () => this.#stopRequested || this.#recheckCancelledLaneRound,
       record: (r) => {
@@ -10264,6 +10250,38 @@ export class Conductor {
    * check record on disk when it was checked before the stop. The resumed
    * round's checks, reviews and hand-off then see what the live build would
    * have given them. */
+  /** The check record of one candidate, read from disk: the parsed record and
+   * the combined per-command logs. Undefined when the candidate was never
+   * checked (or its record is unreadable). */
+  #readCheckRecord(sha: string): { record: CheckRecord; output: string } | undefined {
+    const outDir = path.join(this.#paths.checks, sha);
+    try {
+      const record = parseCheckRecord(JSON.parse(fs.readFileSync(path.join(outDir, "record.json"), "utf8")));
+      if (!record) return undefined;
+      const output = record.commands
+        .map((c) => {
+          try {
+            return fs.readFileSync(path.join(outDir, c.log ?? this.#checkLogName(c.command)), "utf8");
+          } catch {
+            return "";
+          }
+        })
+        .join("\n");
+      return { record, output };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The check output of one candidate: the live map first (the common case),
+   * the recorded check second (an earlier round's candidate, or one checked by
+   * the process that stopped). Empty string when it was never checked. */
+  #checkOutputFor(sha: string): string {
+    const live = this.#laneCheckOutputs.get(sha);
+    if (live !== undefined) return live;
+    return this.#readCheckRecord(sha)?.output ?? "";
+  }
+
   #resumedLaneBuild(round: number, lane: string, sha: string): LaneBuild {
     const key = `${round}-${lane}`;
     const live = this.#laneBuilds.get(key);
@@ -10298,29 +10316,13 @@ export class Conductor {
     this.#laneBuilds.set(key, build);
     // A candidate checked before the stop: its output (for the hand-off's
     // test-verify resolution) is the check's own per-command logs.
-    if (!this.#laneCheckOutputs.has(sha)) {
-      const outDir = path.join(this.#paths.checks, sha);
-      try {
-        const record = parseCheckRecord(JSON.parse(fs.readFileSync(path.join(outDir, "record.json"), "utf8")));
-        if (record) {
-          const output = record.commands
-            .map((c) => {
-              try {
-                return fs.readFileSync(path.join(outDir, c.log ?? this.#checkLogName(c.command)), "utf8");
-              } catch {
-                return "";
-              }
-            })
-            .join("\n");
-          this.#laneCheckOutputs.set(sha, output);
-          if (this.#itemsEnforced()) this.#laneCheckResolutions.set(sha, this.#resolveVerifies(output));
-          // Plan 07b (D3): the doneWhen facts the pre-stop check ran are read
-          // back, so the resumed hand-off records them without running again.
-          if (record.facts) this.#laneFacts.set(sha, record.facts.map((f) => ({ ...f, candidateSha: sha })));
-        }
-      } catch {
-        // Not checked before the stop: the resumed round checks it now.
-      }
+    const recorded = this.#readCheckRecord(sha);
+    if (recorded !== undefined) {
+      this.#laneCheckOutputs.set(sha, recorded.output);
+      if (this.#itemsEnforced()) this.#laneCheckResolutions.set(sha, this.#resolveVerifies(recorded.output));
+      // Plan 07b (D3): the doneWhen facts the pre-stop check ran are read
+      // back, so the resumed hand-off records them without running again.
+      if (recorded.record.facts) this.#laneFacts.set(sha, recorded.record.facts.map((f) => ({ ...f, candidateSha: sha })));
     }
     this.#log.append("lane_build_resumed", { round, lane, candidateSha: sha, payload: build.disclosures !== undefined });
     return build;
@@ -11352,9 +11354,7 @@ export class Conductor {
       .map((r) => {
         const votes = r.votes.map((v) => `${v.seat}→${v.lane}`).join(" ");
         const picked = r.picked ? `${candidateLabel(r.round, r.picked.lane)} won (${r.picked.votes} vote(s))` : "no winner";
-        // tt 09 (change 3): the round's combine step, when it ran.
-        const consolidated = consolidationLine(r);
-        return `round ${r.round} from ${r.base.slice(0, 7)}: ${r.lanes.map((l) => candidateLabel(r.round, l)).join(", ")}${votes ? ` — votes ${votes}` : ""} — ${picked}${consolidated ? ` — ${consolidated}` : ""}`;
+        return `round ${r.round} from ${r.base.slice(0, 7)}: ${r.lanes.map((l) => candidateLabel(r.round, l)).join(", ")}${votes ? ` — votes ${votes}` : ""} — ${picked}`;
       });
   }
 
@@ -11425,29 +11425,24 @@ export class Conductor {
             ? last.lanes
             : ["a"];
       const previous = last ? (this.#state.phase.rounds ?? []).find((r) => r.round === last.round) : undefined;
-      const previousGuard = previous ? this.#pickGuard(previous.round) : undefined;
-      const restartGuard = this.#pickGuard(round);
       // An unfinished round resumes from its own base. A new round starts from
-      // the phase's candidate (the last adopted pick) — or, when that pick
-      // regressed, from the best candidate.
+      // the phase's candidate — the last adopted pick. 07g1b (A4): a lost item
+      // is a point, never a restart from an older candidate, so no round picks
+      // a base other than the pick.
+      // 07g1b (A4/R12): a ruling that named a candidate replaces that round's
+      // pick, so the next repair builds on the named candidate even though the
+      // adopted candidate (phase.candidate) is another one.
+      const ruled = previous?.picked?.ruling ? previous.picked.sha : undefined;
       const base = unfinished
         ? last!.base
         : fix
           ? fix.candidate
-          : previous?.regressed && restartGuard
-            ? restartGuard.best.sha
-            : round === 1
-              ? this.#state.phase.integrationHead
-              : (this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
+          : round === 1
+            ? this.#state.phase.integrationHead
+            : (ruled ?? this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
       // 02k: a repeat of a round that failed only for a missing review or vote
       // restarts each lane that passed its checks from its own candidate.
-      // Plan 06n (A7/R9b): a round where every lane lost an item restarts
-      // every lane from the best candidate.
-      const continuedStarts = previous && previous.round === round - 1 ? this.#continuedLaneStarts(previous, previousGuard) : undefined;
-      this.#laneRoundRestartFromBest =
-        !unfinished && previous && ((previous.regressed && restartGuard) || everyLaneLost(previous, previousGuard))
-          ? (restartGuard ?? previousGuard)!.best.sha
-          : undefined;
+      const continuedStarts = previous && previous.round === round - 1 ? this.#continuedLaneStarts(previous) : undefined;
       // Plan 06k3 (A2): a lane that produced no passing candidate starts from
       // its own saved unsubmitted work (never discarded at its deadline).
       const saved = this.#savedLaneWork();
@@ -11530,9 +11525,10 @@ export class Conductor {
         cancelReviews: (r, lane, sha) => this.#cancelLaneReviews(r, lane, sha),
         pickTurn: (r, at, seat, passing, revote) => this.#runPickTurn(r, at, seat, passing, revote),
         emit: (event) => this.#applyEvent(event),
-        // Plan 06n (A7): the pick compares each lane's item reviews against
-        // the phase's best candidate from the earlier rounds.
-        pickGuard: () => this.#pickGuard(round),
+        // 07g1b (R11): a lane the round stops waiting for is terminated here,
+        // and the round's grace window is the run's own deadline.
+        stopLane: (r, lane) => this.#stopLane(r, lane),
+        pickGraceMs: this.#deadlines.pickGraceMs,
         // Plan 06n (A3): the round records nothing after a requested stop.
         stopRequested: () => this.#stopRequested,
       };
@@ -11582,15 +11578,6 @@ export class Conductor {
         // is). ATTEMPT_NO_SUBMISSION is the ordinary "this attempt produced no
         // acceptable candidate" event; REPAIRING then starts the next round.
         if (outcome.failure) this.#log.append("round_incomplete", { round, reason: outcome.failure });
-        // Plan 06n (A7/R9b): every passing lane lost an item the best
-        // candidate met, so no lane was picked; the next round restarts every
-        // lane from the best candidate.
-        {
-          const record = (this.#state.phase.rounds ?? []).find((r) => r.round === round);
-          const guard = this.#pickGuard(round);
-          const lost = record ? everyLaneLost(record, guard) : undefined;
-          if (lost) this.#log.append("round_no_pick_items_lost", { round, best: guard!.best.sha, lost });
-        }
         this.#applyEvent({ type: "ATTEMPT_NO_SUBMISSION" });
         this.#clearLaneRound(round);
         return;
@@ -11620,14 +11607,14 @@ export class Conductor {
     return best ? { best, itemIds, seatCount } : undefined;
   }
 
-  /** Plan 06n (A7/R9c-d): once the phase has evaluated `last`'s pick and not
-   * accepted it, compare its evaluated items with the best candidate. An item
-   * the best candidate met that the pick does not meet, with its not-met
-   * evidence in a file the pick changed against the best candidate, is a
-   * regression: ITEMS_REGRESSED is recorded, and the next round restarts from
-   * the best candidate instead of the pick. An item whose evidence anchors
-   * only in unchanged files is a newly found defect: the pick is adopted as
-   * today. This chooses a base only; it never accepts a candidate. */
+  /** 07g1b (R13/A4): once the phase has evaluated `last`'s pick and not
+   * accepted it, compare its evaluated items with the best candidate. Only a
+   * TEST-VERIFIED item can regress: one whose `:VERIFY:` test passed on the
+   * best candidate and does not pass on the pick. It becomes a point in its
+   * domain with that test as doneWhen, never a restart — the pick stays the
+   * next base (the fix round repairs the point on it). A review-only item
+   * whose seat votes flip between candidates is not a regression and makes no
+   * point at all (07f1b let C2 "regress" nine times on votes alone). */
   #recordRegression(last: RoundRecord | undefined): void {
     if (!last?.picked || last.regressed || !this.#itemsEnforced()) return;
     const picked = last.picked.sha;
@@ -11637,23 +11624,166 @@ export class Conductor {
     if (!seatsOf(phase.contract).some((w) => phase.reviews[w]?.review?.candidateSha === picked)) return;
     const guard = this.#pickGuard(last.round);
     if (!guard || guard.best.sha === picked) return;
-    let changed: string[];
+    const items = new Map(flatItems(this.#planItems()).map((item) => [item.id, item]));
+    const outcomes = new Map(this.#itemOutcomes().map((o) => [o.item.id, o]));
+    const bestOutput = this.#checkOutputFor(guard.best.sha);
+    const pickOutput = this.#checkOutputFor(picked);
+    const lostTests: Array<{ id: string; test: string; doneWhen?: string }> = [];
+    for (const id of guard.best.met) {
+      const outcome = outcomes.get(id);
+      if (!outcome || outcome.outcome === "met" || outcome.outcome === "fits") continue;
+      const item = items.get(id);
+      if (!item) continue;
+      // A review-only item cannot regress: the seats' votes are not evidence.
+      const test = itemTestVerifies(item)[0];
+      if (!test) continue;
+      // A4: its test passed on the best candidate and does not pass on the pick.
+      if (testOutcomeIn(bestOutput, test.name) !== "passed") continue;
+      if (testOutcomeIn(pickOutput, test.name) === "passed") continue;
+      const doneWhen = testVerifyCommand(test.name, test.file, bestOutput, this.#plan.rerun);
+      this.#raiseLostItemPoint({
+        item,
+        sha: guard.best.sha,
+        paths: this.#changedPaths(guard.best.sha, picked),
+        pickSha: picked,
+        evidence: `${id}${item.title ? ` (${item.title})` : ""}: test "${test.name}" passed on ${guard.best.sha.slice(0, 7)} (round ${guard.best.round}'s pick) and does not pass on ${picked.slice(0, 7)}`,
+        ...(doneWhen ? { doneWhen } : {}),
+      });
+      lostTests.push({ id, test: test.name, ...(doneWhen ? { doneWhen } : {}) });
+    }
+    this.#log.append("regression_points", {
+      round: last.round,
+      sha: picked,
+      best: guard.best.sha,
+      lostTests,
+      lostReviewOnly: guard.best.met.filter((id) => {
+        const o = outcomes.get(id);
+        const item = items.get(id);
+        return o && o.outcome !== "met" && o.outcome !== "fits" && item && itemTestVerifies(item).length === 0;
+      }),
+    });
+  }
+
+  /** 07g1b (A4): raise one point for an item another candidate met and the
+   * pick does not. Skipped when the item already has an open blocking point
+   * (a second round must not stack duplicates), and refused silently when the
+   * item has no domain while the phase declares domains (the conductor's own
+   * points name one, as §3.2 requires). */
+  #raiseLostItemPoint(opts: {
+    item: FlatItem;
+    sha: string;
+    paths: string[];
+    pickSha: string;
+    evidence: string;
+    doneWhen?: string;
+  }): void {
+    const phase = this.#state.phase;
+    if (phase.findings.some((f) => f.status === "open" && f.severity === "blocking" && f.itemId === opts.item.id)) return;
+    const finding: Finding = {
+      id: `F-${phase.phaseId}-from-${opts.item.id}-${phase.findings.length + 1}`,
+      version: 1,
+      phaseId: phase.phaseId,
+      kind: "defect",
+      severity: "blocking",
+      evidence: opts.evidence,
+      raisedBy: "conductor",
+      status: "open",
+      boundCandidateSha: opts.pickSha,
+      itemId: opts.item.id,
+      item: opts.item.id,
+      ...(opts.item.domain ? { domain: opts.item.domain } : {}),
+      ...(opts.item.where ? { where: opts.item.where } : {}),
+      ...(opts.item.text ? { expected: opts.item.text } : {}),
+      ...(opts.doneWhen ? { doneWhen: opts.doneWhen } : {}),
+      from: { sha: opts.sha, paths: opts.paths },
+    };
+    this.#applyEvent({ type: "FINDING_RAISED", finding });
+  }
+
+  /** The files one commit changed against another, or [] when git cannot say. */
+  #changedPaths(from: string, to: string): string[] {
     try {
-      changed = diffNameOnly(this.#plan.repo, guard.best.sha, picked);
+      return from === to ? [] : diffNameOnly(this.#plan.repo, from, to);
     } catch (err) {
-      this.#log.append("error", { where: "regression_diff", error: String((err as Error)?.message ?? err) });
-      return;
+      this.#log.append("error", { where: "lane_point_paths", error: String((err as Error)?.message ?? err) });
+      return [];
     }
-    const items = regressedItems(guard.best, this.#itemOutcomes(), changed);
+  }
+
+  /** 07g1b (A4/R7/R11): the work another lane landed that the pick does not
+   * carry arrives as points, never as a consolidation step and never as a
+   * restart. For every other lane's candidate in the round, an item becomes a
+   * point when
+   * - that lane's own seats met it and the pick's seats did not (R7), or
+   * - its `:VERIFY:` test passes in that lane's check output and not in the
+   *   pick's (R11: a lane stopped while still fixing landed work green even
+   *   though its tree as a whole was red).
+   * The point names the lane's commit and paths in `from` and the item's test
+   * as doneWhen when it has one; otherwise it carries none and is closed by
+   * its domain review (CI §3.2). */
+  #raiseLostLanePoints(round: number, winner: { lane: string; sha: string }): void {
+    if (!this.#itemsEnforced()) return;
+    const roundRecord = (this.#state.phase.rounds ?? []).find((r) => r.round === round);
+    const pick = roundRecord?.candidates.find((c) => c.lane === winner.lane && c.sha === winner.sha);
+    if (!roundRecord || !pick) return;
+    const items = flatItems(this.#planItems());
     if (items.length === 0) return;
-    // 07 (G2): a fix round's pick is never undone; the items it lost stay open
-    // as points (the conductor's item findings), so the next fix round gets them.
-    if (isFixRound(this.#state.phase.rounds, last.round)) {
-      this.#log.append("regression_skipped_fix_round", { round: last.round, items, sha: picked, best: guard.best.sha });
-      return;
+    const itemIds = items.map((item) => item.id);
+    const seatCount = this.#laneSeats().length;
+    const pickMet = laneMetItems(pick, itemIds, seatCount);
+    const pickOutput = this.#checkOutputFor(winner.sha);
+    for (const other of roundRecord.candidates) {
+      if (other.lane === winner.lane || typeof other.sha !== "string" || other.sha.length === 0) continue;
+      if (other.sha === winner.sha) continue;
+      const laneMet = laneMetItems(other, itemIds, seatCount);
+      const laneOutput = this.#checkOutputFor(other.sha);
+      const paths = this.#changedPaths(roundRecord.base, other.sha);
+      for (const item of items) {
+        if (pickMet.has(item.id)) continue;
+        const test = itemTestVerifies(item)[0];
+        const testPassedThere = test ? testOutcomeIn(laneOutput, test.name) === "passed" : false;
+        const metThere = laneMet.has(item.id) || testPassedThere;
+        if (!metThere) continue;
+        // The pick's own tree already proves it green: nothing was lost.
+        if (test && testOutcomeIn(pickOutput, test.name) === "passed") continue;
+        const doneWhen = test ? testVerifyCommand(test.name, test.file, laneOutput, this.#plan.rerun) : undefined;
+        const how = laneMet.has(item.id) ? "its seats met it" : `its check output passes the item's test "${test!.name}"`;
+        this.#raiseLostItemPoint({
+          item,
+          sha: other.sha,
+          paths,
+          pickSha: winner.sha,
+          evidence: `${item.id}${item.title ? ` (${item.title})` : ""}: lane ${other.lane}'s candidate ${other.sha.slice(0, 7)} has the work (${how}); the pick ${winner.sha.slice(0, 7)} (lane ${winner.lane}) does not`,
+          ...(doneWhen ? { doneWhen } : {}),
+        });
+        this.#log.append("lost_lane_point", {
+          round,
+          item: item.id,
+          from: other.sha,
+          lane: other.lane,
+          pick: winner.sha,
+          via: laneMet.has(item.id) ? "seats" : "test",
+          ...(doneWhen ? { doneWhen } : {}),
+        });
+      }
     }
-    this.#log.append("items_regressed", { round: last.round, items, sha: picked, best: guard.best.sha, changed });
-    this.#applyEvent({ type: "ITEMS_REGRESSED", round: last.round, items, sha: picked });
+  }
+
+  /** 07g1b (R11): stop a lane the round no longer reads. Its agent is
+   * terminated (the work it already committed is saved to its own ref by the
+   * lane's own bookkeeping), so a red lane's long fix never holds the phase. */
+  #stopLane(round: number, lane: string): void {
+    const prefix = `lane-${round}-${lane}-`;
+    let agents = 0;
+    for (const [agentId, handle] of [...this.#agents]) {
+      if (!agentId.startsWith(prefix)) continue;
+      agents += 1;
+      for (const pgid of handle.shGroups) {
+        setImmediate(() => void killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined));
+      }
+      void handle.agent.terminate().catch(() => undefined);
+    }
+    this.#log.append("lane_stopped", { round, lane, agents, reason: "the pick was adopted before this lane settled" });
   }
 
   /** Drops one round's per-lane scratch state (its builds, discoveries and
@@ -11806,6 +11936,9 @@ export class Conductor {
       this.#raiseMessage("tradeoff", decision.id, this.#decisionContent(decision), winner.sha);
     }
     if (this.#itemsEnforced() && build?.coverage) this.#applyCoverageNotes(build.coverage as Coverage, winner.sha);
+    // 07g1b (A4/R7): the other lanes' work this pick does not carry arrives
+    // as points with `from` — never as a consolidation step, never a restart.
+    this.#raiseLostLanePoints(round, winner);
     this.#recordBoundaryDataAndSample(winner.sha, { lane: { round, lane: winner.lane } });
     this.drive();
   }
