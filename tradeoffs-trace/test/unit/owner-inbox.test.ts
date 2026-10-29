@@ -366,3 +366,28 @@ test("plan 06d: acceptInput decides applied, queued or refused and only DONE/BLO
     assert.match((r as { reason: string }).reason, new RegExp(phase));
   }
 });
+
+test("07g1b (R12, check 3): a ruling names its candidate through a structured candidate field", () => {
+  const sha = "a".repeat(40);
+  // Both wire forms carry the field onto the ruling.
+  const flat = ownerCommandToEvent({ kind: "ruling", text: "build on C1-a", recordIds: ["F-1"], candidate: "C1-a" }, "cmd-r1");
+  assert.equal((flat as Extract<Event, { type: "RULING_RECORDED" }>).ruling.candidate, "C1-a");
+  const dv = normalizeDecisionViewCommand(
+    { type: "ruling", text: `build on ${sha}`, recordIds: ["F-1"], candidate: sha, binding: { runId: "r", phaseId: "p1" } },
+    "cmd-r2",
+  );
+  assert.equal(dv.ok, true);
+  assert.equal((dv as { event: Extract<Event, { type: "RULING_RECORDED" }> }).event.ruling.candidate, sha);
+  // A SHA in the prose alone is no candidate field.
+  const prose = normalizeDecisionViewCommand({ type: "ruling", text: `build on ${sha}`, recordIds: ["F-1"], binding: { runId: "r", phaseId: "p1" } }, "cmd-r3");
+  assert.equal((prose as { event: Extract<Event, { type: "RULING_RECORDED" }> }).event.ruling.candidate, undefined);
+  // The reducer refuses a candidate the phase never recorded.
+  const state = baseState({
+    findings: [{ id: "F-1", version: 1, phaseId: "p1", kind: "defect", severity: "blocking", evidence: "x", raisedBy: "M", status: "open", boundCandidateSha: sha } as never],
+    rounds: [{ round: 1, base: "b", candidates: [{ lane: "a", sha, ok: true }] } as never],
+  });
+  const unknown = reduce(state, { type: "RULING_RECORDED", ruling: { id: "RUL-x", text: "t", recordIds: ["F-1"], candidate: "C9-z", by: "owner" } });
+  assert.equal(unknown.ok, false);
+  const known = reduce(state, { type: "RULING_RECORDED", ruling: { id: "RUL-y", text: "t", recordIds: ["F-1"], candidate: "C1-a", by: "owner" } });
+  assert.equal(known.ok, true, !known.ok ? known.reason : "");
+});

@@ -321,6 +321,7 @@
         "type": { "const": "ruling" },
         "text": { "type": "string", "minLength": 1 },
         "recordIds": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "candidate": { "type": "string", "minLength": 1, "description": "07g1b (R12): the candidate (C<round>-<lane> or a SHA) the next repair builds on." },
         "binding": { "$ref": "#/$defs/NoteBinding" }
       }
     },
@@ -332,6 +333,7 @@
       "properties": {
         "kind": { "const": "ruling" },
         "text": { "type": "string", "minLength": 1 },
+        "candidate": { "type": "string", "minLength": 1, "description": "07g1b (R12): the candidate (C<round>-<lane> or a SHA) the next repair builds on." },
         "recordIds": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } }
       }
     },

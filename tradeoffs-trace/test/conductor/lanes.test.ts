@@ -1366,10 +1366,13 @@ function itemLaneWorker(lane: string, opts: { fail?: string; testVerify?: boolea
 
 /** Writes an owner ruling to the live run's inbox (owner input, applied by
  * the conductor itself). */
-function sendRuling(setup: TestConductorSetup, recordIds: string[], text: string): void {
+function sendRuling(setup: TestConductorSetup, recordIds: string[], text: string, candidate?: string): void {
   const phase = setup.conductor.state.phase;
   const file = path.join(runPaths(setup.runDir).inbox, `test-ruling-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
-  fs.writeFileSync(file, JSON.stringify({ type: "ruling", text, recordIds, binding: { runId: phase.runId, phaseId: phase.phaseId } }));
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ type: "ruling", text, recordIds, ...(candidate ? { candidate } : {}), binding: { runId: phase.runId, phaseId: phase.phaseId } }),
+  );
 }
 
 const RULED_DOMAINS = [
@@ -1477,9 +1480,14 @@ test("a lead ruling makes the next repair build on the named candidate (SHA in t
     const b = round.candidates.find((c) => c.lane === "b")!;
     assert.equal(round.picked?.lane, "a", "the seats picked lane a");
     const point = setup.conductor.state.phase.findings.find((f) => f.evidence === "BOOKING_POINT")!;
-    // The owner rules on the booking point and names lane b's candidate: the
-    // repair must build on b's commit, not on the pick.
+    // Check 3: a SHA in the ruling's prose names no candidate. A ruling that
+    // only mentions lane b's SHA in its text leaves the seats' pick alone.
     sendRuling(setup, [point.id], `Rule ${point.id} settled. Build on ${b.sha} (lane b).`);
+    await waitFor(() => (setup.conductor.state.phase.rulings ?? []).length === 1, 60_000, 20, setup.runDir);
+    assert.equal(setup.conductor.state.phase.rounds![0].picked?.sha, a.sha, "a SHA in the text is not a structured candidate");
+    // The owner names lane b's candidate through the ruling's candidate
+    // field: the repair must build on b's commit, not on the pick.
+    sendRuling(setup, [point.id], "build on lane b's candidate", b.sha);
     await waitFor(() => setup.conductor.state.phase.rounds?.[0]?.picked?.ruling !== undefined, 120_000, 20, setup.runDir);
     const adopted = setup.conductor.state.phase.rounds![0];
     assert.equal(adopted.picked?.sha, b.sha, "the ruling's candidate is the round's pick");
@@ -1550,6 +1558,7 @@ test("a lead ruling makes the next repair build on the named candidate", async (
         type: "ruling",
         text: "build the repair on lane a's candidate, not on the green one",
         recordIds: ["C1-a"],
+        candidate: "C1-a",
         binding: { runId: phase.runId, phaseId: phase.phaseId },
       }),
     );

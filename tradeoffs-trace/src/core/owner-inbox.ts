@@ -202,7 +202,13 @@ export function ownerCommandToEvent(command: OwnerCommand, commandId: string): E
     case "ruling":
       return {
         type: "RULING_RECORDED",
-        ruling: { id: `RUL-${commandId}`, text: command.text, recordIds: command.recordIds, by: "owner" },
+        ruling: {
+          id: `RUL-${commandId}`,
+          text: command.text,
+          recordIds: command.recordIds,
+          ...(typeof command.candidate === "string" && command.candidate.trim().length > 0 ? { candidate: command.candidate.trim() } : {}),
+          by: "owner",
+        },
       };
     case "steer":
     case "pause":
@@ -460,7 +466,17 @@ export function normalizeDecisionViewCommand(raw: unknown, commandId: string): N
         ok: true,
         runId: b.runId,
         phaseId: b.phaseId,
-        event: { type: "RULING_RECORDED", ruling: { id: `RUL-${commandId}`, text: r.text, recordIds, by: "owner" } },
+        event: {
+          type: "RULING_RECORDED",
+          ruling: {
+            id: `RUL-${commandId}`,
+            text: r.text,
+            recordIds,
+            // 07g1b (R12): the structured candidate the repair builds on.
+            ...(typeof r.candidate === "string" && r.candidate.trim().length > 0 ? { candidate: r.candidate.trim() } : {}),
+            by: "owner",
+          },
+        },
       };
     }
     default:

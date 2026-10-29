@@ -11598,32 +11598,15 @@ export class Conductor {
   /** 07g1b (R12): a lead ruling that names a candidate replaces that round's
    * pick through CANDIDATE_PICKED, not a special reducer state branch. */
   #adoptRulingPick(ruling: Ruling): void {
-    const rounds = this.#state.phase.rounds ?? [];
-    const picks = new Map<number, { lane: string; sha: string; votes: number }>();
-    // Keep candidate record ids (labels and SHA prefixes) as well as lane b's
-    // full SHA in the ruling text. Explicit record ids take precedence.
-    for (const id of ruling.recordIds) {
-      const named = namedCandidate(this.#state.phase, id);
-      if (named) picks.set(named.round, { lane: named.lane, sha: named.sha, votes: 0 });
-    }
-    const latest = rounds[rounds.length - 1];
-    const inText = latest?.candidates.find((c) => typeof c.sha === "string" && c.sha.length > 0 && ruling.text.includes(c.sha));
-    if (latest && inText?.sha && !picks.has(latest.round)) {
-      picks.set(latest.round, { lane: inText.lane, sha: inText.sha, votes: latest.picked?.votes ?? 0 });
-    }
-    for (const [roundNo, named] of picks) {
-      const round = rounds.find((r) => r.round === roundNo)!;
-      if (round.picked?.sha === named.sha && round.picked.ruling === ruling.id) continue;
-      this.#log.append("ruling_pick_adopted", { round: roundNo, lane: named.lane, sha: named.sha, ruling: ruling.id, was: round.picked?.sha });
-      this.#applyEvent({
-        type: "CANDIDATE_PICKED",
-        round: roundNo,
-        lane: named.lane,
-        sha: named.sha,
-        votes: named.votes,
-        ruling: ruling.id,
-      });
-    }
+    // 07g1b (R12, check 3): the ruling names its candidate through its
+    // structured `candidate` field only — never a SHA found in its text, and
+    // never a record id it settles.
+    const named = ruling.candidate ? namedCandidate(this.#state.phase, ruling.candidate) : undefined;
+    if (!named) return;
+    const round = (this.#state.phase.rounds ?? []).find((r) => r.round === named.round);
+    if (!round || (round.picked?.sha === named.sha && round.picked.ruling === ruling.id)) return;
+    this.#log.append("ruling_pick_adopted", { round: named.round, lane: named.lane, sha: named.sha, ruling: ruling.id, was: round.picked?.sha });
+    this.#applyEvent({ type: "CANDIDATE_PICKED", round: named.round, lane: named.lane, sha: named.sha, votes: 0, ruling: ruling.id });
   }
 
   /** Plan 06n (A7): what a round's pick compares each lane against — the

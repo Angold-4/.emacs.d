@@ -1015,6 +1015,10 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
           !namedCandidate(p, id),
       );
       if (unknown.length > 0) return rejected(state, `a ruling names unknown record(s): ${unknown.join(", ")}`);
+      // 07g1b (R12): a named candidate must be one this phase recorded.
+      if (ruling.candidate !== undefined && !namedCandidate(p, ruling.candidate)) {
+        return rejected(state, `a ruling's candidate ${ruling.candidate} names no candidate of this phase`);
+      }
       // Plan 07f (A3, OD-1.3): everything the ruling names is settled at once,
       // points included — a named point is closed by the ruling itself, never
       // silently left open.

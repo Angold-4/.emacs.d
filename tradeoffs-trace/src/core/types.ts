@@ -648,6 +648,11 @@ export interface Ruling {
   text: string;
   /** The finding and decision ids it settles. */
   recordIds: string[];
+  /** 07g1b (R12): the candidate the next repair builds on — a label
+   * `C<round>-<lane>` or its SHA (a prefix of 7 or more). The ruling replaces
+   * that round's pick. The only way a ruling names a candidate: its text is
+   * never scanned for a SHA. */
+  candidate?: string;
   by: "owner" | "lead";
   at?: string;
 }
@@ -940,6 +945,8 @@ export interface RulingCommand {
   kind: "ruling";
   text: string;
   recordIds: string[];
+  /** 07g1b (R12): the candidate the next repair builds on (see Ruling). */
+  candidate?: string;
 }
 
 export interface PauseResumeModeCommand {
