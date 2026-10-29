@@ -1305,7 +1305,7 @@ test("07g1b R7: a lane's seat-met test-verified item makes no point when the pic
     const round = setup.conductor.state.phase.rounds![0];
     assert.equal(round.picked?.lane, "a", "the round picked lane a");
     assert.equal(
-      setup.conductor.state.phase.findings.some((f) => f.itemId === "R3" && f.from),
+      setup.conductor.state.phase.findings.some((f) => f.item === "R3" && f.from),
       false,
       "the pick passes every R3 test, so lane b's seat-met R3 is no lost work",
     );
