@@ -28,7 +28,7 @@ import { expandPromptPath, isLaneId } from "./worker-prompt.ts";
 import { matchesGlob } from "./boundaries.ts";
 import { domainDeclarationIssues, type Domain } from "./domains.ts";
 import { parseVerify, verifyKindIssue } from "./items.ts";
-import { rerunTemplateIssue } from "./test-failures.ts";
+import { declaredVerifyCommand, rerunTemplateIssue } from "./test-failures.ts";
 
 export type LintSeverity = "error" | "warning";
 
@@ -645,6 +645,45 @@ export function lintRerun(plan: LintPlanInput): LintFinding[] {
   ];
 }
 
+/** 07g1b (A4/R7/R13): every `test` verify needs a command the plan declares
+ * for it — the `#+TT_RERUN:` template it fills, or the phase's checks (plus
+ * the final checks for `test final`). A point the pick makes from a lost test
+ * takes that command as its doneWhen, so a test-verified item with none would
+ * reach a run as a point no fact can close; it is refused here instead, never
+ * left to an empty doneWhen at runtime or a command guessed from the file. */
+export function lintVerifyCommands(plan: LintPlanInput): LintFinding[] {
+  const out: LintFinding[] = [];
+  for (const phase of plan.phases ?? []) {
+    const declared = {
+      ...(typeof plan.rerun === "string" ? { rerun: plan.rerun } : {}),
+      checks: [...(plan.checks ?? []), ...(phase.checks ?? [])],
+      finalChecks: phase.finalChecks ?? [],
+    };
+    for (const item of [...(phase.architecture ?? []), ...(phase.requirements ?? []), ...(phase.constraints ?? [])]) {
+      for (const raw of item.verify ?? []) {
+        if (verifyKindIssue(raw) !== undefined) continue;
+        for (const v of parseVerify(raw)) {
+          if (v.kind !== "test" || v.name.trim().length === 0) continue;
+          // A final-only test with no final checks is lintItems' own error.
+          if (v.final && !declared.finalChecks.some((c) => c.trim().length > 0)) continue;
+          if (declaredVerifyCommand(v, declared) !== undefined) continue;
+          out.push({
+            severity: "error",
+            rule: "item-verify",
+            phaseId: phase.id ?? "?",
+            item: (item.text ?? item.title ?? item.id ?? "(item)").split("\n")[0],
+            line: item.verifyLine ?? item.line,
+            sourceFile: plan.sourceFile,
+            problem: `the test verify ${JSON.stringify(v.name)} of ${item.id ?? "(no id)"} has no declared command: the phase has no checks and no #+TT_RERUN the verify fills, so a point for a lost test would have no doneWhen`,
+            fix: "declare the command that runs the test: #+TT_CHECKS (or the phase's :CHECKS:), or a #+TT_RERUN template the verify can fill ({file} needs a test file::name verify)",
+          });
+        }
+      }
+    }
+  }
+  return out;
+}
+
 /** Lines of `rawText` that the parsed `text` does not carry: the proof that a
  * parser dropped part of an item (a sub-list or a source block cut off at the
  * first blank line, the #41 failure). Property-drawer and blank lines are not
@@ -855,6 +894,7 @@ export function lintPlan(plan: LintPlanInput): LintFinding[] {
   const out: LintFinding[] = [
     ...lintModels(plan),
     ...lintRerun(plan),
+    ...lintVerifyCommands(plan),
     ...lintWorkers(plan),
     ...lintWorkerPrompt(plan),
     ...lintCheapFinalChecks(plan),
