@@ -417,6 +417,48 @@ test("a red fix check goes back to the same fixer with no review session", async
   assert.deepEqual(calls, ["facts:a", "fix:a:true", "facts:b", "review"]);
 });
 
+test("a fixer that changed nothing on a red point ends the domain open, never approved", async () => {
+  // 07g1b (A2): a domain is approved only after clean facts and an approving
+  // fresh domain review. An unchanged fixer whose fix check is green leaves a
+  // red point fact behind, so its first commit may still merge (status `open`),
+  // but no review ran and the domain is NOT approved.
+  const calls: string[] = [];
+  const pointOpen: DomainFacts = { checkPassed: true, points: [{ id: "P", onBase: false, onHead: false }] };
+  const outcome = await runDomainLoop(task, {
+    maxReviews: 3,
+    build: async () => ({ sha: "a" }),
+    facts: async (sha) => {
+      calls.push(`facts:${sha}`);
+      return pointOpen;
+    },
+    review: async () => {
+      calls.push("review");
+      return approve;
+    },
+    fix: async (sha) => {
+      calls.push(`fix:${sha}`);
+      return { unchanged: true, note: "its fix of a changed nothing" };
+    },
+  });
+  assert.equal(outcome.status, "open", "an unchanged fix on a red point is not an approval");
+  assert.equal(outcome.sha, "a", "its first commit is still the head the round may merge");
+  assert.equal(outcome.reviews, 0, "no domain review ran, so none approved it");
+  assert.equal(calls.filter((c) => c === "review").length, 0, "a red fact never starts a review");
+  assert.match(outcome.reason ?? "", /not approved/, "the outcome says it is not an approval");
+  assert.ok(!outcome.records.some((r) => r.review !== undefined), "no approval record carries a review");
+
+  // The same unchanged fix with a RED check is still a plain drop: only a
+  // green check leaves work worth merging.
+  const dropped = await runDomainLoop(task, {
+    maxReviews: 3,
+    build: async () => ({ sha: "a" }),
+    facts: async () => red,
+    review: async () => approve,
+    fix: async () => ({ unchanged: true, note: "its fix of a changed nothing" }),
+  });
+  assert.equal(dropped.status, "dropped");
+});
+
 test("a domain loop at its bound is dropped and the other domains merge", async () => {
   const good: FixTask = { ...task, domain: "good", findingIds: ["G"], findings: [{ ...task.findings[0], id: "G", domain: "good" }] };
   const bad: FixTask = { ...task, domain: "bad" };
