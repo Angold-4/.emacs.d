@@ -319,10 +319,13 @@ export function crateOf(name: string): string | undefined {
  * Every substituted value is one single-quoted shell word, and a template
  * that uses a placeholder whose value is unknown (`{file}` without the
  * reporter locating one, `{crate}` without a `::` path) cannot be built — so
- * a half-applied template never runs the wrong test. */
-export function singleTestCommand(name: string, output: string, template?: string): string | undefined {
+ * a half-applied template never runs the wrong test. `knownFile` is the file
+ * the caller already knows for the test (a plan item's `test file::name`
+ * verify), used for `{file}` when the output names none: a test that PASSED
+ * writes no failing line, so the reporter never locates it. */
+export function singleTestCommand(name: string, output: string, template?: string, knownFile?: string): string | undefined {
   const named = runnerAndFileFor(output, name);
-  const file = named?.file;
+  const file = named?.file ?? knownFile;
   // `{crate}` is the failing test's own module path root (`a::b::c` → `a`); a
   // name with no `::` has none, so a `{crate}` template is then never run.
   const crate = crateOf(name);
@@ -380,7 +383,7 @@ export function singleTestCommand(name: string, output: string, template?: strin
  * it has one. Undefined means no command is known, and the point then carries
  * no doneWhen: it is closed by its domain review, never by a fact. */
 export function testVerifyCommand(name: string, file: string | undefined, output: string, template?: string): string | undefined {
-  const known = singleTestCommand(name, output, template);
+  const known = singleTestCommand(name, output, template, file);
   if (known !== undefined) return known;
   if (template !== undefined && template.trim().length > 0) return undefined;
   if (file === undefined || file.trim().length === 0) return undefined;
@@ -388,6 +391,28 @@ export function testVerifyCommand(name: string, file: string | undefined, output
   // ERT names have no built-in re-run, exactly as `singleTestCommand` says.
   if (/\.el$/.test(file)) return undefined;
   return `node --test --test-name-pattern ${shellQuote(escapeRegExp(name))} ${shellQuote(file)}`;
+}
+
+/** 07g1b (A4/R7/R13): the ONE shell command that proves every LOST test of
+ * one item — each test's own `testVerifyCommand`, `&&`-joined in plan order.
+ * An item may name more than one test and the pick may lose either of them.
+ * Undefined when no test was lost or when one lost test's command is unknown:
+ * a doneWhen that proved only some of them would let a fixer close the point
+ * while another is still lost, so such a point is closed by its domain review
+ * instead. */
+export function lostTestsDoneWhen(
+  tests: readonly { name: string; file?: string }[],
+  output: string,
+  template?: string,
+): string | undefined {
+  if (tests.length === 0) return undefined;
+  const commands: string[] = [];
+  for (const test of tests) {
+    const command = testVerifyCommand(test.name, test.file, output, template);
+    if (command === undefined) return undefined;
+    commands.push(command);
+  }
+  return commands.join(" && ");
 }
 
 /** One re-run's outcome, as the caller observed it. */

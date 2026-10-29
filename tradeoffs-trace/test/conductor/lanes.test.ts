@@ -1104,12 +1104,19 @@ test("exex 01a2: when both lanes are still red, the repeat continues each lane f
 // ---------------------------------------------------------------------------
 
 /** The phase items for the 07g1b tests: R1 is review-verified, R3 is verified
- * by a named test in a known file, so its point can carry a doneWhen. */
+ * by two named tests in known files (an item may name more than one), so its
+ * point must carry a doneWhen that proves BOTH lost tests. */
 function laneItems() {
   return {
     requirements: [
       { id: "R1", title: "R1 holds", text: "R1 holds", arch: [], verify: ["review"] },
-      { id: "R3", title: "R3 works", text: "R3 works", arch: [], verify: ["test test/r3.test.ts::R3 holds"] },
+      {
+        id: "R3",
+        title: "R3 works",
+        text: "R3 works",
+        arch: [],
+        verify: ["test \"test/r3.test.ts::R3 a\"", "test \"test/r3b.test.ts::R3 b\""],
+      },
     ],
     architecture: [],
     constraints: [],
@@ -1118,7 +1125,7 @@ function laneItems() {
 
 test("another lane's met item arrives as a point with from and no consolidation agent starts", async () => {
   const items = laneItems();
-  const gate = `sh -c 'if [ -f only-b.txt ]; then printf "ok 1 - R3 holds\\n"; fi; exit 0'`;
+  const gate = `sh -c 'if [ -f only-b.txt ]; then printf "ok 1 - R3 a\\nok 2 - R3 b\\n"; fi; exit 0'`;
   const setup = await setupConductor({
     phase: lanePhase({ requirements: items.requirements, constraints: [], checks: [gate] }),
     items,
@@ -1187,7 +1194,7 @@ test("another lane's met item arrives as a point with from and no consolidation 
   try {
     await setup.conductor.start();
     await waitFor(
-      () => (setup.conductor.state.phase.findings ?? []).some((f) => f.itemId === "R3"),
+      () => (setup.conductor.state.phase.findings ?? []).some((f) => f.itemId === "R3" && f.from),
       120_000,
       50,
       setup.runDir,
@@ -1202,10 +1209,14 @@ test("another lane's met item arrives as a point with from and no consolidation 
     assert.equal(point.status, "open");
     assert.equal(point.from?.sha, b.sha, "the point names lane b's commit");
     assert.deepEqual(point.from?.paths, ["lane-b.txt", "only-b.txt"], "and the paths that commit added");
-    assert.ok(point.doneWhen, "R3 has a test, so its point carries a doneWhen");
+    assert.ok(point.doneWhen, "R3 has tests, so its point carries a doneWhen");
     assert.match(point.doneWhen!, /test-name-pattern/);
-    assert.match(point.doneWhen!, /R3/);
+    assert.match(point.doneWhen!, /R3 a/);
     assert.match(point.doneWhen!, /test\/r3\.test\.ts/);
+    // A4/R7: the item's SECOND test verify counts too — the lane landed both,
+    // the pick neither, so the one fact proves both.
+    assert.match(point.doneWhen!, /R3 b/);
+    assert.match(point.doneWhen!, /test\/r3b\.test\.ts/);
     // R1 was the pick's own: no point for it.
     assert.equal(
       setup.conductor.state.phase.findings.some((f) => f.itemId === "R1"),
@@ -1515,13 +1526,23 @@ test("a lead ruling makes the next repair build on the named candidate", async (
 });
 
 test("a review-only item that flips between candidates makes no regression point", async () => {
-  // Round 1 picks lane a, which meets R1's test and review-only C2. Round 2
-  // (one lane on the pick) drops both: R1's test fails there and C2's seats
-  // flip to unmet. Round 3 therefore starts with exactly one point — R1's,
-  // with its test as doneWhen — and never a restart.
-  const gate = `sh -c 'if [ -f r1.txt ]; then printf "ok 1 - R1\\n"; else printf "not ok 1 - R1\\n"; fi; exit 0'`;
+  // Round 1 picks lane a, which meets R1's two tests and review-only C2. Round
+  // 2 (one lane on the pick) drops R1's SECOND test (the first still passes)
+  // and C2's seats flip to unmet. Round 3 therefore starts with exactly one
+  // point — R1's, whose doneWhen is the lost second test — and never a restart
+  // (A4/R13: a lost second verification is a regression even while the first
+  // still passes).
+  const gate = `sh -c 'if [ -f r1.txt ]; then printf "ok 1 - R1 one\\n"; else printf "not ok 1 - R1 one\\n"; fi; if [ -f r1b.txt ]; then printf "ok 2 - R1 two\\n"; else printf "not ok 2 - R1 two\\n"; fi; exit 0'`;
   const items = {
-    requirements: [{ id: "R1", title: "R1 holds", text: "R1 holds", arch: [], verify: ["test test/r1.test.ts::R1"] }],
+    requirements: [
+      {
+        id: "R1",
+        title: "R1 holds",
+        text: "R1 holds",
+        arch: [],
+        verify: ["test \"test/r1.test.ts::R1 one\"", "test \"test/r1b.test.ts::R1 two\""],
+      },
+    ],
     architecture: [],
     constraints: [{ id: "C2", title: "C2 is kept", text: "C2 is kept", arch: [], verify: ["review"] }],
   };
@@ -1540,8 +1561,8 @@ test("a review-only item that flips between candidates makes no regression point
           kind: "call-sh",
           command:
             round === 1
-              ? `printf 'lane ${lane}\\n' > lane-${lane}.txt && printf 'x\\n' > r1.txt`
-              : "rm -f r1.txt && printf 'r2\\n' > round2.txt",
+              ? `printf 'lane ${lane}\\n' > lane-${lane}.txt && printf 'x\\n' > r1.txt && printf 'x\\n' > r1b.txt`
+              : "rm -f r1b.txt && printf 'r2\\n' > round2.txt",
         },
         {
           kind: "call-submit",
@@ -1604,8 +1625,10 @@ test("a review-only item that flips between candidates makes no regression point
     const r1 = points.filter((f) => f.itemId === "R1");
     assert.equal(r1.length, 1, "exactly one point for the test-verified item");
     assert.equal(r1[0].from?.sha, best.sha, "it names the candidate whose test passed");
-    assert.ok(r1[0].doneWhen, "and carries R1's test as doneWhen");
-    assert.match(r1[0].doneWhen!, /R1/);
+    assert.ok(r1[0].doneWhen, "and carries the LOST test as doneWhen");
+    assert.match(r1[0].doneWhen!, /R1 two/, "the second verification the pick lost is the fact");
+    assert.doesNotMatch(r1[0].doneWhen!, /R1 one/, "the first verification still passes, so it is no part of the fact");
+    assert.match(r1[0].doneWhen!, /test\/r1b\.test\.ts/);
     assert.equal(
       points.some((f) => f.itemId === "C2"),
       false,
