@@ -45,11 +45,6 @@ const FAST = {
   evaluateMs: 8_000,
   reviewMs: 10_000,
   panelMs: 8_000,
-  // 07g1b (R11): the round's own grace window after a lane turns green, kept
-  // short so a test whose other lane stays red does not wait the production
-  // 30 s, but long enough that a lane still building (06l: lane b sleeps 6 s)
-  // still submits and is read.
-  pickGraceMs: 10_000,
 };
 
 async function teardown(setup: TestConductorSetup): Promise<void> {
@@ -869,7 +864,15 @@ test("exex 01a2: a red lane candidate goes back to its own worker, which fixes i
     workerScript: () => laneWorker("a"),
     laneWorkerScriptFor: (lane) => {
       launches[lane] = (launches[lane] ?? 0) + 1;
-      if (lane !== "a") return laneWorker(lane);
+      if (lane !== "a") {
+        // 07g1b (R11): once one lane is green the round no longer waits for a
+        // red lane's fix, so a sibling that lands its candidate first would
+        // stop a's fix before it ran. Here b submits after a's fix: the round
+        // waits for a lane that has not reported yet and still compares both
+        // candidates.
+        const build = laneWorker(lane);
+        return { hello: build.hello, steps: [{ kind: "call-sh", command: "sleep 6" } as FakePiStep, ...build.steps] };
+      }
       return launches[lane] === 1
         ? {
             hello: defaultWorkerHello(),
@@ -1231,7 +1234,7 @@ test("once one lane is green the pick starts without waiting for a red lane's fi
     checks: ["test ! -f red.txt"],
     phaseChecks: ["true"],
     stubReviews: true,
-    deadlines: { ...FAST, pickGraceMs: 1_500, workerAttemptMs: 60_000 },
+    deadlines: { ...FAST, workerAttemptMs: 60_000 },
     workerScript: () => laneWorker("a"),
     laneWorkerScriptFor: (lane) => {
       launches[lane] = (launches[lane] ?? 0) + 1;
