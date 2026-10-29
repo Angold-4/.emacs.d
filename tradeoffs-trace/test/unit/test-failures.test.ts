@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { baselineCoversCommands, baselineFailedCommands, baselineFlakeNames, baselineFailureNames, baselineKey, baselineStatusLine, classifyCheckFailure, classifyRerun, escapeRegExp, failedNormally, parseBaseline, parseTestFailures, parseTestFailuresDetailed, rerunCommandsFor, rerunProvesTheTestRan, rerunTemplateIssue, shellQuote, singleTestCommand, type Baseline, type BaselineCommand, testIsNamedIn } from "../../src/core/test-failures.ts";
+import { baselineCoversCommands, baselineFailedCommands, baselineFlakeNames, baselineFailureNames, baselineKey, baselineStatusLine, classifyCheckFailure, classifyRerun, escapeRegExp, failedNormally, lostTestsDoneWhen, parseBaseline, parseTestFailures, parseTestFailuresDetailed, rerunCommandsFor, rerunProvesTheTestRan, rerunTemplateIssue, shellQuote, singleTestCommand, testVerifyCommand, type Baseline, type BaselineCommand, testIsNamedIn } from "../../src/core/test-failures.ts";
 
 // A real `cargo test` tail: the per-test FAILED lines, the summary list, and
 // the result line. Only the `test <name> ... FAILED` lines are names.
@@ -312,6 +312,48 @@ test("test-failures: a re-run of a test a subset check names uses that test's ow
       },
     ],
   );
+});
+
+// 07g1b (A4/R7/R13): a point made from an item another candidate landed must
+// carry a doneWhen that runs that item's own test verify alone. The test
+// PASSED there, so the check output names no failing line and no file; the
+// plan's `test file::name` verify supplies the file, and a `#+TT_RERUN:`
+// template that needs `{file}` can still be built. An item may name more than
+// one test and the pick may lose either, so its point's doneWhen proves every
+// lost test.
+test("test-failures: a lost item's test verify builds a doneWhen with no failing line", () => {
+  const passingOnly = "ok 1 - R3 holds\n1..1\n";
+  // The Node default from the item's own file.
+  assert.equal(
+    testVerifyCommand("R3 holds", "test/r3.test.ts", passingOnly),
+    "node --test --test-name-pattern 'R3 holds' 'test/r3.test.ts'",
+  );
+  // A `{file}` template is built from the item's file, never left undefined.
+  assert.equal(
+    testVerifyCommand("R3 holds", "test/r3.test.ts", passingOnly, "node --test --test-name-pattern {name} {file}"),
+    "node --test --test-name-pattern 'R3 holds' 'test/r3.test.ts'",
+  );
+  // A cargo item's own file.
+  assert.equal(testVerifyCommand("cancels_order", "tests/x.rs", passingOnly), "cargo test -- --exact 'cancels_order' --test-threads=1");
+  // No file known and no failing line: no command, so no doneWhen.
+  assert.equal(testVerifyCommand("R3 holds", undefined, passingOnly), undefined);
+  // An ERT name has no built-in re-run, exactly as the strict rule says.
+  assert.equal(testVerifyCommand("probe-failing-test", "test/x.el", passingOnly), undefined);
+  // Two lost tests: one command proves both, in plan order.
+  assert.equal(
+    lostTestsDoneWhen(
+      [
+        { name: "R3 holds", file: "test/r3.test.ts" },
+        { name: "R4 holds", file: "test/r4.test.ts" },
+      ],
+      passingOnly,
+    ),
+    "node --test --test-name-pattern 'R3 holds' 'test/r3.test.ts' && node --test --test-name-pattern 'R4 holds' 'test/r4.test.ts'",
+  );
+  // One unbuildable test means no fact at all: a partial doneWhen could close
+  // the point while the other test is still lost.
+  assert.equal(lostTestsDoneWhen([{ name: "R3 holds", file: "test/r3.test.ts" }, { name: "R5" }], passingOnly), undefined);
+  assert.equal(lostTestsDoneWhen([], passingOnly), undefined);
 });
 
 test("test-failures: a #+TT_RERUN template substitutes {name}/{file}/{crate} as shell words", () => {

@@ -116,7 +116,7 @@ import {
   rerunCommandsFor,
   shellQuote,
   rerunProvesTheTestRan,
-  testVerifyCommand,
+  lostTestsDoneWhen,
   baselineHasEnvironmentFailure,
   type Baseline,
   type BaselineCommand,
@@ -11638,11 +11638,12 @@ export class Conductor {
   /** 07g1b (R13/A4): once the phase has evaluated `last`'s pick and not
    * accepted it, compare its evaluated items with the best candidate. Only a
    * TEST-VERIFIED item can regress: one whose `:VERIFY:` test passed on the
-   * best candidate and does not pass on the pick. It becomes a point in its
-   * domain with that test as doneWhen, never a restart — the pick stays the
-   * next base (the fix round repairs the point on it). A review-only item
-   * whose seat votes flip between candidates is not a regression and makes no
-   * point at all (07f1b let C2 "regress" nine times on votes alone). */
+   * best candidate and does not pass on the pick (any of an item's tests, not
+   * just the first). It becomes a point in its domain with the lost tests as
+   * doneWhen, never a restart — the pick stays the next base (the fix round
+   * repairs the point on it). A review-only item whose seat votes flip between
+   * candidates is not a regression and makes no point at all (07f1b let C2
+   * "regress" nine times on votes alone). */
   #recordRegression(last: RoundRecord | undefined): void {
     if (!last?.picked || last.regressed || !this.#itemsEnforced()) return;
     const picked = last.picked.sha;
@@ -11663,21 +11664,22 @@ export class Conductor {
       const item = items.get(id);
       if (!item) continue;
       // A review-only item cannot regress: the seats' votes are not evidence.
-      const test = itemTestVerifies(item)[0];
-      if (!test) continue;
-      // A4: its test passed on the best candidate and does not pass on the pick.
-      if (testOutcomeIn(bestOutput, test.name) !== "passed") continue;
-      if (testOutcomeIn(pickOutput, test.name) === "passed") continue;
-      const doneWhen = testVerifyCommand(test.name, test.file, bestOutput, this.#plan.rerun);
+      // A4/R13: EVERY test verify counts, not just the first — the pick can
+      // lose the item's second test while its first still passes.
+      const lost = itemTestVerifies(item).filter(
+        (v) => testOutcomeIn(bestOutput, v.name) === "passed" && testOutcomeIn(pickOutput, v.name) !== "passed",
+      );
+      if (lost.length === 0) continue;
+      const doneWhen = lostTestsDoneWhen(lost, bestOutput, this.#plan.rerun);
       this.#raiseLostItemPoint({
         item,
         sha: guard.best.sha,
         paths: this.#changedPaths(guard.best.sha, picked),
         pickSha: picked,
-        evidence: `${id}${item.title ? ` (${item.title})` : ""}: test "${test.name}" passed on ${guard.best.sha.slice(0, 7)} (round ${guard.best.round}'s pick) and does not pass on ${picked.slice(0, 7)}`,
+        evidence: `${id}${item.title ? ` (${item.title})` : ""}: ${lost.map((v) => `test "${v.name}"`).join(", ")} passed on ${guard.best.sha.slice(0, 7)} (round ${guard.best.round}'s pick) and does not pass on ${picked.slice(0, 7)}`,
         ...(doneWhen ? { doneWhen } : {}),
       });
-      lostTests.push({ id, test: test.name, ...(doneWhen ? { doneWhen } : {}) });
+      for (const v of lost) lostTests.push({ id, test: v.name, ...(doneWhen ? { doneWhen } : {}) });
     }
     this.#log.append("regression_points", {
       round: last.round,
@@ -11754,9 +11756,9 @@ export class Conductor {
    * - its `:VERIFY:` test passes in that lane's check output and not in the
    *   pick's (R11: a lane stopped while still fixing landed work green even
    *   though its tree as a whole was red).
-   * The point names the lane's commit and paths in `from` and the item's test
-   * as doneWhen when it has one; otherwise it carries none and is closed by
-   * its domain review (CI §3.2). */
+   * The point names the lane's commit and paths in `from` and, when the pick
+   * lost the item's `:VERIFY:` tests (any of them), those tests as doneWhen;
+   * otherwise it carries none and is closed by its domain review (CI §3.2). */
   #raiseLostLanePoints(round: number, winner: { lane: string; sha: string }): void {
     if (!this.#itemsEnforced()) return;
     const roundRecord = (this.#state.phase.rounds ?? []).find((r) => r.round === round);
@@ -11776,14 +11778,17 @@ export class Conductor {
       const paths = this.#changedPaths(roundRecord.base, other.sha);
       for (const item of items) {
         if (pickMet.has(item.id)) continue;
-        const test = itemTestVerifies(item)[0];
-        const testPassedThere = test ? testOutcomeIn(laneOutput, test.name) === "passed" : false;
-        const metThere = laneMet.has(item.id) || testPassedThere;
-        if (!metThere) continue;
-        // The pick's own tree already proves it green: nothing was lost.
-        if (test && testOutcomeIn(pickOutput, test.name) === "passed") continue;
-        const doneWhen = test ? testVerifyCommand(test.name, test.file, laneOutput, this.#plan.rerun) : undefined;
-        const how = laneMet.has(item.id) ? "its seats met it" : `its check output passes the item's test "${test!.name}"`;
+        // A4/R7: EVERY test verify counts, not just the first. A test that
+        // passes in the lane's output and not in the pick's is lost work.
+        const lost = itemTestVerifies(item).filter(
+          (v) => testOutcomeIn(laneOutput, v.name) === "passed" && testOutcomeIn(pickOutput, v.name) !== "passed",
+        );
+        const metBySeats = laneMet.has(item.id);
+        if (!metBySeats && lost.length === 0) continue;
+        // The pick's own tree already proves every test green: nothing was lost.
+        if (metBySeats && lost.length === 0 && itemTestVerifies(item).length > 0) continue;
+        const doneWhen = lostTestsDoneWhen(lost, laneOutput, this.#plan.rerun);
+        const how = metBySeats ? "its seats met it" : `its check output passes the item's test "${lost[0].name}"`;
         this.#raiseLostItemPoint({
           item,
           sha: other.sha,
@@ -11798,7 +11803,7 @@ export class Conductor {
           from: other.sha,
           lane: other.lane,
           pick: winner.sha,
-          via: laneMet.has(item.id) ? "seats" : "test",
+          via: metBySeats ? "seats" : "test",
           ...(doneWhen ? { doneWhen } : {}),
         });
       }
