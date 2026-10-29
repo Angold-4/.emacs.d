@@ -9924,16 +9924,23 @@ export class Conductor {
     };
     const outcome = await runDomainLoop(task, host);
     const outcomeSha = outcome.sha;
+    // 07g1b (A2): only a fresh domain review approves a domain. An `open` loop
+    // ended with its fixer unchanged and its fix check green, so no review ran
+    // and its points stay open; its head commit still joins the round's
+    // candidate, where the next loop's facts judge those points. A dropped
+    // domain's commit never merges.
+    const approved = outcome.status === "approved";
+    const mergeable = approved || outcome.status === "open";
     // 07g1 (A2): a quality problem already sent the work back to the same
     // fixer, so an approved domain's review is quality-ok. Keep its notes for
     // the next fixer on DOMAIN_APPROVED so the record still carries them.
-    const lastReview = outcome.status === "approved" ? [...outcome.records].reverse().find((r) => r.review)?.review : undefined;
+    const lastReview = approved ? [...outcome.records].reverse().find((r) => r.review)?.review : undefined;
     const approvalNotes = lastReview?.notes ?? [];
     this.#applyEvent({
-      type: outcome.status === "approved" ? "DOMAIN_APPROVED" : "DOMAIN_DROPPED",
+      type: approved ? "DOMAIN_APPROVED" : "DOMAIN_DROPPED",
       round,
       domain: task.domain,
-      ...(outcome.status === "dropped" ? { reason: outcome.reason ?? "the domain loop ended" } : { sha: outcomeSha!, ...(approvalNotes.length > 0 ? { notes: approvalNotes } : {}) }),
+      ...(approved ? { sha: outcomeSha!, ...(approvalNotes.length > 0 ? { notes: approvalNotes } : {}) } : { reason: outcome.reason ?? "the domain loop ended" }),
       reviews: outcome.reviews,
     } as Event);
     this.#log.append("domain_loop_finished", {
@@ -9945,7 +9952,7 @@ export class Conductor {
       reviews: outcome.reviews,
       fixes: outcome.fixes,
     });
-    if (outcome.status === "approved" && outcomeSha) return { lane, ok: true, sha: outcomeSha, fixes: outcome.fixes, domainRecords: outcome.records, ...(allDisclosures.length > 0 ? { disclosures: allDisclosures } : {}), ...(allAdded.length > 0 ? { added: allAdded } : {}) };
+    if (mergeable && outcomeSha) return { lane, ok: true, sha: outcomeSha, fixes: outcome.fixes, domainRecords: outcome.records, ...(allDisclosures.length > 0 ? { disclosures: allDisclosures } : {}), ...(allAdded.length > 0 ? { added: allAdded } : {}) };
     return {
       lane,
       ok: false,
