@@ -120,6 +120,7 @@ import {
   baselineHasEnvironmentFailure,
   type Baseline,
   type BaselineCommand,
+  type DeclaredTestCommands,
   type TestRerunOutcome,
 } from "./core/test-failures.ts";
 import { clampMessageTitle, contentHashOf, ledgerEntries, MESSAGE_TITLE_MAX, type MessageContent } from "./core/messages.ts";
@@ -253,6 +254,7 @@ import {
   type ItemOutcome,
   type PlanItems,
   type SeatItemVerdict,
+  type TestVerify,
   type VerdictContext,
   type VerifyResolution,
 } from "./core/items.ts";
@@ -11657,29 +11659,31 @@ export class Conductor {
     const outcomes = new Map(this.#itemOutcomes().map((o) => [o.item.id, o]));
     const bestOutput = this.#checkOutputFor(guard.best.sha);
     const pickOutput = this.#checkOutputFor(picked);
+    const declared = this.#declaredTestCommands();
     const lostTests: Array<{ id: string; test: string; doneWhen?: string }> = [];
-    for (const id of guard.best.met) {
-      const outcome = outcomes.get(id);
-      if (!outcome || outcome.outcome === "met" || outcome.outcome === "fits") continue;
-      const item = items.get(id);
-      if (!item) continue;
+    for (const item of items.values()) {
+      const verifies = itemTestVerifies(item);
       // A review-only item cannot regress: the seats' votes are not evidence.
-      // A4/R13: EVERY test verify counts, not just the first — the pick can
-      // lose the item's second test while its first still passes.
-      const lost = itemTestVerifies(item).filter(
+      if (verifies.length === 0) continue;
+      // R13/A4: for a test-verified item the TEST evidence decides, whatever
+      // the seats voted on either candidate (D-B-44, rejected: a seat "met" on
+      // the pick never hides a lost test). EVERY test verify counts, not just
+      // the first — the pick can lose the item's second test while its first
+      // still passes.
+      const lost = verifies.filter(
         (v) => testOutcomeIn(bestOutput, v.name) === "passed" && testOutcomeIn(pickOutput, v.name) !== "passed",
       );
       if (lost.length === 0) continue;
-      const doneWhen = lostTestsDoneWhen(lost, bestOutput, this.#plan.rerun);
+      const doneWhen = this.#lostTestsDoneWhen(item, lost, declared);
       this.#raiseLostItemPoint({
         item,
         sha: guard.best.sha,
         paths: this.#changedPaths(guard.best.sha, picked),
         pickSha: picked,
-        evidence: `${id}${item.title ? ` (${item.title})` : ""}: ${lost.map((v) => `test "${v.name}"`).join(", ")} passed on ${guard.best.sha.slice(0, 7)} (round ${guard.best.round}'s pick) and does not pass on ${picked.slice(0, 7)}`,
+        evidence: `${item.id}${item.title ? ` (${item.title})` : ""}: ${lost.map((v) => `test "${v.name}"`).join(", ")} passed on ${guard.best.sha.slice(0, 7)} (round ${guard.best.round}'s pick) and does not pass on ${picked.slice(0, 7)}`,
         ...(doneWhen ? { doneWhen } : {}),
       });
-      for (const v of lost) lostTests.push({ id, test: v.name, ...(doneWhen ? { doneWhen } : {}) });
+      for (const v of lost) lostTests.push({ id: item.id, test: v.name, ...(doneWhen ? { doneWhen } : {}) });
     }
     this.#log.append("regression_points", {
       round: last.round,
@@ -11748,6 +11752,35 @@ export class Conductor {
     }
   }
 
+  /** 07g1b (A4/R7/R13): the commands the plan declares for running its
+   * tests — the `#+TT_RERUN:` template and the phase's round (and final)
+   * checks. A lost-test point's doneWhen is only ever taken from these. */
+  #declaredTestCommands(): DeclaredTestCommands {
+    const contract = this.#state.phase.contract;
+    return {
+      ...(this.#plan.rerun ? { rerun: this.#plan.rerun } : {}),
+      checks: checkCommands(this.#plan.checks, contract.checks, contract.finalChecks, "round"),
+      ...(contract.finalChecks ? { finalChecks: contract.finalChecks } : {}),
+    };
+  }
+
+  /** 07g1b (A4/R7/R13): the doneWhen of a point made from `tests` of `item`:
+   * each test's declared command (`lostTestsDoneWhen`). A plan that declares
+   * none is refused by `tt lint` (item-verify); should one reach a run anyway,
+   * the gap is logged as an error, never left as a silently empty doneWhen. */
+  #lostTestsDoneWhen(item: FlatItem, tests: readonly TestVerify[], declared: DeclaredTestCommands): string | undefined {
+    const doneWhen = lostTestsDoneWhen(tests, declared);
+    if (doneWhen === undefined && tests.length > 0) {
+      this.#log.append("error", {
+        where: "lost_test_done_when",
+        item: item.id,
+        tests: tests.map((t) => t.name),
+        error: "the plan declares no command for this test verify (no #+TT_RERUN it fills and no check); tt lint refuses such a plan",
+      });
+    }
+    return doneWhen;
+  }
+
   /** 07g1b (A4/R7/R11): the work another lane landed that the pick does not
    * carry arrives as points, never as a consolidation step and never as a
    * restart. For every other lane's candidate in the round, an item becomes a
@@ -11770,6 +11803,7 @@ export class Conductor {
     const seatCount = this.#laneSeats().length;
     const pickMet = laneMetItems(pick, itemIds, seatCount);
     const pickOutput = this.#checkOutputFor(winner.sha);
+    const declared = this.#declaredTestCommands();
     for (const other of roundRecord.candidates) {
       if (other.lane === winner.lane || typeof other.sha !== "string" || other.sha.length === 0) continue;
       if (other.sha === winner.sha) continue;
@@ -11777,18 +11811,24 @@ export class Conductor {
       const laneOutput = this.#checkOutputFor(other.sha);
       const paths = this.#changedPaths(roundRecord.base, other.sha);
       for (const item of items) {
-        if (pickMet.has(item.id)) continue;
+        const verifies = itemTestVerifies(item);
         // A4/R7: EVERY test verify counts, not just the first. A test that
-        // passes in the lane's output and not in the pick's is lost work.
-        const lost = itemTestVerifies(item).filter(
+        // passes in the lane's output and not in the pick's is lost work,
+        // whatever the pick's seats voted (test evidence decides, as in R13).
+        const lost = verifies.filter(
           (v) => testOutcomeIn(laneOutput, v.name) === "passed" && testOutcomeIn(pickOutput, v.name) !== "passed",
         );
-        const metBySeats = laneMet.has(item.id);
+        // R7, read literally: "lane b met an item lane a missed" is a point —
+        // a test-verified one too, even when no test loss shows in the two
+        // check outputs (the lane's seats met it; the pick's did not).
+        const metBySeats = laneMet.has(item.id) && !pickMet.has(item.id);
         if (!metBySeats && lost.length === 0) continue;
-        // The pick's own tree already proves every test green: nothing was lost.
-        if (metBySeats && lost.length === 0 && itemTestVerifies(item).length > 0) continue;
-        const doneWhen = lostTestsDoneWhen(lost, laneOutput, this.#plan.rerun);
-        const how = metBySeats ? "its seats met it" : `its check output passes the item's test "${lost[0].name}"`;
+        // "The point's doneWhen is the item's :VERIFY: test when it has one":
+        // the lost tests, else every test the item names, each by the plan's
+        // declared command. A review-only item's point carries none and is
+        // closed by its domain review (CI §3.2).
+        const doneWhen = verifies.length > 0 ? this.#lostTestsDoneWhen(item, lost.length > 0 ? lost : verifies, declared) : undefined;
+        const how = lost.length > 0 ? `its check output passes the item's test "${lost[0].name}"` : "its seats met it";
         this.#raiseLostItemPoint({
           item,
           sha: other.sha,
@@ -11803,7 +11843,7 @@ export class Conductor {
           from: other.sha,
           lane: other.lane,
           pick: winner.sha,
-          via: metBySeats ? "seats" : "test",
+          via: lost.length > 0 ? "test" : "seats",
           ...(doneWhen ? { doneWhen } : {}),
         });
       }

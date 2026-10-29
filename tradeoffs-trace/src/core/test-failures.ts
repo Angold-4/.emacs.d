@@ -375,42 +375,64 @@ export function singleTestCommand(name: string, output: string, template?: strin
   });
 }
 
-/** 07g1b (A4): the command that runs ONE plan item's test verify alone, for a
- * point made from a lost item. `singleTestCommand` reads the runner from a
- * FAILING test's line; a test that PASSED writes none, so a point made from
- * work another candidate landed carries the verify's own file instead (the
- * plan's `test file::name` form). The plan's `#+TT_RERUN:` template wins when
- * it has one. Undefined means no command is known, and the point then carries
- * no doneWhen: it is closed by its domain review, never by a fact. */
-export function testVerifyCommand(name: string, file: string | undefined, output: string, template?: string): string | undefined {
-  const known = singleTestCommand(name, output, template, file);
-  if (known !== undefined) return known;
-  if (template !== undefined && template.trim().length > 0) return undefined;
-  if (file === undefined || file.trim().length === 0) return undefined;
-  if (/\.rs$/.test(file)) return `cargo test -- --exact ${shellQuote(name)} --test-threads=1`;
-  // ERT names have no built-in re-run, exactly as `singleTestCommand` says.
-  if (/\.el$/.test(file)) return undefined;
-  return `node --test --test-name-pattern ${shellQuote(escapeRegExp(name))} ${shellQuote(file)}`;
+/** 07g1b (A4/R7/R13): the commands a plan declares for running its tests —
+ * the only sources a lost-test point's doneWhen is taken from. */
+export interface DeclaredTestCommands {
+  /** The plan's `#+TT_RERUN:` single-test template, when it declares one. */
+  rerun?: string;
+  /** The round's check commands: the plan's `#+TT_CHECKS` then the phase's
+   * own `:CHECKS:` (the commands whose output resolves a `test` verify). */
+  checks: readonly string[];
+  /** The phase's final checks, which also run a `test final` verify. */
+  finalChecks?: readonly string[];
 }
 
-/** 07g1b (A4/R7/R13): the ONE shell command that proves every LOST test of
- * one item — each test's own `testVerifyCommand`, `&&`-joined in plan order.
- * An item may name more than one test and the pick may lose either of them.
- * Undefined when no test was lost or when one lost test's command is unknown:
- * a doneWhen that proved only some of them would let a fixer close the point
- * while another is still lost, so such a point is closed by its domain review
- * instead. */
+/** 07g1b (A4/R7/R13): the plan's own declared command for ONE `test` verify.
+ * The `#+TT_RERUN:` template, filled from the verify's own declared name (and
+ * its `file::` path, `{crate}` from a cargo `::` name), when the plan declares
+ * one that the verify can fill; otherwise the phase's check command — the
+ * declared command whose output resolves the verify (`( a ) && ( b )` when the
+ * phase declares more than one). Never a command guessed from the test file's
+ * extension or from a check's output. Undefined only when the plan declares
+ * neither, which `tt lint` refuses (rule item-verify) before any run. */
+export function declaredVerifyCommand(
+  test: { name: string; file?: string; final?: boolean },
+  declared: DeclaredTestCommands,
+): string | undefined {
+  const template = declared.rerun;
+  if (template !== undefined && template.trim().length > 0) {
+    const values: Record<string, string | undefined> = { name: test.name, file: test.file, crate: crateOf(test.name) };
+    if (rerunPlaceholders(template).every((p) => values[p] !== undefined)) {
+      return template.replace(/\{(name|file|crate)\}/g, (_m, key: string) => shellQuote(values[key]!));
+    }
+  }
+  const commands: string[] = [];
+  for (const raw of [...declared.checks, ...(test.final ? (declared.finalChecks ?? []) : [])]) {
+    const command = raw.trim();
+    if (command.length > 0 && !commands.includes(command)) commands.push(command);
+  }
+  if (commands.length === 0) return undefined;
+  return commands.length === 1 ? commands[0] : commands.map((c) => `( ${c} )`).join(" && ");
+}
+
+/** 07g1b (A4/R7/R13): the ONE doneWhen of a point made from an item's LOST
+ * tests — each lost test's `declaredVerifyCommand`, `&&`-joined in plan order
+ * (a command shared by several tests, e.g. the phase check, appears once). An
+ * item may name more than one test and the pick may lose either of them.
+ * Undefined when no test was lost, or when the plan declares no command for
+ * one of them (a lint error, so unreachable for a linted plan): a doneWhen
+ * that proved only some of them would let a fixer close the point while
+ * another is still lost. */
 export function lostTestsDoneWhen(
-  tests: readonly { name: string; file?: string }[],
-  output: string,
-  template?: string,
+  tests: readonly { name: string; file?: string; final?: boolean }[],
+  declared: DeclaredTestCommands,
 ): string | undefined {
   if (tests.length === 0) return undefined;
   const commands: string[] = [];
   for (const test of tests) {
-    const command = testVerifyCommand(test.name, test.file, output, template);
+    const command = declaredVerifyCommand(test, declared);
     if (command === undefined) return undefined;
-    commands.push(command);
+    if (!commands.includes(command)) commands.push(command);
   }
   return commands.join(" && ");
 }
