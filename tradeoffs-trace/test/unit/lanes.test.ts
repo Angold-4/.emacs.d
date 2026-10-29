@@ -278,6 +278,13 @@ test("exex 01a2: a lane whose candidate is still red when its time runs out cont
 
 test("exex 01a2: a lane never hands in a red tree — a failed check goes back to the same lane, which fixes it and submits again", async () => {
   const host = new FakeHost({ a: "Xa", b: "C1b" });
+  // 07g1b (R11): once a lane is green the round no longer waits for a red
+  // lane's fix, so the sibling submits after lane a's own fix has landed; the
+  // round then still compares both lanes.
+  host.buildLane = async (lane: string) => {
+    if (lane === "b") await new Promise((resolve) => setTimeout(resolve, 100));
+    return { lane, sha: host.lanes[lane] as string, disclosures: [] };
+  };
   const fixes: string[] = [];
   host.fixLane = async (lane: string, _round: number, sha: string, failure: string) => {
     fixes.push(`${lane}:${sha}:${failure}`);
@@ -352,6 +359,13 @@ test("09-2: a candidate's reviews start when its lane submits, before its check 
 
 test("09-2: a failed check cancels its reviews, they are not counted, and the fixed candidate gets fresh reviews", async () => {
   const host = new FakeHost({ a: "Xa", b: "C1b" });
+  // 07g1b (R11): the green sibling submits after lane a's fix, so the fix is
+  // still part of the round (once a lane is green the round stops waiting for
+  // a red lane).
+  host.buildLane = async (lane: string) => {
+    if (lane === "b") await new Promise((resolve) => setTimeout(resolve, 120));
+    return { lane, sha: host.lanes[lane] as string, disclosures: [] };
+  };
   // Reviews outlast the 5 ms check, so the red candidate's are in flight
   // when its check fails.
   host.reviewDelayMs = 20;
@@ -381,6 +395,11 @@ test("09-2: reviews a host could not cancel still never count — on the red can
     // ignores them). 0: they land after the fixed candidate was submitted
     // (they name the old sha and never attach to the new one).
     const host = new FakeHost({ a: "Xa", b: "C1b" });
+    // 07g1b (R11): the green sibling submits after lane a's fix.
+    host.buildLane = async (lane: string) => {
+      if (lane === "b") await new Promise((resolve) => setTimeout(resolve, 150));
+      return { lane, sha: host.lanes[lane] as string, disclosures: [] };
+    };
     host.cancelReviews = undefined;
     host.reviewDelayMs = 20;
     let fixedOnce = false;
@@ -459,4 +478,31 @@ test("09-2: the reducer drops a red candidate's reviews and ignores one that lan
   state = apply(state, { type: "ROUND_REVIEW_SUBMITTED", round: 1, lane: "a", seat: "M", review: review("M", "C1a") });
   state = apply(state, { type: "CANDIDATE_CHECKED", round: 1, lane: "a", ok: true });
   assert.deepEqual(state.phase.rounds![0].candidates[0].reviews?.map((r) => r.seat), ["M"]);
+});
+
+test("07g1b (R11): once one lane is green the round stops waiting for a red lane, whose late green is no late candidate", async () => {
+  const host = new FakeHost({ a: "C1a", b: "R1b" });
+  // a is green at once; b's first candidate is red, and its fix turns green
+  // only well after the pick was adopted.
+  host.checkCandidate = async (_round: number, _lane: string, sha: string) => {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    if (sha === "FIXb") {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      return { ok: true };
+    }
+    return sha === "C1a" ? { ok: true } : { ok: false, note: "red" };
+  };
+  host.fixLane = async (lane: string) => ({ lane, sha: "FIXb" });
+  const outcome = await runRound(host, { round: 1, base: "B0", lanes: ["a", "b"] });
+  // a is the pick: one passing candidate wins without a vote, and the red
+  // lane's late green neither fails the round nor joins the pick.
+  assert.deepEqual(outcome.winner, { lane: "a", sha: "C1a", votes: 0 });
+  assert.deepEqual(host.rounds()[0].picked, { lane: "a", sha: "C1a", votes: 0 });
+  assert.equal(types(host).filter((t) => t === "PICK_VOTE").length, 0, "no vote is taken for the late lane");
+  assert.deepEqual(outcome.stoppedLanes ?? [], ["b"], "the red lane is stopped at the freeze, not after the pick");
+  assert.notEqual(host.rounds()[0].candidates.find((c) => c.lane === "b")?.ok, true, "the red lane is no passing candidate");
+  const lateGreen = host.events.filter(
+    (e) => e.type === "CANDIDATE_CHECKED" && (e as { lane?: string; ok?: boolean }).lane === "b" && (e as { ok?: boolean }).ok,
+  );
+  assert.deepEqual(lateGreen, [], "nothing the stopped lane landed after the freeze is read");
 });

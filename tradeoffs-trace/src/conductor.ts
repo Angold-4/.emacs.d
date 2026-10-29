@@ -39,7 +39,6 @@ import { advisoryReason, bestCandidate, blocksAcceptance, candidateLabel, carryB
 // implements its `LaneHost` with the worktree, agent, check, review and vote
 // machinery below and calls it; it decides nothing about lanes itself.
 import {
-  PICK_GRACE_MS,
   isLaneRound,
   laneFailureLines,
   lanesOfContract,
@@ -366,12 +365,6 @@ export interface Deadlines {
   ownerWaitMs: number;
   abortGraceMs: number;
   termGraceMs: number;
-  /** 07g1b (R11): after one lane's candidate passes its checks, how long the
-   * round keeps waiting for another lane's fix before it freezes the passing
-   * set and adopts the pick. A short grace, so the pick never waits out a red
-   * lane's whole attempt (exex 01c3a: 75 minutes), but long enough that a lane
-   * whose fix lands within a second or two still joins the pick. */
-  pickGraceMs: number;
   /** Plan 2d: how long `stop()` waits for an agent to exit after abort before
    * escalating to SIGTERM. Much shorter than `abortGraceMs` (design §8.2's
    * mid-run cancellation grace): `tt stop` must release the run within 15 s,
@@ -430,7 +423,6 @@ export const DEFAULT_DEADLINES: Deadlines = {
   ownerWaitMs: boundDefaultMs("owner-wait"),
   abortGraceMs: 30_000,
   termGraceMs: 10_000,
-  pickGraceMs: PICK_GRACE_MS,
   stopAbortGraceMs: 2_000,
   stallMs: 3 * 60_000,
   inboxPollMs: 1_000,
@@ -8961,7 +8953,7 @@ export class Conductor {
      * from its own lost edits. */
     freshSession?: boolean;
     /** tt 09 (change 3): a mapper that submits its own commit (a fixer). */
-    mapper?: { round: number; worktree: string; fixer?: boolean };
+    mapper?: { round: number; worktree: string };
   }): AgentHandle {
     let helloResolve!: (r: HelloResult) => void;
     const helloPromise = new Promise<HelloResult>((resolve) => {
@@ -8980,11 +8972,11 @@ export class Conductor {
       domainReviewResolve = resolve;
     });
     fs.mkdirSync(opts.sessionDir, { recursive: true });
-    // A fixer (07c) is a mapper: it runs on the worker model, like a lane.
-    // Only the consolidator that combines the lanes runs on the leader's.
-    const providerModel = opts.mapper && !opts.mapper.fixer
-      ? this.#providerModelFor?.("consolidator", this.#laneLeader())
-      : opts.role === "worker"
+    // 07g1b (C3/A4): a mapper — a lane worker or a domain fixer — runs on the
+    // worker model, like a lane. The consolidator that combined the lanes is
+    // gone, so no agent here runs on the leader's model.
+    const providerModel =
+      opts.role === "worker"
         ? // Plan 06g2: `worker.1`/`worker.2` name a lane by its 1-based
           // position, which the caller passes as `seat`.
           this.#providerModelFor?.("worker", opts.seat ?? opts.lane)
@@ -9442,19 +9434,11 @@ export class Conductor {
     return keep.join("\n").trim();
   }
 
-  // -------------------------------------------------------------------------
-  // tt 09 (change 3): combine the lanes
-  // -------------------------------------------------------------------------
-
-  /** The consolidator's own worktree, beside the lanes'. */
-  #consolidationWorktree(): string {
-    return path.join(this.#runDir, "worktrees", "consolidator");
-  }
-
-  /** Plan 07c (D4.3): one mapper in consolidator mode — its own worktree at
-   * `base` (or, for a fix, on its own red commit, continuing its session),
-   * frozen to a commit. Mirrors `#buildLane` without the lane-only parts (no
-   * owner-note delivery, no saved unsubmitted work). */
+  /** Plan 07c (D4.3): one domain fixer mapper — its own worktree at `base`
+   * (or, for a fix, on its own red commit, continuing its session), frozen to
+   * a commit. Mirrors `#buildLane` without the lane-only parts (no owner-note
+   * delivery, no saved unsubmitted work). 07g1b (A4/C3): this is the only
+   * combining agent left — the consolidator step is gone. */
   async #buildFixerAgent(opts: {
     round: number;
     worktree: string;
@@ -9466,12 +9450,7 @@ export class Conductor {
     lane: string;
     logPrefix: string;
     roleWord: string;
-    /** The note a first build whose tree equals the base records (the
-     * consolidator's own wording differs from a fixer's). */
-    changedNothingNote?: string;
     fix?: { of: string; timeoutMs: number };
-    /** A 07c fixer: runs on the worker model, not the consolidator's. */
-    fixer?: boolean;
   }): Promise<LaneBuild> {
     const { worktree, base, fix } = opts;
     const startedAt = Date.now();
@@ -9497,7 +9476,7 @@ export class Conductor {
       sessionDir: opts.sessionDir,
       // It owes submit_phase only: no coverage turn (TT_ITEMS=0).
       env: { ...this.#laneEnv(worktree, this.#piEnvFor?.("worker", agentId) ?? {}), TT_ITEMS: "0" },
-      mapper: { round: opts.round, worktree, ...(opts.fixer ? { fixer: true } : {}) },
+      mapper: { round: opts.round, worktree },
       // A fix continues the session that holds the work; a first build (or a
       // restart's re-run) starts fresh.
       ...(fix ? {} : { freshSession: true }),
@@ -9528,9 +9507,9 @@ export class Conductor {
       // (`#onNoSubmission`); only a recorded submit_phase is a submission.
       if (outcome !== "submitted" || handle.submissionAdded === undefined) {
         // Plan 07e (E2/A2): every timed-out attempt names its bound — the
-        // fixer's own, or the worker attempt a consolidator runs under. The
-        // fixer's is also named in its task note, so a skipped fixer is never
-        // mistaken for a red one.
+        // fixer's own for a fixer, the worker attempt otherwise. The fixer's is
+        // also named in its task note, so a skipped fixer is never mistaken
+        // for a red one.
         if (outcome === "timeout") {
           if (opts.actionKind === "fixer") {
             const limitMs = fix?.timeoutMs ?? this.#deadlines.fixerAttemptMs;
@@ -9565,7 +9544,7 @@ export class Conductor {
         return {
           lane: opts.lane,
           unchanged: true,
-          note: opts.changedNothingNote ?? `the ${opts.roleWord} changed nothing on the base`,
+          note: `the ${opts.roleWord} changed nothing on the base`,
           ...(handle.submissionAdded && handle.submissionAdded.length > 0 ? { added: handle.submissionAdded } : {}),
           ...(disclosures.length > 0 ? { disclosures } : {}),
         };
@@ -10512,10 +10491,9 @@ export class Conductor {
       // round reads them; only the picked candidate's become events.
       // Packet X: each doneWhen that passes here also runs on the round's base
       // (the lane's start), so a command that passes there too repairs
-      // nothing. The consolidator's commit gets no facts: its facts are never
-      // used (the next round's candidates are checked on their own).
+      // nothing.
       const facts =
-        passed && lane !== "consolidator" && (this.#state.phase.contract.domains?.length ?? 0) > 0
+        passed && (this.#state.phase.contract.domains?.length ?? 0) > 0
           ? await this.#runDoneWhenFacts(lane, candidateSha, checkoutDir.dir, laneBase ?? this.#baselineBaseSha())
           : [];
       this.#laneFacts.set(candidateSha, facts);
@@ -11538,10 +11516,9 @@ export class Conductor {
         cancelReviews: (r, lane, sha) => this.#cancelLaneReviews(r, lane, sha),
         pickTurn: (r, at, seat, passing, revote) => this.#runPickTurn(r, at, seat, passing, revote),
         emit: (event) => this.#applyEvent(event),
-        // 07g1b (R11): a lane the round stops waiting for is terminated here,
-        // and the round's grace window is the run's own deadline.
+        // 07g1b (R11): a lane the round stops waiting for is terminated here;
+        // the round itself never waits out a red lane's fix.
         stopLane: (r, lane) => this.#stopLane(r, lane),
-        pickGraceMs: this.#deadlines.pickGraceMs,
         // Plan 06n (A3): the round records nothing after a requested stop.
         stopRequested: () => this.#stopRequested,
       };

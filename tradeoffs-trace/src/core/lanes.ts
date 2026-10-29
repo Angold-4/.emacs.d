@@ -139,10 +139,6 @@ export interface LaneHost {
    * Absent leaves the lane running to its own bound (its events are still
    * ignored). */
   stopLane?(round: number, lane: string): void;
-  /** 07g1b (R11): how long a round that already has a passing candidate waits
-   * for the other lanes before freezing the passing set and adopting it
-   * (`PICK_GRACE_MS` when unset, so the tests can shorten it). */
-  pickGraceMs?: number;
   /** Plan 06n (A7): the phase's best candidate and the plan items the pick
    * compares each lane's reviews against. Undefined (no best candidate yet,
    * or an unstructured plan) keeps the old pick. */
@@ -190,14 +186,6 @@ export interface RoundOutcome {
    * green before the stop is the conductor's to turn into points. */
   stoppedLanes?: readonly string[];
 }
-
-/** 07g1b (R11): how long a round that already has a passing candidate waits
- * for the other lanes before it adopts that candidate and stops them. A red
- * lane keeps a short window to land its own green commit (a lane's fix that
- * succeeds in seconds still counts); after it, the pick never waits for a
- * fixer or a worker again (exex 01c3a: the pick sat reading for a red lane's
- * 75-minute attempt). */
-export const PICK_GRACE_MS = 30_000;
 
 /** exex 01a2: at most this many fixes of a red candidate per lane per round;
  * past it the red candidate is the lane's record and the next round starts
@@ -353,6 +341,10 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
     }
     if (typeof build.sha === "string" && build.sha.length > 0) {
       if (host.stopRequested?.()) return markDone(lane, build);
+      // 07g1b (R11): a lane the round already stopped waiting for starts no
+      // review and no check; what it landed before the stop is its own work
+      // (the conductor turns it into points), never a late candidate.
+      if (stopped.has(build.lane)) return markDone(lane, build);
       emit(build.lane, { type: "CANDIDATE_SUBMITTED", round: ctx.round, lane: build.lane, sha: build.sha });
       startReviews(build.lane, build.sha);
       let check = await checkWithReviews(build.lane, build.sha);
@@ -413,33 +405,25 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
     return markDone(lane, build);
   });
 
-  // 07g1b (R11): once a lane has a passing candidate, the round gives the
-  // other lanes a short grace window to land their own green commit, then
-  // stops waiting for them. The passing set is frozen here: a lane that turns
-  // green afterwards is stopped at the pick, and the work it landed before
-  // then arrives as points (R7), never as a late candidate.
-  const pickGraceMs = host.pickGraceMs ?? PICK_GRACE_MS;
-  let greenAt: number | undefined;
+  // 07g1b (R11): the pick never waits for a red lane. The round waits for a
+  // lane that has not reported a check yet (a two-lane round compares two
+  // candidates), but the moment one lane is green and no other lane can still
+  // hand in an unchecked candidate, the passing set is frozen and the pick
+  // starts: a red lane's fix — a lane that already failed its checks — is
+  // never waited for, however short it would be (exex 01c3a: the pick sat
+  // reading for a red lane's 75-minute attempt). Such a lane is stopped at the
+  // pick, and the work it landed before then arrives as points (R7), never as
+  // a late candidate.
+  const green = (): boolean => lanes.some((lane) => laneState.get(lane)!.ok === true);
+  const unchecked = (): boolean =>
+    lanes.some((lane) => {
+      const state = laneState.get(lane)!;
+      return !state.done && state.ok === undefined;
+    });
   for (;;) {
-    const states = lanes.map((lane) => laneState.get(lane)!);
-    if (states.every((s) => s.done) || host.stopRequested?.()) break;
-    if (states.some((s) => s.ok === true)) {
-      if (greenAt === undefined) greenAt = Date.now();
-      if (Date.now() - greenAt >= pickGraceMs) break;
-    } else {
-      greenAt = undefined;
-    }
-    const deadline = greenAt === undefined ? undefined : greenAt + pickGraceMs;
-    const change = waitChange();
-    if (deadline === undefined) {
-      await change;
-    } else {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([change, new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
-      })]);
-      if (timer !== undefined) clearTimeout(timer);
-    }
+    if (lanes.every((lane) => laneState.get(lane)!.done) || host.stopRequested?.()) break;
+    if (green() && !unchecked()) break;
+    await waitChange();
   }
   const settled = (lane: string): boolean => laneState.get(lane)!.done;
   const frozen = new Set(lanes.filter((lane) => laneState.get(lane)!.ok === true));
@@ -456,9 +440,13 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
       // ignored either way.
     }
   };
-  /** The round's outcome: every lane the pick does not need is stopped (the
-   * pick was adopted, or the round failed), and the lanes' own builds are
-   * waited for, so no round leaves a live lane behind. */
+  // 07g1b (R11): freezing the passing set IS the adoption, so every lane that
+  // is still running is stopped right here — not after the pick — and nothing
+  // it lands from now on reaches the record.
+  for (const lane of lanes) if (!settled(lane)) stopLane(lane);
+  /** The round's outcome: any lane still unsettled is stopped (the pick was
+   * adopted, or the round failed), and the lanes' own builds are waited for,
+   * so no round leaves a live lane behind. */
   const finish = async (out: Omit<RoundOutcome, "builds" | "stoppedLanes">): Promise<RoundOutcome> => {
     for (const lane of lanes) if (!settled(lane)) stopLane(lane);
     const builds = await Promise.all(tasks);
@@ -471,8 +459,14 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
     return await finish({ round: ctx.round, base: ctx.base, lanes, stopped: true });
   }
 
-  const record = host.rounds().find((r) => r.round === ctx.round);
-  const passing = (record ? passingCandidates(record) : []).filter((candidate) => frozen.has(candidate.lane));
+  // 07g1b (R11): only the frozen passing set decides the round. A lane that
+  // turned green after the freeze is never a late candidate, so the reviews,
+  // the revote and the pick all read the record reduced to that set — a late
+  // green sibling can neither fail the round nor win it.
+  const frozenView = (held: RoundRecord | undefined): RoundRecord | undefined =>
+    held ? { ...held, candidates: held.candidates.filter((candidate) => frozen.has(candidate.lane)) } : undefined;
+  const frozenRecord = frozenView(host.rounds().find((r) => r.round === ctx.round));
+  const passing = frozenRecord ? passingCandidates(frozenRecord) : [];
 
   // 3. M, A and B each review every passing candidate — K × N reviews. A
   //    review that cannot be taken is NOT a candidate with fewer reviews: the
@@ -494,8 +488,8 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
   await Promise.allSettled(cancelled);
   let failure = reviewFailures.find((r): r is string => r !== undefined);
   if (!failure) {
-    const reviewed = host.rounds().find((r) => r.round === ctx.round);
-    for (const candidate of (reviewed ? passingCandidates(reviewed) : []).filter((c) => frozen.has(c.lane))) {
+    const reviewed = frozenView(host.rounds().find((r) => r.round === ctx.round));
+    for (const candidate of reviewed ? passingCandidates(reviewed) : []) {
       const count = (candidate.reviews ?? []).length;
       if (count < host.seats.length) {
         failure = `${candidateLabel(ctx.round, candidate.lane)} was reviewed by ${count} of ${host.seats.length} seats`;
@@ -538,12 +532,19 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
       // no missing vote could make another lane win, so the round picks and
       // records which seats did not vote. Otherwise the round fails as before:
       // a majority is never invented.
-      const decided = afterPick && passing.length === 2 ? pickWinner(afterPick, host.seats, host.leader, host.pickGuard?.()) : undefined;
+      const decidedRecord = afterPick ? frozenView(afterPick) : undefined;
+      const decided =
+        decidedRecord && passing.length === 2
+          ? pickWinner(decidedRecord, host.seats, host.leader, host.pickGuard?.())
+          : undefined;
       if (decided) missingVotes = missing;
       else failure = pickFailures[0] ?? `the pick turn is missing a vote from ${missing.join(", ")}`;
     }
   }
-  let finalRecord = host.rounds().find((r) => r.round === ctx.round);
+  // 07g1b (R11): the revote and the pick read the frozen passing set only, so
+  // a lane that turned green after the freeze can neither join a revote nor
+  // win one.
+  let finalRecord = frozenView(host.rounds().find((r) => r.round === ctx.round));
 
   // 4b. Plan 06h (A3): with three or more candidates and no strict majority,
   //     the top two by votes go to ONE revote. A tie in the revote is broken
@@ -561,7 +562,7 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
           break;
         }
       }
-      finalRecord = host.rounds().find((r) => r.round === ctx.round);
+      finalRecord = frozenView(host.rounds().find((r) => r.round === ctx.round));
       if (!failure && finalRecord) {
         const voted = new Set((finalRecord.revote?.votes ?? []).map((v) => v.seat));
         const missing = host.seats.filter((s) => !voted.has(s));
