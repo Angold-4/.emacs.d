@@ -9888,7 +9888,11 @@ export class Conductor {
         const ms = remaining();
         if (ms < Math.min(60_000, this.#deadlines.fixerAttemptMs / 10)) {
           this.#log.append("fixer_fix_skipped", { round, domain: task.domain, sha, reason: "no attempt time left" });
-          return { lane, note: "its attempt time is spent" };
+          // 07g1b (R14): no fix ran, so the head is unchanged. With its fix
+          // check green the loop ends `open` (its commit may merge, its points
+          // stay open) exactly as when a fix changes nothing — never dropped
+          // just because the first build used most of the attempt.
+          return { lane, unchanged: true, note: "its attempt time is spent" };
         }
         this.#log.append("fixer_fix_started", { round, domain: task.domain, sha, remainingMs: ms });
         const fixedBuild = await buildFixer({ of: sha, feedback: failure });

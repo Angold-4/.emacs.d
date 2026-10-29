@@ -18,6 +18,8 @@ import type { FixTask } from "./core/fix-rounds.ts";
 export interface DomainBuild {
   sha?: string;
   note?: string;
+  /** The head stays as it is: the fix changed nothing, or no fix could run
+   * because the fixer's attempt time is spent (07g1b R14). */
   unchanged?: boolean;
 }
 
