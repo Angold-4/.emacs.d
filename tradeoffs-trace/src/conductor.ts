@@ -11772,6 +11772,9 @@ export class Conductor {
    * - its `:VERIFY:` test passes in that lane's check output and not in the
    *   pick's (R11: a lane stopped while still fixing landed work green even
    *   though its tree as a whole was red).
+   * For a test-verified item the test outputs overrule the seats: a seat
+   * "met" makes no point when the pick passes every one of the item's tests
+   * or the lane fails one; it counts only where the outputs show neither.
    * The point names the lane's commit and paths in `from` and, when the pick
    * lost the item's `:VERIFY:` tests (any of them), those tests as doneWhen;
    * otherwise it carries none and is closed by its domain review (CI §3.2). */
@@ -11806,6 +11809,14 @@ export class Conductor {
         // check outputs (the lane's seats met it; the pick's did not).
         const metBySeats = laneMet.has(item.id) && !pickMet.has(item.id);
         if (!metBySeats && lost.length === 0) continue;
+        // Test evidence wins over the seats for a test-verified item, both
+        // ways: when the pick's own check output passes every test the item
+        // names, the pick carries it whatever its seats voted; when the lane's
+        // output fails one of them, its seats' "met" is not lost work.
+        if (lost.length === 0 && verifies.length > 0) {
+          if (verifies.every((v) => testOutcomeIn(pickOutput, v.name) === "passed")) continue;
+          if (verifies.some((v) => testOutcomeIn(laneOutput, v.name) === "failed")) continue;
+        }
         // "The point's doneWhen is the item's :VERIFY: test when it has one":
         // the lost tests, else every test the item names, each by the plan's
         // declared command. A review-only item's point carries none and is

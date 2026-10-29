@@ -1282,6 +1282,43 @@ test("07g1b R7: another lane's seat-met test-verified item is a point with from 
   }
 });
 
+test("07g1b R7: a lane's seat-met test-verified item makes no point when the pick's output passes all its tests", async () => {
+  // Test evidence wins over the seats: lane b's seats met R3 and lane a's
+  // (the pick's) did not, but the pick's own check output passes both of R3's
+  // tests, so the pick carries R3 and nothing was lost.
+  const gate = `sh -c 'printf "ok 1 - R3 a\\nok 2 - R3 b\\n"; exit 0'`;
+  const setup = await lostLaneSetup(gate);
+  try {
+    await setup.conductor.start();
+    // The pick's reviews are promoted after its hand-off, which raises the
+    // lost-lane points synchronously before it returns.
+    await waitFor(
+      () => {
+        const phase = setup.conductor.state.phase;
+        const picked = phase.rounds?.[0]?.picked?.sha;
+        return picked !== undefined && Object.values(phase.reviews ?? {}).some((r) => r?.review?.candidateSha === picked);
+      },
+      120_000,
+      50,
+      setup.runDir,
+    );
+    const round = setup.conductor.state.phase.rounds![0];
+    assert.equal(round.picked?.lane, "a", "the round picked lane a");
+    assert.equal(
+      setup.conductor.state.phase.findings.some((f) => f.itemId === "R3" && f.from),
+      false,
+      "the pick passes every R3 test, so lane b's seat-met R3 is no lost work",
+    );
+    const { records } = readLog(runPaths(setup.runDir).events);
+    assert.equal(
+      records.some((r) => r.kind === "lost_lane_point" && (r.event as { item?: string }).item === "R3"),
+      false,
+    );
+  } finally {
+    await teardown(setup);
+  }
+});
+
 test("once one lane is green the pick starts without waiting for a red lane's fix", async () => {
   const launches: Record<string, number> = {};
   const setup = await setupConductor({
