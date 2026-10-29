@@ -30,6 +30,7 @@ import { renderPhaseChart, statsFromTimeline } from "./charts.ts";
 import { metricEvents, projectMetrics, type MetricEvent } from "./metrics.ts";
 import { acceptInput, expandEntryCommand, normalizeDecisionViewCommand, ownerCommandToEvent, type InputKind } from "./core/owner-inbox.ts";
 import { unchangedResubmissionRequesters } from "./core/owner-commands.ts";
+import { namedCandidate } from "./core/ruling-picks.ts";
 // Plan 06g: the round's only decision points — `pickWinner`, `blocksAcceptance`
 // and `roundBudget` (architecture A3 and A6). Nothing in this file decides a
 // winner or whether a finding blocks by itself.
@@ -4360,6 +4361,9 @@ export class Conductor {
     }
     this.#appliedCommandIds.add(commandId);
     this.#applyEvent(event, commandId);
+    // 07g1b (R12): a ruling that names a candidate replaces the round's pick,
+    // so the next repair builds on the candidate the owner named.
+    if (event.type === "RULING_RECORDED") this.#adoptRulingPick(event.ruling);
     crashAt("before_inbox_move");
     this.#moveInboxFile(file, this.#paths.inboxApplied);
   }
@@ -9590,8 +9594,10 @@ export class Conductor {
     if (!record?.picked || record.fixed || record.regressed) return undefined;
     if (this.#state.phase.contract.fixRounds !== "domains") return undefined;
     // Only a pick the phase adopted and evaluated is fixed (a round that was
-    // handed off and then not accepted).
-    if (this.#state.phase.candidate?.sha !== record.picked.sha) return undefined;
+    // handed off and then not accepted). 07g1b (R12): a ruling's pick is
+    // adopted without the seats' hand-off, so it is fixed from the candidate
+    // the ruling named, whatever the phase's own candidate is.
+    if (this.#state.phase.candidate?.sha !== record.picked.sha && !record.picked.ruling) return undefined;
     const domains = this.#state.phase.contract.domains ?? [];
     if (domains.length === 0) return undefined;
     const findings: FixFinding[] = this.#state.phase.findings.map((f) => {
@@ -11589,10 +11595,48 @@ export class Conductor {
         this.#clearLaneRound(round);
         return;
       }
-      const build = outcome.builds.find((b) => b.lane === outcome.winner!.lane);
-      await this.#handOffLaneWinner(round, outcome.winner, build);
+      // 07g1b (R12): a ruling that named a candidate while the round was still
+      // running is honoured now — its pick replaced the seats' own when the
+      // round's CANDIDATE_PICKED was recorded. The ruling's candidate is what
+      // is handed off and what the next repair builds on.
+      for (const ruling of this.#state.phase.rulings ?? []) this.#adoptRulingPick(ruling);
+      const adopted = (this.#state.phase.rounds ?? []).find((r) => r.round === round)?.picked;
+      const winner = adopted ? { lane: adopted.lane, sha: adopted.sha, votes: adopted.votes } : outcome.winner!;
+      const build = outcome.builds.find((b) => b.lane === winner.lane) ?? outcome.builds.find((b) => b.sha === winner.sha);
+      await this.#handOffLaneWinner(round, winner, build);
       this.#clearLaneRound(round);
       return;
+    }
+  }
+
+  /** 07g1b (R12): a lead ruling that names a candidate replaces that round's
+   * pick through CANDIDATE_PICKED, not a special reducer state branch. */
+  #adoptRulingPick(ruling: Ruling): void {
+    const rounds = this.#state.phase.rounds ?? [];
+    const picks = new Map<number, { lane: string; sha: string; votes: number }>();
+    // Keep candidate record ids (labels and SHA prefixes) as well as lane b's
+    // full SHA in the ruling text. Explicit record ids take precedence.
+    for (const id of ruling.recordIds) {
+      const named = namedCandidate(this.#state.phase, id);
+      if (named) picks.set(named.round, { lane: named.lane, sha: named.sha, votes: 0 });
+    }
+    const latest = rounds[rounds.length - 1];
+    const inText = latest?.candidates.find((c) => typeof c.sha === "string" && c.sha.length > 0 && ruling.text.includes(c.sha));
+    if (latest && inText?.sha && !picks.has(latest.round)) {
+      picks.set(latest.round, { lane: inText.lane, sha: inText.sha, votes: latest.picked?.votes ?? 0 });
+    }
+    for (const [roundNo, named] of picks) {
+      const round = rounds.find((r) => r.round === roundNo)!;
+      if (round.picked?.sha === named.sha && round.picked.ruling === ruling.id) continue;
+      this.#log.append("ruling_pick_adopted", { round: roundNo, lane: named.lane, sha: named.sha, ruling: ruling.id, was: round.picked?.sha });
+      this.#applyEvent({
+        type: "CANDIDATE_PICKED",
+        round: roundNo,
+        lane: named.lane,
+        sha: named.sha,
+        votes: named.votes,
+        ruling: ruling.id,
+      });
     }
   }
 

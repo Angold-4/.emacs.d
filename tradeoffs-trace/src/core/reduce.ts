@@ -34,6 +34,7 @@ import {
 import { isLiveDecision, panelOutcome, panelSeatNumbers, panelSeatSettled, panelSeatsSettled, reviewIngestionIssue, sameVersion } from "./predicate.ts";
 import { factKeepsOpen } from "./fix-rounds.ts";
 import { seatsOf } from "./seats.ts";
+import { namedCandidate } from "./ruling-picks.ts";
 import { findOwnerRequest } from "./triage.ts";
 import { rowsFor } from "./transitions.ts";
 import type {
@@ -293,27 +294,6 @@ function upsertLane(
   const existing = candidates.find((c) => c.lane === lane);
   if (!existing) return [...candidates, { lane, ...patch }];
   return candidates.map((c) => (c.lane === lane ? { ...c, ...patch } : c));
-}
-
-/** 07g1b (A4/R12): the lane candidate a ruling id names, by its label
- * (`C<round>-<lane>`) or its sha (exact, or a prefix of 7+ characters). */
-function namedCandidate(
-  phase: { rounds?: import("./types.ts").RoundRecord[] },
-  id: string,
-): { round: number; lane: string; sha: string } | undefined {
-  const wanted = id.trim().toLowerCase();
-  if (wanted.length === 0) return undefined;
-  for (const round of phase.rounds ?? []) {
-    for (const candidate of round.candidates) {
-      if (typeof candidate.sha !== "string" || candidate.sha.length === 0) continue;
-      const label = `c${round.round}-${candidate.lane}`;
-      if (label === wanted) return { round: round.round, lane: candidate.lane, sha: candidate.sha };
-      if (candidate.sha === id || (wanted.length >= 7 && candidate.sha.toLowerCase().startsWith(wanted))) {
-        return { round: round.round, lane: candidate.lane, sha: candidate.sha };
-      }
-    }
-  }
-  return undefined;
 }
 
 /** Plan 06g: replace one round record in order. */
@@ -1039,22 +1019,6 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // points included — a named point is closed by the ruling itself, never
       // silently left open.
       const settledIds = ruling.recordIds;
-      // 07g1b (A4/R12): a ruling may also name a CANDIDATE — its label
-      // `C<round>-<lane>` or its sha — and then it replaces that round's pick
-      // (votes 0, the ruling's id). The next repair builds on the named
-      // candidate even when the vote picked another one (exex 01c3a: the lead
-      // had to restart the node to get off a green but test-gutted lane). No
-      // new owner-input kind is added: `recordIds` already carries ids.
-      const ruledPicks = new Map<number, { lane: string; sha: string }>();
-      for (const id of settledIds) {
-        const named = namedCandidate(p, id);
-        if (named) ruledPicks.set(named.round, { lane: named.lane, sha: named.sha });
-      }
-      const rounds = (p.rounds ?? []).map((r) => {
-        const named = ruledPicks.get(r.round);
-        if (!named || !r.candidates.some((c) => c.lane === named.lane && c.sha === named.sha)) return r;
-        return { ...r, picked: { lane: named.lane, sha: named.sha, votes: 0, ruling: ruling.id } };
-      });
       const decided = new Map(p.decisions.map((d) => [d.id, d]));
       const rulings = [...(p.rulings ?? [])];
       if (!rulings.some((r) => r.id === ruling.id)) rulings.push(ruling);
@@ -1080,7 +1044,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
             }
           : f,
       );
-      let next: PhaseState = { ...p, rulings, ruledDecisions, findings, ...(p.rounds ? { rounds } : {}) };
+      let next: PhaseState = { ...p, rulings, ruledDecisions, findings };
       for (const id of settledIds) {
         next = autoResolveLinkedRequest(next, id, "ruled", p.candidate?.sha ?? "", p.contract.contractVersion);
       }

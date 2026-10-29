@@ -1284,6 +1284,172 @@ test("once one lane is green the pick starts without waiting for a red lane's fi
   }
 });
 
+/** A lane worker that submits coverage for R1 and R2. */
+function itemLaneWorker(lane: string, opts: { fail?: string; testVerify?: boolean; round?: number } = {}): { hello: unknown; steps: FakePiStep[] } {
+  return {
+    hello: defaultWorkerHello(),
+    steps: [
+      { kind: "call-sh", command: `printf 'lane ${lane} round ${opts.round ?? 1}\n' > lane-${lane}.txt${opts.fail ? ` && printf 'broken\n' > ${opts.fail}` : ""}` },
+      {
+        kind: "call-submit",
+        tool: "submit_coverage",
+        args: {
+          items: [
+            { id: "R1", status: "done", where: [`lane-${lane}.txt:1`], tests: opts.testVerify ? ["R1 proves it"] : [] },
+            { id: "R2", status: "done", where: [`lane-${lane}.txt:1`], tests: [] },
+          ],
+          arch: [],
+        },
+      },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+    ],
+  };
+}
+
+/** Writes an owner ruling to the live run's inbox (owner input, applied by
+ * the conductor itself). */
+function sendRuling(setup: TestConductorSetup, recordIds: string[], text: string): void {
+  const phase = setup.conductor.state.phase;
+  const file = path.join(runPaths(setup.runDir).inbox, `test-ruling-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
+  fs.writeFileSync(file, JSON.stringify({ type: "ruling", text, recordIds, binding: { runId: phase.runId, phaseId: phase.phaseId } }));
+}
+
+const RULED_DOMAINS = [
+  { name: "booking", globs: ["lane-a.txt", "booking/**"] },
+  { name: "gates", globs: ["lane-b.txt", "gates/**"] },
+];
+
+test("a lead ruling makes the next repair build on the named candidate (SHA in text)", async () => {
+  const setup = await setupConductor({
+    phase: lanePhase({
+      requirements: [
+        { id: "R1", title: "R1 holds", text: "R1 holds", arch: [], verify: ["review"], domain: "booking" },
+        { id: "R2", title: "R2 holds", text: "R2 holds", arch: [], verify: ["review"], domain: "gates" },
+      ],
+      constraints: [],
+      domains: RULED_DOMAINS,
+      fixRounds: "domains",
+      fixers: 2,
+      fixChecks: "true",
+    }),
+    items: {
+      requirements: [
+        { id: "R1", title: "R1 holds", text: "R1 holds", arch: [], verify: ["review"], domain: "booking" },
+        { id: "R2", title: "R2 holds", text: "R2 holds", arch: [], verify: ["review"], domain: "gates" },
+      ],
+    } as never,
+    domains: RULED_DOMAINS,
+    // A slow probe after the hand-off leaves the owner's ruling time to land
+    // before the repair round reads the round's own pick.
+    checks: ["sleep 3 && true"],
+    phaseChecks: ["sleep 3 && true"],
+    stubReviews: false,
+    deadlines: { ...FAST, workerAttemptMs: 60_000, reviewMs: 30_000 },
+    workerScript: () => itemLaneWorker("a"),
+    laneWorkerScriptFor: (lane) => itemLaneWorker(lane),
+    laneReviewerScriptFor: (seat, _candidate, state, lane) => {
+      const K = state.phase.contract.contractVersion;
+      const items = [
+        { id: "R1", verdict: "met", evidence: `lane-${lane}.txt:1` },
+        { id: "R2", verdict: "met", evidence: `lane-${lane}.txt:1` },
+      ];
+      // A and B keep the round open for a few seconds after M publishes the
+      // points, so the owner's ruling lands before the pick is recorded.
+      if (seat !== "M") {
+        return {
+          hello: defaultReviewerHello(),
+          steps: [
+            { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+            { kind: "wait-for-prompt" },
+            { kind: "sleep", ms: 6_000 },
+            { kind: "call-tool", tool: "read", args: { path: `lane-${lane}.txt` } },
+            {
+              kind: "call-submit",
+              tool: "submit_review",
+              args: {
+                reviewer: seat,
+                phaseId: "p1",
+                candidateSha: "$TT_CANDIDATE_SHA",
+                contractVersion: K,
+                correctionStatements: [],
+                findingStatements: [],
+                ballots: [],
+                items,
+                arch: [],
+                findings: [],
+              },
+            },
+          ],
+        };
+      }
+      // Two points of different domains, so a ruling that settles one still
+      // leaves the other a fixer task.
+      return laneReview("M", K, {
+        items,
+        read: `lane-${lane}.txt`,
+        findings: [
+          // Its own fact runs on the base and on the pick, so the hand-off
+          // leaves a window in which the owner's ruling can arrive.
+          { kind: "defect", severity: "blocking", evidence: "BOOKING_POINT", domain: "booking", item: "R1", where: "booking/a.txt:1", expected: "the booking path", doneWhen: "sleep 3 && true" },
+          { kind: "defect", severity: "blocking", evidence: "GATES_POINT", domain: "gates", item: "R2", where: "gates/b.txt:1", expected: "the gates path", doneWhen: "test -f gates-fixed.txt" },
+        ],
+      });
+    },
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", `${seat} picks a`),
+    fixerScriptFor: (domain) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: `printf '${domain} fixed\\n' > ${domain === "gates" ? "gates-fixed.txt" : "booking-fixed.txt"}` },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () =>
+        (setup.conductor.state.phase.rounds?.[0]?.candidates.length ?? 0) === 2 &&
+        setup.conductor.state.phase.findings.some((f) => f.evidence === "BOOKING_POINT"),
+      150_000,
+      20,
+      setup.runDir,
+    );
+    const round = setup.conductor.state.phase.rounds![0];
+    const a = round.candidates.find((c) => c.lane === "a")!;
+    const b = round.candidates.find((c) => c.lane === "b")!;
+    assert.equal(round.picked?.lane, "a", "the seats picked lane a");
+    const point = setup.conductor.state.phase.findings.find((f) => f.evidence === "BOOKING_POINT")!;
+    // The owner rules on the booking point and names lane b's candidate: the
+    // repair must build on b's commit, not on the pick.
+    sendRuling(setup, [point.id], `Rule ${point.id} settled. Build on ${b.sha} (lane b).`);
+    await waitFor(() => setup.conductor.state.phase.rounds?.[0]?.picked?.ruling !== undefined, 120_000, 20, setup.runDir);
+    const adopted = setup.conductor.state.phase.rounds![0];
+    assert.equal(adopted.picked?.sha, b.sha, "the ruling's candidate is the round's pick");
+    assert.equal(adopted.picked?.lane, "b");
+    assert.notEqual(a.sha, b.sha, "the fixture's two lanes committed different trees");
+    const { records } = readLog(runPaths(setup.runDir).events);
+    const adoptedRecord = records.find((r) => r.kind === "ruling_pick_adopted");
+    assert.ok(adoptedRecord, "the adopted ruling is recorded");
+    assert.equal((adoptedRecord!.event as { lane?: string }).lane, "b", "and it adopted lane b's candidate");
+    // The repair that starts after the ruling builds on the candidate it
+    // named. (A repair the conductor had already started keeps its own base:
+    // the ruling is a pick, not a retroactive rebuild.)
+    const fixStarted = records.find((r) => r.kind === "fix_round_started");
+    if (fixStarted && Date.parse(fixStarted.ts) > Date.parse(adoptedRecord!.ts)) {
+      await waitFor(() => setup.conductor.state.phase.rounds?.[0]?.fixed !== undefined, 240_000, 20, setup.runDir);
+      const fixed = setup.conductor.state.phase.rounds![0].fixed!;
+      assert.equal(fixed.base, b.sha, "the repair built on the candidate the ruling named");
+      assert.deepEqual(fixed.tasks.map((t) => t.domain), ["gates"], "the ruled point is settled; only the other domain is fixer work");
+    } else if (setup.conductor.state.phase.rounds?.[0]?.fixed) {
+      // A repair was already recorded from the pick the seats made; the
+      // ruling stands on the round either way.
+      assert.equal(setup.conductor.state.phase.rounds[0].picked?.ruling !== undefined, true);
+    }
+  } finally {
+    await teardown(setup);
+  }
+});
+
 test("a lead ruling makes the next repair build on the named candidate", async () => {
   const setup = await setupConductor({
     phase: lanePhase({ checks: ["test ! -f red.txt"] }),
