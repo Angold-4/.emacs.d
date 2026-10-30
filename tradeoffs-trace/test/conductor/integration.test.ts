@@ -228,6 +228,25 @@ function reviewerWithPoints() {
   };
 }
 
+function reviewerWithBookingPoint() {
+  return (seat: Reviewer, _candidate: string, state: State): { hello: unknown; steps: FakePiStep[] } => {
+    const K = state.phase.contract.contractVersion;
+    if (seat !== "M" || (state.phase.findings ?? []).some((f) => f.status === "open")) return laneReview(seat, K);
+    return laneReview("M", K, [
+      {
+        kind: "defect",
+        severity: "blocking",
+        evidence: "the booking path is wrong",
+        domain: "booking",
+        item: "R1",
+        where: "booking/a.ts:1 fn",
+        expected: "BOOKING_EXPECTED",
+        doneWhen: "test -f booking-fixed.txt",
+      },
+    ]);
+  };
+}
+
 function pickVote(seat: Reviewer, round: number): { hello: unknown; steps: FakePiStep[] } {
   return {
     hello: { role: "picker" as const, tools: ROLE_TOOLS.picker },
@@ -469,6 +488,162 @@ test("the loop chains on the candidate it picked and the third loop with a point
     assert.ok(
       reviews.every((e) => String(e.agentId ?? "").startsWith("lane-review-1-")),
       `no seat review starts while points stay open: ${JSON.stringify(reviews.map((e) => e.agentId))}`,
+    );
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("a red merged check that names no declared domain parks for the lead with no lane round", async () => {
+  // R3: a red merged candidate whose failing file belongs to no declared
+  // domain has no owning loop to re-enter. The conductor records LEAD_CALLED
+  // and parks for the lead (design G3) — it never starts a fresh lane fix or
+  // any seat review on that red merge.
+  const RED_WITH_NO_DOMAIN = 'if [ -f poison.txt ]; then echo "error: docs/README.md:4: bad link"; exit 1; fi';
+  const setup = await setupConductor({
+    phase: {
+      id: "p1",
+      goal: "a red merge with no owning domain is the lead's",
+      acceptance: ["it works"],
+      checks: [RED_WITH_NO_DOMAIN],
+      boundaries: [],
+      reserved: [],
+      workers: 2,
+      domains: FIX_DOMAINS,
+      rounds: 3,
+      fixRounds: "domains",
+      fixers: 4,
+      fixChecks: "true",
+    },
+    checks: [RED_WITH_NO_DOMAIN],
+    phaseChecks: [RED_WITH_NO_DOMAIN],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorker("a", 1),
+    laneWorkerScriptFor: (lane, round) => laneWorker(lane, round),
+    laneReviewerScriptFor: (seat, candidate, state) => reviewerWithBookingPoint()(seat as Reviewer, candidate, state),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1),
+    // The booking fix is green on its own; the merged candidate it lands on
+    // carries a file whose failing check names docs/README.md — no domain.
+    fixerScriptFor: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: "printf 'booking fixed\n' > booking-fixed.txt; printf 'poison\n' > poison.txt" },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+  });
+  try {
+    const events = () =>
+      readEvents(setup.runDir)
+        .filter((r) => r.kind === "event")
+        .map((r) => r.event as Record<string, unknown>);
+    await setup.conductor.start();
+    await waitFor(() => events().some((e) => e.type === "LEAD_CALLED"), 120_000, 20, setup.runDir);
+    const lead = events().find((e) => e.type === "LEAD_CALLED");
+    assert.match(
+      ((lead?.reasons as string[] | undefined) ?? []).join(" "),
+      /names no file of a declared domain/,
+      "LEAD_CALLED names the red merge whose output has no declared domain",
+    );
+    assert.equal(setup.conductor.state.phase.phase, "AWAITING_OWNER", "the phase parks for the lead");
+    assert.ok(events().some((e) => e.type === "LOOP_BOUND_REACHED"), "the park is recorded like the loop bound's");
+    assert.ok(
+      !events().some((e) => e.type === "fix_loop_chained"),
+      "no loop chains on a red merge with no owning domain",
+    );
+    const intents = readEvents(setup.runDir)
+      .filter((r) => r.kind === "intent")
+      .map((r) => String((r.event as { agentId?: string }).agentId ?? ""));
+    assert.ok(
+      !intents.some((id) => id.startsWith("lane-2-a-")),
+      `no fresh lane fix starts on the red merge: ${JSON.stringify(intents)}`,
+    );
+    assert.ok(
+      !intents.some((id) => id.startsWith("lane-review-2-")),
+      "no seat review starts on the red merge",
+    );
+    const noLoop = readLog(runPaths(setup.runDir).events).records.filter((r) => r.kind === "merged_check_no_loop");
+    assert.equal(noLoop.length, 1, "the ownerless red check is recorded once");
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("a point proven by an earlier loop does not keep the seats from reviewing once every point closes", async () => {
+  // R4: booking's point closes on the first loop's merged candidate and
+  // gates' point only on the second loop's. On that second candidate booking's
+  // fact passes on the base too (the base now carries its fix), but it stays
+  // closed (design G4): the seats review, because every point is closed — no
+  // extra loop and no park for the lead.
+  const setup = await setupConductor({
+    phase: {
+      id: "p1",
+      goal: "staggered point closure still reaches the seats",
+      acceptance: ["it works"],
+      checks: ["true"],
+      boundaries: [],
+      reserved: [],
+      workers: 2,
+      domains: FIX_DOMAINS,
+      rounds: 3,
+      fixRounds: "domains",
+      fixers: 4,
+      fixChecks: "true",
+    },
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorker("a", 1),
+    laneWorkerScriptFor: (lane, round) => laneWorker(lane, round),
+    laneReviewerScriptFor: (seat, candidate, state) => reviewerWithPoints()(seat as Reviewer, candidate, state),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1),
+    // booking closes its point on the first loop; gates only on the second.
+    fixerScriptFor: (domain, round) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        {
+          kind: "call-sh",
+          command:
+            domain === "booking"
+              ? round === 1
+                ? "printf 'booking fixed\n' > booking-fixed.txt"
+                : "true"
+              : round === 1
+                ? "printf 'gates\n' > gates.txt"
+                : "printf 'gates fixed\n' > gates-fixed.txt",
+        },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+  });
+  try {
+    const events = () =>
+      readEvents(setup.runDir)
+        .filter((r) => r.kind === "event")
+        .map((r) => r.event as Record<string, unknown>);
+    const intents = () =>
+      readEvents(setup.runDir)
+        .filter((r) => r.kind === "intent")
+        .map((r) => String((r.event as { agentId?: string }).agentId ?? ""));
+    await setup.conductor.start();
+    await waitFor(() => intents().some((id) => id.startsWith("lane-review-3-a-")), 120_000, 20, setup.runDir);
+    assert.ok(
+      !events().some((e) => e.type === "LEAD_CALLED"),
+      "a point closed on an earlier candidate never parks the phase",
+    );
+    assert.ok(!events().some((e) => e.type === "LOOP_BOUND_REACHED"), "no loop bound is reached on a closed set");
+    assert.deepEqual(
+      readEvents(setup.runDir)
+        .filter((r) => r.kind === "fix_loop_chained")
+        .map((r) => (r.event as { round?: number }).round),
+      [2],
+      "only the first loop with a point still open chains",
+    );
+    assert.ok(
+      intents().some((id) => id.startsWith("lane-review-3-a-")),
+      "the seats review the candidate on which every point closed",
     );
   } finally {
     await teardown(setup);
