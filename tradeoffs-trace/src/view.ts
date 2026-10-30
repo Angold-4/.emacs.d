@@ -880,7 +880,17 @@ export function buildView(
   const reviewers = reviewerOutcomes(phase);
   // Plan 07f (F1/C3): the status reads the ONE blocker list and ends each
   // blocker line with the command that clears it.
-  const reasons = acceptanceBlockers(phase, failedCheckCommands(runDir, phase)).map((b) => `${b.detail} — ${b.command}`);
+  // 07g2 (A4/R9): a failed check's status line names the failing step (the
+  // simple command the shell ran last before the non-zero exit) and marks a
+  // step that printed nothing as silent. The step comes from the check record
+  // the conductor wrote, never from re-running the check here.
+  const failingStep = phase.checks?.passed === false ? phase.checks?.failingStep : undefined;
+  const stepNote = failingStep
+    ? ` (failing step: \`${failingStep}\`${phase.checks?.failingStepSilent ? ", silent" : ""})`
+    : "";
+  const reasons = acceptanceBlockers(phase, failedCheckCommands(runDir, phase)).map(
+    (b) => `${b.detail}${b.kind === "check" ? stepNote : ""} — ${b.command}`,
+  );
   // Plan 06n (A6): the header's round is the round of the last ROUND_STARTED,
   // so it always equals the events. The old `timeline.rounds.length + 1`
   // inferred it from completed freezes, which drifts when a round was

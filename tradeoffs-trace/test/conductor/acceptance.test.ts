@@ -80,6 +80,10 @@ function reviewerFor(id: string, verdicts: Record<string, string> = {}) {
           contractVersion: state.phase.contract.contractVersion,
           correctionStatements: [],
           findingStatements: [],
+          // 07g2 (R6): a seat that neither affirms nor denies the item votes
+          // `partial`; that is the vote that leaves R2 without a strict
+          // majority. (A seat may not omit the verdict: a review that omits an
+          // item is refused.)
           items: [{ id, verdict: verdicts[reviewer] ?? "met", evidence: "src/core/rounds.ts:1 README.md:1" }],
           arch: [],
         },
@@ -137,7 +141,7 @@ test("a split item starts the evaluator with only that item in its brief", async
     deadlines: FAST,
     extraEnv: { FAKE_PI_PROMPT_LOG: promptLog },
     workerScript: () => workerFor("R2"),
-    reviewerScriptFor: reviewerFor("R2", { B: "unmet" }),
+    reviewerScriptFor: reviewerFor("R2", { A: "partial", B: "unmet" }),
     evaluatorScriptFor: (messageType) =>
       messageType === "finding"
         ? {
@@ -166,26 +170,25 @@ test("a split item starts the evaluator with only that item in its brief", async
       20,
       setup.runDir,
     );
+    // 07g2 (R6): with M met, B unmet and A partial there is no strict
+    // majority of the votes cast, so R2 is an exception; the brief re-checks it
+    // as the split item and the evaluator's contradiction is recorded against
+    // it. The old expectation that the ruling OVERTURNS a met majority is gone:
+    // no evaluator ruling flips a verdict a majority gave.
     await waitFor(
-      () =>
-        readEvents(setup.runDir).some(
-          (r) =>
-            r.kind === "event" &&
-            (r.event as { type?: string; overturns?: Array<{ id: string }> }).type === "ITEM_STATE_UPDATED" &&
-            ((r.event as { overturns?: Array<{ id: string }> }).overturns ?? []).some((o) => o.id === "R2"),
-        ),
+      () => (setup.conductor.state.phase.itemChecks ?? []).some((c) => c.itemId === "R2" && c.verdict === "contradicted"),
       90_000,
       20,
       setup.runDir,
     );
     const prompt = fs.existsSync(promptLog) ? fs.readFileSync(promptLog, "utf8") : "";
     assert.match(prompt, /Plan-item re-check:/, "the evaluator brief carries the item re-check");
-    assert.match(prompt, /- R2 R2 proves it: met \(the seats split on it\)/, "it names the split item R2");
+    assert.match(prompt, /- R2 R2 proves it: .*\(the seats split on it\)/, "it names the split item R2");
     assert.doesNotMatch(prompt, /\bR1\b/, "no other item is in the brief");
     assert.doesNotMatch(prompt, /\bF-\d+\b/, "no point is in the brief");
     assert.ok(
-      readEvents(setup.runDir).some((r) => r.kind === "event" && (r.event as { type?: string }).type === "ITEM_STATE_UPDATED"),
-      "the evaluator's ruling is recorded as the item's overturn",
+      (setup.conductor.state.phase.itemChecks ?? []).some((c) => c.itemId === "R2" && c.verdict === "contradicted"),
+      "the evaluator's ruling is recorded as R2's item check",
     );
   } finally {
     await teardown(setup);

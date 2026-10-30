@@ -9598,18 +9598,15 @@ export class Conductor {
   // Plan 07c (D4): fix rounds
   // -------------------------------------------------------------------------
 
-  /** Plan 07c (D4) / 07g2 (A1/A2): the fix step after `roundNo`'s pick was
-   * evaluated and not accepted. Every open finding triaged `fix` with a domain
-   * becomes a task (`fixTasks`); one fixer per task runs in parallel from the
-   * same base B = the round's pick. git merges their commits onto B in task
-   * order (a conflict goes to the fenced integrate duty); a red merged check
-   * or a point still open sends its own domain back into the loop with the
-   * failure, with no seat review until every point is closed. ROUND_FIXED
-   * records the result either way. Returns "stopped" when the owner's stop or
-   * a recheck ended it before the record (the fix step then re-runs on resume)
-   * and "parked" when the loop bound ran out with points open — the phase then
-   * waits for the lead, and no further loop or acceptance review starts. */
-  async #fixRound(roundNo: number): Promise<"stopped" | "parked" | undefined> {
+  /** Plan 07c (D4): the fix step after `roundNo`'s pick was evaluated and not
+   * accepted. Every open finding triaged `fix` with a domain becomes a task
+   * (`fixTasks`); one fixer per task runs in parallel from the same base B =
+   * the round's consolidated base or its pick. Each green fixer commit is
+   * merged into a fresh worktree at B in task order; a conflict or a red
+   * fixer skips that fixer with a note. ROUND_FIXED records the result either
+   * way. Returns "stopped" when the owner's stop or a recheck ended it before
+   * the record — the fix step then re-runs on resume. */
+  async #fixRound(roundNo: number): Promise<"stopped" | undefined> {
     const record = (this.#state.phase.rounds ?? []).find((r) => r.round === roundNo);
     if (!record?.picked || record.fixed || record.regressed) return undefined;
     if (this.#state.phase.contract.fixRounds !== "domains") return undefined;
@@ -9645,8 +9642,7 @@ export class Conductor {
     const results: Array<LaneBuild & { ok: boolean; fixes: number; domainRecords?: DomainLoopRecord[] }> = new Array(tasks.length);
     let candidate: string | undefined;
     let mergeWorktreeReady = false;
-    let boundReached = false;
-    let parkedReason: string | undefined;
+    let mergeBoundReached = false;
     try {
       if (fs.existsSync(mergeWorktree)) removeWorktree(this.#plan.repo, mergeWorktree);
       createWorktree(this.#plan.repo, mergeWorktree, base);
@@ -9655,157 +9651,71 @@ export class Conductor {
       const error = String((err as Error)?.message ?? err);
       this.#log.append("fix_merge_worktree_failed", { round: roundNo, error });
     }
-    // 07g2 (A1/A2): the integration loop. Each iteration runs the pending
-    // domains' fixers from the current head, merges their commits with git
-    // (`--no-commit`; the conductor commits with the pick and every domain as
-    // parents), then judges the merged head: a red check goes back to the
-    // domain owning the failing file, a point whose doneWhen fact does not
-    // prove it goes back to its own domain — with NO seat review while any
-    // point stays open. When every point is closed the loop ends and the
-    // round's single acceptance review follows.
-    const integrateMax = this.#state.phase.contract.integrateMax ?? DEFAULT_INTEGRATE_MAX;
-    // A loop iteration spends one round of the phase's own budget: iteration i
-    // of the fix step at round N is followed by acceptance round N+i-1, so the
-    // loop may never take the phase past `#+TT_ROUNDS` (A2/R4).
-    const loopBudget = Math.max(1, roundBudget(this.#state.phase.contract) - roundNo + 1);
-    let pendingTasks: FixTask[] = [...tasks];
-    /** Each domain's failure text for its next build (the same session's fix). */
-    const failures = new Map<string, string>();
-    let loops = 0;
-    while (pendingTasks.length > 0) {
-      loops += 1;
-      const loopBase = candidate ?? base;
-      const settled = await Promise.all(
-        pendingTasks.map(async (task) => {
-          const index = tasks.indexOf(task);
-          try {
-            return { task, index, result: await this.#runFixer(task, roundNo, loopBase, failures.get(task.domain)) };
-          } catch (err) {
-            return {
-              task,
-              index,
-              result: {
-                lane: `fix-${task.domain}`,
-                ok: false,
-                fixes: 0,
-                note: `the fixer failed: ${String((err as Error)?.message ?? err)}`,
-              } as (typeof results)[number],
-            };
-          }
-        }),
-      );
-      for (const settledTask of settled) {
-        results[settledTask.index] = settledTask.result;
-        if (typeof settledTask.result.sha === "string" && settledTask.result.sha.length > 0) {
-          taskRecords[settledTask.index].sha = settledTask.result.sha;
-        } else {
-          taskRecords[settledTask.index].note = settledTask.result.note ?? "the fixer produced no commit";
-        }
-      }
-      if (stopped()) {
-        this.#log.append("fix_round_stopped", { round: roundNo, reason: this.#stopRequested ? "the owner stopped the run" : "a recheck stopped it" });
-        this.#removeFixWorktrees(roundNo, tasks, mergeWorktree);
-        return "stopped";
-      }
-      // 07g2 (A1): git merges this iteration's commits onto the head, in task
-      // order. A conflict is the integrate duty's job (fenced, bounded).
-      const commits = settled
-        .filter((s) => s.result.ok && typeof s.result.sha === "string" && s.result.sha.length > 0)
-        .map((s) => ({ domain: s.task.domain, sha: s.result.sha! }));
-      if (commits.length > 0 && mergeWorktreeReady) {
-        const integration = await this.#integrateDomains(mergeWorktree, loopBase, commits, roundNo, integrateMax);
-        for (const dropped of integration.dropped) {
-          const index = tasks.findIndex((t) => t.domain === dropped.domain);
-          if (index >= 0) taskRecords[index].note = dropped.reason;
-          mergesByIndex.delete(index);
-        }
-        for (const landed of integration.integrated) {
-          const index = tasks.findIndex((t) => t.domain === landed.domain);
-          if (index >= 0) mergesByIndex.set(index, { sha: landed.sha });
-        }
-        if (integration.head) candidate = integration.head;
-      }
-      const head = candidate;
-      if (head === undefined) {
-        // Nothing merged: the fix step has no candidate (a fixer that changed
-        // nothing, or one the integrate duty had to drop).
-        break;
-      }
-      const check = await this.#checkIntegratedCandidate(roundNo, head, base);
-      const facts = this.#factsFor(head);
-      // A point is closed only by a fact that PROVES it: exit 0 and not
-      // passing on the round's own base (a doneWhen that passes there too
-      // proves nothing — the hand-off applies the same rule, R8).
-      const openFindings = this.#state.phase.findings.filter((f) => {
-        if (f.status !== "open" || typeof f.domain !== "string" || f.domain.length === 0) return false;
-        const fact = facts.find((x) => x.findingId === f.id);
-        return !(fact && !fact.timedOut && fact.exitCode === 0 && fact.passesOnBase === false);
-      });
-      const openDomains = [...new Set(openFindings.map((f) => f.domain!))];
-      const checkText = `${check.note ?? ""}\n${this.#laneCheckOutputs.get(head) ?? ""}`;
-      // 07g2 (R3): the domain owning the first file the failing output names.
-      const redOwner = check.ok ? undefined : failingDomainOf(checkText, domains);
-      if (check.ok && openDomains.length === 0) break;
-      // 07g2 (R3): a red check whose output names no declared domain's file is
-      // not guessed at — the lead is called and the loop stops.
-      if (!check.ok && !redOwner) {
-        parkedReason = `the merged candidate's check failed and its output names no declared domain's file: ${check.note ?? "see the check record"}`;
-        this.#applyEvent({ type: "LEAD_CALLED", reasons: [parkedReason] });
-        break;
-      }
-      if (loops >= loopBudget) {
-        boundReached = true;
-        parkedReason = `the fix loop spent ${loops} loop(s) with ${openDomains.length} point(s) still open${check.ok ? "" : " and a red check"}`;
-        break;
+    // R3: every domain runs concurrently and the merge stream starts as soon
+    // as ANY domain is green, so a slow domain never holds the others. Only
+    // one merge runs at a time (the merge worktree is shared); the record is
+    // kept in task order below.
+    const mergeResult = async (index: number, result: (typeof results)[number]): Promise<void> => {
+      if (typeof result.sha === "string" && result.sha.length > 0) taskRecords[index].sha = result.sha;
+      if (mergeBoundReached) {
+        taskRecords[index].note = "not merged: the merge bound was reached on an earlier fixer (bound: merge)";
+        return;
       }
       if (!mergeWorktreeReady) {
-        parkedReason = "the merge worktree could not be created";
-        break;
+        taskRecords[index].note = `the merge worktree could not be created`;
+        return;
       }
-      // The next iteration: the domains that own an open point and the domain
-      // that owns the failing file (a red check is the more urgent failure).
-      const next = new Map<string, FixTask>();
-      for (const domain of openDomains) next.set(domain, tasks.find((t) => t.domain === domain) ?? { domain, findings: [], findingIds: [] });
-      if (redOwner) {
-        next.set(redOwner.domain, tasks.find((t) => t.domain === redOwner.domain) ?? { domain: redOwner.domain, findings: [], findingIds: [] });
+      if (!result.ok || typeof result.sha !== "string" || result.sha.length === 0) {
+        taskRecords[index].note = result.note ?? "the fixer produced no commit";
+        return;
       }
-      failures.clear();
-      for (const [domain, task] of next) {
-        const parts: string[] = [];
-        if (!check.ok && redOwner?.domain === domain) {
-          parts.push(`The merged check failed (${check.note ?? "see the check record"}):\n${this.#laneCheckOutputs.get(head) ?? ""}`);
-        }
-        for (const finding of openFindings.filter((f) => f.domain === domain)) {
-          const fact = facts.find((x) => x.findingId === finding.id);
-          parts.push(
-            `Point ${finding.id} (${finding.item}) is still open on ${head.slice(0, 7)}: its doneWhen \`${finding.doneWhen ?? ""}\` ` +
-              (fact
-                ? `exited ${fact.exitCode}${fact.timedOut ? " (timed out)" : ""}${fact.passesOnBase ? " (it passes on the round's base too, so it proves nothing)" : ""}`
-                : "was not run") +
-              (fact?.outputTail ? `\n${fact.outputTail}` : ""),
-          );
-        }
-        failures.set(domain, parts.join("\n\n"));
-        this.#log.append("fix_loop_reentry", { round: roundNo, loop: loops + 1, domain, findingIds: task.findingIds });
+      const merge = await this.#mergeFixerBounded(mergeWorktree, result.sha, tasks[index].domain, roundNo);
+      // Keep the commits merged so far as the candidate; do not risk another
+      // hung merge after this round has reached the merge bound.
+      if (!merge.ok && merge.timedOut) {
+        mergeBoundReached = true;
+        this.#log.append("fix_merge_timed_out", { round: roundNo, domain: tasks[index].domain, sha: result.sha });
+        taskRecords[index].note = `its commit ${result.sha.slice(0, 7)} could not be merged within the merge bound (bound: merge)`;
+        return;
       }
-      pendingTasks = [...next.values()];
+      if (!merge.ok) {
+        taskRecords[index].note = merge.timedOut
+          ? `its merge timed out and was skipped (bound: merge)`
+          : `its commit ${result.sha.slice(0, 7)} conflicted and was skipped`;
+        this.#log.append(merge.timedOut ? "fix_merge_timed_out" : "fix_merge_conflict", {
+          round: roundNo,
+          domain: tasks[index].domain,
+          sha: result.sha,
+        });
+        return;
+      }
+      mergesByIndex.set(index, { sha: result.sha });
+    };
+    const pending = new Map<number, Promise<{ index: number; result: (typeof results)[number] }>>();
+    for (let i = 0; i < tasks.length; i += 1) {
+      const task = tasks[i];
+      pending.set(
+        i,
+        this.#runFixer(task, roundNo, base)
+          .then((result) => ({ index: i, result }))
+          .catch((err): { index: number; result: (typeof results)[number] } => ({
+            index: i,
+            result: { lane: `fix-${task.domain}`, ok: false, fixes: 0, note: `the fixer failed: ${String((err as Error)?.message ?? err)}` },
+          })),
+      );
     }
-    // 07g2 (A2/R4): the loop stopped with its bound reached or with a red check
-    // that names no declared domain: park, so no further loop and no seat
-    // acceptance review starts.
-    if (parkedReason !== undefined) {
-      this.#log.append("fix_loop_parked", { round: roundNo, loops, reason: parkedReason, bound: boundReached });
-      if (boundReached) this.#recordRoundsExhausted(this.#state.phase);
-      this.#applyEvent({ type: "LOOP_BOUND_REACHED", round: roundNo, loops: Math.max(1, loops), reason: parkedReason });
-      this.#removeFixWorktrees(roundNo, tasks, mergeWorktree);
-      return "parked";
+    while (pending.size > 0) {
+      const settled = await Promise.race([...pending.values()]);
+      pending.delete(settled.index);
+      results[settled.index] = settled.result;
+      await mergeResult(settled.index, settled.result);
     }
     if (stopped()) {
       this.#log.append("fix_round_stopped", { round: roundNo, reason: this.#stopRequested ? "the owner stopped the run" : "a recheck stopped it" });
-      this.#removeFixWorktrees(roundNo, tasks, mergeWorktree);
       return "stopped";
     }
     const merges = tasks.flatMap((_, i) => (mergesByIndex.has(i) ? [mergesByIndex.get(i)!] : []));
+    if (mergeWorktreeReady && merges.length > 0) candidate = headOf(mergeWorktree);
     // Packet X: a merge whose tree is B's own changed nothing (e.g. a fixer
     // whose fix undid its own commit): there is no candidate, and the next
     // round is today's.
@@ -9855,20 +9765,14 @@ export class Conductor {
     // Packet X: once ROUND_FIXED records every fixer's outcome and the merged
     // candidate has its own checkout, the fix worktrees are spent. Only the
     // worktrees go; every commit stays (the record names them).
-    this.#removeFixWorktrees(roundNo, tasks, mergeWorktree);
-    return undefined;
-  }
-
-  /** 07g2: the fix worktrees are spent once the fix step recorded its result
-   * (or parked). Only the worktrees go; every commit stays. */
-  #removeFixWorktrees(round: number, tasks: readonly FixTask[], mergeWorktree: string): void {
     for (const dir of [mergeWorktree, ...tasks.map((t) => this.#fixerWorktree(t.domain))]) {
       try {
         if (fs.existsSync(dir)) removeWorktree(this.#plan.repo, dir);
       } catch (err) {
-        this.#log.append("fix_worktree_remove_failed", { round, worktree: dir, error: String((err as Error)?.message ?? err) });
+        this.#log.append("fix_worktree_remove_failed", { round: roundNo, worktree: dir, error: String((err as Error)?.message ?? err) });
       }
     }
+    return undefined;
   }
 
   /** Plan 07c (D4.3): one fixer's own worktree, beside the lanes'. */
@@ -9876,107 +9780,53 @@ export class Conductor {
     return path.join(this.#runDir, "worktrees", `fix-${domain}`);
   }
 
-  /** 07g2 (A1): one bounded git command in the merge worktree. Everything the
-   * merge step runs goes through the conductor's process-group machinery, so a
-   * hung git (a credential prompt, a wrapper, a huge tree) is killed instead
-   * of hanging the fix round. */
-  async #integrateGit(worktree: string, args: readonly string[], scope: string): Promise<{ ok: boolean; timedOut: boolean; output: string }> {
+  /** Plan 07e (E2): merge one fixer commit under the merge bound. The same
+   * git command runs through the conductor's process-group machinery, so a
+   * hung merge (a credential prompt, a wrapper, a huge tree) is killed and
+   * skipped instead of hanging the fix round. R5: the worktree's HEAD before
+   * the merge is the only state that may survive, so a merge wrapper that
+   * commits and only then hangs cannot leave its commit in the candidate. */
+  async #mergeFixerBounded(worktree: string, sha: string, domain: string, round: number): Promise<{ ok: boolean; timedOut: boolean; output: string }> {
     const startedAt = Date.now();
+    const before = headOf(worktree);
+    const scope = `round ${round} fixer ${domain}`;
+    const gitArgs = [
+      "-C",
+      shellQuote(worktree),
+      "-c",
+      "user.name=tradeoffs-trace",
+      "-c",
+      "user.email=tradeoffs-trace@localhost",
+      "-c",
+      "core.hooksPath=/dev/null",
+      "merge",
+      "--no-ff",
+      "--no-verify",
+      "-m",
+      shellQuote(`merge fixer commit ${sha}\n\nTT-Action: fix-merge-${sha}`),
+      shellQuote(sha),
+    ].join(" ");
     const result = await runCommand({
-      command: `git -C ${shellQuote(worktree)} -c user.name=tradeoffs-trace -c user.email=tradeoffs-trace@localhost -c core.hooksPath=/dev/null ${args.join(" ")}`,
+      command: `git ${gitArgs}`,
       cwd: worktree,
       env: process.env,
       deadlineMs: this.#deadlines.mergeMs,
       termGraceMs: this.#deadlines.termGraceMs,
-      onIntent: ({ pgid }) => this.#onStageShIntent(pgid),
+      onIntent: ({ pgid }) => {
+        this.#onStageShIntent(pgid);
+        this.#log.intent(`fixer-merge-${domain}-${pgid}`, { pgid, domain, sha });
+      },
     }).result;
     if (result.timedOut) {
       this.#recordBound("merge", scope, this.#deadlines.mergeMs, Math.max(this.#deadlines.mergeMs, Date.now() - startedAt));
+      await this.#restoreMergeState(worktree, before, `${scope} merge --abort`);
       return { ok: false, timedOut: true, output: result.output };
     }
-    return { ok: result.exitCode === 0, timedOut: false, output: result.output };
-  }
-
-  /** 07g2 (A1/R1): git merges the approved domains onto `base` in task order
-   * and the conductor commits the result with the pick and EVERY integrated
-   * domain as parents (an octopus merge commit; `git merge` alone would
-   * fast-forward onto the first domain and drop the pick from the parents).
-   *
-   * A conflict starts the integrate duty: the one writer this phase allows,
-   * fenced to the files git left unmerged (C4), with `#+TT_INTEGRATE_MAX`
-   * attempts. When the attempts are spent the last domain (task order) is
-   * dropped and the merge is retried without it, so one unresolvable domain
-   * never holds the others. */
-  async #integrateDomains(
-    worktree: string,
-    base: string,
-    commits: ReadonlyArray<{ domain: string; sha: string }>,
-    round: number,
-    integrateMax: number,
-  ): Promise<{ head?: string; integrated: Array<{ domain: string; sha: string }>; dropped: Array<{ domain: string; sha: string; reason: string }>; timedOut: boolean }> {
-    const integrated: Array<{ domain: string; sha: string }> = [];
-    const dropped: Array<{ domain: string; sha: string; reason: string }> = [];
-    let remaining = [...commits];
-    while (remaining.length > 0) {
-      for (let attempt = 1; attempt <= integrateMax; attempt += 1) {
-        // Every attempt starts from the same clean head, so a refused or
-        // unresolved attempt leaves nothing behind.
-        const reset = await this.#integrateGit(worktree, ["reset", "--hard", shellQuote(base)], `round ${round} integrate reset`);
-        if (reset.timedOut) return { integrated, dropped, timedOut: true };
-        const merge = await this.#integrateGit(
-          worktree,
-          ["merge", "--no-commit", "--no-ff", "--no-verify", ...remaining.map((c) => shellQuote(c.sha))],
-          `round ${round} integrate merge`,
-        );
-        if (merge.timedOut) return { integrated, dropped, timedOut: true };
-        if (merge.ok) {
-          const committed = await this.#commitIntegrated(worktree, base, remaining, round);
-          if (committed) return { head: committed, integrated: remaining, dropped, timedOut: false };
-          break;
-        }
-        // 07g2 (R2/C4): the conflicted paths are what the fence allows.
-        const status = await this.#integrateGit(worktree, ["status", "--porcelain", "-z"], `round ${round} integrate status`);
-        const conflicted = unmergedPaths(status.output);
-        if (conflicted.length === 0) {
-          this.#log.append("integrate_merge_failed", { round, attempt, domains: remaining.map((c) => c.domain), output: merge.output });
-          continue;
-        }
-        this.#log.append("integrate_conflict", { round, attempt, conflicted, domains: remaining.map((c) => c.domain), output: merge.output });
-        const duty = await this.#runIntegrateDuty(worktree, {
-          round,
-          base,
-          commits: remaining,
-          conflicted,
-          mergeOutput: merge.output,
-          attempt,
-          maxAttempts: integrateMax,
-        });
-        if (!duty.ok) {
-          this.#log.append("integrate_attempt_failed", { round, attempt, conflicted, reason: duty.reason });
-          continue;
-        }
-        const committed = await this.#commitIntegrated(worktree, base, remaining, round, conflicted);
-        if (committed) return { head: committed, integrated: remaining, dropped, timedOut: false };
-        break;
-      }
-      if (remaining.length === 1) {
-        // A single domain that cannot be integrated has nowhere left to go.
-        dropLast();
-        break;
-      }
-      // 07g2 (A1): attempts spent — drop the last domain and retry without it.
-      dropLast();
+    if (result.exitCode !== 0) {
+      await this.#restoreMergeState(worktree, before, `${scope} merge --abort`);
+      return { ok: false, timedOut: false, output: result.output };
     }
-    return { integrated, dropped, timedOut: false };
-
-    function dropLast(this: void): void {
-      const last = remaining.pop()!;
-      dropped.push({
-        domain: last.domain,
-        sha: last.sha,
-        reason: `its commit ${last.sha.slice(0, 7)} could not be integrated within ${integrateMax} attempt(s) (bound: integrate); the domain was dropped`,
-      });
-    }
+    return { ok: true, timedOut: false, output: result.output };
   }
 
   /** Plan 07e (E2/A2): undo a failed or killed merge, bounded like the merge
@@ -10015,196 +9865,12 @@ export class Conductor {
   }
 
 
-  /** 07g2 (A1/R1): commit the index git just merged as a commit whose parents
-   * are the base (the pick, or the previous integrated head) and every domain
-   * commit, in task order. `git merge --no-ff` alone fast-forwards onto the
-   * first domain and would make the pick disappear from the parents, so the
-   * conductor writes the commit itself with `git commit-tree`. A conflicted
-   * merge's files are staged first (only those paths; the fence already
-   * refused anything else). */
-  async #commitIntegrated(
-    worktree: string,
-    base: string,
-    commits: ReadonlyArray<{ domain: string; sha: string }>,
-    round: number,
-    conflicted?: readonly string[],
-  ): Promise<string | undefined> {
-    if (conflicted && conflicted.length > 0) {
-      const add = await this.#integrateGit(worktree, ["add", "--", ...conflicted.map((p) => shellQuote(p))], `round ${round} integrate add`);
-      if (!add.ok) {
-        this.#log.append("integrate_stage_failed", { round, conflicted, output: add.output });
-        return undefined;
-      }
-    }
-    const tree = await this.#integrateGit(worktree, ["write-tree"], `round ${round} integrate write-tree`);
-    if (!tree.ok) {
-      this.#log.append("integrate_write_tree_failed", { round, output: tree.output });
-      return undefined;
-    }
-    const treeSha = tree.output.trim().split("\n")[0];
-    if (!/^[0-9a-f]{40,64}$/.test(treeSha)) return undefined;
-    const message = `merge domains ${commits.map((c) => c.domain).join(", ")}\n\nTT-Action: fix-merge-${round}`;
-    const committed = await this.#integrateGit(
-      worktree,
-      ["commit-tree", shellQuote(treeSha), "-p", shellQuote(base), ...commits.flatMap((c) => ["-p", shellQuote(c.sha)]), "-m", shellQuote(message)],
-      `round ${round} integrate commit`,
-    );
-    if (!committed.ok) {
-      this.#log.append("integrate_commit_failed", { round, output: committed.output });
-      return undefined;
-    }
-    const head = committed.output.trim().split("\n")[0];
-    if (!/^[0-9a-f]{40,64}$/.test(head)) return undefined;
-    const reset = await this.#integrateGit(worktree, ["reset", "--hard", shellQuote(head)], `round ${round} integrate reset-head`);
-    if (!reset.ok) return undefined;
-    this.#log.append("integrate_committed", {
-      round,
-      base,
-      domains: commits.map((c) => ({ domain: c.domain, sha: c.sha })),
-      head,
-      ...(conflicted ? { conflicted } : {}),
-    });
-    return head;
-  }
-
-  /** 07g2 (A1/C4): the integrate duty. One writer, fenced by file: after the
-   * session ends, the conductor refuses a resolution whose diff touches a path
-   * git did not leave unmerged, refuses a session that committed or left
-   * conflict markers behind, and only then stages the conflicted files and
-   * commits the merge itself. Hunks inside a conflicted file are never judged. */
-  async #runIntegrateDuty(
-    worktree: string,
-    opts: {
-      round: number;
-      base: string;
-      commits: ReadonlyArray<{ domain: string; sha: string }>;
-      conflicted: readonly string[];
-      mergeOutput: string;
-      attempt: number;
-      maxAttempts: number;
-    },
-  ): Promise<{ ok: boolean; reason?: string }> {
-    const startedAt = Date.now();
-    const actionId = this.#log.actionId("integrate");
-    const agentId = `integrate-${opts.round}-${opts.attempt}-${actionId}`;
-    this.#log.intent(actionId, { round: opts.round, attempt: opts.attempt, conflicted: opts.conflicted });
-    const handle = this.#spawnLaneAgent({
-      role: "worker",
-      agentId,
-      cwd: worktree,
-      sessionDir: path.join(this.#paths.sessions, `integrate-${opts.round}-${opts.attempt}`),
-      env: { ...this.#laneEnv(worktree, this.#piEnvFor?.("worker", agentId) ?? {}), TT_ITEMS: "0" },
-      mapper: { round: opts.round, worktree },
-      freshSession: true,
-    });
-    try {
-      const hello = await raceTimeout(handle.helloPromise, this.#deadlines.helloTimeoutMs, "hello");
-      if (hello === "timeout" || !hello.ok) {
-        await handle.agent.terminate();
-        this.#log.completion(actionId, { round: opts.round, outcome: "no-commit", reason: "the integrate duty did not start" });
-        return { ok: false, reason: "the integrate duty did not start" };
-      }
-      await handle.agent.prompt(
-        this.#agentPrompt(
-          integrateBrief({
-            round: opts.round,
-            base: opts.base,
-            commits: opts.commits,
-            conflicted: opts.conflicted,
-            mergeOutput: opts.mergeOutput,
-            attempt: opts.attempt,
-            maxAttempts: opts.maxAttempts,
-          }),
-        ),
-      );
-      const timeout = new PausableTimer<"timeout">(this.#deadlines.workerAttemptMs, "timeout");
-      const outcome = await Promise.race([
-        handle.donePromise.then(() => "submitted" as const),
-        handle.agent.waitSettled().then(() => "settled" as const),
-        handle.agent.waitExit().then(() => "exited" as const),
-        timeout.promise,
-      ]);
-      timeout.cancel();
-      await handle.agent.terminate();
-      if (outcome !== "submitted") {
-        if (outcome === "timeout") {
-          this.#recordBound("merge", `round ${opts.round} integrate attempt ${opts.attempt}`, this.#deadlines.workerAttemptMs, Math.max(this.#deadlines.workerAttemptMs, Date.now() - startedAt));
-        }
-        this.#log.completion(actionId, { round: opts.round, outcome: "no-commit", reason: `the integrate duty ${outcome}` });
-        return { ok: false, reason: `the integrate duty ${outcome} without a resolution` };
-      }
-      // The duty never commits: a moved HEAD is a refused attempt.
-      if (headOf(worktree) !== opts.base) {
-        this.#log.append("integrate_refused", { round: opts.round, attempt: opts.attempt, reason: "the duty committed", head: headOf(worktree) });
-        return { ok: false, reason: "the integrate duty committed; the conductor commits the merge" };
-      }
-      const changed = await this.#integrateChangedPaths(worktree, opts.round);
-      const outside = resolutionOutsideConflicted(changed, opts.conflicted);
-      if (outside.length > 0) {
-        this.#log.append("integrate_refused", { round: opts.round, attempt: opts.attempt, outside, conflicted: opts.conflicted });
-        return { ok: false, reason: `the resolution changed files outside the conflicted set: ${outside.join(", ")}` };
-      }
-      const unresolved = opts.conflicted.filter((p) => {
-        try {
-          return /^(?:<{7}|>{7})(?: |$)/m.test(fs.readFileSync(path.join(worktree, p), "utf8"));
-        } catch {
-          return false;
-        }
-      });
-      if (unresolved.length > 0) {
-        this.#log.append("integrate_unresolved", { round: opts.round, attempt: opts.attempt, unresolved });
-        return { ok: false, reason: `the resolution left conflict markers in ${unresolved.join(", ")}` };
-      }
-      this.#log.completion(actionId, { round: opts.round, outcome: "resolved", changed });
-      return { ok: true };
-    } finally {
-      this.#agents.delete(agentId);
-    }
-  }
-
-  /** 07g2 (C4): every path the integrate duty changed in the worktree — the
-   * worktree-vs-index diff plus untracked files. The merge itself stages its
-   * own paths in the index, so a clean conflicted file is not "changed" here;
-   * only the duty's edits are. */
-  async #integrateChangedPaths(worktree: string, round: number): Promise<string[]> {
-    const diff = await this.#integrateGit(worktree, ["diff", "--name-only"], `round ${round} integrate diff`);
-    const untracked = await this.#integrateGit(worktree, ["ls-files", "--others", "--exclude-standard"], `round ${round} integrate untracked`);
-    const lines = (text: string) => text.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
-    return [...new Set([...lines(diff.output), ...lines(untracked.output)])];
-  }
-
-  /** 07g2 (A2): the merged candidate's checks, run once per integrated head
-   * under the machine-wide lock and cached, so the acceptance round's synthetic
-   * lane reads the same result instead of running the same checks twice. Its
-   * doneWhen facts land in the candidate's own check record (`#factsFor`). */
-  async #checkIntegratedCandidate(round: number, sha: string, base: string): Promise<LaneCheck> {
-    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
-    const window = this.#openCheckWindow();
-    try {
-      this.#log.append("lane_check_started", { round, lane: "a", candidateSha: sha, base, integrated: true });
-      const result = await this.#runLaneChecks("a", sha, base);
-      this.#log.append("lane_check_finished", { round, lane: "a", candidateSha: sha, passed: result.ok, ...(result.note ? { note: result.note } : {}) });
-      this.#integratedChecks.set(sha, result);
-      return result;
-    } finally {
-      window.release();
-      await lock.release();
-    }
-  }
-
   /** 07g1: one domain's loop. The domain gets its own worktree at B and its
    * own fixer session; every red check, failing doneWhen or unfixed review
    * verdict goes back to that same session. A fresh stateless domain review
    * judges the points only after every fact is green; a domain that spends its
-   * review bound is dropped and never holds another domain. 07g2 (A1/A2): a
-   * re-entry after a red merged check or a point still open on the integrated
-   * head starts the SAME domain session with that failure as its first prompt. */
-  async #runFixer(
-    task: FixTask,
-    round: number,
-    base: string,
-    feedback?: string,
-  ): Promise<LaneBuild & { ok: boolean; fixes: number; domainRecords?: DomainLoopRecord[] }> {
+   * review bound is dropped and never holds another domain. */
+  async #runFixer(task: FixTask, round: number, base: string): Promise<LaneBuild & { ok: boolean; fixes: number; domainRecords?: DomainLoopRecord[] }> {
     const worktree = this.#fixerWorktree(task.domain);
     const sessionDir = path.join(this.#paths.sessions, `fix-${round}-${task.domain}`);
     const lane = `fix-${task.domain}`;
@@ -10251,7 +9917,7 @@ export class Conductor {
       // its stateless brief keeps every earlier pass instead of overwriting
       // iteration 1 with a fresh one.
       startIteration: this.#domainLoopResumeIteration(task, round),
-      build: () => (feedback !== undefined ? buildFixer({ of: base, feedback }) : buildFixer()),
+      build: () => buildFixer(),
       facts: (sha, iteration) => this.#domainFacts(task, round, base, sha, iteration),
       review: (sha, iteration, facts) => this.#runDomainReview(task, round, base, sha, iteration, facts, records),
       fix: async (sha, failure) => {

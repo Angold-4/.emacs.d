@@ -797,12 +797,10 @@ function acceptanceBlockersFor(
   // can never accept a failing or stale candidate.
   if (!(phase.checks && phase.checks.candidateSha === C && phase.checks.passed === true)) {
     const failed = phase.checks?.candidateSha === C && phase.checks.passed === false;
-    // 07g2 (A4/R9): a failed check names the simple command the shell ran last
-    // before the non-zero exit — on the status line, not only in the record.
-    const step = failed ? phase.checks?.failingStep : undefined;
-    const detail = failed
-      ? `checks failed${step ? ` at \`${step}\`` : ""}${phase.checks?.failingStepSilent ? " (no output)" : ""}`
-      : "checks have not passed for the candidate";
+    // 07g2 (A4/R9): the failing step is recorded in the check record and named
+    // on the status line (`view.ts` reads `phase.checks.failingStep` there);
+    // the blocker detail stays the stable `checks failed` every reader matches.
+    const detail = failed ? "checks failed" : "checks have not passed for the candidate";
     // Plan 07f1b (A1): one blocker per command that FAILED, so every blocker
     // names the failing check command itself — never a command that passed and
     // never a synthesized `a && b` (see `failingCheckCommands`).

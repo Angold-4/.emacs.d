@@ -271,10 +271,11 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
         steps.push({ command: line.slice(STEP_MARKER.length), output: "" });
         continue;
       }
-      if (steps.length === 0) {
-        visible.push(line);
-        continue;
-      }
+      // Every non-marker line stays in the visible output: the step's own
+      // output is a SECOND copy, never a removal, so a reader of the check's
+      // output (an ENOSPC sniff, a review) sees exactly what it saw before.
+      visible.push(line);
+      if (steps.length === 0) continue;
       const step = steps[steps.length - 1];
       step.output = step.output.length === 0 ? line : `${step.output}\n${line}`;
     }
