@@ -11,6 +11,21 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { ROLE_TOOLS } from "../../src/core/roles.ts";
+import type { Reviewer, State } from "../../src/core/types.ts";
+import { runPaths } from "../../src/conductor.ts";
+import { readLog } from "../../src/effects/log.ts";
+import {
+  cleanupDir,
+  defaultReviewerHello,
+  defaultWorkerHello,
+  readEvents,
+  setupConductor,
+  waitFor,
+  type FakePiStep,
+  type TestConductorSetup,
+} from "./harness.ts";
 import {
   failingDomainOf,
   integrateBrief,
@@ -129,4 +144,170 @@ test("the seats review only once every point is closed", () => {
   assert.deepEqual(loopsRun, [1, 2, 3]);
   assert.equal(loopsRun.length >= budget, true, "the third loop is the budget's last");
   assert.equal(4 > budget, true, "no fourth loop starts");
+});
+
+const FAST = {
+  abortGraceMs: 300,
+  termGraceMs: 300,
+  helloTimeoutMs: 10_000,
+  workerAttemptMs: 30_000,
+  checkMs: 20_000,
+  probeMs: 20_000,
+  freezeMs: 20_000,
+  evaluateMs: 10_000,
+  reviewMs: 20_000,
+  panelMs: 10_000,
+  reproductionMs: 20_000,
+};
+
+const FIX_DOMAINS = [
+  { name: "booking", globs: ["booking/**"] },
+  { name: "gates", globs: ["gates/**"] },
+];
+
+function laneWorker(lane: string, round: number): { hello: unknown; steps: FakePiStep[] } {
+  return {
+    hello: defaultWorkerHello(),
+    steps: [
+      { kind: "call-sh", command: `printf 'lane ${lane} r${round}\\n' > lane-${lane}-r${round}.txt` },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+    ],
+  };
+}
+
+function laneReview(seat: Reviewer, contractVersion: unknown, findings: unknown[] = []): { hello: unknown; steps: FakePiStep[] } {
+  return {
+    hello: defaultReviewerHello(),
+    steps: [
+      { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+      { kind: "wait-for-prompt" },
+      {
+        kind: "call-submit",
+        tool: "submit_review",
+        args: {
+          reviewer: seat,
+          phaseId: "p1",
+          candidateSha: "$TT_CANDIDATE_SHA",
+          contractVersion,
+          correctionStatements: [],
+          findingStatements: [],
+          ballots: [],
+          findings,
+        },
+      },
+    ],
+  };
+}
+
+function reviewerWithPoints() {
+  return (seat: Reviewer, _candidate: string, state: State): { hello: unknown; steps: FakePiStep[] } => {
+    const K = state.phase.contract.contractVersion;
+    if (seat !== "M" || (state.phase.findings ?? []).some((f) => f.status === "open")) return laneReview(seat, K);
+    return laneReview("M", K, [
+      {
+        kind: "defect",
+        severity: "blocking",
+        evidence: "the booking path is wrong",
+        domain: "booking",
+        item: "R1",
+        where: "booking/a.ts:1 fn",
+        expected: "BOOKING_EXPECTED",
+        doneWhen: "test -f booking-fixed.txt",
+      },
+      {
+        kind: "defect",
+        severity: "blocking",
+        evidence: "the gates path is wrong",
+        domain: "gates",
+        item: "R2",
+        where: "gates/b.ts:1 fn",
+        expected: "GATES_EXPECTED",
+        doneWhen: "test -f gates-fixed.txt",
+      },
+    ]);
+  };
+}
+
+function pickVote(seat: Reviewer, round: number): { hello: unknown; steps: FakePiStep[] } {
+  return {
+    hello: { role: "picker" as const, tools: ROLE_TOOLS.picker },
+    steps: [{ kind: "call-submit", tool: "submit_pick_vote", args: { inspected: ["a", "b"], round, seat, lane: "a", why: `${seat} picks a`, loserHad: { yes: false, anchors: [] } } }],
+  };
+}
+
+function git(repo: string, ...args: string[]): string {
+  return execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
+}
+
+async function teardown(setup: TestConductorSetup): Promise<void> {
+  await setup.conductor.stop();
+  cleanupDir(setup.runRoot);
+  cleanupDir(setup.scriptsDir);
+}
+
+test("a conflicted merge is resolved by the fenced integrate duty and retried when it leaves the fence", async () => {
+  // A1/C4: git merges both approved domains; the add/add conflict on
+  // `shared.txt` starts the integrate duty. Its first attempt also edits an
+  // unconflicted file, so the conductor refuses it; its second attempt edits
+  // only the conflicted file and both domains land in the candidate.
+  const setup = await setupConductor({
+    phase: {
+      id: "p1",
+      goal: "integrate the domains",
+      acceptance: ["it works"],
+      checks: ["true"],
+      boundaries: [],
+      reserved: [],
+      workers: 2,
+      domains: FIX_DOMAINS,
+      rounds: 3,
+      fixRounds: "domains",
+      fixers: 4,
+      fixChecks: "true",
+    },
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorker("a", 1),
+    laneWorkerScriptFor: (lane, round) => laneWorker(lane, round),
+    laneReviewerScriptFor: (seat, candidate, state) => reviewerWithPoints()(seat as Reviewer, candidate, state),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1),
+    fixerScriptFor: (domain) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: `printf '${domain}\\n' > shared.txt; printf '${domain} fixed\\n' > ${domain}-fixed.txt` },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    integrateScriptFor: (_round, attempt) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        {
+          kind: "call-sh",
+          command:
+            attempt === 1
+              ? "printf 'tamper\\n' > booking-fixed.txt; grep -v -E '^(<<<<<<< |=======$|>>>>>>> )' shared.txt > shared.txt.tmp; mv shared.txt.tmp shared.txt"
+              : "grep -v -E '^(<<<<<<< |=======$|>>>>>>> )' shared.txt > shared.txt.tmp; mv shared.txt.tmp shared.txt",
+        },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.rounds?.[0]?.fixed !== undefined, 120_000, 20, setup.runDir);
+    const record = setup.conductor.state.phase.rounds![0].fixed!;
+    assert.equal(record.merges.length, 2, "both domains merged after the integrate duty resolved the conflict");
+    assert.equal(git(setup.repo.dir, "show", `${record.candidate}:shared.txt`), "booking\ngates", "the conflicted file carries both sides");
+    const refusals = readEvents(setup.runDir).filter((r) => r.kind === "integrate_refused");
+    assert.equal(refusals.length, 1, "the out-of-fence edit was refused");
+    assert.deepEqual((refusals[0].event as { outside: string[] }).outside, ["booking-fixed.txt"], "the refusal names the unconflicted file");
+    assert.equal(git(setup.repo.dir, "show", `${record.candidate}:booking-fixed.txt`), "booking fixed", "the refused edit did not survive");
+    const agents = readLog(runPaths(setup.runDir).events).records
+      .filter((r) => r.kind === "intent" && String((r.event as { agentId?: string }).agentId ?? "").startsWith("integrate-1-"));
+    assert.ok(agents.length >= 2, "the refused resolution was retried");
+  } finally {
+    await teardown(setup);
+  }
 });
