@@ -299,6 +299,13 @@ test("a conflicted merge is resolved by the fenced integrate duty and retried wh
     await waitFor(() => setup.conductor.state.phase.rounds?.[0]?.fixed !== undefined, 120_000, 20, setup.runDir);
     const record = setup.conductor.state.phase.rounds![0].fixed!;
     assert.equal(record.merges.length, 2, "both domains merged after the integrate duty resolved the conflict");
+    // A1: the candidate is ONE merge commit whose direct parents are the pick and
+    // each domain commit, in task order — not a chain of per-domain merges.
+    assert.deepEqual(
+      git(setup.repo.dir, "rev-list", "--parents", "-n1", record.candidate).split(/\s+/).slice(1),
+      [record.base, ...record.merges.map((m) => m.sha)],
+      "the candidate's parents are the pick and both domain commits",
+    );
     assert.equal(git(setup.repo.dir, "show", `${record.candidate}:shared.txt`), "booking\ngates", "the conflicted file carries both sides");
     const refusals = readEvents(setup.runDir).filter((r) => r.kind === "integrate_refused");
     assert.equal(refusals.length, 1, "the out-of-fence edit was refused");

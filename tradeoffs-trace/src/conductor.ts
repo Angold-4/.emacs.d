@@ -9825,11 +9825,16 @@ export class Conductor {
   }
 
   /** 07g2 (A1/R1): git merges the approved domains onto `base` in task order,
-   * one `git merge --no-ff` per domain. A conflict starts the integrate duty:
-   * the one writer this phase allows, fenced to the files git left unmerged
-   * (C4), with `#+TT_INTEGRATE_MAX` attempts. When the attempts are spent that
-   * domain is dropped (its work never lands) and the next one is tried, so one
-   * unresolvable domain never holds the others. */
+   * one `git merge --no-ff` per domain, and the CANDIDATE is one merge commit
+   * whose parents are `base` and every domain that landed, in task order — the
+   * commit git's octopus strategy builds for `git merge --no-ff <branch>...`.
+   * Merging one domain at a time is what lets each conflict go to the integrate
+   * duty; it is not the candidate's shape, so `#mergeCommitOntoBase` rebuilds
+   * that shape instead of chaining one merge commit per domain. A conflict
+   * starts the integrate duty: the one writer this phase allows, fenced to the
+   * files git left unmerged (C4), with `#+TT_INTEGRATE_MAX` attempts. When the
+   * attempts are spent that domain is dropped (its work never lands) and the
+   * next one is tried, so one unresolvable domain never holds the others. */
   async #integrateDomains(
     worktree: string,
     base: string,
@@ -9840,23 +9845,31 @@ export class Conductor {
     const integrated: Array<{ domain: string; sha: string }> = [];
     const dropped: Array<{ domain: string; sha: string; reason: string }> = [];
     let current = base;
+    let timedOut = false;
     const remaining = [...commits];
-    while (remaining.length > 0) {
+    while (remaining.length > 0 && !timedOut) {
       const commit = remaining[0];
       let landed: string | undefined;
-      for (let attempt = 1; attempt <= integrateMax; attempt += 1) {
+      for (let attempt = 1; attempt <= integrateMax && !timedOut; attempt += 1) {
         // Every attempt starts from the head merged so far, so a refused or
         // unresolved attempt leaves nothing behind.
         const reset = await this.#integrateGit(worktree, ["reset", "--hard", shellQuote(current)], `round ${round} integrate reset`);
-        if (reset.timedOut) return { head: integrated.length > 0 ? current : undefined, integrated, dropped, timedOut: true };
+        if (reset.timedOut) {
+          timedOut = true;
+          break;
+        }
         // A refused attempt may have left an untracked file outside the fence;
         // every attempt starts from the same clean head.
         const clean = await this.#integrateGit(worktree, ["clean", "-fd"], `round ${round} integrate clean`);
-        if (clean.timedOut) return { head: integrated.length > 0 ? current : undefined, integrated, dropped, timedOut: true };
+        if (clean.timedOut) {
+          timedOut = true;
+          break;
+        }
         const merge = await this.#mergeFixerBounded(worktree, commit.sha, commit.domain, round);
         if (merge.timedOut) {
           this.#log.append("fix_merge_timed_out", { round, domain: commit.domain, sha: commit.sha });
-          return { head: integrated.length > 0 ? current : undefined, integrated, dropped, timedOut: true };
+          timedOut = true;
+          break;
         }
         if (merge.ok) {
           landed = headOf(worktree);
@@ -9897,6 +9910,7 @@ export class Conductor {
           break;
         }
       }
+      if (timedOut) break;
       remaining.shift();
       if (landed) {
         integrated.push(commit);
@@ -9909,7 +9923,63 @@ export class Conductor {
         reason: `its commit ${commit.sha.slice(0, 7)} conflicted and was dropped: it could not be integrated within ${integrateMax} attempt(s) (bound: integrate)`,
       });
     }
-    return { head: integrated.length > 0 ? current : undefined, integrated, dropped, timedOut: false };
+    // 07g2 (A1): the candidate is ONE merge commit over the tree the per-domain
+    // merges produced, with `base` and every landed domain commit as its direct
+    // parents. A chain of per-domain merge commits would leave the pick and the
+    // domains on opposite sides of intermediate commits instead.
+    let head = integrated.length > 0 ? current : undefined;
+    if (head !== undefined && integrated.length > 1) {
+      const candidate = await this.#mergeCommitOntoBase(worktree, base, integrated, head, round);
+      if (candidate !== undefined) head = candidate;
+    }
+    return { head, integrated, dropped, timedOut };
+  }
+
+  /** 07g2 (A1): the candidate's shape — one merge commit whose parents are
+   * `base` and every domain commit that landed, in task order, over the tree
+   * `head` holds (the tree the merges produced, conflicts resolved). This is
+   * the commit `git merge --no-ff <branch>...` makes; when a conflict forced
+   * the merges to run one at a time, this is what keeps the candidate's history
+   * `base` plus every domain head instead of a chain of merge commits. Each
+   * tree, commit and reset is a bounded git command like every other step here. */
+  async #mergeCommitOntoBase(
+    worktree: string,
+    base: string,
+    landed: ReadonlyArray<{ domain: string; sha: string }>,
+    head: string,
+    round: number,
+  ): Promise<string | undefined> {
+    const tree = await this.#integrateGit(worktree, ["rev-parse", `${shellQuote(head)}^{tree}`], `round ${round} integrate tree`);
+    const treeSha = tree.output.trim().split("\n")[0];
+    if (!tree.ok || !/^[0-9a-f]{40,64}$/.test(treeSha)) {
+      this.#log.append("integrate_merge_shape_failed", { round, head, step: "rev-parse", output: tree.output });
+      return undefined;
+    }
+    const message = `merge domains ${landed.map((c) => c.domain).join(", ")}\n\nTT-Action: fix-merge-${round}`;
+    const committed = await this.#integrateGit(
+      worktree,
+      ["commit-tree", shellQuote(treeSha), "-p", shellQuote(base), ...landed.flatMap((c) => ["-p", shellQuote(c.sha)]), "-m", shellQuote(message)],
+      `round ${round} integrate commit-candidate`,
+    );
+    const sha = committed.output.trim().split("\n")[0];
+    if (!committed.ok || !/^[0-9a-f]{40,64}$/.test(sha)) {
+      this.#log.append("integrate_merge_shape_failed", { round, head, step: "commit-tree", output: committed.output });
+      return undefined;
+    }
+    const reset = await this.#integrateGit(worktree, ["reset", "--hard", shellQuote(sha)], `round ${round} integrate reset-candidate`);
+    if (!reset.ok) {
+      this.#log.append("integrate_merge_shape_failed", { round, head, step: "reset", output: reset.output });
+      return undefined;
+    }
+    this.#log.append("integrate_candidate", {
+      round,
+      base,
+      head: sha,
+      from: head,
+      parents: [base, ...landed.map((c) => c.sha)],
+      domains: landed.map((c) => ({ domain: c.domain, sha: c.sha })),
+    });
+    return sha;
   }
 
   /** 07g2 (A1/C4): the conductor's own merge commit. The index it commits is
