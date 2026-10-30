@@ -486,11 +486,22 @@ test("a fixer whose commit conflicts is skipped with a note, the other fixer's w
     // Its findings stay open.
     const open = setup.conductor.state.phase.findings.filter((f) => f.status === "open" && f.domain === conflicted!.domain);
     assert.ok(open.length > 0, "the conflicted fixer's findings stay open");
-    // The merged candidate's hand-off records the merged fixer's decision and
-    // never the skipped one's.
-    await waitFor(() => setup.conductor.state.phase.candidate?.sha === record.candidate, 120_000, 50, setup.runDir);
+    // 07g2 (A2/R4): the conflicted fixer's point never closed on the merge, so
+    // the seats do not review it: the loop chains on the merged candidate at
+    // once (no seat review, no evaluator), and only a later loop's candidate is
+    // handed off. The skipped fixer's disclosure still never reaches the phase
+    // record, because its code is not in any candidate.
+    await waitFor(
+      () => (setup.conductor.state.phase.rounds ?? []).some((r) => r.round === 2 && r.picked?.sha === record.candidate),
+      180_000,
+      50,
+      setup.runDir,
+    );
+    const loopRound = (setup.conductor.state.phase.rounds ?? []).find((r) => r.round === 2)!;
+    assert.equal(loopRound.base, record.candidate, "the next loop starts on the merged candidate at once");
+    assert.equal(loopRound.votes.length, 0, "a loop round takes no pick vote");
+    assert.equal(loopRound.candidates[0]?.reviews, undefined, "a loop round starts no seat review");
     const choices = (setup.conductor.state.phase.decisions ?? []).map((d) => d.choice);
-    assert.ok(choices.includes("FIXER_DISCLOSURE_booking"), `the merged fixer's decision reached the phase record: ${JSON.stringify(choices)}`);
     assert.ok(!choices.includes("FIXER_DISCLOSURE_gates"), `the skipped fixer's decision did not reach the phase record: ${JSON.stringify(choices)}`);
   } finally {
     await teardown(setup);

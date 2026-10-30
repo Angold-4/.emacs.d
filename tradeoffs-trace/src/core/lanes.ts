@@ -147,6 +147,11 @@ export interface LaneHost {
    * checks it before lane checks, reviews and the pick, and records nothing
    * after it. */
   stopRequested?(): boolean;
+  /** 07g2 (A2/R4): the seats review only once every point is closed. When this
+   * returns false for a passing candidate, its reviews are never started: the
+   * round picks it as a loop candidate and the conductor starts the next fix
+   * loop on it at once (no seat review, no pick vote, no evaluator). */
+  reviewGate?(sha: string): boolean;
 }
 
 export interface RoundContext {
@@ -185,6 +190,10 @@ export interface RoundOutcome {
    * adopted. Their later submissions are never read; the work they landed
    * green before the stop is the conductor's to turn into points. */
   stoppedLanes?: readonly string[];
+  /** 07g2 (A2/R4): the round picked a loop candidate without a seat review
+   * because points were still open; the conductor chains the loop instead of
+   * handing the candidate to the acceptance review. */
+  loopOnly?: boolean;
 }
 
 /** exex 01a2: at most this many fixes of a red candidate per lane per round;
@@ -219,8 +228,17 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
   // reviews), and the lane's fixed candidate gets a fresh set at its own
   // submission. The pick still waits for every passing candidate's set.
   const reviewSets = new Map<string, { sha: string; done: Promise<string | undefined> }>();
+  /** 07g2 (A2/R4): lanes whose candidate is picked without a seat review. */
+  const loopOnly = new Map<string, string>();
   const cancelled: Promise<unknown>[] = [];
   const startReviews = (lane: string, sha: string): void => {
+    // 07g2 (A2/R4): points still open on this candidate: no seat review starts,
+    // and the round picks it as a loop candidate instead.
+    if (host.reviewGate && !host.reviewGate(sha)) {
+      loopOnly.set(lane, sha);
+      bump();
+      return;
+    }
     const done = Promise.all(
       // The three seats review a candidate IN PARALLEL (the discovery
       // barrier needs all three in flight).
@@ -235,8 +253,7 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
     ).then((results) => results.find((r): r is string => r !== undefined));
     reviewSets.set(lane, { sha, done });
   };
-  const cancelReviews = (lane: string): void => {
-    const set = reviewSets.get(lane);
+  const cancelReviews = (lane: string): void => {    const set = reviewSets.get(lane);
     if (!set) return;
     reviewSets.delete(lane);
     cancelled.push(set.done);
@@ -346,9 +363,13 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
       // (the conductor turns it into points), never a late candidate.
       if (stopped.has(build.lane)) return markDone(lane, build);
       emit(build.lane, { type: "CANDIDATE_SUBMITTED", round: ctx.round, lane: build.lane, sha: build.sha });
-      startReviews(build.lane, build.sha);
+      // 07g2 (A2/R4): when the gate decides whether the seats review at all, the
+      // check runs FIRST — its facts are the gate's input.
+      const gateFirst = host.reviewGate !== undefined && lanes.length === 1;
+      if (!gateFirst) startReviews(build.lane, build.sha);
       let check = await checkWithReviews(build.lane, build.sha);
       noteCheck(build.lane, check);
+      if (gateFirst && check.ok) startReviews(build.lane, build.sha);
       if (host.stopRequested?.()) return markDone(lane, build);
       emit(build.lane, {
         type: "CANDIDATE_CHECKED",
@@ -379,9 +400,10 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
         build = fixed;
         if (host.stopRequested?.()) return markDone(lane, build);
         emit(build.lane, { type: "CANDIDATE_SUBMITTED", round: ctx.round, lane: build.lane, sha: build.sha! });
-        startReviews(build.lane, build.sha!);
+        if (!gateFirst) startReviews(build.lane, build.sha!);
         check = await checkWithReviews(build.lane, build.sha!);
         noteCheck(build.lane, check);
+        if (gateFirst && check.ok) startReviews(build.lane, build.sha!);
         if (host.stopRequested?.()) return markDone(lane, build);
         emit(build.lane, {
           type: "CANDIDATE_CHECKED",
@@ -467,6 +489,21 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
     held ? { ...held, candidates: held.candidates.filter((candidate) => frozen.has(candidate.lane)) } : undefined;
   const frozenRecord = frozenView(host.rounds().find((r) => r.round === ctx.round));
   const passing = frozenRecord ? passingCandidates(frozenRecord) : [];
+
+  // 07g2 (A2/R4): a loop candidate — points still open on it — is the round's
+  // pick with no seat review and no pick vote; the next loop starts on it.
+  const looped = passing.filter((c) => typeof c.sha === "string" && loopOnly.get(c.lane) === c.sha);
+  if (looped.length > 0) {
+    const pick = looped[0];
+    host.emit({ type: "CANDIDATE_PICKED", round: ctx.round, lane: pick.lane, sha: pick.sha as string, votes: 0 });
+    return await finish({
+      round: ctx.round,
+      base: ctx.base,
+      lanes,
+      winner: { lane: pick.lane, sha: pick.sha as string, votes: 0 },
+      loopOnly: true,
+    });
+  }
 
   // 3. M, A and B each review every passing candidate — K × N reviews. A
   //    review that cannot be taken is NOT a candidate with fewer reviews: the
