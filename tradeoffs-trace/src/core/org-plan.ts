@@ -171,6 +171,7 @@ function parsePhaseNode(
   globalFixers?: number,
   globalFixChecks?: string,
   globalDomainLoopMax?: number,
+  globalIntegrateMax?: number,
   globalForbidden?: string[],
   globalTestRemovals?: string[],
 ): LintPhaseInput {
@@ -235,6 +236,7 @@ function parsePhaseNode(
     ...(globalFixers !== undefined ? { fixers: globalFixers } : {}),
     ...(globalFixChecks ? { fixChecks: globalFixChecks } : {}),
     ...(globalDomainLoopMax !== undefined ? { domainLoopMax: globalDomainLoopMax } : {}),
+    ...(globalIntegrateMax !== undefined ? { integrateMax: globalIntegrateMax } : {}),
     ...(globalForbidden && globalForbidden.length > 0 ? { forbidden: globalForbidden } : {}),
     ...(globalTestRemovals && globalTestRemovals.length > 0 ? { testRemovals: globalTestRemovals } : {}),
   };
@@ -409,6 +411,10 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   // allowances are per-plan switches, carried onto every phase.
   const globalDomainLoopMaxKeyword = first("TT_DOMAIN_LOOP_MAX");
   const globalDomainLoopMax = globalDomainLoopMaxKeyword ? parseCount(globalDomainLoopMaxKeyword) : undefined;
+  // 07g2 (A1): the integration-conflict bound, carried onto every phase like
+  // the domain-loop bound.
+  const globalIntegrateMaxKeyword = first("TT_INTEGRATE_MAX");
+  const globalIntegrateMax = globalIntegrateMaxKeyword ? parseCount(globalIntegrateMaxKeyword) : undefined;
   const globalForbiddenKeyword = first("TT_FORBIDDEN");
   const globalForbidden = globalForbiddenKeyword ? splitCommands(globalForbiddenKeyword.value) : undefined;
   const globalTestRemovalsKeyword = first("TT_TEST_REMOVALS");
@@ -416,7 +422,7 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   const phases = roots
     .filter((r) => r.level === 1)
     .map((r) =>
-      parsePhaseNode(r, [], globalFinalChecks, globalGenerated, globalRegen, globalWidePaths, globalDomains, globalFixRounds, globalFixers, globalFixChecks, globalDomainLoopMax, globalForbidden, globalTestRemovals),
+      parsePhaseNode(r, [], globalFinalChecks, globalGenerated, globalRegen, globalWidePaths, globalDomains, globalFixRounds, globalFixers, globalFixChecks, globalDomainLoopMax, globalIntegrateMax, globalForbidden, globalTestRemovals),
     );
   const rerun = first("TT_RERUN");
   const envFile = first("TT_ENV_FILE")?.value;
@@ -472,6 +478,7 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
     ...(globalFixers !== undefined ? { fixers: globalFixers, fixersLine: globalFixersKeyword!.line } : {}),
     ...(globalFixChecks ? { fixChecks: globalFixChecks, fixChecksLine: globalFixChecksKeyword!.line } : {}),
     ...(globalDomainLoopMax !== undefined ? { domainLoopMax: globalDomainLoopMax } : {}),
+    ...(globalIntegrateMax !== undefined ? { integrateMax: globalIntegrateMax } : {}),
     ...(globalForbidden && globalForbidden.length > 0 ? { forbidden: globalForbidden } : {}),
     ...(globalTestRemovals && globalTestRemovals.length > 0 ? { testRemovals: globalTestRemovals } : {}),
     ...(globalTestRemovalsKeyword ? { testRemovalsLine: globalTestRemovalsKeyword.line } : {}),

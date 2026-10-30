@@ -130,6 +130,10 @@ export interface PhaseContract {
   /** 07g1: how many domain-loop reviews one domain may spend before it is
    * dropped. Absent means 3. */
   domainLoopMax?: number;
+  /** 07g2 (A1): `#+TT_INTEGRATE_MAX` — how many conflicted integration
+   * attempts one fix round may spend before it drops the last domain. Absent
+   * means 2. */
+  integrateMax?: number;
   /** 07g1: `#+TT_FORBIDDEN` — shell patterns a mapper must never run. */
   forbidden?: string[];
   /** 07g1: `#+TT_TEST_REMOVALS` — test files/functions the owner allowed a
@@ -1165,6 +1169,10 @@ export interface ChecksResult {
    * re-run alone), so the worker's repair prompt labels a real failure and a
    * flake apart (finding #35). Cleared when the next candidate freezes. */
   failures?: CheckFailureClass[];
+  /** 07g2 (A4/R9): the simple command that failed inside the check chain, and
+   * whether it was silent, so the status line names the failing step. */
+  failingStep?: string;
+  failingStepSilent?: boolean;
 }
 
 /** Plan 05d: the last check failure of a candidate, kept across the repair
@@ -1746,6 +1754,17 @@ export interface EvLeadCalled {
   reasons: string[];
 }
 
+/** 07g2 (A2/R4): the fix/inspect loop spent the phase's round budget with
+ * points still open. It parks the phase (IMPLEMENTING -> AWAITING_OWNER) so no
+ * further loop and no seat acceptance review starts; the conductor records
+ * BOUND_REACHED (rounds) and LEAD_CALLED beside it. */
+export interface EvLoopBoundReached {
+  type: "LOOP_BOUND_REACHED";
+  round: number;
+  loops: number;
+  reason: string;
+}
+
 /** Plan 04a: one message type's evaluator state inside EVALUATING. */
 export interface EvaluatorOutcome {
   settled?: boolean;
@@ -2062,6 +2081,10 @@ export interface EvChecksFailed {
    * classification. Absent for a check whose output named no test (the strict
    * rule), which stores no classifications. */
   failures?: CheckFailureClass[];
+  /** 07g2 (A4/R9): the failing step inside the check chain, and whether it
+   * said nothing. */
+  failingStep?: string;
+  failingStepSilent?: boolean;
 }
 export interface EvChecksInterrupted {
   type: "CHECKS_INTERRUPTED";
@@ -3053,6 +3076,7 @@ export type Event =
   | EvAttemptTimedOut
   | EvBoundReached
   | EvLeadCalled
+  | EvLoopBoundReached
   | EvAttemptNoSubmission
   | EvAttemptInterrupted
   | EvWorkerResumed

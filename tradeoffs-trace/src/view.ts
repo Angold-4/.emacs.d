@@ -18,14 +18,14 @@ import { parseWorkerPromptRecord, workerPromptLineText } from "./core/worker-pro
 import { modelsCheckStatusText, parseModelsCheck, type ModelsCheck } from "./core/models-check.ts";
 // Plan 01f: the gate stage's own record (the conductor's live proof).
 import { gateOutcomeText, parseGateRecord, type GateRecord } from "./core/gate.ts";
-import { acceptanceBlockers, decisionStatus, isLiveDecision, setSeatAnchorResolver } from "./core/predicate.ts";
+import { acceptanceBlockers, decisionStatus, isLiveDecision, itemMinorityNotes, setSeatAnchorResolver } from "./core/predicate.ts";
 import { evaluationExceptions } from "./core/verdict.ts";
 import { recordedRunnerRevision } from "./effects/runner.ts";
 import { baselineCoversCommands, baselineStatusLine, parseBaseline, type Baseline } from "./core/test-failures.ts";
 // Plan 05i: the environment block's one-line reason and the resolved tool rows.
 import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
 import { reviewerOutcomes, tradeoffEntries, type ReviewerOutcome, type TradeoffEntry } from "./core/verdict.ts";
-import { countsLine, evidenceHasAnchor, isStructured, matrixMarkdown, overturnCounts, phaseItemCounts } from "./core/items.ts";
+import { countsLine, evidenceHasAnchor, isStructured, matrixMarkdown, overturnCounts, phaseItemCounts, phaseItemOutcomes } from "./core/items.ts";
 // Plan 05c: the status view's `review' row is counted from the same messages
 // the review renderer shows, so the two views never disagree.
 import { reviewSummary } from "./render.ts";
@@ -797,6 +797,10 @@ export interface WhyReport {
   candidate?: string;
   blockers: WhyBlocker[];
   exceptions: string[];
+  /** 07g2 (R6): a strict majority decided the item and a seat still disagreed.
+   * Its reason is a follow-up note — shown, never blocking and never sent to
+   * the evaluator. */
+  followUpNotes: string[];
   runnerRevision?: string;
   bounds: Array<{ kind: string; scope: string; limitMs: number; elapsedMs: number }>;
 }
@@ -818,6 +822,11 @@ export function whyReport(runDir: string, plan: RunPlanFile): WhyReport {
     ...(phase.candidate ? { candidate: phase.candidate.sha } : {}),
     blockers: blockers.map((b) => ({ kind: b.kind, detail: b.detail, command: b.command })),
     exceptions: evaluationExceptions(phase).map((e) => `${e.kind}: ${e.detail}`),
+    followUpNotes: isStructured(phase.contract)
+      ? phaseItemOutcomes(phase).flatMap((o) =>
+          o.outcome === "met" || o.outcome === "fits" ? itemMinorityNotes(o) : [],
+        )
+      : [],
     ...(revision !== undefined ? { runnerRevision: revision } : {}),
     bounds,
   };
@@ -837,6 +846,10 @@ export function whyText(report: WhyReport): string {
   if (report.exceptions.length > 0) {
     lines.push("", "Open evaluation exceptions:");
     for (const e of report.exceptions) lines.push(`- ${e}`);
+  }
+  if (report.followUpNotes.length > 0) {
+    lines.push("", "Follow-up notes (the majority decided; not work for this phase):");
+    for (const n of report.followUpNotes) lines.push(`- ${n}`);
   }
   if (report.bounds.length > 0) {
     lines.push("", "Bounds reached:");

@@ -14,6 +14,7 @@
 
 import type { DomainFacts, DomainLoopRecord, DomainReview } from "./core/types.ts";
 import type { FixTask } from "./core/fix-rounds.ts";
+import { domainOf } from "./core/domains.ts";
 
 export interface DomainBuild {
   sha?: string;
@@ -277,4 +278,98 @@ export async function runDomainLoop(task: FixTask, host: DomainLoopHost): Promis
 /** Small wrapper so the approval rule is one function, not two copies. */
 function reviewApproved(task: FixTask, review: DomainReview, itemIds: readonly string[] = []): boolean {
   return domainReviewApproves(task, review, itemIds);
+}
+
+// ---------------------------------------------------------------------------
+// 07g2 (A1): integration of the approved domains onto the pick
+// ---------------------------------------------------------------------------
+// git does the merge (`merge --no-ff` of every approved domain commit); a
+// conflict is the ONE place another writer runs — the integrate duty — and its
+// resolution may change only the files git left unmerged (C4). The functions
+// below are pure so the conductor's merge step, its fence and its brief are
+// testable without git, a model or a run directory.
+
+/** The two-character porcelain code of an unmerged entry: `UU`, `AA`, `DU`,
+ * `UD`, `AU`, `UA` or `DD`. Any other code is a settled path. */
+function isUnmergedCode(code: string): boolean {
+  return code.length === 2 && (code[0] === "U" || code[1] === "U" || code === "AA" || code === "DD");
+}
+
+/** The paths `git status --porcelain` reports as unmerged, in git's order. Accepts
+ * both the NUL-separated form (`-z`, no quoting of odd names) and the line
+ * form. A rename entry's second name is never a conflict path. */
+export function unmergedPaths(porcelain: string): string[] {
+  const entries = porcelain.includes("\u0000") ? porcelain.split("\u0000") : porcelain.split("\n");
+  const out: string[] = [];
+  for (const entry of entries) {
+    if (entry.length < 4) continue;
+    const code = entry.slice(0, 2);
+    if (!isUnmergedCode(code)) continue;
+    const name = entry.slice(3).trim();
+    if (name.length > 0) out.push(name);
+  }
+  return out;
+}
+
+/** 07g2 (C4): the paths the integrate duty changed that git did NOT leave
+ * conflicted. A resolution may rewrite a conflicted file however it needs;
+ * any other path is outside its fence and the conductor refuses it. */
+export function resolutionOutsideConflicted(changed: readonly string[], conflicted: readonly string[]): string[] {
+  const allowed = new Set(conflicted.map((p) => p.replace(/^\.\//, "")));
+  return changed.map((p) => p.replace(/^\.\//, "")).filter((p) => !allowed.has(p));
+}
+
+/** The repository path `git merge`'s output or a red check names, if any: a
+ * token with at least one `/` (or a bare `name.ext`), stripped of a trailing
+ * `:line`, `,` or `)`. Quoted and word-boundary forms both count. */
+function namedPaths(text: string): string[] {
+  const out: string[] = [];
+  const re = /(?:\.\/)?[A-Za-z0-9_@+][A-Za-z0-9_.@+-]*(?:\/[A-Za-z0-9_.@+-]+)+(?::\d+)?|[A-Za-z0-9_@+-]+\.(?:ts|tsx|js|mjs|cjs|el|json|org|md|css|html|py|go|rs)(?::\d+)?/g;
+  for (const match of text.matchAll(re)) {
+    const path = match[0].replace(/:\d+$/, "");
+    if (!out.includes(path)) out.push(path);
+  }
+  return out;
+}
+
+/** 07g2 (A1/R3): the domain that owns the first file a failing check names, in
+ * the output's own order. `undefined` when the output names no declared
+ * domain's file — the conductor then records LEAD_CALLED instead of guessing. */
+export function failingDomainOf(
+  output: string,
+  domains: readonly { name: string; globs: string[] }[],
+): { domain: string; path: string } | undefined {
+  if (!domains || domains.length === 0) return undefined;
+  for (const path of namedPaths(output)) {
+    const domain = domainOf(path, domains);
+    if (domain) return { domain, path };
+  }
+  return undefined;
+}
+
+/** 07g2 (A1): the integrate duty's brief. It is fenced by FILES: the resolution
+ * may change only the conflicted files, and hunks inside them are never judged
+ * (C4). The merge's own output is quoted so the duty sees both sides. */
+export function integrateBrief(opts: {
+  round: number;
+  base: string;
+  commits: readonly { domain: string; sha: string }[];
+  conflicted: readonly string[];
+  mergeOutput: string;
+  attempt: number;
+  maxAttempts: number;
+}): string {
+  return [
+    `The approved domain commits could not be merged onto ${opts.base.slice(0, 7)} (attempt ${opts.attempt} of ${opts.maxAttempts}).`,
+    "",
+    "Resolve the conflict in this worktree, which is mid-merge. This is the integrate duty: you may change ONLY these conflicted files:",
+    ...opts.conflicted.map((p) => `- ${p}`),
+    "",
+    "Keep both domains' intent; do not drop one side's work, do not edit any other file, do not delete, skip or #[ignore] a test, and do not commit or run git merge/commit/abort — the conductor stages the conflicted files and commits the merge itself. Leave no conflict markers in the tree.",
+    "",
+    `Domains being integrated: ${opts.commits.map((c) => `${c.domain} ${c.sha.slice(0, 7)}`).join(", ")}.`,
+    "",
+    "git's merge output:",
+    opts.mergeOutput.trim() || "(git printed nothing)",
+  ].join("\n");
 }

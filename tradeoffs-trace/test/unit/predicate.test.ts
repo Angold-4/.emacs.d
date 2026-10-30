@@ -232,7 +232,11 @@ test("an item met by two of three seats with resolving anchors is met whatever t
   });
   assert.deepEqual(
     acceptanceBlockers(unreadable).filter((b) => b.kind === "item").map((b) => b.detail),
-    ["R1 is met (the seats split on it) without a majority of resolving anchors"],
+    ["R1 is met without a majority of resolving anchors"],
+    // 07g2 (R6): two of three seats said met, so the seats did NOT split for
+    // the evaluator — the dissenting seat is a follow-up note. R1 still blocks
+    // because M's anchor does not resolve, so the resolving majority is A's
+    // alone.
     "an anchor that does not resolve does not count, so M is not a second met seat",
   );
 });

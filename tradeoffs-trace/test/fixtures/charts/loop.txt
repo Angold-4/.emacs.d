@@ -23,6 +23,7 @@ phase states:
       +- RECHECK_REQUESTED (recheckAvailableRound) -> CHECKING        [recheck-requested-from-implementing]
       +- RECHECK_REQUESTED (recheckAvailableFinal) -> FINAL_CHECKING  [recheck-requested-final-from-implementing]
       +- REVISE                    -> REPAIRING       [revise-from-implementing]
+      +- LOOP_BOUND_REACHED        -> AWAITING_OWNER  [implementing-loop-bound-reached]
 
   +----------------+
   | REPAIRING      |  entered 1x - 10s

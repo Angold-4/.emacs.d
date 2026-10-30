@@ -128,8 +128,28 @@ export function realSampler(pgid: number): { rssMB: number; freeMemMB: number } 
  * sample is taken at spawn, so a short deadline always has a reading. */
 const SAMPLE_INTERVAL_MS = 1000;
 
+/** 07g2 (A4/R9): the marker a step-traced command prints before each simple
+ * command it runs. A check records which step failed: the whole chain runs in
+ * ONE shell process (so `cd` and env persist between steps), and xtrace names
+ * every simple command as the shell reaches it — the last one before a
+ * non-zero exit is the failing step. The marker is unusual enough that no
+ * ordinary check output contains it; every line that does is stripped from the
+ * output the rest of the conductor reads. */
+const STEP_MARKER = "\u0001tt-step ";
+
+/** One simple command the shell ran, with the output it produced. */
+export interface CommandStep {
+  command: string;
+  output: string;
+}
+
 export interface RunCommandOptions {
   command: string;
+  /** 07g2 (A4/R9): run the command under `set -x` with a step marker, so the
+   * result names the simple command the shell ran last and its own output.
+   * Used for checks only: the trace lines are stripped from `output`, so
+   * nothing else observes them. */
+  traceSteps?: boolean;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   /** Kill the group if the command has not finished after this many ms. */
@@ -155,6 +175,9 @@ export interface RunCommandResult {
   cancelled: boolean;
   output: string;
   signalsSent: string[];
+  /** 07g2 (A4/R9): every simple command the shell ran, in order, when the
+   * command was step-traced. The trace lines themselves are not in `output`. */
+  steps?: CommandStep[];
   /** A3: the command's peak resident set and the machine's free memory, from
    * the sampler, when at least one sample was taken. Present on every
    * outcome; a kill note uses it when the command was killed at its limit. */
@@ -231,6 +254,34 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
   let freeMemMB = 0;
   let sampled = false;
   let sampleTimer: NodeJS.Timeout | undefined;
+  // 07g2 (A4/R9): the step tracer. The command runs in the SAME shell (one
+  // process, so `cd` and exported env persist); every line the shell traces
+  // starts a new step and is stripped from the output everyone else reads.
+  const traceSteps = options.traceSteps === true;
+  const innerCommand = traceSteps
+    ? `PS4='${STEP_MARKER}'; exec 2>&1; set -x; ${options.command}`
+    : options.command;
+  let stepsForResult: CommandStep[] | undefined;
+  const visibleOutput = (raw: string): string => {
+    if (!traceSteps) return raw;
+    const steps: CommandStep[] = [];
+    const visible: string[] = [];
+    for (const line of raw.split("\n")) {
+      if (line.startsWith(STEP_MARKER)) {
+        steps.push({ command: line.slice(STEP_MARKER.length), output: "" });
+        continue;
+      }
+      if (steps.length === 0) {
+        visible.push(line);
+        continue;
+      }
+      const step = steps[steps.length - 1];
+      step.output = step.output.length === 0 ? line : `${step.output}\n${line}`;
+    }
+    for (const step of steps) step.output = step.output.replace(/\n$/, "");
+    stepsForResult = steps;
+    return visible.join("\n");
+  };
 
   function takeSample(): void {
     if (resolvedPgid === undefined) return;
@@ -264,7 +315,7 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
   const result = new Promise<RunCommandResult>((resolveResult, rejectResult) => {
     child = spawn(
       "/bin/sh",
-      ["-c", 'kill -STOP $$; exec /bin/sh -c "$1"', "tt-sh", options.command],
+      ["-c", 'kill -STOP $$; exec /bin/sh -c "$1"', "tt-sh", innerCommand],
       {
         cwd: options.cwd,
         env: options.env,
@@ -349,8 +400,9 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
         signal: exited.signal,
         timedOut,
         cancelled: cancelRequested,
-        output,
+        output: visibleOutput(output),
         signalsSent,
+        ...(stepsForResult ? { steps: stepsForResult } : {}),
         ...(sampled ? { resourceSample: { peakRssMB, freeMemMB } } : {}),
       });
     };

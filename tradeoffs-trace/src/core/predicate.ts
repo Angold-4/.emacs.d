@@ -212,13 +212,29 @@ export function itemsNeedingEvaluatorReverify(phase: PhaseState): boolean {
   return outcomes.some(itemIsSplit);
 }
 
-/** True when the seats do not unanimously agree on an item's required
- * verdict (met/fits) — one or more say it and one or more do not. */
+/** True when the seats do not give an item the verdict the plan requires by
+ * a STRICT MAJORITY of the seats that voted for it — at least one says the
+ * required verdict and less than a majority does. 07g2 (R6, design §7a.4):
+ * two of three met/fits is a majority and is mechanically decided; the
+ * dissenting seat's reason is a follow-up note, never an evaluator exception. */
 export function itemIsSplit(outcome: { item: { kind: string }; seats: ReadonlyArray<{ verdict: string }> }): boolean {
   const required = outcome.item.kind === "architecture" ? "fits" : "met";
+  const votes = outcome.seats.length;
   const yes = outcome.seats.filter((s) => s.verdict === required).length;
   const no = outcome.seats.filter((s) => s.verdict !== required).length;
-  return yes > 0 && no > 0;
+  return yes > 0 && no > 0 && yes * 2 <= votes;
+}
+
+/** 07g2 (R6): the seats' dissenting reasons on an item the majority decided —
+ * one line each, for the report's follow-up notes. Empty when the seats gave
+ * the required verdict or when there is no majority either way (that item is
+ * an evaluator exception instead). */
+export function itemMinorityNotes(outcome: { item: { id: string; kind: string }; seats: ReadonlyArray<{ seat: string; verdict: string; evidence?: string }> }): string[] {
+  if (itemIsSplit(outcome)) return [];
+  const required = outcome.item.kind === "architecture" ? "fits" : "met";
+  return outcome.seats
+    .filter((s) => s.verdict !== required)
+    .map((s) => `${s.seat} did not mark ${outcome.item.id} ${required}: ${s.verdict}${s.evidence ? ` — ${s.evidence}` : ""}`);
 }
 
 /** Plan 04a: whether everything EVALUATING waits for has settled. In 04a
@@ -781,7 +797,12 @@ function acceptanceBlockersFor(
   // can never accept a failing or stale candidate.
   if (!(phase.checks && phase.checks.candidateSha === C && phase.checks.passed === true)) {
     const failed = phase.checks?.candidateSha === C && phase.checks.passed === false;
-    const detail = failed ? "checks failed" : "checks have not passed for the candidate";
+    // 07g2 (A4/R9): a failed check names the simple command the shell ran last
+    // before the non-zero exit — on the status line, not only in the record.
+    const step = failed ? phase.checks?.failingStep : undefined;
+    const detail = failed
+      ? `checks failed${step ? ` at \`${step}\`` : ""}${phase.checks?.failingStepSilent ? " (no output)" : ""}`
+      : "checks have not passed for the candidate";
     // Plan 07f1b (A1): one blocker per command that FAILED, so every blocker
     // names the failing check command itself — never a command that passed and
     // never a synthesized `a && b` (see `failingCheckCommands`).

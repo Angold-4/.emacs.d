@@ -281,6 +281,13 @@ export interface CheckRecordCommand {
   class?: "passed" | "failed" | "silent" | "interrupted" | "disk-full";
   /** 07e (A4): the one-line reason, e.g. `check exited 3 with no output`. */
   note?: string;
+  /** 07g2 (A4/R9): the simple command the shell ran last before the non-zero
+   * exit, named inside the chain (`test -z x`), with its own output. */
+  failingStep?: string;
+  /** 07g2 (A4/R9): the failing step's own output (empty when it was silent). */
+  failingStepOutput?: string;
+  /** 07g2 (A4/R9): the failing step produced no output at all. */
+  failingStepSilent?: boolean;
   /** The log file name under the candidate's checks directory. */
   log?: string;
 }
@@ -351,6 +358,9 @@ export function parseCheckRecord(value: unknown): CheckRecord | undefined {
         : {}),
       ...(e.class === "passed" || e.class === "failed" || e.class === "silent" || e.class === "interrupted" || e.class === "disk-full" ? { class: e.class } : {}),
       ...(typeof e.note === "string" ? { note: e.note } : {}),
+      ...(typeof e.failingStep === "string" ? { failingStep: e.failingStep } : {}),
+      ...(typeof e.failingStepOutput === "string" ? { failingStepOutput: e.failingStepOutput } : {}),
+      ...(typeof e.failingStepSilent === "boolean" ? { failingStepSilent: e.failingStepSilent } : {}),
       ...(typeof e.log === "string" ? { log: e.log } : {}),
     });
   }

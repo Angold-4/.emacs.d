@@ -14,6 +14,11 @@ import type { Finding, FindingFact } from "./types.ts";
  * domain) a fix round may run. */
 export const DEFAULT_FIXERS = 4;
 
+/** 07g2 (A1): the default `#+TT_INTEGRATE_MAX` — how many attempts the
+ * integrate duty gets on one conflicted merge before the last domain is
+ * dropped to the next loop. */
+export const DEFAULT_INTEGRATE_MAX = 2;
+
 /** A finding as `fixTasks` reads it: the frozen finding plus its triage
  * disposition, when the evaluator has recorded one. A finding with no
  * disposition is not triaged `fix`, so it is in no task. */

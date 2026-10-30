@@ -564,9 +564,18 @@ failureRows("checks-failed", "CHECKING", "CHECKS_FAILED", REPAIR_ATTEMPT_ACTIONS
   // classification into state, so the repair prompt and the reviewers' prompts
   // label a real regression and a flake apart (finding #35).
   const failures = (ev as Extract<Event, { type: "CHECKS_FAILED" }>).failures;
+  const failingStep = (ev as Extract<Event, { type: "CHECKS_FAILED" }>).failingStep;
+  const failingStepSilent = (ev as Extract<Event, { type: "CHECKS_FAILED" }>).failingStepSilent;
   const candidateSha = s.phase.candidate!.sha;
   return withPhase(s, {
-    checks: { candidateSha, passed: false, tier: "round", ...(failures && failures.length > 0 ? { failures } : {}) },
+    checks: {
+      candidateSha,
+      passed: false,
+      tier: "round",
+      ...(failures && failures.length > 0 ? { failures } : {}),
+      ...(failingStep ? { failingStep } : {}),
+      ...(failingStepSilent ? { failingStepSilent } : {}),
+    },
     // Plan 05d: keep the split across the repair freeze too, so the reviewers
     // of the repaired candidate see which tests failed and how each was
     // classified (finding A-5).
@@ -2107,6 +2116,25 @@ addRow({
       blockedReason: launchFailedReason(e),
       inFlight: clearInFlight(s.phase, "dispatch_worker"),
     });
+  },
+});
+
+// Plan 07e (E2/A3) / 07g2 (A2): the rounds bound ran out while points were
+// still open in the fix loop. Parking is the whole meaning: no further loop
+// and no seat acceptance review starts. The conductor records BOUND_REACHED
+// (rounds) and LEAD_CALLED beside this event.
+addRow({
+  id: "implementing-loop-bound-reached",
+  axis: "phase",
+  from: "IMPLEMENTING",
+  trigger: "LOOP_BOUND_REACHED",
+  guardName: "always",
+  guard: () => true,
+  to: "AWAITING_OWNER",
+  actions: [],
+  apply: (s, ev) => {
+    const e = ev as Extract<Event, { type: "LOOP_BOUND_REACHED" }>;
+    return enterAwaitingOwner(s, e.reason);
   },
 });
 

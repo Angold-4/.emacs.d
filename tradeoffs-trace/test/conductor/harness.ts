@@ -136,6 +136,10 @@ export async function setupConductor(opts: {
    * The script's `submit_review` names its candidate with the
    * `$TT_CANDIDATE_SHA` token, which fake-pi substitutes at dispatch time. */
   laneReviewerScriptFor?: (seat: string, candidate: string, state: State, lane?: string) => { hello?: unknown; steps: FakePiStep[] };
+  /** 07g2 (A1): one script per integrate-duty attempt
+   * (`integrate-<round>-<attempt>-…`). Absent: the duty settles without
+   * changing anything, so the merge is dropped after its attempts. */
+  integrateScriptFor?: (round: number, attempt: number, state: State) => { hello?: unknown; steps: FakePiStep[] };
   /** Plan 06g2: one script per pick seat (`pick-<round>-<seat>-…`). */
   pickScriptFor?: (seat: string, state: State) => { hello?: unknown; steps: FakePiStep[] };
   /** Plan 07c (D4): one script per fixer run (`fix-<round>-<domain>-…`), `n`
@@ -315,6 +319,7 @@ export async function setupConductor(opts: {
   const laneReviewerScriptPaths = new Map<string, string>();
   const pickScriptPaths = new Map<string, string>();
   const fixerScriptPaths = new Map<string, string>();
+  const integrateScriptPaths = new Map<string, string>();
   const domainReviewScriptPaths = new Map<string, string>();
   const evaluatorScriptPaths = new Map<string, string>();
   const briefScriptPaths = new Map<string, string>();
@@ -483,6 +488,22 @@ export async function setupConductor(opts: {
         return { FAKE_PI_SCRIPT: domainReviewScriptPaths.get(key)! };
       }
       // Plan 06g2: a lane agent's own script, keyed by its lane/round/seat.
+      // 07g2 (A1/C4): the integrate duty's own script, keyed by round and
+      // attempt. The default settles with a submission but changes nothing, so
+      // the conflicted files keep their markers and the attempt is refused.
+      const integrate = agentId.match(/^integrate-(\d+)-(\d+)-/);
+      if (role === "worker" && integrate) {
+        const round = Number(integrate[1]);
+        const attempt = Number(integrate[2]);
+        const key = `integrate-${agentId}`;
+        if (!integrateScriptPaths.has(key)) {
+          const script = opts.integrateScriptFor
+            ? opts.integrateScriptFor(round, attempt, conductor.state)
+            : { hello: defaultWorkerHello(), steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } }] };
+          integrateScriptPaths.set(key, writeScript(scriptsDir, key, script));
+        }
+        return { FAKE_PI_SCRIPT: integrateScriptPaths.get(key)!, ...(opts.extraWorkerEnv ?? {}) };
+      }
       const laneWorker = agentId.match(/^lane-(\d+)-([a-z])-/);
       if (role === "worker" && laneWorker && opts.laneWorkerScriptFor) {
         const round = Number(laneWorker[1]);

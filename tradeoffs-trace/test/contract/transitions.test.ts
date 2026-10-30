@@ -517,6 +517,11 @@ const BUILD: Record<string, Fixture> = {
     state: baseState({ phase: "REPAIRING", repairRoundsUsed: 3, repairRoundsGranted: 3 }),
     event: { type: "REPAIR_BUDGET_EXHAUSTED" },
   },
+  // 07g2 (A2/R4): the fix loop spent the round budget with points still open.
+  "implementing-loop-bound-reached": {
+    state: baseState({ phase: "IMPLEMENTING" }),
+    event: { type: "LOOP_BOUND_REACHED", round: 3, loops: 3, reason: "the fix loop bound was reached" },
+  },
   "run-budget-exceeded": {
     state: baseState({}, "RUN_ACTIVE"),
     event: { type: "RUN_BUDGET_EXCEEDED" },
