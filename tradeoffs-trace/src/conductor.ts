@@ -8362,43 +8362,30 @@ export class Conductor {
         out.push(...testOverturns);
         continue;
       }
-      // Plan 06b (OD-1 R3b): the evaluator's substantive re-check. A
-      // `contradicted` check overturns every seat whose verdict made the
-      // majority, recorded with what the evaluator checked. R7 governs the
-      // acceptance direction: a unanimous met/fits (an approval seats agreed
-      // on) is never withdrawn by a re-check (see below).
-      if (o.outcome === "unmet" || o.outcome === "deviates") {
+      // Plan 07f (F0) / 07g2 (R7/A3): a unanimous verdict — met/fits or
+      // unmet/deviates — is never overturned by an evaluator re-check. A
+      // unanimous item is not an evaluator exception at all, so the re-check
+      // judges against the plan item's text and its disagreement is recorded
+      // for the lead instead; nothing the seats agreed on is flipped.
+      if (unanimous) {
         const check = (this.#state.phase.itemChecks ?? []).find((c) => c.itemId === o.item.id && c.verdict === "contradicted");
-        // OD-2 A3: a contradicted check overturns only when its evidence
-        // anchors are valid (each cited file exists and its lines are in
-        // range), exactly like a reviewer verdict.
         if (check && this.#itemCheckAnchorsValid(check.evidence, ctx)) {
-          for (const v of o.seats.filter((s) => s.verdict === o.outcome)) {
-            out.push({ seat: v.seat, id: o.item.id, kind: o.item.kind, verdict: v.verdict, effect: "flip", reason: `evaluator re-check contradicted it: ${check.evidence}` });
-          }
+          this.#recordItemDisagreement(o.item.id, o.outcome, check.evidence);
         }
+        continue;
       }
-      // Plan 07f (F0): a split item (a seat majority met/fits, a minority did
-      // not) is exactly what the evaluator rules on. A `contradicted` check
-      // with valid anchors overturns the seats that made the majority.
-      if ((o.outcome === "met" || o.outcome === "fits") && itemIsSplit(o)) {
+      // Plan 07f (F0): a split item is exactly what the evaluator rules on. A
+      // `contradicted` check with valid anchors overturns the seats that made
+      // the majority, whichever direction that majority went. OD-2 A3: the
+      // check overturns only when its evidence anchors are valid (each cited
+      // file exists and its lines are in range), exactly like a reviewer
+      // verdict.
+      if (itemIsSplit(o)) {
         const check = (this.#state.phase.itemChecks ?? []).find((c) => c.itemId === o.item.id && c.verdict === "contradicted");
         if (check && this.#itemCheckAnchorsValid(check.evidence, ctx)) {
           for (const v of o.seats.filter((s) => s.verdict === o.outcome)) {
             out.push({ seat: v.seat, id: o.item.id, kind: o.item.kind, verdict: v.verdict, effect: "flip", reason: `evaluator re-check contradicted the split majority: ${check.evidence}` });
           }
-        }
-        continue;
-      }
-      // Plan 06c (R5) / 07g2 (R7/A3): an evaluator re-check that contradicts a
-      // unanimous seat verdict is never an overturn — whatever the outcome and
-      // whatever the evidence's thickness. The evaluator judges against the
-      // plan item's text; the disagreement is recorded for the lead instead, so
-      // it can never quietly flip a verdict every seat agreed on.
-      if (unanimous && (o.outcome === "met" || o.outcome === "fits")) {
-        const check = (this.#state.phase.itemChecks ?? []).find((c) => c.itemId === o.item.id && c.verdict === "contradicted");
-        if (check && this.#itemCheckAnchorsValid(check.evidence, ctx)) {
-          this.#recordItemDisagreement(o.item.id, o.outcome, check.evidence);
         }
       }
     }
