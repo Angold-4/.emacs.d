@@ -163,6 +163,35 @@ test("plan 07e: a silent check is class silent and a check killed by a stop is i
   }
 });
 
+test("a silent failing check step is named with its output", async () => {
+  // R9/A4: the check chain runs in one shell under a step trace. The last
+  // simple command before the non-zero exit is the failing step; its own (here
+  // empty) output is recorded too, and the check's log names both.
+  const setup = await setupConductor({
+    checks: ["true && exit 3"],
+    phaseChecks: ["true"],
+    rounds: 1,
+    stubReviews: true,
+    deadlines: { ...FAST, checkMs: 10_000 },
+    workerScript: () => quickWorker(),
+    reviewerScriptFor: (seat, state) => stubReviewer(seat, state),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => checkRecords(setup.runDir).length > 0, 60_000, 100, setup.runDir);
+    const record = checkRecords(setup.runDir)[0]!;
+    const command = (record.commands as Array<Record<string, unknown>>)[0]!;
+    assert.equal(command.passed, false, "the chain failed");
+    assert.equal(command.failingStep, "exit 3", "the failing step is named in the check record");
+    assert.equal(command.failingStepSilent, true, "a step that printed nothing is marked silent");
+    assert.equal(command.failingStepOutput, "", "the failing step's own output is recorded (empty here)");
+    const logText = fs.readFileSync(path.join(setup.runDir, "checks", String(record.candidateSha), String(command.log)), "utf8");
+    assert.match(logText, /failing step: exit 3 \(no output\)/, "the check's log names the silent failing step");
+  } finally {
+    await teardown(setup);
+  }
+});
+
 test("plan 07e: a check stopped by a full disk is class disk-full", async () => {
   // The full disk's own stop path (`#onDiskFull` calls `stop("disk full")`).
   // A running check it cuts off is recorded as `disk-full`, never

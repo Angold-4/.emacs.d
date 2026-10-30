@@ -620,6 +620,73 @@ test("plan 06b: the evaluator's substantive re-check overturns a review-only maj
   }
 });
 
+test("an evaluator re-check never overturns a unanimous seat verdict", async () => {
+  // R7/A3: every seat marked R1 met. The evaluator contradicts R1 on the
+  // finding pass (R2 is the exception that starts the session: M met, A
+  // partial, B unmet), and the unanimous R1 verdict must stand — the
+  // disagreement is recorded for the lead, never applied as an overturn.
+  const setup = await setupConductor({
+    items: ITEMS,
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: WRITE_ROUNDS },
+        { kind: "call-submit", tool: "submit_coverage", args: coverage() },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => {
+      const verdicts = reviewer === "A" ? { R2: "partial" } : reviewer === "B" ? { R2: "unmet" } : {};
+      return reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review(verdicts));
+    },
+    evaluatorScriptFor: () => ({
+      hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_evaluation",
+          args: {
+            evaluations: [],
+            itemChecks: [
+              { id: "R1", verdict: "contradicted", evidence: "src/core/rounds.ts:1 does not implement R1" },
+              { id: "R2", verdict: "confirmed", evidence: "src/core/rounds.ts:1" },
+              { id: "C1", verdict: "confirmed", evidence: "src/core/rounds.ts:1" },
+              { id: "A1", verdict: "confirmed", evidence: "src/core/rounds.ts:1" },
+            ],
+          },
+        },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () => readEvents(setup.runDir).some((r) => r.kind === "event" && (r.event as { type?: string }).type === "LEAD_CALLED"),
+      120_000,
+      50,
+      setup.runDir,
+    );
+    const phase = setup.conductor.state.phase;
+    assert.deepEqual(
+      (phase.overturns ?? []).filter((o) => o.id === "R1"),
+      [],
+      "no evaluator re-check overturns the unanimous R1 verdict",
+    );
+    const lead = readEvents(setup.runDir).find((r) => r.kind === "event" && (r.event as { type?: string }).type === "LEAD_CALLED");
+    assert.match(
+      JSON.stringify((lead?.event as { reasons?: string[] }).reasons ?? []),
+      /R1 stays met: the evaluator's re-check disagrees with the unanimous seats/,
+      "the disagreement is recorded as an exception for the lead",
+    );
+    assert.ok((phase.itemChecks ?? []).some((c) => c.itemId === "R1" && c.verdict === "contradicted"), "the re-check itself is kept");
+  } finally {
+    await teardown(setup);
+  }
+});
+
 test("plan 06b: an old-format phase started through Emacs owes submit_phase only and its prompts never mention submit_coverage", async () => {
   // 1. Run the REAL Emacs parser on an old-format org file.
   const dir = fs.mkdtempSync("/tmp/tt-r1-");

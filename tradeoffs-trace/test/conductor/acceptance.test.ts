@@ -98,7 +98,7 @@ async function teardown(setup: TestConductorSetup): Promise<void> {
   cleanupDir(setup.scriptsDir);
 }
 
-test("a candidate with green checks passed tests fact-closed points and a unanimous seat majority is accepted with no evaluator session", async () => {
+async function candidateWithoutExceptions(): Promise<void> {
   const setup = await setupConductor({
     items: { requirements: [ITEM("R1")], finalChecks: ["sleep 2"] } as never,
     checks: ["true"],
@@ -129,9 +129,14 @@ test("a candidate with green checks passed tests fact-closed points and a unanim
   } finally {
     await teardown(setup);
   }
-});
+}
 
-test("a split item starts the evaluator with only that item in its brief", async () => {
+// Keep the existing regression names as well as the phase's named verifies.
+// Each registration runs the full scenario in its own conductor setup.
+test("a candidate with green checks passed tests fact-closed points and a unanimous seat majority is accepted with no evaluator session", candidateWithoutExceptions);
+test("a candidate with no exception is decided with no evaluator session", candidateWithoutExceptions);
+
+async function itemWithoutSeatMajority(): Promise<void> {
   const promptLog = path.join(fs.mkdtempSync("/tmp/tt-07f-prompt-"), "prompts.log");
   const setup = await setupConductor({
     items: { requirements: [ITEM("R2")] },
@@ -193,7 +198,10 @@ test("a split item starts the evaluator with only that item in its brief", async
   } finally {
     await teardown(setup);
   }
-});
+}
+
+test("a split item starts the evaluator with only that item in its brief", itemWithoutSeatMajority);
+test("an item with no seat majority starts the evaluator with only that item in its brief", itemWithoutSeatMajority);
 
 // -- plan 07f (F1/R5): a failing doneWhen fact cannot be closed by a drop ----
 
