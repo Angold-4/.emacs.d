@@ -9,7 +9,10 @@ import { test } from "node:test";
 
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import type { Reviewer } from "../../src/core/types.ts";
-import { accept, acceptanceBlockers, shortId } from "../../src/core/predicate.ts";
+import { accept, acceptanceBlockers, itemIsSplit, itemMinorityNotes, shortId } from "../../src/core/predicate.ts";
+import { phaseItemOutcomes } from "../../src/core/items.ts";
+import { openFindings } from "../../src/core/triage.ts";
+import { evaluationExceptions } from "../../src/core/verdict.ts";
 import { reduce } from "../../src/core/reduce.ts";
 import { ownerCommandToEvent } from "../../src/core/owner-inbox.ts";
 import { runPaths } from "../../src/conductor.ts";
@@ -708,3 +711,193 @@ test("a decision bound to an older contract version never blocks acceptance", as
     await teardown(setup);
   }
 });
+
+// -- R5/R6/R7: the evaluator rules only on exceptions, and never over a -------
+//    unanimous verdict -------------------------------------------------------
+
+const EX_C = "C1";
+const EX_K = CV();
+
+const EX_CONTRACT = {
+  ...basePhase().contract,
+  acceptance: ["R1 works", "R2 works"],
+  architecture: [],
+  itemsSynthesized: false,
+  requirements: [ITEM("R1"), ITEM("R2")].map((i) => ({ ...i, verify: ["review"] })),
+  constraints: [],
+};
+
+function exReview(seat: string, verdicts: Record<string, string>) {
+  return {
+    reviewer: seat,
+    phaseId: "p1",
+    candidateSha: EX_C,
+    contractVersion: EX_K,
+    correctionStatements: [],
+    findingStatements: [],
+    items: Object.entries(verdicts).map(([id, verdict]) => ({ id, verdict, evidence: "README.md:1 README.md:2" })),
+    arch: [],
+  };
+}
+
+/** R5: items the seats decided by review anchors, and a point a passing
+ * doneWhen fact closed. Nothing here is an exception, so no evaluator starts
+ * and the mechanical verdict accepts. */
+function noExceptionPhase() {
+  return basePhase({
+    contract: EX_CONTRACT,
+    phase: "RESOLVING",
+    candidate: { sha: EX_C, contractVersion: EX_K },
+    integrationHead: "H0",
+    checks: { candidateSha: EX_C, passed: true },
+    probe: { candidateSha: EX_C, head: "H0", probedI: "I1", passed: true },
+    reviews: {
+      M: { review: exReview("M", { R1: "met", R2: "met" }) },
+      A: { review: exReview("A", { R1: "met", R2: "met" }) },
+      B: { review: exReview("B", { R1: "met", R2: "met" }) },
+    },
+    findings: [
+      {
+        id: "F-1",
+        version: 1,
+        phaseId: "p1",
+        kind: "defect",
+        severity: "blocking",
+        evidence: "the point the fact proves",
+        raisedBy: "M",
+        status: "repaired",
+        boundCandidateSha: "C0",
+        repairedByCandidateSha: EX_C,
+        domain: "booking",
+        doneWhen: "test -f done",
+      },
+    ],
+    doneWhenFacts: [{ findingId: "F-1", candidateSha: EX_C, exitCode: 0, timedOut: false, outputTail: "", passesOnBase: false }],
+  } as never);
+}
+
+function factClosedNoEvaluator(): void {
+  const phase = noExceptionPhase();
+  const exceptions = evaluationExceptions(phase);
+  assert.deepEqual(exceptions, [], `anchor-decided items and a fact-closed point are no exception: ${JSON.stringify(exceptions)}`);
+  assert.deepEqual(acceptanceBlockers(phase, []), [], "nothing is left to decide, so the mechanical verdict accepts");
+  assert.ok(!openFindings(phase).some((f) => f.id === "F-1"), "the fact closed the point");
+}
+
+test("a candidate with green checks, anchor-decided items and a fact-closed point has no exception, so no evaluator starts", factClosedNoEvaluator);
+test("no exceptions means no evaluator session: the fact-closed point and the seats' anchors are decided by code", factClosedNoEvaluator);
+
+/** R6: an absent seat leaves the remaining seats' verdict standing (it is not
+ * an exception), and a 2-of-3 majority is decided by code — its dissent is a
+ * follow-up note, never an evaluator exception. */
+function absentSeatAndMajority(): void {
+  const absent = noExceptionPhase();
+  absent.reviews = { M: { review: exReview("M", { R1: "met", R2: "met" }) }, B: { review: exReview("B", { R1: "met", R2: "met" }) } } as never;
+  assert.deepEqual(evaluationExceptions(absent), [], "an absent seat does not start the evaluator: the seats that voted agree");
+
+  const majority = noExceptionPhase();
+  majority.reviews = {
+    M: { review: exReview("M", { R1: "met", R2: "met" }) },
+    A: { review: exReview("A", { R1: "met", R2: "met" }) },
+    B: { review: exReview("B", { R1: "unmet", R2: "met" }) },
+  } as never;
+  const outcomes = phaseItemOutcomes(majority);
+  const r1 = outcomes.find((o) => o.item.id === "R1")!;
+  assert.equal(itemIsSplit(r1), false, "two of three met is a strict majority, not a split");
+  assert.deepEqual(evaluationExceptions(majority), [], "a strict majority is mechanically decided; no evaluator rules on it");
+  assert.equal(accept(majority, EX_C, EX_K), true, "the mechanical verdict accepts over B's dissent");
+  assert.deepEqual(itemMinorityNotes(r1), ["B did not mark R1 met: unmet — README.md:1 README.md:2"], "the dissent is a follow-up note");
+}
+
+test("an absent seat and a two-of-three majority are no evaluator exception; the dissent is a follow-up note", absentSeatAndMajority);
+
+/** R7: every seat marked both items met; the evaluator's re-check contradicts
+ * R1. Nothing overturns a unanimous verdict — the contradiction is kept as a
+ * recorded exception for the lead, and R1 stays met. */
+async function unanimousNotOverturned(): Promise<void> {
+  const setup = await setupConductor({
+    items: { requirements: [ITEM("R1"), ITEM("R2")] } as never,
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: WRITE_ROUNDS },
+        { kind: "call-submit", tool: "submit_coverage", args: { items: [COVERAGE("R1").items[0], COVERAGE("R2").items[0]], arch: [] } },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer: Reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+        { kind: "wait-for-prompt" },
+        { kind: "call-tool", tool: "read", args: { path: "src/core/rounds.ts" } },
+        { kind: "call-tool", tool: "read", args: { path: "README.md" } },
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer,
+            phaseId: "p1",
+            candidateSha: state.phase.candidate?.sha,
+            contractVersion: state.phase.contract.contractVersion,
+            correctionStatements: [],
+            findingStatements: [],
+            items: [
+              { id: "R1", verdict: "met", evidence: "src/core/rounds.ts:1 README.md:1" },
+              // R2 is the split item that starts the evaluator (M met, A
+              // partial, B unmet): every seat's R1 verdict is unanimous, so no
+              // re-check may overturn it.
+              { id: "R2", verdict: reviewer === "A" ? "partial" : reviewer === "B" ? "unmet" : "met", evidence: "src/core/rounds.ts:1 README.md:1" },
+            ],
+            arch: [],
+          },
+        },
+      ],
+    }),
+    evaluatorScriptFor: () => ({
+      hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_evaluation",
+          args: {
+            evaluations: [],
+            itemChecks: [
+              { id: "R1", verdict: "contradicted", evidence: "src/core/rounds.ts:1 does not implement R1" },
+              { id: "R2", verdict: "confirmed", evidence: "src/core/rounds.ts:1" },
+            ],
+          },
+        },
+      ],
+    }),
+  } as never);
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.acceptedWithCarried !== undefined || ["DONE", "BLOCKED", "AWAITING_OWNER"].includes(setup.conductor.state.phase.phase), 120_000, 50, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    assert.deepEqual(
+      (phase.overturns ?? []).filter((o) => o.id === "R1"),
+      [],
+      "no evaluator re-check overturns the unanimous R1 verdict",
+    );
+    const r1 = phaseItemOutcomes(phase).find((o) => o.item.id === "R1");
+    assert.equal(r1?.outcome, "met", `R1 keeps the verdict all three seats gave it: ${JSON.stringify(r1)} phase=${phase.phase}`);
+    assert.equal(r1?.seats.length, 3, "all three seats' votes still stand");
+    const lead = readEvents(setup.runDir).find((r) => r.kind === "event" && (r.event as { type?: string }).type === "LEAD_CALLED");
+    if ((phase.itemChecks ?? []).some((c) => c.itemId === "R1" && c.verdict === "contradicted")) {
+      assert.match(
+        JSON.stringify((lead?.event as { reasons?: string[] }).reasons ?? []),
+        /R1 stays met: the evaluator's re-check disagrees with the unanimous seats/,
+        "the disagreement is recorded as an exception for the lead",
+      );
+    }
+  } finally {
+    await teardown(setup);
+  }
+}
+
+test("an evaluator re-check never overturns a unanimous seat verdict", unanimousNotOverturned);

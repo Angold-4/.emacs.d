@@ -779,6 +779,26 @@ function failedCheckCommands(runDir: string, phase: PhaseState): string[] | unde
   }
 }
 
+/** 07g2 (R9): the failing step's own output, from the same check record the
+ * status reads its step name from. Undefined when the record names none (a
+ * silent step's output is empty, and the status marks it `silent` instead). */
+function failingStepOutput(runDir: string, phase: PhaseState): string | undefined {
+  const candidateSha = phase.checks?.candidateSha ?? phase.candidate?.sha;
+  if (!candidateSha) return undefined;
+  try {
+    const record = parseCheckRecord(
+      JSON.parse(fs.readFileSync(path.join(runPaths(runDir).checks, candidateSha, "record.json"), "utf8")),
+    );
+    if (!record) return undefined;
+    if (record.tier !== (phase.checks?.tier ?? "round")) return undefined;
+    const failed = record.commands.find((c) => !c.passed && typeof c.failingStepOutput === "string");
+    const output = failed?.failingStepOutput?.trim();
+    return output && output.length > 0 ? output.split("\n")[0] : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface WhyBlocker {
   kind: string;
   detail: string;
@@ -885,8 +905,9 @@ export function buildView(
   // step that printed nothing as silent. The step comes from the check record
   // the conductor wrote, never from re-running the check here.
   const failingStep = phase.checks?.passed === false ? phase.checks?.failingStep : undefined;
+  const stepOutput = failingStep ? failingStepOutput(runDir, phase) : undefined;
   const stepNote = failingStep
-    ? ` (failing step: \`${failingStep}\`${phase.checks?.failingStepSilent ? ", silent" : ""})`
+    ? ` (failing step: \`${failingStep}\`${phase.checks?.failingStepSilent ? ", silent" : stepOutput ? `, output: ${stepOutput}` : ""})`
     : "";
   const reasons = acceptanceBlockers(phase, failedCheckCommands(runDir, phase)).map(
     (b) => `${b.detail}${b.kind === "check" ? stepNote : ""} — ${b.command}`,

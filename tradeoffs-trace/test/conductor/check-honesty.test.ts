@@ -13,6 +13,7 @@ import { test } from "node:test";
 
 import { cleanupDir, defaultReviewerHello, defaultWorkerHello, readEvents, setupConductor, waitFor, type FakePiStep, type TestConductorSetup } from "./harness.ts";
 import type { Reviewer, State } from "../../src/core/types.ts";
+import { buildView } from "../../src/view.ts";
 
 const FAST = {
   abortGraceMs: 300,
@@ -187,6 +188,43 @@ test("a silent failing check step is named with its output", async () => {
     assert.equal(command.failingStepOutput, "", "the failing step's own output is recorded (empty here)");
     const logText = fs.readFileSync(path.join(setup.runDir, "checks", String(record.candidateSha), String(command.log)), "utf8");
     assert.match(logText, /failing step: exit 3 \(no output\)/, "the check's log names the silent failing step");
+    // R9: the same failing step and its output are in the status line too, so
+    // the owner reads which step failed without opening the record.
+    await waitFor(() => setup.conductor.state.phase.checks?.passed === false, 60_000, 100, setup.runDir);
+    const view = buildView(setup.runDir, setup.plan, false);
+    const status = [view.verdict ?? "", ...(view.addressing ?? [])].join("\n");
+    assert.match(status, /failing step: `exit 3`, silent/, `the status line names the failing step: ${status}`);
+    assert.doesNotMatch(status, /output:/, `a silent step's output is empty, so the status marks it silent instead: ${status}`);
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("a failing check step's own output is named in the status line", async () => {
+  // R9: a step that prints its failure is named with that output too — the
+  // record keeps it and the status line shows it.
+  const setup = await setupConductor({
+    checks: ["true && sh -c 'echo boom >&2; exit 4'"],
+    phaseChecks: ["true"],
+    rounds: 1,
+    stubReviews: true,
+    deadlines: { ...FAST, checkMs: 10_000 },
+    workerScript: () => quickWorker(),
+    reviewerScriptFor: (seat, state) => stubReviewer(seat, state),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => checkRecords(setup.runDir).length > 0, 60_000, 100, setup.runDir);
+    const record = checkRecords(setup.runDir)[0]!;
+    const command = (record.commands as Array<Record<string, unknown>>)[0]!;
+    assert.equal(command.passed, false, "the chain failed");
+    assert.match(String(command.failingStep), /exit 4/, "the failing step is named in the check record");
+    assert.match(String(command.failingStepOutput), /boom/, "that step's own output is recorded");
+    await waitFor(() => setup.conductor.state.phase.checks?.passed === false, 60_000, 100, setup.runDir);
+    const view = buildView(setup.runDir, setup.plan, false);
+    const status = [view.verdict ?? "", ...(view.addressing ?? [])].join("\n");
+    assert.match(status, /failing step: `sh -c echo boom >&2; exit 4`/, `the status line names the failing step: ${status}`);
+    assert.match(status, /output: boom/, `the status line carries that step's own output: ${status}`);
   } finally {
     await teardown(setup);
   }

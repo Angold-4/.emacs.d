@@ -587,9 +587,9 @@ test("plan 06b: the evaluator's substantive re-check overturns a review-only maj
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
       ],
     }),
-    // R2 is review-only: all three seats judge it unmet, so only the
-    // evaluator's own re-check can contradict the majority.
-    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: "unmet" })),
+    // R2 is review-only: M and A judge it unmet, B met. This is a split
+    // majority, not a unanimous verdict protected by 07g2 R7.
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: reviewer === "B" ? "met" : "unmet" })),
     evaluatorScriptFor: () => ({
       hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
       steps: [
