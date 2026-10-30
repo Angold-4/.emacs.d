@@ -255,8 +255,8 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
   let sampled = false;
   let sampleTimer: NodeJS.Timeout | undefined;
   // 07g2 (A4/R9): the step tracer. The command runs in the SAME shell (one
-  // process, so `cd` and exported env persist); every line the shell traces
-  // starts a new step and is stripped from the output everyone else reads.
+  // process, so `cd` and exported env persist); every trace line starts a new
+  // step and is stripped from the output everyone else reads.
   const traceSteps = options.traceSteps === true;
   const innerCommand = traceSteps
     ? `PS4='${STEP_MARKER}'; exec 2>&1; set -x; ${options.command}`
@@ -265,23 +265,24 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
   const visibleOutput = (raw: string): string => {
     if (!traceSteps) return raw;
     const steps: CommandStep[] = [];
-    const visible: string[] = [];
-    for (const line of raw.split("\n")) {
-      if (line.startsWith(STEP_MARKER)) {
-        steps.push({ command: line.slice(STEP_MARKER.length), output: "" });
-        continue;
-      }
-      // Every non-marker line stays in the visible output: the step's own
-      // output is a SECOND copy, never a removal, so a reader of the check's
-      // output (an ENOSPC sniff, a review) sees exactly what it saw before.
-      visible.push(line);
-      if (steps.length === 0) continue;
-      const step = steps[steps.length - 1];
-      step.output = step.output.length === 0 ? line : `${step.output}\n${line}`;
+    // A marker starts a step wherever it appears, not only at a line start:
+    // a step that prints without a trailing newline runs straight into the
+    // next trace line, so that next step's marker is mid-line. Splitting on
+    // the marker keeps each step's output with its own step and strips the
+    // trace (command plus its terminating newline) from the visible output,
+    // which is therefore the same stream an untraced shell would have printed.
+    const chunks = raw.split(STEP_MARKER);
+    let visible = chunks[0] ?? "";
+    for (let i = 1; i < chunks.length; i += 1) {
+      const chunk = chunks[i];
+      const newline = chunk.indexOf("\n");
+      const command = newline < 0 ? chunk : chunk.slice(0, newline);
+      const stepOutput = newline < 0 ? "" : chunk.slice(newline + 1);
+      steps.push({ command, output: stepOutput.replace(/\n$/, "") });
+      visible += stepOutput;
     }
-    for (const step of steps) step.output = step.output.replace(/\n$/, "");
     stepsForResult = steps;
-    return visible.join("\n");
+    return visible;
   };
 
   function takeSample(): void {

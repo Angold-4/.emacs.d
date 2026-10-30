@@ -148,6 +148,24 @@ test("output capture, streamed and accumulated", async () => {
   assert.ok(streamed.join("").includes("world"));
 });
 
+// A4: a step that prints without a trailing newline runs straight into the
+// next trace line, so the next step's marker is not at a line start. The
+// failing step must still be the one that exited non-zero, and the marker must
+// not leak into the output.
+test("A4: a marker after output without a newline still starts its own step", async () => {
+  const { result } = runCommand({
+    command: "printf no-newline && test -z x && true",
+    traceSteps: true,
+    termGraceMs: 200,
+  });
+  const outcome = await result;
+  assert.equal(outcome.exitCode, 1);
+  assert.equal(outcome.steps?.at(-1)?.command, "test -z x");
+  assert.equal(outcome.steps?.at(-1)?.output, "");
+  assert.equal(outcome.output, "no-newline");
+  assert.ok(!outcome.output.includes("\u0001tt-step"));
+});
+
 // 09-2: the result waits for the pipes to drain, not only for `exit`. A fast
 // failing check's whole output (its failing test names) must be in the
 // result, or the conductor cannot classify the failure.
