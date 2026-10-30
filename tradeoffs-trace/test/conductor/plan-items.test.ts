@@ -573,7 +573,7 @@ test("plan-items: a met verdict citing only the worker's anchors with no file th
   }
 });
 
-test("plan 07g2 (R7): the evaluator's substantive re-check never overturns a unanimous review-only verdict", async () => {
+test("plan 06b: the evaluator's substantive re-check overturns a review-only majority (R3b)", async () => {
   const setup = await setupConductor({
     items: ITEMS,
     phaseChecks: [CHECK_OUTPUT],
@@ -587,10 +587,9 @@ test("plan 07g2 (R7): the evaluator's substantive re-check never overturns a una
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
       ],
     }),
-    // R2 is review-only: all three seats judge it unmet. 07g2 (R7/A3) makes
-    // that a UNANIMOUS verdict, so the evaluator's re-check never overturns it
-    // — it is recorded as a disagreement for the lead instead.
-    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: "unmet" })),
+    // R2 is review-only: M and A judge it unmet, B met. This is a split
+    // majority, not a unanimous verdict protected by 07g2 R7.
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: reviewer === "B" ? "met" : "unmet" })),
     evaluatorScriptFor: () => ({
       hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
       steps: [
@@ -613,16 +612,9 @@ test("plan 07g2 (R7): the evaluator's substantive re-check never overturns a una
   try {
     await setup.conductor.start();
     await waitFor(() => ["DONE", "BLOCKED", "AWAITING_OWNER"].includes(setup.conductor.state.phase.phase), 120_000, 50, setup.runDir);
-    const phase = setup.conductor.state.phase;
-    assert.notEqual(phase.phase, "DONE", "the contradicted unanimous majority is not silently accepted");
-    assert.ok((setup.conductor.state.phase.itemChecks ?? []).some((c) => c.itemId === "R2" && c.verdict === "contradicted"), "the re-check itself is kept");
-    assert.deepEqual((phase.overturns ?? []).filter((o) => o.id === "R2"), [], "no re-check overturns a unanimous verdict");
-    const lead = readEvents(setup.runDir).find((r) => r.kind === "event" && (r.event as { type?: string }).type === "LEAD_CALLED");
-    assert.match(
-      JSON.stringify((lead?.event as { reasons?: string[] }).reasons ?? []),
-      /R2 stays unmet: the evaluator's re-check disagrees with the unanimous seats/,
-      "the disagreement is the recorded exception for the lead",
-    );
+    assert.equal(setup.conductor.state.phase.phase, "DONE", "the contradicted majority did not block");
+    assert.ok(!setup.conductor.state.phase.findings.some((f) => f.itemId === "R2"), "no finding is raised for the contradicted item");
+    assert.ok((setup.conductor.state.phase.itemChecks ?? []).some((c) => c.itemId === "R2" && c.verdict === "contradicted"));
   } finally {
     await teardown(setup);
   }
