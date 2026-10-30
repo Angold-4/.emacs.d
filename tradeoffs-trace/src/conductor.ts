@@ -1963,6 +1963,12 @@ export class Conductor {
    * `#runLaneRound` reads and clears this before emitting any attempt-failure
    * event, so the stopped round never fights the recheck. */
   #recheckCancelledLaneRound = false;
+  /** 07g2 (A2/R3): a red merged candidate whose failing file no domain loop can
+   * take (no declared domain owns it, or that domain has no open point).
+   * `#fixLane` records it here and answers with no candidate; `#runLaneRound`
+   * parks the phase for the lead once the round has returned, so the phase
+   * never leaves IMPLEMENTING in the middle of a round. */
+  #mergedCheckNoLoop: { round: number; sha: string; reason: string } | undefined;
 
   constructor(opts: ConductorOptions) {
     this.#runDir = opts.runDir;
@@ -9402,11 +9408,15 @@ export class Conductor {
     const fixRound = lane === "a" ? fixRoundCandidate(this.#state.phase.rounds, round) : undefined;
     if (fixRound && fixRound.candidate === sha) {
       // 07g2 (A2/R3): a red merged candidate goes back to the loop of the DOMAIN
-      // that owns the failing file, with the check's output. Only when no
-      // declared domain owns it (or that domain has no open point) does the
-      // fresh fix session below run.
+      // that owns the failing file, with the check's output. A check naming no
+      // declared domain's file (or a domain with no open point to loop on) has
+      // no loop to go back to: design G3 puts it on the lead (LEAD_CALLED), so
+      // no lane round and no fresh merge fix starts. The fresh merge fix below
+      // stays only for the case of an owning domain whose loop failed to
+      // produce a commit.
       const domains = this.#state.phase.contract.domains ?? [];
-      const owner = failingDomainOf(digest || this.#laneCheckFailureDigest(sha), domains);
+      const output = digest || this.#laneCheckFailureDigest(sha);
+      const owner = failingDomainOf(output, domains);
       const ownerTask = owner ? this.#ownerTaskFor(owner.domain) : undefined;
       if (owner && ownerTask) {
         this.#log.append("merged_check_reentered", { lane, round, sha, domain: owner.domain, path: owner.path, points: ownerTask.findingIds });
@@ -9420,6 +9430,19 @@ export class Conductor {
           };
         }
         this.#log.append("merged_check_reentry_failed", { lane, round, sha, domain: owner.domain, reason: reentered.reason ?? reentered.note });
+      } else {
+        const reason = owner
+          ? `the merged candidate ${sha.slice(0, 7)} is red in ${owner.path} (domain ${owner.domain}), which has no open point to loop on`
+          : `the merged candidate ${sha.slice(0, 7)} is red and its check output names no file of a declared domain`;
+        this.#log.append("merged_check_no_loop", {
+          lane,
+          round,
+          sha,
+          reason,
+          ...(owner ? { domain: owner.domain, path: owner.path } : {}),
+        });
+        this.#mergedCheckNoLoop = { round, sha, reason };
+        return { lane, note: reason };
       }
     }
     if (fixRound && fixRound.candidate === sha) {
@@ -9833,17 +9856,31 @@ export class Conductor {
   }
 
   /** 07g2 (A2/R3): the points still open on a merged candidate. A point with
-   * a proving fact closes for this gate only when that fact passes on the
-   * candidate and does not pass on its base (a command that already passed
-   * before the fix proves nothing). */
+   * a proving fact closes for this gate when that fact passes on the candidate
+   * and does not pass on its base (a command that already passed before the
+   * fix proves nothing). A point a fact already closed on an earlier candidate
+   * stays closed (design G4): on this candidate its fact passes, and the base
+   * now carries the earlier fix, so `passesOnBase` no longer proves anything
+   * either way. Only a fact that FAILS on this candidate reopens it. */
   #openPointsOn(candidateSha: string): string[] {
     const facts = this.#factsFor(candidateSha);
+    const earlierFacts = this.#state.phase.doneWhenFacts ?? [];
     return this.#state.phase.findings
       .filter((f) => f.status === "open")
       .filter((f) => {
         const fact = facts.find((x) => x.findingId === f.id);
-        const closedByFact = fact !== undefined && !fact.timedOut && fact.exitCode === 0 && fact.passesOnBase === false;
-        return !closedByFact;
+        if (fact === undefined) return true;
+        // Its fact fails on this candidate: the point is open whatever closed
+        // it before.
+        if (fact.timedOut || fact.exitCode !== 0) return true;
+        // Proven on this candidate: it failed on this candidate's base.
+        if (fact.passesOnBase === false) return false;
+        // It passes here and also on the base — because an earlier loop's fix
+        // moved the base. Closed on an earlier candidate, it stays closed.
+        const closedEarlier = earlierFacts.some(
+          (x) => x.findingId === f.id && x.candidateSha !== candidateSha && !x.timedOut && x.exitCode === 0 && x.passesOnBase === false,
+        );
+        return !closedEarlier;
       })
       .map((f) => f.id);
   }
@@ -9885,6 +9922,16 @@ export class Conductor {
   #parkOpenPoints(round: number, reason: string, points: readonly string[]): void {
     this.#log.append("lead_called", { round, reason, points });
     this.#applyEvent({ type: "BOUND_REACHED", kind: "rounds", scope: `round ${round} fix loop`, limitMs: 0, elapsedMs: 0, action: "the phase parks for the lead" });
+    this.#applyEvent({ type: "LEAD_CALLED", reasons: [reason] });
+    this.#applyEvent({ type: "LOOP_BOUND_REACHED", round, loops: this.#state.phase.contract.domainLoopMax ?? 3, reason });
+  }
+
+  /** 07g2 (A2/R3): a red merged candidate whose failing file no domain loop
+   * can take (design G3's "no path maps to a domain") parks the phase for the
+   * lead, exactly as the loop bound does: LEAD_CALLED, never a lane round. */
+  #parkMergedCheck(round: number, reason: string): void {
+    this.#log.append("lead_called", { round, reason, points: [] });
+    this.#applyEvent({ type: "BOUND_REACHED", kind: "rounds", scope: `round ${round} merged check`, limitMs: 0, elapsedMs: 0, action: "the phase parks for the lead" });
     this.#applyEvent({ type: "LEAD_CALLED", reasons: [reason] });
     this.#applyEvent({ type: "LOOP_BOUND_REACHED", round, loops: this.#state.phase.contract.domainLoopMax ?? 3, reason });
   }
@@ -12106,10 +12153,14 @@ export class Conductor {
           return this.#openPointsOn(sha).length === 0;
         },
       };
+      // A fresh attempt consumes only its own ownerless red check: a flag a
+      // stopped attempt left behind must never park this one.
+      this.#mergedCheckNoLoop = undefined;
       const outcome = await runRound(host, { round, base, lanes, ...(laneBases ? { laneBases } : {}) });
       // Plan 06n (A3): a clean stop left the round in place; the next start
       // resumes it. Nothing further is recorded here.
       if (outcome.stopped) {
+        this.#mergedCheckNoLoop = undefined;
         try {
           this.#log.append("round_stopped", { round, reason: "the owner stopped the run" });
         } catch {
@@ -12126,6 +12177,17 @@ export class Conductor {
         ...(outcome.missingVotes ? { missingVotes: outcome.missingVotes } : {}),
         candidates: outcome.builds.map((b) => ({ lane: b.lane, sha: b.sha, note: b.note })),
       });
+      // 07g2 (A2/R3): the merged candidate's red check named no domain loop to
+      // re-enter. Design G3 puts that on the lead, so the phase parks now — no
+      // lane round, no fresh merge fix and no seat review follows. A recheck
+      // that already stopped the round is the phase's, not this park's.
+      const noLoop = this.#mergedCheckNoLoop;
+      this.#mergedCheckNoLoop = undefined;
+      if (noLoop && !this.#recheckCancelledLaneRound) {
+        this.#parkMergedCheck(noLoop.round, noLoop.reason);
+        this.#clearLaneRound(round);
+        return;
+      }
       // 07g2 (A2/R4): the round picked a loop candidate with no seat review.
       // The loop chains on it (the next iteration's `#fixRound` fixes it); the
       // round budget is what stops the chain, and the last loop with points
