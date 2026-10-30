@@ -388,3 +388,89 @@ test("the integrate duty is fenced by files even when its edit is staged", async
     await teardown(setup);
   }
 });
+
+test("the loop chains on the candidate it picked and the third loop with a point open parks with no seat review", async () => {
+  // R4: while points stay open the loop re-enters the owning domain and no
+  // reviewer agent starts. Each loop starts on the candidate the round before
+  // it picked — never on the older pick that candidate was based on — and the
+  // third loop with a point still open is the round budget's last: it parks
+  // for the lead instead of starting a fourth loop or an acceptance review.
+  const setup = await setupConductor({
+    phase: {
+      id: "p1",
+      goal: "chain the fix loop to the round bound",
+      acceptance: ["it works"],
+      checks: ["true"],
+      boundaries: [],
+      reserved: [],
+      workers: 2,
+      domains: FIX_DOMAINS,
+      rounds: 3,
+      fixRounds: "domains",
+      fixers: 4,
+      fixChecks: "true",
+    },
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorker("a", 1),
+    laneWorkerScriptFor: (lane, round) => laneWorker(lane, round),
+    laneReviewerScriptFor: (seat, candidate, state) => reviewerWithPoints()(seat as Reviewer, candidate, state),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1),
+    // booking closes its point on the first fix; gates keeps its point open
+    // and changes nothing on a later loop, so the fix step produces no new
+    // candidate and the chain must use the candidate that loop round picked.
+    fixerScriptFor: (domain, round) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        {
+          kind: "call-sh",
+          command: domain === "booking" ? "printf 'booking fixed\\n' > booking-fixed.txt" : round === 1 ? "printf 'gates\\n' > gates.txt" : "true",
+        },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+  });
+  try {
+    const events = () =>
+      readEvents(setup.runDir)
+        .filter((r) => r.kind === "event")
+        .map((r) => r.event as Record<string, unknown>);
+    await setup.conductor.start();
+    await waitFor(() => events().some((e) => e.type === "LOOP_BOUND_REACHED"), 180_000, 50, setup.runDir);
+    const rounds = setup.conductor.state.phase.rounds ?? [];
+    const [first, second, third] = [rounds[0], rounds[1], rounds[2]];
+    assert.ok(first?.picked && second?.picked && third?.picked, "the three loop rounds each picked their candidate");
+    const firstFix = first.fixed;
+    assert.ok(firstFix?.candidate, "the first fix merged a candidate");
+    assert.equal(second.base, firstFix.candidate, "the first loop starts on the merged candidate");
+    assert.equal(third.base, second.picked.sha, "the later loop chains on the candidate the previous loop picked");
+    assert.notEqual(third.base, first.picked.sha, "the chain never falls back to the original pick");
+    for (const round of [second, third]) {
+      assert.equal(round.votes.length, 0, `loop round ${round.round} takes no pick vote`);
+      assert.equal(round.candidates[0]?.reviews, undefined, `loop round ${round.round} starts no seat review`);
+    }
+    assert.deepEqual(
+      readEvents(setup.runDir)
+        .filter((r) => r.kind === "fix_loop_chained")
+        .map((r) => (r.event as { round?: number }).round),
+      [2, 3],
+      "both open-point rounds are recorded as chained loops",
+    );
+    const bound = events().find((e) => e.type === "LOOP_BOUND_REACHED");
+    assert.equal(bound?.round, 3, "the third loop with a point still open is the bound's last");
+    assert.ok(events().some((e) => e.type === "LEAD_CALLED"), "the bound parks the phase for the lead");
+    const intents = readEvents(setup.runDir)
+      .filter((r) => r.kind === "intent")
+      .map((r) => r.event as { agentId?: string; round?: number });
+    const reviews = intents.filter((e) => String(e.agentId ?? "").startsWith("lane-review-"));
+    assert.ok(reviews.length >= 3, "round 1's seats reviewed its lanes");
+    assert.ok(
+      reviews.every((e) => String(e.agentId ?? "").startsWith("lane-review-1-")),
+      `no seat review starts while points stay open: ${JSON.stringify(reviews.map((e) => e.agentId))}`,
+    );
+  } finally {
+    await teardown(setup);
+  }
+});
