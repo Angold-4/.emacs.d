@@ -8354,6 +8354,9 @@ export class Conductor {
     };
     for (const o of outcomes) {
       const ctx = this.#verdictContext(o.item, (o.seats[0]?.seat ?? "M") as Reviewer);
+      // 07g2 (R7): every seat gave the same verdict — no evaluator re-check may
+      // overturn it. It is a disagreement for the lead instead (A3/R7).
+      const unanimous = o.seats.length > 0 && o.seats.every((s) => s.verdict === o.seats[0]!.verdict);
       const testOverturns = reverify(o.item, o.seats, ctx, readsBySeat);
       if (testOverturns.length > 0) {
         out.push(...testOverturns);
@@ -8361,7 +8364,9 @@ export class Conductor {
       }
       // Plan 06b (OD-1 R3b): the evaluator's substantive re-check. A
       // `contradicted` check overturns every seat whose verdict made the
-      // majority, recorded with what the evaluator checked.
+      // majority, recorded with what the evaluator checked. R7 governs the
+      // acceptance direction: a unanimous met/fits (an approval seats agreed
+      // on) is never withdrawn by a re-check (see below).
       if (o.outcome === "unmet" || o.outcome === "deviates") {
         const check = (this.#state.phase.itemChecks ?? []).find((c) => c.itemId === o.item.id && c.verdict === "contradicted");
         // OD-2 A3: a contradicted check overturns only when its evidence
@@ -8385,12 +8390,12 @@ export class Conductor {
         }
         continue;
       }
-      // Plan 06c (R5) / 07g2 (R7): a unanimous thin met/fits the evaluator
-      // contradicts (with valid anchors) is NOT overturned — the evaluator
-      // judges against the plan item's text, and a unanimous seat verdict
-      // stands. The disagreement is recorded for the lead instead (R7), so it
-      // can never quietly flip a verdict three seats agreed on.
-      if ((o.outcome === "met" || o.outcome === "fits") && thinMetItems([o], this.#workerAnchors()).length > 0) {
+      // Plan 06c (R5) / 07g2 (R7/A3): an evaluator re-check that contradicts a
+      // unanimous seat verdict is never an overturn — whatever the outcome and
+      // whatever the evidence's thickness. The evaluator judges against the
+      // plan item's text; the disagreement is recorded for the lead instead, so
+      // it can never quietly flip a verdict every seat agreed on.
+      if (unanimous && (o.outcome === "met" || o.outcome === "fits")) {
         const check = (this.#state.phase.itemChecks ?? []).find((c) => c.itemId === o.item.id && c.verdict === "contradicted");
         if (check && this.#itemCheckAnchorsValid(check.evidence, ctx)) {
           this.#recordItemDisagreement(o.item.id, o.outcome, check.evidence);
@@ -9606,7 +9611,7 @@ export class Conductor {
    * fixer skips that fixer with a note. ROUND_FIXED records the result either
    * way. Returns "stopped" when the owner's stop or a recheck ended it before
    * the record — the fix step then re-runs on resume. */
-  async #fixRound(roundNo: number): Promise<"stopped" | undefined> {
+  async #fixRound(roundNo: number): Promise<"stopped" | "parked" | undefined> {
     const record = (this.#state.phase.rounds ?? []).find((r) => r.round === roundNo);
     if (!record?.picked || record.fixed || record.regressed) return undefined;
     if (this.#state.phase.contract.fixRounds !== "domains") return undefined;
@@ -9639,7 +9644,7 @@ export class Conductor {
     const taskRecords: FixTaskRecord[] = tasks.map((t) => ({ domain: t.domain, findingIds: [...t.findingIds] }));
     const mergeWorktree = path.join(this.#runDir, "worktrees", `fix-merge-${roundNo}`);
     const mergesByIndex = new Map<number, { sha: string }>();
-    const results: Array<LaneBuild & { ok: boolean; fixes: number; domainRecords?: DomainLoopRecord[] }> = new Array(tasks.length);
+    const results: Array<LaneBuild & { ok: boolean; fixes: number; status?: string; reason?: string; domainRecords?: DomainLoopRecord[] }> = new Array(tasks.length);
     let candidate: string | undefined;
     let mergeWorktreeReady = false;
     let mergeBoundReached = false;
@@ -9762,6 +9767,28 @@ export class Conductor {
       ...(added.length > 0 ? { added } : {}),
       ...(domainRecords.length > 0 ? { domains: domainRecords } : {}),
     });
+    // 07g2 (A2/R4): a domain whose loop bound was reached leaves its points
+    // open. The round budget and the domain loop are spent, so the phase parks
+    // for the lead — no acceptance round and no seat review starts on a
+    // candidate that still has open points.
+    const bound = results.find((r) => r.status === "dropped" && /domain loop bound was reached/.test(r.reason ?? ""));
+    if (bound) {
+      const open = tasks.flatMap((t) => t.findingIds);
+      const loops = this.#state.phase.contract.domainLoopMax ?? 3;
+      const reason = `the fix loop's bound was reached with points still open: ${open.join(", ")}`;
+      this.#log.append("lead_called", { round: roundNo, reason, points: open });
+      this.#applyEvent({
+        type: "BOUND_REACHED",
+        kind: "rounds",
+        scope: `round ${roundNo} fix loop`,
+        limitMs: 0,
+        elapsedMs: 0,
+        action: "the phase parks for the lead",
+      });
+      this.#applyEvent({ type: "LEAD_CALLED", reasons: [reason] });
+      this.#applyEvent({ type: "LOOP_BOUND_REACHED", round: roundNo, loops, reason });
+      return "parked";
+    }
     // Packet X: once ROUND_FIXED records every fixer's outcome and the merged
     // candidate has its own checkout, the fix worktrees are spent. Only the
     // worktrees go; every commit stays (the record names them).
@@ -9973,11 +10000,13 @@ export class Conductor {
       reviews: outcome.reviews,
       fixes: outcome.fixes,
     });
-    if (mergeable && outcomeSha) return { lane, ok: true, sha: outcomeSha, fixes: outcome.fixes, domainRecords: outcome.records, ...(allDisclosures.length > 0 ? { disclosures: allDisclosures } : {}), ...(allAdded.length > 0 ? { added: allAdded } : {}) };
+    if (mergeable && outcomeSha) return { lane, ok: true, sha: outcomeSha, fixes: outcome.fixes, status: outcome.status, domainRecords: outcome.records, ...(allDisclosures.length > 0 ? { disclosures: allDisclosures } : {}), ...(allAdded.length > 0 ? { added: allAdded } : {}) };
     return {
       lane,
       ok: false,
       fixes: outcome.fixes,
+      status: outcome.status,
+      reason: outcome.reason,
       note: outcome.status === "stopped" ? "the run was stopped" : (outcome.reason ?? "the domain was dropped"),
       ...(outcomeSha ? { sha: outcomeSha } : {}),
       domainRecords: outcome.records,

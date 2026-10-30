@@ -98,7 +98,7 @@ async function teardown(setup: TestConductorSetup): Promise<void> {
   cleanupDir(setup.scriptsDir);
 }
 
-test("a candidate with green checks passed tests fact-closed points and a unanimous seat majority is accepted with no evaluator session", async () => {
+test("a candidate with no exception is decided with no evaluator session", async () => {
   const setup = await setupConductor({
     items: { requirements: [ITEM("R1")], finalChecks: ["sleep 2"] } as never,
     checks: ["true"],
@@ -131,7 +131,7 @@ test("a candidate with green checks passed tests fact-closed points and a unanim
   }
 });
 
-test("a split item starts the evaluator with only that item in its brief", async () => {
+test("an item with no seat majority starts the evaluator with only that item in its brief", async () => {
   const promptLog = path.join(fs.mkdtempSync("/tmp/tt-07f-prompt-"), "prompts.log");
   const setup = await setupConductor({
     items: { requirements: [ITEM("R2")] },
