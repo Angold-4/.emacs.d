@@ -9925,6 +9925,12 @@ export class Conductor {
     return { head: integrated.length > 0 ? current : undefined, integrated, dropped, timedOut: false };
   }
 
+  /** 07g2 (A1/C4): the conductor's own merge commit. The index it commits is
+   * the merge's own index — git staged every cleanly merged path before the
+   * integrate duty ran — plus the duty's resolution of the conflicted files,
+   * and nothing else: the fence (`#integrateChangedPaths`) refuses an attempt
+   * whose staged or worktree change falls outside that set, so the tree here
+   * is exactly the merge's tree with the fenced resolution. */
   async #commitIntegrated(
     worktree: string,
     base: string,
@@ -9991,6 +9997,15 @@ export class Conductor {
     const actionId = this.#log.actionId("integrate");
     const agentId = `integrate-${opts.round}-${opts.attempt}-${actionId}`;
     this.#log.intent(actionId, { round: opts.round, attempt: opts.attempt, conflicted: opts.conflicted });
+    // 07g2 (C4): the fence compares the index the merge left with the index
+    // after the duty, so a resolution that STAGES an out-of-fence path
+    // (`git add`, `git rm`, a new file) is caught too, not only a worktree
+    // edit. The snapshot is taken before the session exists.
+    const before = await this.#integrateIndexSnapshot(worktree, opts.round);
+    if (!before.ok) {
+      this.#log.append("integrate_index_failed", { round: opts.round, attempt: opts.attempt, output: before.output });
+      return { ok: false, reason: "the conductor could not read the merge index" };
+    }
     const handle = this.#spawnLaneAgent({
       role: "worker",
       // 07g2 (G3): the integrate duty writes, so it keeps the worker role's
@@ -10044,7 +10059,7 @@ export class Conductor {
         this.#log.append("integrate_refused", { round: opts.round, attempt: opts.attempt, reason: "the duty committed", head: headOf(worktree) });
         return { ok: false, reason: "the integrate duty committed; the conductor commits the merge" };
       }
-      const changed = await this.#integrateChangedPaths(worktree, opts.round);
+      const changed = await this.#integrateChangedPaths(worktree, opts.round, before.entries);
       const outside = resolutionOutsideConflicted(changed, opts.conflicted);
       if (outside.length > 0) {
         this.#log.append("integrate_refused", { round: opts.round, attempt: opts.attempt, outside, conflicted: opts.conflicted });
@@ -10068,15 +10083,48 @@ export class Conductor {
     }
   }
 
-  /** 07g2 (C4): every path the integrate duty changed in the worktree — the
-   * worktree-vs-index diff plus untracked files. The merge itself stages its
-   * own paths in the index, so a clean conflicted file is not "changed" here;
-   * only the duty's edits are. */
-  async #integrateChangedPaths(worktree: string, round: number): Promise<string[]> {
+  /** 07g2 (C4): the merge's index, keyed by path — every stage entry of a
+   * conflicted path, in git's order. Taken just before the integrate duty
+   * runs, so the fence can tell the duty's staged edits from the merge's own. */
+  async #integrateIndexSnapshot(
+    worktree: string,
+    round: number,
+  ): Promise<{ ok: boolean; entries: Map<string, string[]>; output: string }> {
+    const listed = await this.#integrateGit(worktree, ["ls-files", "-s", "-z"], `round ${round} integrate ls-files`);
+    const entries = new Map<string, string[]>();
+    for (const entry of listed.output.split("\u0000")) {
+      const tab = entry.indexOf("\t");
+      if (tab < 0) continue;
+      const path = entry.slice(tab + 1);
+      const meta = entry.slice(0, tab);
+      const stages = entries.get(path);
+      if (stages) stages.push(meta);
+      else entries.set(path, [meta]);
+    }
+    return { ok: listed.ok, entries, output: listed.output };
+  }
+
+  /** 07g2 (C4): every path the integrate duty changed — its worktree edits
+   * (worktree-vs-index diff), its untracked files, AND anything it staged
+   * (`git add`, `git rm`, a new path): the index is compared with the snapshot
+   * taken before the duty. The merge itself staged its own clean paths before
+   * that snapshot, so they are not "changed" here; only the duty's edits are. */
+  async #integrateChangedPaths(
+    worktree: string,
+    round: number,
+    before: ReadonlyMap<string, readonly string[]>,
+  ): Promise<string[]> {
+    const after = await this.#integrateIndexSnapshot(worktree, round);
+    const staged: string[] = [];
+    for (const [path, stages] of after.entries) {
+      const previous = before.get(path);
+      if (!previous || previous.join("\n") !== stages.join("\n")) staged.push(path);
+    }
+    for (const path of before.keys()) if (!after.entries.has(path)) staged.push(path);
     const diff = await this.#integrateGit(worktree, ["diff", "--name-only"], `round ${round} integrate diff`);
     const untracked = await this.#integrateGit(worktree, ["ls-files", "--others", "--exclude-standard"], `round ${round} integrate untracked`);
     const lines = (text: string) => text.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
-    return [...new Set([...lines(diff.output), ...lines(untracked.output)])];
+    return [...new Set([...staged, ...lines(diff.output), ...lines(untracked.output)])];
   }
 
   /** Plan 07e (E2): merge one fixer commit under the merge bound. The same

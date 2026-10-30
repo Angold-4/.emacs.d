@@ -311,3 +311,73 @@ test("a conflicted merge is resolved by the fenced integrate duty and retried wh
     await teardown(setup);
   }
 });
+
+test("the integrate duty is fenced by files even when its edit is staged", async () => {
+  // C4/R2: staging an out-of-fence path is still changing it. The duty's first
+  // attempt resolves `shared.txt` (which it may) but also stages a modified
+  // unconflicted file and a brand-new file; the conductor compares the index
+  // with the merge's own, refuses that attempt, and neither staged edit
+  // reaches the candidate.
+  const setup = await setupConductor({
+    phase: {
+      id: "p1",
+      goal: "integrate the domains",
+      acceptance: ["it works"],
+      checks: ["true"],
+      boundaries: [],
+      reserved: [],
+      workers: 2,
+      domains: FIX_DOMAINS,
+      rounds: 3,
+      fixRounds: "domains",
+      fixers: 4,
+      fixChecks: "true",
+    },
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorker("a", 1),
+    laneWorkerScriptFor: (lane, round) => laneWorker(lane, round),
+    laneReviewerScriptFor: (seat, candidate, state) => reviewerWithPoints()(seat as Reviewer, candidate, state),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1),
+    fixerScriptFor: (domain) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: `printf '${domain}\\n' > shared.txt; printf '${domain} fixed\\n' > ${domain}-fixed.txt` },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    integrateScriptFor: (_round, attempt) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        {
+          kind: "call-sh",
+          command:
+            attempt === 1
+              ? "printf 'tamper\\n' > booking-fixed.txt; git add booking-fixed.txt; printf 'injected\\n' > injected.txt; git add injected.txt; grep -v -E '^(<<<<<<< |=======$|>>>>>>> )' shared.txt > shared.txt.tmp; mv shared.txt.tmp shared.txt; git add shared.txt"
+              : "grep -v -E '^(<<<<<<< |=======$|>>>>>>> )' shared.txt > shared.txt.tmp; mv shared.txt.tmp shared.txt",
+        },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.rounds?.[0]?.fixed !== undefined, 120_000, 20, setup.runDir);
+    const record = setup.conductor.state.phase.rounds![0].fixed!;
+    assert.equal(record.merges.length, 2, "both domains merged after the staged out-of-fence edit was refused");
+    assert.equal(git(setup.repo.dir, "show", `${record.candidate}:shared.txt`), "booking\ngates", "the conflicted file carries both sides");
+    const refusals = readEvents(setup.runDir).filter((r) => r.kind === "integrate_refused");
+    assert.equal(refusals.length, 1, "the staged out-of-fence edit was refused");
+    assert.deepEqual(
+      [...(refusals[0].event as { outside: string[] }).outside].sort(),
+      ["booking-fixed.txt", "injected.txt"],
+      "the refusal names the staged files, and not the conflicted file it may rewrite",
+    );
+    assert.equal(git(setup.repo.dir, "show", `${record.candidate}:booking-fixed.txt`), "booking fixed", "the refused staged edit did not survive");
+    assert.throws(() => git(setup.repo.dir, "cat-file", "-e", `${record.candidate}:injected.txt`), "the staged new file never reached the candidate");
+  } finally {
+    await teardown(setup);
+  }
+});
