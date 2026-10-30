@@ -11987,13 +11987,20 @@ export class Conductor {
       // pick, so the next repair builds on the named candidate even though the
       // adopted candidate (phase.candidate) is another one.
       const ruled = previous?.picked?.ruling ? previous.picked.sha : undefined;
+      // 07g2 (A2/R4): a loop round whose fix produced no merge candidate
+      // chains on the candidate the loop round picked, never on the older pick
+      // it was based on. Nothing changed relative to that loop candidate, so
+      // the next loop must judge it again — not restart from the original pick.
+      const chainedLoop = previous && this.#isFixLoopRound(previous.round) ? previous.picked?.sha : undefined;
       const base = unfinished
         ? last!.base
         : fix
           ? fix.candidate
-          : round === 1
-            ? this.#state.phase.integrationHead
-            : (ruled ?? this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
+          : chainedLoop
+            ? chainedLoop
+            : round === 1
+              ? this.#state.phase.integrationHead
+              : (ruled ?? this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
       // 02k: a repeat of a round that failed only for a missing review or vote
       // restarts each lane that passed its checks from its own candidate.
       const continuedStarts = previous && previous.round === round - 1 ? this.#continuedLaneStarts(previous) : undefined;
@@ -12089,7 +12096,13 @@ export class Conductor {
         // seat review; the next loop starts on it at once.
         reviewGate: (sha: string): boolean => {
           const loop = fixRoundCandidate(this.#state.phase.rounds, round);
-          if (!loop || loop.candidate !== sha) return true;
+          // A loop round whose fix produced no merge candidate still chains on
+          // the candidate it picked; it gates exactly like a fresh fix round.
+          const chained = previous !== undefined && this.#isFixLoopRound(previous.round);
+          if (!loop && !chained) return true;
+          // The gate is about the candidate the lane submits, not the fix
+          // base: a lane may repair a red merged candidate before the pick, and
+          // that repaired sha must still wait for every point to close.
           return this.#openPointsOn(sha).length === 0;
         },
       };
@@ -12119,6 +12132,22 @@ export class Conductor {
       // still open parks for the lead.
       if (outcome.loopOnly) {
         const chained = outcome.winner?.sha;
+        // Plan 07b (D3): a loop candidate's doneWhen facts are recorded like
+        // any picked candidate's — the record shows them, and a timed-out fact
+        // stays visible — while the loop below chains without a seat review or
+        // a hand-off.
+        const winnerFacts = chained ? this.#factsFor(chained) : [];
+        for (const fact of winnerFacts) {
+          this.#applyEvent({
+            type: "FINDING_FACT",
+            findingId: fact.findingId,
+            candidateSha: fact.candidateSha,
+            exitCode: fact.exitCode,
+            timedOut: fact.timedOut,
+            outputTail: fact.outputTail,
+            ...(fact.passesOnBase !== undefined ? { passesOnBase: fact.passesOnBase } : {}),
+          });
+        }
         const openPoints = chained ? this.#openPointsOn(chained) : [];
         this.#log.append("fix_loop_chained", { round, ...(chained ? { candidate: chained } : {}), openPoints });
         this.#clearLaneRound(round);
