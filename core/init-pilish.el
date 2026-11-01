@@ -95,7 +95,10 @@
 
 (defcustom +pilish-provider "vercel-ai-gateway"
   "Provider passed to the `pi' CLI as `--provider'.
-Defaults to the Vercel AI Gateway.  Set to nil to let Pi choose."
+Defaults to the Vercel AI Gateway.  Pi rejects `--provider' unless
+`--model' is given too, so this is passed only alongside `+pilish-model';
+for the default `+pilish-model' nil, Pi applies the provider its settings
+remember.  Set to nil to let Pi choose."
   :type '(choice (const :tag "Vercel AI Gateway" "vercel-ai-gateway")
                  (const :tag "Let Pi choose" nil)
                  string)
@@ -146,9 +149,13 @@ hints."
   :group 'tools)
 
 (defun +pilish--extra-args ()
-  "Return the `--provider'/`--model' args for `pilish-extra-args'."
-  (append (when +pilish-provider (list "--provider" +pilish-provider))
-          (when +pilish-model (list "--model" +pilish-model))))
+  "Return the `--provider'/`--model' args for `pilish-extra-args'.
+Pi requires `--model' whenever `--provider' is given, so with
+`+pilish-model' nil nothing is returned and Pi applies the model its
+settings remember."
+  (when +pilish-model
+    (append (when +pilish-provider (list "--provider" +pilish-provider))
+            (list "--model" +pilish-model))))
 
 ;;;; Pi's data directory and the remembered model
 
