@@ -391,6 +391,19 @@ function resolveRunDir(rootOrId: string, root: string): string {
   if (existsSync(path.join(candidate, "meta.json"))) return candidate;
   const readable = resolveReadableRunDir(rootOrId, root);
   if (readable) return readable;
+  // Views and owner bindings name the init record's runId. The directory
+  // name can differ (including runs created before this resolver existed).
+  const entries = existsSync(root) ? readdirSync(root, { withFileTypes: true }) : [];
+  for (const entry of entries) {
+    const dir = path.join(root, entry.name);
+    if (!entry.isDirectory() || !existsSync(path.join(dir, "meta.json"))) continue;
+    try {
+      const init = readLog(path.join(dir, "events.jsonl")).records.find((r) => r.kind === "init");
+      if ((init?.event as { runId?: string } | undefined)?.runId === rootOrId) return dir;
+    } catch {
+      // An unrelated unreadable/corrupt run cannot resolve this id.
+    }
+  }
   return path.resolve(rootOrId);
 }
 
