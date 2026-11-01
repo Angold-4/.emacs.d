@@ -601,11 +601,11 @@ export interface DecisionBrief {
   command?: "resolve" | "override" | "entry";
   /** One plain line, no code identifiers. */
   question: string;
-  /** What the system does today, with one concrete example using real market
-   * names and times from the plan's calendars. */
+  /** What the system does today; with catalogs, include a concrete example
+   * using their real product names and session times. */
   today: string;
-  /** What the owner would notice; always answers whether any market stops
-   * publishing. */
+  /** What the owner would notice in the plan's domain; with catalogs, also
+   * answers whether any market stops publishing. */
   impact: string;
   options: BriefOption[];
   /** One option and why, citing the plan or an IC section. Absent only for

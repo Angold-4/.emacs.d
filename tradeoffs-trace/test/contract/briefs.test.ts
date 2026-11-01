@@ -191,7 +191,7 @@ test("a weekday reopen claim is checked against the calendar's weekly schedule",
 test("the backstop omits a recommendation and does not recommend the risky first option", () => {
   const f = fixture();
   const request = f.requests.find((r) => r.id === "F-M-9")!;
-  const brief = fallbackBrief(request, { catalogs: null });
+  const brief = fallbackBrief(request, { catalogs: catalogs() });
   assert.equal(brief.recommendation, undefined);
   assert.ok(brief.noRecommendationReason, "the backstop records why it has no recommendation");
   assert.equal(briefIssue(brief, { requestOptions: request.options.map((o) => o.id), allowUnverifiedImpact: true }), undefined);
@@ -219,7 +219,7 @@ test("a live entry's brief sends an entry verdict, and the conductor merges rela
 test("renderBriefOrg renders a backstop brief whose recommendation is omitted", () => {
   const f = fixture();
   const request = f.requests.find((r) => r.id === "F-M-9")!;
-  const brief = fallbackBrief(request, { catalogs: null });
+  const brief = fallbackBrief(request, { catalogs: catalogs() });
   assert.equal(brief.recommendation, undefined);
   const org = renderBriefOrg(brief);
   assert.match(org, /\*\* Should this stay as it is/);
@@ -241,7 +241,7 @@ test("the deterministic backstop lists related items on the same concern and nev
   const f = fixture();
   const concerns = f.openItems;
   const request = f.requests.find((r) => r.id === "F-M-9")!;
-  const brief = fallbackBrief(request, { catalogs: null, allItems: concerns, files: ["src/core/blend.rs"], planRefs: ["IC §5"] });
+  const brief = fallbackBrief(request, { catalogs: catalogs(), allItems: concerns, files: ["src/core/blend.rs"], planRefs: ["IC §5"] });
   assert.equal(impactUnestablished(brief.impact), true);
   assert.equal(impactAnswersPublishing(brief.impact), false, "the strict model check refuses the backstop wording");
   assert.deepEqual(brief.related.map((r) => r.id).sort(), ["D-A-80", "T-54"]);
@@ -446,7 +446,7 @@ test("briefIssue rejects an impact that does not answer whether a market stops p
 test("the deterministic backstop brief passes the same gate without inventing an example", () => {
   const f = fixture();
   for (const request of f.requests) {
-    const brief = fallbackBrief(request, { catalogs: null });
+    const brief = fallbackBrief(request, { catalogs: catalogs() });
     assert.equal(briefIssue(brief, { requestOptions: request.options.map((o) => o.id), allowUnverifiedImpact: true }), undefined);
     assert.equal(briefQuestionHasNoCode(brief.question), true);
     assert.equal(impactUnestablished(brief.impact), true);

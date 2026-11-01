@@ -8,10 +8,10 @@
 //                weekend stay excluded when its market reopens?")
 //   - today:     what the system does now, in plain words, with one concrete
 //                example using real market names and times from the plan's
-//                calendars (checked against calendars.yaml/products.yaml)
+//                catalogs when supplied (checked against calendars.yaml/products.yaml)
 //   - impact:    what the owner would notice — price flow, number of vendors,
-//                quality, duration — ALWAYS answering "does any market stop
-//                publishing?"
+//                quality, duration — with catalogs, also answering "does any
+//                market stop publishing?"
 //   - options:   each of the request's own options, relabelled in plain words
 //                with what happens and its cost (ids unchanged, so resolving
 //                from the brief is the same command as resolving the request)
@@ -49,6 +49,42 @@ export interface ProductDef {
 export interface Catalogs {
   calendars: Record<string, CalendarDef>;
   products: Record<string, ProductDef>;
+}
+
+/** The brief writer's domain instructions, shared by the conductor and tests. */
+export function briefInstructions(catalogs: Catalogs | null): string[] {
+  return [
+    "For EACH item below call submit_brief exactly once, with:",
+    catalogs
+      ? '- question: one plain line, NO code identifiers (no snake_case, no path/file.rs), e.g. "Should a vendor excluded before a weekend stay excluded when its market reopens?"'
+      : "- question: one plain line, NO code identifiers (no snake_case, no path/file.rs).",
+    catalogs
+      ? "- today: what the system does now, with ONE concrete example naming a real product and session time from the calendars below; a weekday reopen must match the calendar's weekly reopen. If you cannot check it, write \"(example unverified)\"."
+      : "- today: what the system does now, using the plan's own domain and recorded evidence.",
+    catalogs
+      ? "- ALL owner-facing text (the question, today, impact, the options, the recommendation and the related questions) must stay PLAIN: no file paths and no code identifiers. Cite a claim by its evidence number in square brackets, e.g. '10 s after a reopen[2]'."
+      : "- ALL owner-facing text must stay PLAIN: no file paths and no code identifiers. Cite claims by evidence number in square brackets.",
+    "- evidence: the numbered list of what you read, e.g. 'message: ...' then 'config: ...' or 'code: path:line'. Every time, count or duration in today, impact or an option must carry its OWN [n] reference into this list; one reference does not cover another claim.",
+    catalogs
+      ? "- impact: what the owner would notice (price flow, number of vendors, quality, duration) and ALWAYS whether any market stops publishing. The publishing answer itself must cite the config or code it was checked against, or say it is unverified."
+      : "- impact: what the owner would notice in the plan's domain, supported by the recorded evidence.",
+    "- options: exactly the item's own option ids, each relabelled in plain words with what happens and its cost.",
+    "- recommendation: one option id and why, citing the plan or an IC section.",
+    "- related: the other item ids below that touch the same file or plan clause.",
+    "",
+    ...(catalogs ? [
+      "Calendars (calendars.yaml):",
+      ...Object.entries(catalogs.calendars).map(
+        ([name, c]) => `- ${name}: weekly reopen ${c.opens ?? "(none declared)"}; sessions ${Object.entries(c.sessions).map(([s, t]) => `${s} ${t}`).join(", ")}`,
+      ),
+      "Products (products.yaml):",
+      ...Object.entries(catalogs.products).map(([sym, p]) => `- ${sym}: vendor ${p.vendor ?? "?"}, calendar ${p.calendar ?? "?"}`),
+      "",
+      "Glossary — use these terms as-is and never explain them inline; the brief links each one:",
+      ...BRIEF_GLOSSARY.map((g) => `- ${g.term}: ${g.meaning}`),
+      "",
+    ] : []),
+  ];
 }
 
 // ---------------------------------------------------------------------------
@@ -303,7 +339,8 @@ export interface BriefIssueOptions {
    * given, the brief's option ids must map one-to-one. */
   requestOptions?: string[];
   /** The plan's calendars/products. When given, `today` is checked; a `today`
-   * that cannot be checked must carry "(example unverified)". */
+   * that cannot be checked must carry "(example unverified)". Null means the
+   * plan has no catalogs: no catalog example or publishing answer is owed. */
   catalogs?: Catalogs | null;
   /** Only the deterministic backstop may say the impact was not established;
    * a model brief must answer whether any market stops publishing (finding
@@ -328,7 +365,7 @@ export function briefIssue(brief: Partial<DecisionBrief> | undefined, opts: Brie
   if (!impact) return "a brief needs an `impact` paragraph";
   // The impact must at least talk about markets/publishing; whether each
   // publishing sentence is answered and cited is checked below, per sentence.
-  if (!/\bmarket[s]?\b|\b(?:publish|publishes|publishing|publication)\b/i.test(impact)) {
+  if (opts.catalogs !== null && !/\bmarket[s]?\b|\b(?:publish|publishes|publishing|publication)\b/i.test(impact)) {
     return "the impact must say whether any market stops publishing";
   }
   if (!Array.isArray(brief.options) || brief.options.length === 0) return "a brief needs at least one option";
@@ -370,7 +407,7 @@ export function briefIssue(brief: Partial<DecisionBrief> | undefined, opts: Brie
   if (!Array.isArray(brief.evidence) || brief.evidence.filter((e) => typeof e === "string" && e.trim()).length === 0) {
     return "a brief needs the original evidence";
   }
-  if (opts.catalogs !== undefined) {
+  if (opts.catalogs != null) {
     // The catalog example is checked before the per-claim citation rule, so a
     // wrong weekday or an uncheckable example is reported as such rather than
     // as a missing citation.
@@ -447,6 +484,7 @@ export function briefIssue(brief: Partial<DecisionBrief> | undefined, opts: Brie
   // in its OWN sentence; a sentence that says the answer is unverified is
   // exempt, and the backstop's "not established" is exempt for the backstop
   // (OD-3 (3) / findings disc-M-140, B-142, disc-M-157).
+  if (opts.catalogs === null) return undefined;
   const publishingSentences = sentences(impact).filter((s) => assertsPublishing(s) || impactUnverified(s));
   if (publishingSentences.length === 0) {
     if (!(opts.allowUnverifiedImpact && impactUnestablished(impact))) {
@@ -745,8 +783,8 @@ export function renderBriefsSection(
 
 /** A deterministic brief derived from an owner request when the evaluator did
  * not (or could not) produce one. It never invents a market time and never
- * asserts an unchecked impact (it says the impact was not established); if no
- * catalog is available, `today` says the example is unverified. The option ids
+ * asserts an unchecked impact. With catalogs it marks an unchecked example;
+ * without catalogs it stays within the request's domain. The option ids
  * are the request's own, so resolving is unchanged. */
 export function fallbackBrief(
   request: OwnerRequest,
@@ -758,7 +796,9 @@ export function fallbackBrief(
   const question = opts.question ?? `Should this stay as it is? ${plain}`;
   const today = opts.catalogs
     ? "The plan's calendars were available, but no concrete example was recorded. (example unverified)"
-    : "No readable calendars were available when this brief was written, so the example could not be checked. (example unverified)";
+    : opts.catalogs === null
+      ? "The request describes the current behavior; its recorded evidence is below."
+      : "No readable calendars were available when this brief was written, so the example could not be checked. (example unverified)";
   const related = opts.allItems
     ? relatedOpenItems({ id: request.id, question, files: opts.files, planRefs: opts.planRefs }, opts.allItems).map((r) => ({ id: r.id, question: r.question }))
     : [];
@@ -767,7 +807,9 @@ export function fallbackBrief(
     question,
     today,
     // The backstop never asserts what it did not check.
-    impact: "Whether any market stops publishing is not established by this backstop; the request's own evidence is below.",
+    impact: opts.catalogs === null
+      ? "The effect of this choice has not been checked by this backstop; decide from the request's own evidence."
+      : "Whether any market stops publishing is not established by this backstop; the request's own evidence is below.",
     noRecommendationReason: opts.noRecommendationReason ?? "the brief writer did not run",
     // No recommendation: the backstop never recommends an option by position
     // without a citation (finding M-31).
@@ -796,7 +838,7 @@ export function fallbackBrief(
  * an override command instead of a resolve. */
 export function fallbackDecisionBrief(
   decision: { id: string; choice: string; whyItMatters?: string },
-  opts: { allItems?: readonly OpenItemConcern[]; files?: string[]; planRefs?: string[]; noRecommendationReason?: string } = {},
+  opts: { catalogs?: Catalogs | null; allItems?: readonly OpenItemConcern[]; files?: string[]; planRefs?: string[]; noRecommendationReason?: string } = {},
 ): DecisionBrief {
   const plain = stripCounts(stripCodeTokens(decision.choice ?? "")).replace(/\s+/g, " ").trim();
   const question = `Should this choice stand? ${plain}`;
@@ -807,8 +849,10 @@ export function fallbackDecisionBrief(
     requestId: decision.id,
     command: "override",
     question,
-    today: "No concrete example was recorded for this flagged choice. (example unverified)",
-    impact: "Whether any market stops publishing is not established by this backstop; the decision's own reasoning is what the reviewers voted on.",
+    today: opts.catalogs === null ? "The flagged choice and its recorded reasoning are below." : "No concrete example was recorded for this flagged choice. (example unverified)",
+    impact: opts.catalogs === null
+      ? "The effect of this choice has not been checked by this backstop; decide from its recorded reasoning."
+      : "Whether any market stops publishing is not established by this backstop; the decision's own reasoning is what the reviewers voted on.",
     noRecommendationReason: opts.noRecommendationReason ?? "the brief writer did not run",
     options: [
       { id: "approve", label: "Approve it", effect: "the choice stands", cost: "none beyond what the choice already does" },
@@ -825,7 +869,7 @@ export function fallbackDecisionBrief(
  * review view does. */
 export function fallbackEntryBrief(
   entry: { id: string; title: string; messages?: ReadonlyArray<{ id: string; title?: string; evidence?: string[] }> },
-  opts: { allItems?: readonly OpenItemConcern[]; files?: string[]; planRefs?: string[]; noRecommendationReason?: string } = {},
+  opts: { catalogs?: Catalogs | null; allItems?: readonly OpenItemConcern[]; files?: string[]; planRefs?: string[]; noRecommendationReason?: string } = {},
 ): DecisionBrief {
   const plain = stripCounts(stripCodeTokens(entry.title ?? "")).replace(/\s+/g, " ").trim();
   const question = `Should this stand? ${plain}`;
@@ -837,8 +881,10 @@ export function fallbackEntryBrief(
     requestId: entry.id,
     command: "entry",
     question,
-    today: "No concrete example was recorded for this entry. (example unverified)",
-    impact: "Whether any market stops publishing is not established by this backstop; the entry's own linked messages are below.",
+    today: opts.catalogs === null ? "The entry and its linked messages describe the current behavior." : "No concrete example was recorded for this entry. (example unverified)",
+    impact: opts.catalogs === null
+      ? "The effect of this choice has not been checked by this backstop; decide from the linked messages."
+      : "Whether any market stops publishing is not established by this backstop; the entry's own linked messages are below.",
     noRecommendationReason: opts.noRecommendationReason ?? "the brief writer did not run",
     options: [
       { id: "accept", label: "Accept it", effect: "the entry is settled as it stands", cost: "none beyond what it already does" },

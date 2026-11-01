@@ -209,7 +209,7 @@ import {
 } from "./core/predicate.ts";
 import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { FAILED_VOTE_OPTIONS, isRepairForcingOption, openFindingOptions } from "./core/owner-requests.ts";
-import { BRIEF_GLOSSARY, briefIssue, enrichBriefRelated, evidenceFile, fallbackBrief, fallbackDecisionBrief, fallbackEntryBrief, parseCatalogs, renderGlossaryOrg, stripCodeTokens, stripCounts, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
+import { briefInstructions, briefIssue, enrichBriefRelated, evidenceFile, fallbackBrief, fallbackDecisionBrief, fallbackEntryBrief, parseCatalogs, renderGlossaryOrg, stripCodeTokens, stripCounts, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
 import { evaluationExceptions, notAcceptedReasons } from "./core/verdict.ts";
 import { evaluationSettled, itemsNeedingEvaluatorReverify, pendingEvidenceItems, setSeatAnchorResolver } from "./core/predicate.ts";
 // Plan 06b: the pure item machinery (coverage, test-verify resolution,
@@ -15861,19 +15861,15 @@ export class Conductor {
     return lines.join("\n");
   }
 
-  /** The plan's calendars.yaml / products.yaml, or null when neither is
-   * readable. Never throws: a missing catalog makes a brief say its example
-   * is unverified, it never invents one. */
+  /** The plan repository's calendars.yaml / products.yaml, or null when
+   * neither is readable. No catalogs means briefs use the plan's domain. */
   #briefCatalogs(): Catalogs | null {
     const tryRead = (rel: string): string | undefined => {
-      for (const candidate of [path.join(this.#plan.repo, rel), rel]) {
-        try {
-          return fs.readFileSync(candidate, "utf8");
-        } catch {
-          // keep looking
-        }
+      try {
+        return fs.readFileSync(path.join(this.#plan.repo, rel), "utf8");
+      } catch {
+        return undefined;
       }
-      return undefined;
     };
     const calendars = tryRead("config/index/calendars.yaml");
     const products = tryRead("config/index/products.yaml");
@@ -16056,10 +16052,10 @@ export class Conductor {
         continue;
       }
       const concern = concerns.find((c) => c.id === id);
-      const opts = { allItems: concerns, files: concern?.files, planRefs: concern?.planRefs, noRecommendationReason: reason };
+      const opts = { catalogs, allItems: concerns, files: concern?.files, planRefs: concern?.planRefs, noRecommendationReason: reason };
       const request = findOwnerRequest(phase, id);
       if (request) {
-        briefs.push({ ...fallbackBrief(request, { catalogs, ...opts }), candidateSha: C });
+        briefs.push({ ...fallbackBrief(request, opts), candidateSha: C });
         this.#briefBackstopEpisode.set(`${C}::${id}`, this.#awaitingEpisode);
         continue;
       }
@@ -16209,8 +16205,7 @@ export class Conductor {
 
   /** The brief-writing evaluator prompt: each item that still needs a brief,
    * its own option ids, the underlying evidence, the other open items on the
-   * same concern, and the plan's calendars/products so `today` can name a real
-   * market and session time. */
+   * same concern, and the plan's catalogs when provided. */
   #buildBriefPrompt(ids: readonly string[]): string {
     const phase = this.#state.phase;
     const catalogs = this.#briefCatalogs();
@@ -16218,28 +16213,7 @@ export class Conductor {
       `You write the owner-facing decision briefs for phase ${phase.phaseId}, candidate ${(phase.candidate?.sha ?? "").slice(0, 9)}.`,
       "The owner must be able to decide from each brief alone, in under a minute.",
       "",
-      "For EACH item below call submit_brief exactly once, with:",
-      "- question: one plain line, NO code identifiers (no snake_case, no path/file.rs), e.g. \"Should a vendor excluded before a weekend stay excluded when its market reopens?\"",
-      "- today: what the system does now, with ONE concrete example naming a real product and session time from the calendars below; a weekday reopen must match the calendar's weekly reopen. If you cannot check it, write \"(example unverified)\".",
-      "- ALL owner-facing text (the question, today, impact, the options, the recommendation and the related questions) must stay PLAIN: no file paths and no code identifiers. Cite a claim by its evidence number in square brackets, e.g. '10 s after a reopen[2]'.",
-      "- evidence: the numbered list of what you read, e.g. 'message: ...' then 'config: ...' or 'code: path:line'. Every time, count or duration in today, impact or an option must carry its OWN [n] reference into this list; one reference does not cover another claim.",
-      "- impact: what the owner would notice (price flow, number of vendors, quality, duration) and ALWAYS whether any market stops publishing. The publishing answer itself must cite the config or code it was checked against, or say it is unverified.",
-      "- options: exactly the item's own option ids, each relabelled in plain words with what happens and its cost.",
-      "- recommendation: one option id and why, citing the plan or an IC section.",
-      "- related: the other item ids below that touch the same file or plan clause.",
-      "",
-      "Calendars (calendars.yaml):",
-      ...(catalogs
-        ? Object.entries(catalogs.calendars).map(
-            ([name, c]) => `- ${name}: weekly reopen ${c.opens ?? "(none declared)"}; sessions ${Object.entries(c.sessions).map(([s, t]) => `${s} ${t}`).join(", ")}`,
-          )
-        : ["(none readable)"]),
-      "Products (products.yaml):",
-      ...(catalogs ? Object.entries(catalogs.products).map(([sym, p]) => `- ${sym}: vendor ${p.vendor ?? "?"}, calendar ${p.calendar ?? "?"}`) : ["(none readable)"]),
-      "",
-      "Glossary — use these terms as-is and never explain them inline; the brief links each one:",
-      ...BRIEF_GLOSSARY.map((g) => `- ${g.term}: ${g.meaning}`),
-      "",
+      ...briefInstructions(catalogs),
       `Items needing a brief (${ids.length}):`,
     ];
     const concerns = this.#briefConcerns();
