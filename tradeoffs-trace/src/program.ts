@@ -12,7 +12,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import { createRun, runnerRevision, runPaths } from "./conductor.ts";
@@ -22,8 +22,9 @@ import { admit, admitPiCommand } from "./effects/admit.ts";
 import { admitRefusalText } from "./core/admit.ts";
 import { triageRecordFor } from "./core/triage.ts";
 import type { RequirementItem } from "./core/items.ts";
-import { readRunState } from "./effects/runner.ts";
-import { hasLintErrors, lintPlan } from "./core/plan-lint.ts";
+import { readRunState, installedRunnerRoot } from "./effects/runner.ts";
+// Plan 07h2 (A2/R3, C3): re-export validation lives in its own effect.
+import { planForNodeStart, planSha256 } from "./effects/node-plan.ts";
 import { processAlive } from "./effects/sweep.ts";
 import { envBlockedLine } from "./core/env-preflight.ts";
 import { execFileSync } from "node:child_process";
@@ -517,11 +518,14 @@ export interface SchedulerOptions {
   /** Plan 07h2 (A2/R3): the exporter a node's own start re-runs over the
    * program's `--source` file. Injectable, so a test needs no Emacs; the
    * default is `TT_EXPORT_COMMAND <source>`, else the same Emacs batch
-   * exporter `tt program start` is given. Absent (and unconfigured): a node
-   * starts from the snapshot in `program.json`, exactly as on the base. */
+   * exporter `tt program start` is given. With a source file and no exporter
+   * at all a node cannot read the plan file as it is NOW, so it is blocked
+   * with `X:PLAN_DEFECT` instead of running the program-start snapshot (A2). */
   exporter?: ProgramExporter;
   /** Plan 07h2 (A2/R3): the program's current runner, read when a node
-   * starts (never at program start). Defaults to `runnerRevision()`. */
+   * starts (never at program start). Defaults to `currentProgramRunner` — the
+   * copy `tt runner install` last selected (`<root>/runner/current`), else
+   * this process's own revision. */
   runner?: () => string;
 }
 
@@ -545,8 +549,8 @@ function emacsExporterFile(): string {
 /** Plan 07h2 (A2/R3): the exporter a node start uses when the caller passes
  * none. A configured `TT_EXPORT_COMMAND` wins; otherwise this runner's own
  * Emacs exporter is used, when that Emacs is on this host. `undefined` when
- * neither is available — a node then keeps the snapshot's plan (base
- * behaviour, constraint C1). */
+ * neither is available — with a source file that is a node's named
+ * `X:PLAN_DEFECT`, because the plan file as it is NOW cannot be read. */
 function defaultExporter(): ProgramExporter | undefined {
   const command = exporterCommand();
   if (command !== undefined) {
@@ -592,26 +596,43 @@ function findOnPath(name: string): string | undefined {
   return undefined;
 }
 
+/** Plan 07h2 (A2/R3): the runner THIS PROGRAM is on now, as a node's own
+ * start reads it. `tt runner install <sha>` freezes a revision under
+ * `<root>/runner/<sha>/tradeoffs-trace` and points `<root>/runner/current` at
+ * it; that selection — not the revision of the copy the scheduler process
+ * happens to be running — is what a node started after the install must run
+ * under. A root with no selection (or one whose copy is gone) falls back to
+ * this process's own `runnerRevision()`, which is also what a plain checkout
+ * gives. */
+export function currentProgramRunner(root: string, fallback: () => string): string {
+  try {
+    const link = path.join(root, "runner", "current");
+    const target = path.basename(fs.readlinkSync(link).trim());
+    // `runner/current` is a symlink to the revision's directory name, and only
+    // an actual installed copy can serve a run: a dangling selection is not a
+    // runner.
+    if (target.length > 0 && installedRunnerRoot(root, target) !== undefined) return target;
+  } catch {
+    // no runner install here (the usual checkout), or it is not a symlink
+  }
+  return fallback();
+}
+
 /** Plan 07h2 (A2/R3): what a node's start recorded about the plan it ran —
  * the source it was re-exported from, the exporter, the program's current
  * runner and the sha of the plan snapshot the run was created with. Written
  * into the node's `program.json`, beside the program id. */
 export interface NodeSnapshot {
   source: string;
-  exporter: "command" | "emacs" | "snapshot";
+  exporter: "command" | "emacs" | "injected" | "snapshot";
   runner: string;
   planSha256: string;
   reexported: boolean;
 }
 
-/** Plan 07h2 (A2/R3): the plan a node starts with, and the snapshot recorded
- * on the node's run. When the program has a `--source` file and an exporter is
- * available, the source is exported NOW — at the node's start, so a plan fixed
- * between nodes applies without restarting the program — linted, and used in
- * place of the snapshot taken when the program started. The program's CURRENT
- * runner is recorded with it. An export or lint failure is the node's named
- * `X:PLAN_DEFECT`, never a silent fall back to the older plan. Without a
- * source or an exporter the snapshot stands (base behaviour, constraint C1). */
+/** Observe the source, exporter and current runner at the node's own start.
+ * Re-exporting and validating the plan is delegated to `planForNodeStart`.
+ * A source with no available exporter is a defect, not a stale-plan fallback. */
 function nodeStartPlan(
   dir: string,
   program: ProgramFile,
@@ -619,66 +640,38 @@ function nodeStartPlan(
   opts: SchedulerOptions,
 ): { ok: true; entryId: string; plan: ProgramFile["entries"][number]["plan"]; snapshot: NodeSnapshot } | { ok: false; reason: string } {
   const entry = program.entries.find((e) => e.id === node.entry)!;
-  const runner = (opts.runner ?? runnerRevision)();
+  // Plan 07h2 (A2): the program's current runner, resolved NOW — at this
+  // node's start, never cached at the program's — and recorded beside the
+  // plan. The node's run is created under this same value (`createRun`'s
+  // `runner`), so the run's own `meta.json` and this snapshot can never name
+  // two runners.
+  const runner = opts.runner !== undefined ? opts.runner() : currentProgramRunner(path.dirname(path.dirname(dir)), runnerRevision);
   const source = readProgramSource(dir);
   const exporter = opts.exporter ?? defaultExporter();
-  const kept = (why: string): { ok: true; entryId: string; plan: ProgramFile["entries"][number]["plan"]; snapshot: NodeSnapshot } => {
-    try {
-      fs.appendFileSync(programPaths(dir).log, `${new Date().toISOString()} node ${node.id}: starting from the snapshot (${why})\n`);
-    } catch {
-      // a log line that cannot be written must never stop a node
-    }
-    return {
-      ok: true,
-      entryId: entry.id,
-      plan: entry.plan,
-      snapshot: { source: source ?? "", exporter: "snapshot", runner, planSha256: planSha256(entry.plan), reexported: false },
-    };
-  };
-  if (source === undefined) return kept("the program has no source file");
-  if (exporter === undefined) return kept("no exporter is configured");
-  let fresh: ProgramFile;
-  try {
-    fresh = exporter(source);
-  } catch (err) {
-    return { ok: false, reason: `X:PLAN_DEFECT: ${source} could not be re-exported for node ${node.id}: ${String((err as Error)?.message ?? err).split("\n")[0]}` };
-  }
-  const freshEntry = (fresh.entries ?? []).find((e) => e.id === entry.id);
-  if (freshEntry === undefined) {
-    return { ok: false, reason: `X:PLAN_DEFECT: ${source} no longer has an entry ${entry.id} for node ${node.id}` };
-  }
-  if ((freshEntry.plan.phases ?? []).length !== (entry.plan.phases ?? []).length) {
+  // A2: a source file must be read now, never replaced by the old snapshot.
+  // The shared effect still supports snapshot-only callers without exporters.
+  if (source !== undefined && exporter === undefined) {
     return {
       ok: false,
-      reason: `X:PLAN_DEFECT: ${source}'s entry ${entry.id} has ${(freshEntry.plan.phases ?? []).length} phase(s); node ${node.id} was created for ${(entry.plan.phases ?? []).length}`,
+      reason: `X:PLAN_DEFECT: ${source} cannot be re-exported for node ${node.id}: no exporter is configured (set TT_EXPORT_COMMAND, or run on a host with Emacs and the runner's exporter)`,
     };
   }
-  // The same lint `tt program start` runs, so a re-exported plan that does not
-  // lint blocks the node instead of running.
-  const findings = lintPlan(freshEntry.plan);
-  if (hasLintErrors(findings)) {
-    return {
-      ok: false,
-      reason: `X:PLAN_DEFECT: ${source}'s entry ${entry.id} does not lint: ${findings.find((f) => f.severity === "error")?.message ?? "see tt lint"}`,
-    };
-  }
-  return {
-    ok: true,
+  const result = planForNodeStart({
+    nodeId: node.id,
     entryId: entry.id,
-    plan: freshEntry.plan,
-    snapshot: {
-      source,
-      exporter: exporterCommand() !== undefined ? "command" : "emacs",
-      runner,
-      planSha256: planSha256(freshEntry.plan),
-      reexported: true,
-    },
-  };
-}
-
-/** A stable fingerprint of one plan, recorded with the node's snapshot. */
-function planSha256(plan: unknown): string {
-  return createHash("sha256").update(JSON.stringify(plan)).digest("hex");
+    recorded: entry.plan,
+    ...(source !== undefined ? { source } : {}),
+    exporter: exporter === undefined ? "snapshot" : exporterCommand() !== undefined ? "command" : "emacs",
+    runner,
+    ...(exporter !== undefined ? { reexport: exporter } : {}),
+    logPath: programPaths(dir).log,
+  });
+  // The effect's exporter labels describe host exporters; retain the scheduler's
+  // explicit injected-exporter provenance only when it actually re-exported.
+  if (result.ok && result.snapshot.reexported && opts.exporter !== undefined) {
+    return { ...result, snapshot: { ...result.snapshot, exporter: "injected" } };
+  }
+  return result;
 }
 
 /** One scheduler step: observe active nodes, start ready ones. Returns the
@@ -767,7 +760,7 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
     }
     let runDir: string;
     try {
-      runDir = createRun(opts.runRoot, plan);
+      runDir = createRun(opts.runRoot, plan, undefined, { runner: startPlan.snapshot.runner });
     } catch (err) {
       // e.g. a shallow clone: the node cannot start, and says why.
       record({ type: "NODE_BLOCKED", node: id, reason: String((err as Error).message ?? err) });

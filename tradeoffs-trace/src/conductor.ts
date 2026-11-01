@@ -186,7 +186,7 @@ import {
   type Role,
   type ToolSetMismatch,
 } from "./core/roles.ts";
-import { CHANGED_TEST_BUDGET_MS, isChangedTestCommand, rerunBudgetMs } from "./core/checks.ts";
+import { CHANGED_TEST_BUDGET_MS, rerunBudgetMs } from "./core/checks.ts";
 import {
   decisionSettled,
   decisionStatus,
@@ -260,7 +260,7 @@ import { validate } from "./core/schema.ts";
 
 import { EventLog, readLog, type LogRecord } from "./effects/log.ts";
 import { acquireCheckSlot, acquireLock, acquireWaitingLock, DEFAULT_CHECK_SLOTS, openCheckWindow, otherCheckWindowOwner, PausableTimer, type Lock } from "./effects/lock.ts";
-import { childEnv, runCommand, type CommandStep, type RunCommandResult } from "./effects/shell.ts";
+import { childEnv, runCommand, shBoundFor, type CommandStep, type RunCommandResult } from "./effects/shell.ts";
 // 07 design A1: ADMIT — the one gate start, resume and a program node's own
 // start run before any event.
 import { admitOrRefuse } from "./effects/admit.ts";
@@ -1111,7 +1111,18 @@ function seededDirective(seed: RunPlanDirectiveSeed, index: number): OwnerDirect
 /** Creates a fresh run directory (fails if it already exists) with the
  * layout design §9.1 describes, writes `meta.json` and the plan snapshot,
  * and returns the run id (the directory's basename). */
-export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().slice(0, 8)): string {
+export function createRun(
+  root: string,
+  plan: RunPlanFile,
+  runId = randomUUID().slice(0, 8),
+  // Plan 07h2 (A2): a program node's run is recorded under the runner the
+  // node's START snapshotted, not under a second, independent reading of this
+  // conductor's own installed `RUNNER_SHA`. The two readings are the same in
+  // an ordinary `tt start`; keeping ONE value is what makes "the node
+  // snapshots its runner at its start" true of the record rather than of the
+  // snapshot file alone.
+  opts: { runner?: string } = {},
+): string {
   if (plan.repo && isShallowRepository(plan.repo)) {
     throw new Error(`${plan.repo} is a shallow clone; candidate checkouts cannot be made from it. Run \`git -C ${plan.repo} fetch --unshallow\` first.`);
   }
@@ -1196,7 +1207,7 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
           repo: plan.repo,
           createdAt: new Date().toISOString(),
           status: "created",
-          runnerRevision: runnerRevision(),
+          runnerRevision: opts.runner ?? runnerRevision(),
         },
         maskable,
       ),
@@ -2315,12 +2326,11 @@ export class Conductor {
         this.#log.append("forbidden_refused", { agentId, pattern, command: redactText(command, this.#secretMaskable) });
         return `refused: the command matches the phase's forbidden pattern ${JSON.stringify(pattern)} (#+TT_FORBIDDEN)`;
       },
-      // Plan 06l (A2): `tt test --changed` gets its own budget (20 min),
-      // never the conductor's shell cap; every other command keeps the cap.
-      shDeadline: (command: string) => ({
-        deadlineMs: isChangedTestCommand(command) ? CHANGED_TEST_BUDGET_MS : this.#deadlines.shCommandMs,
-        termGraceMs: this.#deadlines.termGraceMs,
-      }),
+      // Plan 06l (A2) / 07h2 (C3): the bound ONE worker `sh` command runs
+      // under is an effect's policy (`shBoundFor`), not the socket wiring's:
+      // `tt test --changed` gets its own budget, every other command the
+      // plan's `TT_SH_MINUTES` cap (R12).
+      shDeadline: (command: string) => shBoundFor(command, this.#deadlines),
       // Plan 06e (A1): a `sh` command's environment carries childEnv() plus
       // every resolved secret value, so `$NAME` works whether the environment
       // or the env file supplied the value.

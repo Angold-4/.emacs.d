@@ -18,9 +18,13 @@ import { cleanupDir, makeRepo, waitFor } from "./harness.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import { contractVersionFor, runnerRevision, type RunPlanFile } from "../../src/conductor.ts";
 import type { ProgramFile } from "../../src/core/program.ts";
+import { appendProgramEvent, createProgram, recordProgramSource, schedulerTick } from "../../src/program.ts";
 
 const FAKE_PI_PATH = fileURLToPath(new URL("../fake-pi/fake-pi.ts", import.meta.url));
 const CLI_PATH = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
+/** This checkout's package root, copied by the A2 test to make two installed
+ * runners (`tt runner install`'s own layout). */
+const PACKAGE_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 
 function shortTmp(prefix: string): string {
   const dir = path.join("/tmp", `${prefix}-${randomBytes(4).toString("hex")}`);
@@ -400,7 +404,12 @@ test("plan 07h2 (R3, A2, exex 01: five restarts): a node started after its plan 
   }
 });
 
-test("plan 07h2 (R10, exex 01c3): two running nodes of one program each have their own check slot, and neither run's workers are paused by the other's check", async () => {
+/** Plan 07h2 (R10): the behaviour the phase contract names as "two running
+ * nodes of one program check without pausing each other's workers" — two
+ * nodes of one program each take their own check slot, and neither plan's
+ * exclusive check window freezes the other node's workers. Registered under
+ * both the plan-named test name and this packet's own descriptive one. */
+async function twoRunningNodesCheckWithoutPausingEachOther(): Promise<void> {
   const repo = makeRepo();
   const root = shortTmp("tt-07h2-r10-root");
   const scriptsDir = shortTmp("tt-07h2-r10-scripts");
@@ -551,7 +560,12 @@ test("plan 07h2 (R10, exex 01c3): two running nodes of one program each have the
     cleanupDir(scriptsDir);
     cleanupDir(repo.dir);
   }
-});
+}
+
+// The phase contract's own name for this behaviour, registered beside the
+// packet's descriptive one: both drive the same end-to-end body once each.
+test("plan 07h2 (R10, exex 01c3): two running nodes of one program each have their own check slot, and neither run's workers are paused by the other's check", twoRunningNodesCheckWithoutPausingEachOther);
+test("two running nodes of one program check without pausing each other's workers", twoRunningNodesCheckWithoutPausingEachOther);
 
 test("plan 07h2 (A2): a failed re-export blocks the node with X:PLAN_DEFECT instead of running a stale plan", async () => {
   const repo = makeRepo();
@@ -627,4 +641,272 @@ test("plan 07h2 (A2): a failed re-export blocks the node with X:PLAN_DEFECT inst
     cleanupDir(scriptsDir);
     cleanupDir(repo.dir);
   }
+});
+
+/** Plan 07h2 (R3/A2): the phase contract's own name for "a plan fixed between
+ * nodes applies without a restart". The end-to-end proof is the plan-named
+ * test above (two real nodes, a real conductor each); this one drives the
+ * step that decides it — `schedulerTick` — so the *node start* itself is
+ * pinned: node a already ran and finished from the program-as-started
+ * snapshot, the owner then fixed node b's plan file, and the next node start
+ * is the one that reads it. No conductor is spawned (`launch` is recorded),
+ * so this is deterministic and fast. */
+test("a node started after its plan file changed runs the changed plan", () => {
+  const repo = makeRepo();
+  const root = shortTmp("tt-07h2-r3-plan-root");
+  const scriptsDir = shortTmp("tt-07h2-r3-plan-scripts");
+  const STALE = "echo the-plan-as-the-program-started";
+  const CHANGED = "echo the-plan-fixed-between-nodes";
+  const phase = (checks: string[]) => ({ id: "p1", goal: "g", acceptance: ["it works"], checks, boundaries: [], reserved: [] });
+  const plan = (title: string, checks: string[]): RunPlanFile => ({
+    title,
+    repo: repo.dir,
+    integrationBranch: "main",
+    checks,
+    phases: [phase(checks)],
+  });
+  const program = (bChecks: string[]): ProgramFile => ({
+    title: "plan-fixed-between-nodes",
+    maxParallel: 1,
+    entries: [
+      { id: "a", after: [], plan: plan("a", ["true"]) },
+      { id: "b", after: ["a"], plan: plan("b", bChecks) },
+    ],
+  });
+  const source = path.join(scriptsDir, "source.json");
+  fs.writeFileSync(source, JSON.stringify(program([STALE])));
+  // The program was STARTED from this snapshot, which still says STALE; the
+  // `--source` file is what a node's own start re-exports.
+  const dir = createProgram(root, program([STALE]), "r3plan");
+  recordProgramSource(dir, source);
+  // Node a already ran and finished — from the program-as-started snapshot.
+  appendProgramEvent(dir, { type: "NODE_STARTED", node: "a", runId: "aaaaaaaa", branch: "tt/a", base: repo.head });
+  appendProgramEvent(dir, { type: "NODE_STATUS", node: "a", status: "done" });
+  // ...and published its work on its own branch, which node b is cut from.
+  execFileSync("git", ["-C", repo.dir, "branch", "main--a", repo.head]);
+  // The owner fixes node b's plan file AFTER node a started.
+  fs.writeFileSync(source, JSON.stringify(program([CHANGED])));
+
+  const launched: string[] = [];
+  let asked = 0;
+  schedulerTick(dir, {
+    runRoot: root,
+    launch: (runDir) => launched.push(runDir),
+    // The exporter is injectable, exactly as `TT_EXPORT_COMMAND` is: `cat`
+    // would print the source file, and so does this.
+    exporter: (file) => {
+      asked += 1;
+      return JSON.parse(fs.readFileSync(file, "utf8")) as ProgramFile;
+    },
+    // Plan 07h2 (A2): the program's current runner, read at THIS node's
+    // start — a distinct value from the program's own start, so the record
+    // cannot be a leftover.
+    runner: () => "runner-at-node-start",
+  });
+
+  assert.equal(asked, 1, "the node's start re-exported the source file");
+  assert.equal(launched.length, 1, "exactly the ready node started");
+  const runDir = launched[0];
+  // The node's run carries the CHANGED plan, not the snapshot.
+  const runPlan = JSON.parse(fs.readFileSync(path.join(runDir, "plan", "v1.json"), "utf8")) as RunPlanFile;
+  assert.deepEqual(runPlan.checks, [CHANGED], "the node's own run runs the plan file as it is NOW");
+  // ...and it records where that plan came from and which runner started it.
+  const nodeRecord = JSON.parse(fs.readFileSync(path.join(runDir, "program.json"), "utf8")) as {
+    node: string;
+    snapshot: { source: string; exporter: string; runner: string; reexported: boolean; planSha256: string };
+  };
+  assert.equal(nodeRecord.node, "b");
+  assert.equal(nodeRecord.snapshot.reexported, true);
+  assert.equal(nodeRecord.snapshot.source, source);
+  assert.equal(nodeRecord.snapshot.runner, "runner-at-node-start");
+  const meta = JSON.parse(fs.readFileSync(path.join(runDir, "meta.json"), "utf8")) as { runnerRevision: string };
+  assert.equal(meta.runnerRevision, "runner-at-node-start", "the run itself is recorded under the runner its start snapshotted");
+  // The program-as-started snapshot is never edited: it still holds STALE.
+  const asStarted = JSON.parse(fs.readFileSync(path.join(root, "programs", "r3plan", "program.json"), "utf8")) as ProgramFile;
+  assert.deepEqual(asStarted.entries[1].plan!.checks, [STALE]);
+  cleanupDir(root);
+  cleanupDir(scriptsDir);
+  cleanupDir(repo.dir);
+});
+
+/** Plan 07h2 (A2): "the program's current runner" is a production fact, not a
+ * parameter: `tt runner install <sha>` freezes a copy under
+ * `<root>/runner/<sha>/tradeoffs-trace` and points `<root>/runner/current` at
+ * it. So this test starts the program under an INSTALLED runner A, installs a
+ * different runner B while node a runs, and asserts the NEXT node not only
+ * records B but is actually executed by B (the conductor that starts the run
+ * writes its own `RUNNER_SHA` into the run's `init` record). */
+test("plan 07h2 (A2): a node started after a newer runner is installed records and runs that runner", async () => {
+  const repo = makeRepo();
+  const root = shortTmp("tt-07h2-a2-runner-root");
+  const scriptsDir = shortTmp("tt-07h2-a2-runner-scripts");
+  const phase = { id: "p1", goal: "g", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [] };
+  const plan = (title: string): RunPlanFile => ({ title, repo: repo.dir, integrationBranch: "main", checks: ["true"], phases: [phase] });
+  const program: ProgramFile = {
+    title: "runner-at-node-start",
+    maxParallel: 1,
+    entries: [
+      { id: "a", after: [], plan: plan("a") },
+      { id: "b", after: ["a"], plan: plan("b") },
+    ],
+  };
+  const sourcePath = path.join(scriptsDir, "source.json");
+  const programPath = path.join(scriptsDir, "program.json");
+  fs.writeFileSync(sourcePath, JSON.stringify(program));
+  fs.writeFileSync(programPath, JSON.stringify(program));
+  // Node a holds the program long enough for the owner to install the newer
+  // runner (the real gap was the minutes between two nodes).
+  fs.writeFileSync(
+    path.join(scriptsDir, "worker.json"),
+    JSON.stringify({
+      hello: { role: "worker", tools: ROLE_TOOLS.worker },
+      steps: [
+        { kind: "call-sh", command: "sleep 4" },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+  );
+  fs.writeFileSync(
+    path.join(scriptsDir, "reviewer.json"),
+    JSON.stringify({
+      hello: { role: "reviewer", tools: ROLE_TOOLS.reviewer },
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer: "$TT_REVIEWER",
+            phaseId: "p1",
+            candidateSha: "$TT_CANDIDATE_SHA",
+            contractVersion: contractVersionFor(phase),
+            correctionStatements: [],
+            findingStatements: [],
+          },
+        },
+      ],
+    }),
+  );
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    TT_TEST_MODE: "1",
+    TT_TEST_PI_COMMAND: process.execPath,
+    TT_TEST_PI_ARGS_PREFIX: JSON.stringify([FAKE_PI_PATH]),
+    TT_TEST_STUB_REVIEWS: "1",
+    TT_TEST_DEADLINES: JSON.stringify(LIVE_FAST),
+    FAKE_PI_SCRIPT: scriptsDir,
+    TT_EXPORT_COMMAND: "cat",
+  };
+  const state = (id: string) =>
+    JSON.parse(
+      execFileSync(process.execPath, [CLI_PATH, "program", "state", id, "--root", root], { encoding: "utf8", env }),
+    ) as { state: { nodes: Record<string, { status: string; runId?: string }> } };
+  const runFile = (runId: string, file: string) =>
+    JSON.parse(fs.readFileSync(path.join(root, runId, file), "utf8")) as Record<string, unknown>;
+  /** `tt runner install <sha>`'s own layout: the frozen copy, its `RUNNER_SHA`,
+   * and `<root>/runner/current` pointing at it. The copy is the working
+   * checkout's package, so both installs carry this runner's code and differ
+   * only in which revision they are. */
+  const installRunner = (revision: string): string => {
+    const dest = path.join(root, "runner", revision, "tradeoffs-trace");
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    execFileSync("cp", ["-a", PACKAGE_ROOT, dest]);
+    fs.writeFileSync(path.join(dest, "RUNNER_SHA"), `${revision}\n`);
+    const current = path.join(root, "runner", "current");
+    fs.rmSync(current, { force: true });
+    fs.symlinkSync(revision, current);
+    return dest;
+  };
+  const runnerA = installRunner("runner-a");
+  let programId = "";
+  try {
+    // The program is STARTED by runner A's own CLI, so its scheduler is A.
+    programId = execFileSync(
+      process.execPath,
+      [path.join(runnerA, "src", "cli.ts"), "program", "start", programPath, "--source", sourcePath, "--root", root],
+      { encoding: "utf8", env },
+    )
+      .trim()
+      .split("\n")[0];
+    await waitFor(() => state(programId).state.nodes.a.status === "running", 90_000, 100);
+    const aRun = state(programId).state.nodes.a.runId!;
+    assert.equal((runFile(aRun, "program.json").snapshot as { runner: string }).runner, "runner-a", "node a started under A");
+
+    // The owner installs the newer runner WHILE node a runs: from now on the
+    // program's current runner is B.
+    installRunner("runner-b");
+
+    await waitFor(() => state(programId).state.nodes.b.status === "running", 150_000, 100);
+    const bRun = state(programId).state.nodes.b.runId!;
+    // Node b's start SELECTED B...
+    const snapshotB = runFile(bRun, "program.json").snapshot as { runner: string };
+    assert.equal(snapshotB.runner, "runner-b", "node b's start resolved the program's current runner");
+    assert.equal((runFile(bRun, "meta.json") as { runnerRevision: string }).runnerRevision, "runner-b", "node b's run is recorded under B");
+    // ...and B's own code EXECUTED it: the conductor writes its own
+    // `RUNNER_SHA` into the run's `init` record.
+    const init = fs
+      .readFileSync(path.join(root, bRun, "events.jsonl"), "utf8")
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+      .map((l) => JSON.parse(l) as { kind?: string; event?: { runnerRevision?: string } })
+      .find((r) => r.kind === "init");
+    assert.equal(init?.event?.runnerRevision, "runner-b", "the conductor that ran node b was B's");
+  } finally {
+    if (programId) {
+      try {
+        execFileSync(process.execPath, [CLI_PATH, "program", "stop", programId, "--root", root], { encoding: "utf8", env });
+      } catch {
+        // already finished
+      }
+    }
+    cleanupDir(root);
+    cleanupDir(scriptsDir);
+    cleanupDir(repo.dir);
+  }
+});
+
+/** Plan 07h2 (A2): a node's plan is its own plan FILE, read at its start. A
+ * program started from `--source` whose host cannot re-export that file has no
+ * way to read it, so the node is blocked with `X:PLAN_DEFECT` — running the
+ * program-start snapshot instead would be exactly the stale plan the item
+ * exists to remove. */
+test("plan 07h2 (A2): a node that cannot re-export its source is blocked instead of running the stale plan", () => {
+  const repo = makeRepo();
+  const root = shortTmp("tt-07h2-noexport-root");
+  const scriptsDir = shortTmp("tt-07h2-noexport-scripts");
+  const phase = { id: "p1", goal: "g", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [] };
+  const plan: RunPlanFile = { title: "a", repo: repo.dir, integrationBranch: "main", checks: ["true"], phases: [phase] };
+  const program: ProgramFile = { title: "no-exporter", maxParallel: 1, entries: [{ id: "a", after: [], plan }] };
+  const source = path.join(scriptsDir, "source.json");
+  fs.writeFileSync(source, JSON.stringify(program));
+  const dir = createProgram(root, program, "noexport");
+  recordProgramSource(dir, source);
+  const launched: string[] = [];
+  // No `TT_EXPORT_COMMAND` and no Emacs on PATH: this host cannot export.
+  const saved = { path: process.env.PATH, emacs: process.env.TT_EMACS, command: process.env.TT_EXPORT_COMMAND };
+  try {
+    process.env.PATH = "";
+    process.env.TT_EMACS = "no-such-emacs-binary";
+    delete process.env.TT_EXPORT_COMMAND;
+    schedulerTick(dir, { runRoot: root, launch: (runDir) => launched.push(runDir) });
+  } finally {
+    if (saved.path === undefined) delete process.env.PATH;
+    else process.env.PATH = saved.path;
+    if (saved.emacs === undefined) delete process.env.TT_EMACS;
+    else process.env.TT_EMACS = saved.emacs;
+    if (saved.command === undefined) delete process.env.TT_EXPORT_COMMAND;
+    else process.env.TT_EXPORT_COMMAND = saved.command;
+  }
+  const events = fs
+    .readFileSync(path.join(root, "programs", "noexport", "events.jsonl"), "utf8")
+    .split("\n")
+    .filter((l) => l.trim().length > 0)
+    .map((l) => JSON.parse(l) as { event: { type: string; reason?: string } });
+  const blocked = events.find((e) => e.event.type === "NODE_BLOCKED");
+  assert.ok(blocked, "the node is blocked");
+  assert.match(blocked!.event.reason ?? "", /X:PLAN_DEFECT/);
+  assert.match(blocked!.event.reason ?? "", /no exporter is configured/);
+  assert.deepEqual(launched, [], "no run was created from the stale plan");
+  cleanupDir(root);
+  cleanupDir(scriptsDir);
+  cleanupDir(repo.dir);
 });

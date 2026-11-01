@@ -21,6 +21,7 @@ import { test } from "node:test";
 
 import { AdmitRefusal, Conductor, contractVersionFor, createRun, runPaths, type RunPlanFile } from "../../src/conductor.ts";
 import { ADMIT_PINNED_PI } from "../../src/core/admit.ts";
+import { pruneRunTargets } from "../../src/effects/prune.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import {
   cleanupDir,
@@ -358,6 +359,12 @@ test("a conductor start refuses a check command that does not parse, before any 
 // ---------------------------------------------------------------------------
 // Plan 07h2 (A3/R4, R11, R12): what a stopped-or-finished run leaves behind, and
 // what a worker's shell command may never outlive.
+//
+// R4 (run d170bb37): a finished conductor exits and prunes — its worktrees and
+// its build targets, including a package's nested target.
+// R11 (exex 01c3b): a resumed run keeps each lane's uncommitted changes.
+// R12 (exex 01c3a): a worker command that runs past TT_SH_MINUTES is killed and
+// reported to the worker.
 // ---------------------------------------------------------------------------
 
 const CLI_PATH = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
@@ -384,7 +391,7 @@ function pidsWith(token: string): number[] {
   return pids;
 }
 
-test("plan 07h2 (R4, run d170bb37): a conductor at DONE exits and removes the run's worktrees and build targets", async () => {
+async function conductorAtDoneExitsAndPrunes(): Promise<void> {
   const repo = makeRepo();
   const root = shortTmp("tt-07h2-root");
   const scriptsDir = shortTmp("tt-07h2-scripts");
@@ -397,13 +404,19 @@ test("plan 07h2 (R4, run d170bb37): a conductor at DONE exits and removes the ru
   };
   fs.writeFileSync(path.join(scriptsDir, "plan.json"), JSON.stringify(plan));
   // The worker builds "134 GB of targets" the way the incident did: inside its
-  // own worktree, before it submits.
+  // own worktree, before it submits. One of them is nested inside a package
+  // directory and committed, so the run's candidate checkout holds it too —
+  // the shape a depth-limited walk of the checkout used to miss.
   fs.writeFileSync(
     path.join(scriptsDir, "worker.json"),
     JSON.stringify({
       hello: { role: "worker", tools: ROLE_TOOLS.worker },
       steps: [
-        { kind: "call-sh", command: "mkdir -p target node_modules/pkg && echo big > target/big.bin && echo dep > node_modules/pkg/index.js" },
+        {
+          kind: "call-sh",
+          command:
+            "mkdir -p target node_modules/pkg packages/web/target && echo big > target/big.bin && echo dep > node_modules/pkg/index.js && echo nested > packages/web/target/bundle.js && git add -f packages/web/target && git -c user.name=t -c user.email=t@t commit -q -m 'nested targets'",
+        },
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
       ],
     }),
@@ -449,17 +462,36 @@ test("plan 07h2 (R4, run d170bb37): a conductor at DONE exits and removes the ru
     const conductorPid = Number(fs.readFileSync(path.join(runDir, "conductor.pid"), "utf8"));
     await waitFor(() => !pidFile(conductorPid), 180_000, 200, runDir);
     assert.equal(pidFile(conductorPid), false, "no conductor process remains after DONE");
+    // The nested package target the worker committed is in the candidate
+    // checkout's tree (the shape a depth-limited walk missed): the run's repo
+    // holds a commit that contains it.
+    const committed = execFileSync("git", ["-C", repo.dir, "log", "--all", "--format=%H", "--", "packages/web/target/bundle.js"], { encoding: "utf8" }).trim();
+    assert.notEqual(committed, "", "the nested target was committed, so the candidate checkout held it");
     const status = execFileSync(process.execPath, [CLI_PATH, "status", runId, "--root", root], { encoding: "utf8", env });
     assert.match(status, /phase: p1 — DONE/, `the run ended DONE:\n${status}`);
 
     // The worktrees and the build targets are gone; the run's evidence is not.
+    const candidatesAfter = fs.readdirSync(paths.candidates);
     assert.equal(fs.existsSync(paths.worktree), false, "the run's worktree is pruned");
     assert.equal(fs.existsSync(path.join(runDir, "worktrees")), false, "no lane worktrees remain");
     assert.equal(fs.existsSync(path.join(paths.candidates, "target")), false);
+    assert.ok(candidatesAfter.length > 0, "the run kept its candidate checkouts");
+    for (const sha of candidatesAfter) {
+      assert.equal(
+        fs.existsSync(path.join(paths.candidates, sha, "packages", "web", "target")),
+        false,
+        `the nested package target is pruned from candidate ${sha}`,
+      );
+      assert.equal(fs.existsSync(path.join(paths.candidates, sha, "packages", "web", "target", "bundle.js")), false);
+    }
     assert.equal(fs.existsSync(paths.events), true, "the control log is kept");
+    // The conductor's own log says what it pruned (so an owner can tell a
+    // finished run's clean exit from a crashed one).
+    assert.match(fs.readFileSync(paths.log, "utf8"), /pruned \d+ director(y|ies) after DONE/, "the prune is recorded in the conductor's log");
     assert.ok(readEvents(runDir).length > 0);
-    // Nothing named `target` survives anywhere in the run directory.
-    const leftovers = execFileSync("find", [runDir, "-name", "target", "-type", "d"], { encoding: "utf8" }).trim();
+    // Nothing named `target`/`node_modules` survives anywhere in the run
+    // directory, at any depth.
+    const leftovers = execFileSync("find", [runDir, "(", "-name", "target", "-o", "-name", "node_modules", ")", "-type", "d"], { encoding: "utf8" }).trim();
     assert.equal(leftovers, "", `no target directory survives:\n${leftovers}`);
   } finally {
     try {
@@ -471,9 +503,42 @@ test("plan 07h2 (R4, run d170bb37): a conductor at DONE exits and removes the ru
     cleanupDir(scriptsDir);
     cleanupDir(repo.dir);
   }
+}
+test("plan 07h2 (R4, run d170bb37): a conductor at DONE exits and removes the run's worktrees and build targets", conductorAtDoneExitsAndPrunes);
+test("a conductor at DONE exits and removes its worktrees and targets", conductorAtDoneExitsAndPrunes);
+
+test("the prune reaches a build target nested in a package directory", () => {
+  // A3/R4: run d170bb37 left 134 GB of targets behind. A repository nests its
+  // build products (`packages/web/target`, `crates/api/target`), so the prune
+  // that removes them cannot stop at the checkout's first level.
+  const runDir = shortTmp("tt-07h2-prune");
+  const worktree = shortTmp("tt-07h2-prune-wt");
+  try {
+    const candidate = path.join(runDir, "candidates", "abc123");
+    const nested = path.join(candidate, "packages", "web");
+    fs.mkdirSync(path.join(nested, "target"), { recursive: true });
+    fs.writeFileSync(path.join(nested, "target", "bundle.js"), "built\n");
+    fs.mkdirSync(path.join(candidate, "node_modules", "pkg"), { recursive: true });
+    fs.writeFileSync(path.join(candidate, "node_modules", "pkg", "index.js"), "dep\n");
+    fs.writeFileSync(path.join(candidate, "README.md"), "kept\n");
+    // `.git` is never walked: a repository's own directory is not a build
+    // target and may hold anything.
+    fs.mkdirSync(path.join(candidate, ".git", "target"), { recursive: true });
+    const result = pruneRunTargets(runDir, { run: worktree });
+    assert.equal(fs.existsSync(path.join(nested, "target")), false, "the nested package target is pruned");
+    assert.equal(fs.existsSync(path.join(candidate, "node_modules")), false, "a nested node_modules is pruned");
+    assert.equal(fs.existsSync(path.join(candidate, "README.md")), true, "a checked-in file is kept");
+    assert.equal(fs.existsSync(path.join(candidate, ".git", "target")), true, ".git is not walked");
+    assert.equal(fs.existsSync(worktree), false, "the worktree is pruned");
+    assert.equal(fs.existsSync(path.join(runDir, "candidates")), true, "the candidate checkout itself is kept");
+    assert.ok(result.removed.length >= 3, `the prune reports what it removed: ${JSON.stringify(result.removed)}`);
+  } finally {
+    cleanupDir(runDir);
+    fs.rmSync(worktree, { recursive: true, force: true });
+  }
 });
 
-test("plan 07h2 (R11, exex 01c3b): an owner stop and resume keep a lane's uncommitted work, and the resumed worker is told its worktree is unchanged", async () => {
+async function resumedRunKeepsEachLanesChanges(): Promise<void> {
   const scripts = shortTmp("tt-07h2-lanes");
   const promptLog = path.join(scripts, "prompts.log");
   let conductor: Conductor | undefined;
@@ -482,40 +547,43 @@ test("plan 07h2 (R11, exex 01c3b): an owner stop and resume keep a lane's uncomm
     checks: ["true"],
     phase: { id: "p1", goal: "two lanes", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [], workers: 2 },
     deadlines: FAST,
-    laneWorkerScriptFor: (lane) =>
-      lane === "a"
-        ? { hello: defaultWorkerHello(), steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } }] }
-        : {
-            hello: defaultWorkerHello(),
-            // The lane's uncommitted edit, then it waits for the owner's stop.
-            steps: [{ kind: "call-sh", command: "printf 'kept work\\n' > uncommitted.txt" }, { kind: "hang-until-abort" }],
-          },
+    laneWorkerScriptFor: (lane) => ({
+      hello: defaultWorkerHello(),
+      // Each lane's uncommitted edit, then it waits for the owner's stop.
+      steps: [{ kind: "call-sh", command: `printf 'kept ${lane}\\n' > uncommitted-${lane}.txt` }, { kind: "hang-until-abort" }],
+    }),
     workerScript: () => ({
       hello: defaultWorkerHello(),
       steps: [{ kind: "call-sh", command: "printf 'kept work\\n' > uncommitted.txt" }, { kind: "hang-until-abort" }],
     }),
     reviewerScriptFor: () => ({ hello: defaultReviewerHello(), steps: [] }),
   });
-  const laneWorktree = path.join(setup.runDir, "worktrees", "lane-b");
+  // The lanes' own worktrees, each with its own uncommitted file.
+  const lanes = { a: path.join(setup.runDir, "worktrees", "lane-a"), b: path.join(setup.runDir, "worktrees", "lane-b") };
+  const keptFiles = { a: path.join(lanes.a, "uncommitted-a.txt"), b: path.join(lanes.b, "uncommitted-b.txt") };
   try {
     conductor = setup.conductor;
     await conductor.start();
-    // Lane b has an UNCOMMITTED file in its own worktree...
-    await waitFor(() => fs.existsSync(path.join(laneWorktree, "uncommitted.txt")), 60_000, 50, setup.runDir);
-    const status = execFileSync("git", ["-C", laneWorktree, "status", "--porcelain"], { encoding: "utf8" });
-    assert.match(status, /uncommitted\.txt/, "the edit is uncommitted before the stop");
+    for (const lane of ["a", "b"] as const) {
+      // Each lane has an UNCOMMITTED file in its OWN worktree.
+      await waitFor(() => fs.existsSync(keptFiles[lane]), 60_000, 50, setup.runDir);
+      const status = execFileSync("git", ["-C", lanes[lane], "status", "--porcelain"], { encoding: "utf8" });
+      assert.match(status, new RegExp(`uncommitted-${lane}\\.txt`), `lane ${lane}'s edit is uncommitted before the stop`);
+    }
 
-    // ...the owner stops, and the edit survives the stop.
+    // ...the owner stops, and each lane's edit survives the stop.
     await conductor.stop();
     conductor = undefined;
-    assert.ok(fs.existsSync(path.join(laneWorktree, "uncommitted.txt")), "the lane's edits are still on disk after the stop");
-    assert.equal(
-      execFileSync("git", ["-C", laneWorktree, "status", "--porcelain"], { encoding: "utf8" }).includes("uncommitted.txt"),
-      true,
-      "and still uncommitted",
-    );
+    for (const lane of ["a", "b"] as const) {
+      assert.ok(fs.existsSync(keptFiles[lane]), `lane ${lane}'s edits are still on disk after the stop`);
+      assert.equal(
+        execFileSync("git", ["-C", lanes[lane], "status", "--porcelain"], { encoding: "utf8" }).includes(`uncommitted-${lane}.txt`),
+        true,
+        `lane ${lane}'s edit is still uncommitted`,
+      );
+    }
     const keptRecord = readEvents(setup.runDir).find((r) => r.kind === "lane_worktree_kept");
-    assert.ok(keptRecord, "the stop recorded the kept lane worktree (so a resume can find it)");
+    assert.ok(keptRecord, "the stop recorded the kept lane worktrees (so a resume can find them)");
 
     // The resume: the same run, the same plan, a fresh prompt log.
     resumed = new Conductor({
@@ -539,8 +607,11 @@ test("plan 07h2 (R11, exex 01c3b): an owner stop and resume keep a lane's uncomm
     await resumed.start();
     await waitFor(() => fs.existsSync(promptLog), 60_000, 50, setup.runDir);
     const prompts = fs.readFileSync(promptLog, "utf8");
-    assert.match(prompts, /worktree of lane b is unchanged/, "the resumed worker is told its worktree is unchanged");
-    assert.ok(fs.existsSync(path.join(laneWorktree, "uncommitted.txt")), "the resumed run did not reset the lane's worktree");
+    assert.match(prompts, /worktree of lane [a-z, ]+ is unchanged/, "each resumed worker is told its worktree is unchanged");
+    for (const lane of ["a", "b"] as const) {
+      assert.match(prompts, new RegExp(`worktree of lane [a-z, ]*${lane}`), `the note names lane ${lane}`);
+      assert.ok(fs.existsSync(keptFiles[lane]), `the resumed run did not reset lane ${lane}'s worktree`);
+    }
     assert.ok(
       readEvents(setup.runDir).some(
         (r) => r.kind === "lane_worktree_reused" && String(JSON.stringify(r.event)).includes("unchanged"),
@@ -556,9 +627,14 @@ test("plan 07h2 (R11, exex 01c3b): an owner stop and resume keep a lane's uncomm
     cleanupDir(setup.scriptsDir);
     cleanupDir(setup.repo.dir);
   }
-});
+}
+test(
+  "plan 07h2 (R11, exex 01c3b): an owner stop and resume keep a lane's uncommitted work, and the resumed worker is told its worktree is unchanged",
+  resumedRunKeepsEachLanesChanges,
+);
+test("a resumed run keeps each lane's uncommitted changes", resumedRunKeepsEachLanesChanges);
 
-test("plan 07h2 (R12, exex 01c3a): a worker's command and the child process it spawns are killed at the sh bound, and the worker is told the command, the bound and that it was killed", async () => {
+async function workerCommandPastShMinutesIsKilled(): Promise<void> {
   const scripts = shortTmp("tt-07h2-sh");
   const marker = "tt-07h2-busyloop";
   let conductor: Conductor | undefined;
@@ -605,6 +681,12 @@ while True: pass  # ${marker}'`,
     assert.match(streams, /process group/, "the note says the whole process group was killed");
     assert.ok(streams.includes("python3 -c"), `the note names the command the worker ran:\n${streams.slice(-2000)}`);
     assert.match(streams, /tt-07h2-busyloop/, "the note quotes the worker's own command text");
+    // The bound is a recorded event, scoped to the agent, not a silent kill.
+    const bound = eventsOfType(setup.runDir, "BOUND_REACHED").find((e) => (e as { kind?: string }).kind === "sh") as
+      | { scope?: string; limitMs?: number; action?: string }
+      | undefined;
+    assert.ok(bound, "reaching the sh bound is recorded as BOUND_REACHED");
+    assert.equal(bound.limitMs, 3_000, "the record names the limit the plan set");
   } finally {
     if (conductor) await conductor.stop().catch(() => undefined);
     for (const pid of pidsWith(marker)) {
@@ -621,4 +703,9 @@ while True: pass  # ${marker}'`,
     }
     cleanupDir(scripts);
   }
-});
+}
+test(
+  "plan 07h2 (R12, exex 01c3a): a worker's command and the child process it spawns are killed at the sh bound, and the worker is told the command, the bound and that it was killed",
+  workerCommandPastShMinutesIsKilled,
+);
+test("a worker command that runs past TT_SH_MINUTES is killed and reported to the worker", workerCommandPastShMinutesIsKilled);
