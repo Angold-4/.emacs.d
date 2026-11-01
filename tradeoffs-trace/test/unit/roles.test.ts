@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { assertToolSet, launchArgs, PI_VERSION, planModelSelector, ROLE_TOOLS } from "../../src/core/roles.ts";
 
 test("roles: PI_VERSION is the pinned version", () => {
-  assert.equal(PI_VERSION, "0.87.0");
+  assert.equal(PI_VERSION, "1.4.0");
 });
 
 test("roles: ROLE_TOOLS matches design §2.1's launch table exactly", () => {

@@ -4,7 +4,7 @@
 # host the wall-clock tests need (they flake on a laptop that is building Rust).
 # macOS, because tradeoffs-trace targets macOS hosts: the process sweep uses `lsof +D`, macOS
 # process-group semantics and macOS-protected paths, and the role-tool-sets contract test spawns
-# the real pinned Pi (0.87.0, docs/tradeoffs-trace-runbook.md) without calling a model.
+# the real pinned Pi (1.4.0, docs/tradeoffs-trace-runbook.md) without calling a model.
 name: tradeoffs-trace
 
 on:
@@ -29,7 +29,7 @@ jobs:
       - name: Install Emacs and the pinned Pi
         run: |
           brew install emacs
-          npm install -g @earendil-works/pi-coding-agent@0.87.0
+          npm install -g @earendil-works/pi-coding-agent@1.4.0
           pi --version
       - name: Git identity for tests that commit
         run: git config --global user.name "tt-ci" && git config --global user.email "tt-ci@users.noreply.github.com"
@@ -47,7 +47,7 @@ jobs:
       - name: Install Emacs and the pinned Pi
         run: |
           brew install emacs
-          npm install -g @earendil-works/pi-coding-agent@0.87.0
+          npm install -g @earendil-works/pi-coding-agent@1.4.0
           pi --version
       - name: Git identity for tests that commit
         run: git config --global user.name "tt-ci" && git config --global user.email "tt-ci@users.noreply.github.com"
