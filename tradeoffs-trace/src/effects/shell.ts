@@ -27,6 +27,7 @@
 // workers").
 
 import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 
 // A2/C3 (plan 06e): the sweep owns the signalling decision. This module asks
 // it to signal the groups it recorded at spawn; it never calls `process.kill`
@@ -34,6 +35,12 @@ import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from "node:c
 import { groupAlive, signalGroup } from "./sweep.ts";
 
 const DEFAULT_TERM_GRACE_MS = 10_000;
+
+/** The shell a step-traced command runs under: dash where it exists (Linux's
+ * /bin/sh, and /bin/dash on macOS), so its xtrace steps read the same on every
+ * machine. macOS's /bin/sh is bash, whose xtrace quotes arguments. Untraced
+ * commands keep /bin/sh. */
+const TRACE_SHELL = existsSync("/bin/dash") ? "/bin/dash" : "/bin/sh";
 const STOP_POLL_INTERVAL_MS = 5;
 const STOP_POLL_TIMEOUT_MS = 5_000;
 /** 09-2: how long a command's result waits, after its process exited, for
@@ -315,10 +322,11 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
     }, termGraceMs);
   }
 
+  const shell = traceSteps ? TRACE_SHELL : "/bin/sh";
   const result = new Promise<RunCommandResult>((resolveResult, rejectResult) => {
     child = spawn(
-      "/bin/sh",
-      ["-c", 'kill -STOP $$; exec /bin/sh -c "$1"', "tt-sh", innerCommand],
+      shell,
+      ["-c", `kill -STOP $$; exec ${shell} -c "$1"`, "tt-sh", innerCommand],
       {
         cwd: options.cwd,
         env: options.env,
