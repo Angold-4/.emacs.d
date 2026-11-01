@@ -2138,7 +2138,9 @@ addRow({
   actions: [],
   apply: (s, ev) => {
     const e = ev as Extract<Event, { type: "LOOP_BOUND_REACHED" }>;
-    return enterAwaitingOwner(s, e.reason);
+    // The domain driver has finished when it parks. Retaining its action
+    // would suppress the next MAP after an owner rewrites or grants work.
+    return enterAwaitingOwner(withPhase(s, { inFlight: clearInFlight(s.phase, "dispatch_worker") }), e.reason);
   },
 });
 

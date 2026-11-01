@@ -1175,6 +1175,8 @@ for (const namesTest of [true, false]) test(namesTest
   try {
     await setup.conductor.start();
     await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 90_000, 50, setup.runDir);
+    assert.equal(setup.conductor.state.phase.inFlight.dispatch_worker, undefined,
+      "parking finishes the domain driver so an owner resolution can dispatch MAP again");
     const request = setup.conductor.state.phase.ownerRequests.find((r) => r.status === "open" && r.origin === "failed_vote");
     assert.ok(request, "a failed vote asks the owner to rule");
     const before = readEvents(setup.runDir).length;
