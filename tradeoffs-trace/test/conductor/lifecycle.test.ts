@@ -391,7 +391,7 @@ function pidsWith(token: string): number[] {
   return pids;
 }
 
-test("a conductor at DONE exits and removes its worktrees and targets", async () => {
+async function conductorAtDoneExitsAndPrunes(): Promise<void> {
   const repo = makeRepo();
   const root = shortTmp("tt-07h2-root");
   const scriptsDir = shortTmp("tt-07h2-scripts");
@@ -503,7 +503,9 @@ test("a conductor at DONE exits and removes its worktrees and targets", async ()
     cleanupDir(scriptsDir);
     cleanupDir(repo.dir);
   }
-});
+}
+test("plan 07h2 (R4, run d170bb37): a conductor at DONE exits and removes the run's worktrees and build targets", conductorAtDoneExitsAndPrunes);
+test("a conductor at DONE exits and removes its worktrees and targets", conductorAtDoneExitsAndPrunes);
 
 test("the prune reaches a build target nested in a package directory", () => {
   // A3/R4: run d170bb37 left 134 GB of targets behind. A repository nests its
@@ -536,7 +538,7 @@ test("the prune reaches a build target nested in a package directory", () => {
   }
 });
 
-test("a resumed run keeps each lane's uncommitted changes", async () => {
+async function resumedRunKeepsEachLanesChanges(): Promise<void> {
   const scripts = shortTmp("tt-07h2-lanes");
   const promptLog = path.join(scripts, "prompts.log");
   let conductor: Conductor | undefined;
@@ -625,9 +627,14 @@ test("a resumed run keeps each lane's uncommitted changes", async () => {
     cleanupDir(setup.scriptsDir);
     cleanupDir(setup.repo.dir);
   }
-});
+}
+test(
+  "plan 07h2 (R11, exex 01c3b): an owner stop and resume keep a lane's uncommitted work, and the resumed worker is told its worktree is unchanged",
+  resumedRunKeepsEachLanesChanges,
+);
+test("a resumed run keeps each lane's uncommitted changes", resumedRunKeepsEachLanesChanges);
 
-test("a worker command that runs past TT_SH_MINUTES is killed and reported to the worker", async () => {
+async function workerCommandPastShMinutesIsKilled(): Promise<void> {
   const scripts = shortTmp("tt-07h2-sh");
   const marker = "tt-07h2-busyloop";
   let conductor: Conductor | undefined;
@@ -696,4 +703,9 @@ while True: pass  # ${marker}'`,
     }
     cleanupDir(scripts);
   }
-});
+}
+test(
+  "plan 07h2 (R12, exex 01c3a): a worker's command and the child process it spawns are killed at the sh bound, and the worker is told the command, the bound and that it was killed",
+  workerCommandPastShMinutesIsKilled,
+);
+test("a worker command that runs past TT_SH_MINUTES is killed and reported to the worker", workerCommandPastShMinutesIsKilled);
