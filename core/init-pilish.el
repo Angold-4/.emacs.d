@@ -100,6 +100,8 @@
 (declare-function pilish--restore-input-text "pilish-ui")
 (declare-function pilish-send "pilish-input")
 (declare-function pilish-abort "pilish-input")
+(declare-function pilish--prepare-and-send "pilish-input")
+(declare-function pilish--session-transition-active-p "pilish-ui")
 (declare-function pilish-open-session-file "pilish")
 (declare-function pilish--display-startup-header "pilish-ui")
 (declare-function pilish--append-to-chat "pilish-ui")
@@ -410,21 +412,41 @@ started."
   "Time a send queued a follow-up for a busy session, or nil.
 Only a send made that recently makes the next RET mean interrupt.")
 
+(defun +pilish--session-settled-p (chat-buf)
+  "Return non-nil when CHAT-BUF has no run, abort or transition in flight.
+An aborted turn still owns the session while `pilish--aborted' is set, and
+a prompt sent then is queued and then discarded by the abort's settle."
+  (with-current-buffer chat-buf
+    (and (not (pilish--session-busy-p))
+         (not pilish--aborted)
+         (not (pilish--session-transition-active-p)))))
+
+(defun +pilish--return-text-to-input (chat-buf text)
+  "Put TEXT back at the top of CHAT-BUF's input buffer.
+`pilish--restore-input-text' finds the input buffer through the chat
+buffer, so this has to run in CHAT-BUF, not in the input buffer."
+  (when (buffer-live-p chat-buf)
+    (with-current-buffer chat-buf
+      (pilish--restore-input-text text))))
+
 (defun +pilish--deliver-when-idle (chat-buf input-buf text attempts)
-  "Send TEXT in INPUT-BUF once CHAT-BUF settles, trying ATTEMPTS times.
-Give the text back to INPUT-BUF rather than drop it when the session never
-settles."
+  "Send TEXT once CHAT-BUF settles, trying ATTEMPTS times.
+The text is sent straight through `pilish--prepare-and-send' rather than
+`pilish-send', which would queue it as a follow-up for a session that is
+still aborting, where the abort's settle clears it.  Give the text back to
+INPUT-BUF rather than drop it when it cannot be sent."
   (cond
    ((not (buffer-live-p chat-buf)) nil)
-   ((not (pilish--session-busy-p chat-buf))
-    (with-current-buffer input-buf
-      (when (derived-mode-p 'pilish-input-mode)
-        (pilish--restore-input-text text)
-        (pilish-send))))
+   ((+pilish--session-settled-p chat-buf)
+    (condition-case err
+        (with-current-buffer chat-buf
+          (pilish--prepare-and-send text))
+      ((error quit)
+       (+pilish--return-text-to-input chat-buf text)
+       (message "Pi: could not send the message (%s); it is in the input"
+                (error-message-string err)))))
    ((zerop attempts)
-    (with-current-buffer input-buf
-      (when (derived-mode-p 'pilish-input-mode)
-        (pilish--restore-input-text text)))
+    (+pilish--return-text-to-input chat-buf text)
     (message "Pi: still running, message returned to the input"))
    (t (run-at-time +pilish--interrupt-poll-interval nil
                    #'+pilish--deliver-when-idle
