@@ -20,6 +20,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { reduce } from "./core/reduce.ts";
+import { acceptedReplayRecords } from "./log-replay.ts";
 import { parseWorkerPromptRecord, SINGLE_WORKER_LANE, workerPromptPaths, type WorkerPromptMap, type WorkerPromptRecord } from "./core/worker-prompt.ts";
 import { resolveWorkerPrompts } from "./effects/worker-prompt.ts";
 import { curatorEvent, entryVerdictEvents, formatAnchor, planEntryEvents, validateLink, type CuratorProposal, type Entry } from "./core/entries.ts";
@@ -1333,9 +1334,10 @@ function timelineFromRecords(records: readonly LogRecord[], plan: RunPlanFile): 
   let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "", plan.ownerDirectives ?? [], init?.seats, plan);
   const phases: Timeline["phases"] = [];
   const rounds: Timeline["rounds"] = [];
-  const restarts = restartInstants(records);
-  const stops = records.filter((r) => r.kind === "stop").map((r) => r.ts);
-  for (const record of records) {
+  const accepted = [...acceptedReplayRecords(records)];
+  const restarts = restartInstants(accepted);
+  const stops = accepted.filter((r) => r.kind === "stop").map((r) => r.ts);
+  for (const record of accepted) {
     if (record.kind !== "event") continue;
     const before = state;
     const result = reduce(state, record.event);
@@ -1377,7 +1379,7 @@ export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
  * re-parsing the whole log once per status beat. */
 export function rebuildTimelineWithEvents(runDir: string, plan: RunPlanFile): { timeline: Timeline; events: MetricEvent[]; records: LogRecord[] } {
   const { records } = readLog(runPaths(runDir).events);
-  return { timeline: timelineFromRecords(records, plan), events: metricEvents(records), records };
+  return { timeline: timelineFromRecords(records, plan), events: metricEvents([...acceptedReplayRecords(records)]), records };
 }
 
 /** Folds every `"event"`-kind record in `records` (in order) through
@@ -1387,13 +1389,8 @@ export function rebuildTimelineWithEvents(runDir: string, plan: RunPlanFile): { 
 function foldEvents(base: State, records: readonly LogRecord[], lenient = false): State {
   installRecordedSeatAnchorRule();
   let state = base;
-  for (let i = 0; i < records.length; i++) {
-    const record = records[i];
+  for (const record of acceptedReplayRecords(records)) {
     if (record.kind !== "event") continue;
-    // A runner before the stale-review fix logged an event and THEN its
-    // rejection; the live conductor never applied it, so neither does
-    // recovery (otherwise such a run could never be resumed).
-    if (records[i + 1]?.kind === "rejected") continue;
     const result = reduce(state, record.event);
     if (!result.ok && lenient) {
       // Read-only views of a run written by an older runner revision: skip
