@@ -7,7 +7,6 @@
 // `<run>/conductor.log`, so the parent (this CLI invocation) returns the
 // run id immediately rather than blocking for the whole run.
 
-import { adoptRecordedPath } from "./effects/run-env.ts";
 // 07 design A1: ADMIT — the one gate `tt start`, `tt resume` and a program's
 // node start all run before anything is created or any event exists.
 import { admit, admitPiCommand } from "./effects/admit.ts";
@@ -1209,12 +1208,17 @@ function testStubReviews(): boolean {
  * script) to stay inside this packet's file scope. */
 async function runConductorProcess(runDir: string): Promise<void> {
   const p = runPaths(runDir);
-  // 07 design A1: the shell's own PATH, captured BEFORE `adoptRecordedPath`
-  // prepends the PATH this run recorded at its first start. ADMIT resolves the
-  // pinned pi against this one — a recorded path is never the source on resume
-  // (exex 07f1: a resume adopted a recorded brew `pi` 1.4.0).
+  // 07 design A1: a resume resolves the environment from the shell that runs
+  // it — the PATH the run recorded at its first start is never adopted. It
+  // used to be (`adoptRecordedPath`), and on 07f1 that record led a resume to
+  // a brew `pi` 1.4.0: ADMIT would have passed on the shell's pinned pi, and
+  // every agent this conductor spawns resolves `pi` on `process.env.PATH`
+  // (`spawnPiAgent`), so the recorded PATH would still have picked the wrong
+  // binary. A check that needs the recorded variables keeps getting them from
+  // the recorded check environment (`Conductor#checkEnv`), which is a
+  // different question. A shell without the pinned pi is `X:ENV_FAULT` from
+  // ADMIT, naming it.
   const shellPath = process.env.PATH ?? "";
-  adoptRecordedPath(runDir);
   const plan = JSON.parse(readFileSync(path.join(p.plan, "v1.json"), "utf8")) as RunPlanFile;
   const { piCommand, piArgsPrefix } = testPiInjection();
   // A plan's own limits (TT_*_MINUTES), then the test-only override.
