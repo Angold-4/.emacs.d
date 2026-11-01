@@ -16,6 +16,10 @@
 ;;   C-c m c   create (start or focus) a session in this workspace
 ;;   C-c m m   browse every previous session (all projects)
 ;;   C-c m a   pick the agent's model
+;;   C-c m t   run the `pi' CLI itself in a terminal (vterm)
+;;
+;; `:pi' opens a new session, a fresh chat and input buffer; `C-c m c'
+;; reuses the session this project already has.
 ;;
 ;; Pilish's own `C-c C-*' bindings are removed so this config's global
 ;; `C-c' bindings apply inside its buffers; sending is RET in the input
@@ -26,8 +30,9 @@
 ;; the rest of the Pi harness.  Disable with `+pilish-keep-menu' nil; the
 ;; rest of Pilish is on `M-x pilish-*'.  Pilish's startup header is
 ;; suppressed (`+pilish-startup-header' nil) because it advertises the
-;; stripped keys; completed thinking is removed (`+pilish-show-thinking'
-;; nil) so the transcript stays on prompts, answers, and tool output.
+;; stripped keys; thinking is removed (`+pilish-show-thinking' nil), live
+;; as well as completed, so the transcript stays on prompts, answers, and
+;; tool output.
 ;;
 ;; Chat buffer: Pilish's optional Evil integration normally puts the
 ;; read-only transcript in *motion* state.  We use the normal state instead
@@ -81,12 +86,34 @@
 (declare-function pilish--browse-switch-session "pilish-browse")
 (declare-function pilish--session-live-process-p "pilish-ui")
 (declare-function pilish-project-buffers "pilish-ui")
+(declare-function pilish--session-directory "pilish-ui")
+(declare-function pilish--find-session "pilish-ui")
+(declare-function pilish--get-chat-buffer "pilish-ui")
+(declare-function pilish--get-input-buffer "pilish-ui")
+(declare-function pilish--display-buffers "pilish-ui")
+(declare-function pilish--rebalance-input-window "pilish-ui")
+(declare-function pilish--window-can-split-for-input-p "pilish-ui")
+(declare-function pilish--split-input-below-chat "pilish-ui")
+(declare-function pilish--session-busy-p "pilish-ui")
+(declare-function pilish--followups-in-fifo-order "pilish-ui")
+(declare-function pilish--clear-followup-queue "pilish-ui")
+(declare-function pilish--restore-input-text "pilish-ui")
+(declare-function pilish-send "pilish-input")
+(declare-function pilish-abort "pilish-input")
+(declare-function pilish--prepare-and-send "pilish-input")
+(declare-function pilish--session-transition-active-p "pilish-ui")
 (declare-function pilish-open-session-file "pilish")
 (declare-function pilish--display-startup-header "pilish-ui")
 (declare-function pilish--append-to-chat "pilish-ui")
 (declare-function pilish--format-startup-banner-compact "pilish-ui")
 (declare-function pilish--thinking-hidden-stub "pilish-render")
+(declare-function pilish--display-thinking-start "pilish-render")
+(declare-function pilish--display-thinking-delta "pilish-render")
+(declare-function pilish--display-thinking-end "pilish-render")
 (declare-function evil-define-key* "evil-core")
+(declare-function vterm-mode "vterm")
+(declare-function vterm-send-string "vterm")
+(declare-function vterm-send-return "vterm")
 
 ;; Native Evil state for the chat buffer, set before `pilish-evil' loads.
 (setq pilish-evil-chat-state 'normal)
@@ -95,7 +122,10 @@
 
 (defcustom +pilish-provider "vercel-ai-gateway"
   "Provider passed to the `pi' CLI as `--provider'.
-Defaults to the Vercel AI Gateway.  Set to nil to let Pi choose."
+Defaults to the Vercel AI Gateway.  Pi rejects `--provider' unless
+`--model' is given too, so this is passed only alongside `+pilish-model';
+for the default `+pilish-model' nil, Pi applies the provider its settings
+remember.  Set to nil to let Pi choose."
   :type '(choice (const :tag "Vercel AI Gateway" "vercel-ai-gateway")
                  (const :tag "Let Pi choose" nil)
                  string)
@@ -105,6 +135,22 @@ Defaults to the Vercel AI Gateway.  Set to nil to let Pi choose."
   "Model passed to the `pi' CLI as `--model'.
 Nil (the default) lets Pi apply the model remembered in its settings."
   :type '(choice (const :tag "Use remembered model" nil) string)
+  :group 'tools)
+
+(defcustom +pilish-thinking nil
+  "Thinking level passed to the `pi' CLI as `--thinking'.
+Nil (the default) lets Pi apply the level its settings remember, which
+is the `defaultThinkingLevel' key Pi's own TUI writes.  Pi does not
+persist a level set over RPC, so without this every session starts on
+the remembered one again."
+  :type '(choice (const :tag "Use remembered level" nil)
+                 (const :tag "Off" "off")
+                 (const :tag "Minimal" "minimal")
+                 (const :tag "Low" "low")
+                 (const :tag "Medium" "medium")
+                 (const :tag "High" "high")
+                 (const :tag "Extra high" "xhigh")
+                 (const :tag "Max" "max"))
   :group 'tools)
 
 (defcustom +pilish-remember-model t
@@ -117,14 +163,14 @@ session."
   :group 'tools)
 
 (defcustom +pilish-show-thinking nil
-  "When non-nil, show completed assistant thinking in the transcript.
-The default removes completed thinking blocks entirely, so the chat stays
-on prompts, answers, and tool output.  Pilish itself would render them as
-a `> Thinking hidden...' stub; this module advises
-`pilish--thinking-hidden-stub' to render nothing instead, which Pilish's
-renderer supports as a block removal.  Live thinking is still streamed
-while the agent works (Pilish always shows that), and it disappears when
-the turn completes."
+  "When non-nil, show assistant thinking in the transcript.
+The default removes thinking entirely, so the chat stays on prompts,
+answers, and tool output.  Live streaming is suppressed by advising
+`pilish--display-thinking-start', `pilish--display-thinking-delta' and
+`pilish--display-thinking-end' to do nothing; that is the only live path,
+so nothing is written while the agent works.  Completed thinking and
+history reloads are suppressed by advising `pilish--thinking-hidden-stub'
+to render nothing, which Pilish's renderer supports as a block removal."
   :type 'boolean
   :group 'tools)
 
@@ -146,9 +192,15 @@ hints."
   :group 'tools)
 
 (defun +pilish--extra-args ()
-  "Return the `--provider'/`--model' args for `pilish-extra-args'."
-  (append (when +pilish-provider (list "--provider" +pilish-provider))
-          (when +pilish-model (list "--model" +pilish-model))))
+  "Return the startup args for `pilish-extra-args'.
+Pi requires `--model' whenever `--provider' is given, so with
+`+pilish-model' nil the provider is omitted and Pi applies the model its
+settings remember."
+  (append (when +pilish-thinking (list "--thinking" +pilish-thinking))
+          (when +pilish-model
+            (append (when +pilish-provider
+                      (list "--provider" +pilish-provider))
+                    (list "--model" +pilish-model)))))
 
 ;;;; Pi's data directory and the remembered model
 
@@ -221,8 +273,76 @@ stub line."
       (funcall orig normalized)
     ""))
 
+(defun +pilish--hide-streaming-thinking (orig &rest args)
+  "Skip live thinking rendering when `+pilish-show-thinking' is nil.
+Runs as :around advice on the streaming thinking display functions, the
+only path that writes live thinking: start opens the block, delta fills
+it, end closes it.  Suppressing all three leaves the transcript untouched
+while the agent works."
+  (when +pilish-show-thinking
+    (apply orig args)))
+
+(defun +pilish--drop-orphan-input-windows (chat-buf input-buf &rest _)
+  "Delete pi input windows whose chat buffer is not on screen.
+Runs as :after advice on `pilish--display-buffers'.  Showing a session
+takes over the window that showed the previous session's chat, because
+an input window is too short to split, so that session's input window is
+left behind with no chat to talk to.  Deleting it gives its lines back to
+the frame, so the displayed pair is rebalanced to the configured ratio."
+  (let ((shown (mapcar #'window-buffer (window-list nil 'nomini))))
+    (dolist (window (window-list nil 'nomini))
+      (when (window-live-p window)
+        (let ((buffer (window-buffer window)))
+          (when (and (with-current-buffer buffer
+                       (derived-mode-p 'pilish-input-mode))
+                     (not (memq (buffer-local-value 'pilish--chat-buffer buffer)
+                                shown))
+                     (eq t (window-deletable-p window)))
+            (delete-window window))))))
+  (let ((chat-win (get-buffer-window chat-buf))
+        (input-win (get-buffer-window input-buf)))
+    (when (and chat-win input-win)
+      (pilish--rebalance-input-window chat-win input-win))))
+
+(defun +pilish--display-in-selected-window (orig chat-buf input-buf &optional chat-only)
+  "Show the session in the selected window, not the tallest one.
+Runs as :around advice on `pilish--display-buffers', which bases the
+layout on the tallest splittable window: a session opened from a small
+window then takes over some other window's buffer.  Splitting the
+selected window keeps every other window, including the previous
+session's chat and input, exactly as it is.  An input window is too short
+to split, so it gives up its place to the window next to it, which keeps
+the previous session's region."
+  (let ((window (selected-window)))
+    (when (and (not chat-only)
+               (with-current-buffer (window-buffer window)
+                 (derived-mode-p 'pilish-input-mode))
+               (eq t (window-deletable-p window)))
+      (let ((next (or (window-in-direction 'above window)
+                      (window-in-direction 'below window))))
+        (delete-window window)
+        (when (window-live-p next)
+          (setq window next))))
+    (if (and (not chat-only)
+             (pilish--window-can-split-for-input-p window))
+        (with-selected-window window
+          (switch-to-buffer chat-buf)
+          (with-current-buffer chat-buf
+            (goto-char (point-max)))
+          (when-let* ((input-win (pilish--split-input-below-chat chat-buf input-buf)))
+            (select-window input-win)))
+      (funcall orig chat-buf input-buf chat-only))))
+
 (defun +pilish--install-advice ()
   "Install the Pilish advices this module relies on."
+  (unless (advice-member-p #'+pilish--display-in-selected-window
+                           'pilish--display-buffers)
+    (advice-add 'pilish--display-buffers
+                :around #'+pilish--display-in-selected-window))
+  (unless (advice-member-p #'+pilish--drop-orphan-input-windows
+                           'pilish--display-buffers)
+    (advice-add 'pilish--display-buffers
+                :after #'+pilish--drop-orphan-input-windows))
   (unless (advice-member-p #'+pilish--remember-model
                            'pilish--update-state-from-response)
     (advice-add 'pilish--update-state-from-response
@@ -231,6 +351,11 @@ stub line."
                            'pilish--thinking-hidden-stub)
     (advice-add 'pilish--thinking-hidden-stub
                 :around #'+pilish--thinking-hidden-stub))
+  (dolist (function '(pilish--display-thinking-start
+                      pilish--display-thinking-delta
+                      pilish--display-thinking-end))
+    (unless (advice-member-p #'+pilish--hide-streaming-thinking function)
+      (advice-add function :around #'+pilish--hide-streaming-thinking)))
   (unless (advice-member-p #'+pilish--display-startup-header
                            'pilish--display-startup-header)
     (advice-add 'pilish--display-startup-header
@@ -271,6 +396,144 @@ started."
   (unless (pilish-project-buffers)
     (pilish))
   (pilish-session-browser))
+
+;;;; Interrupting a busy turn
+
+(defconst +pilish--interrupt-window 3
+  "Seconds after a queued send in which a second RET interrupts instead.")
+
+(defconst +pilish--interrupt-poll-interval 0.2
+  "Seconds between checks that an aborted turn has settled.")
+
+(defconst +pilish--interrupt-timeout 10
+  "Seconds to wait for an aborted turn before the message goes back to input.")
+
+(defvar +pilish--queued-at nil
+  "Time a send queued a follow-up for a busy session, or nil.
+Only a send made that recently makes the next RET mean interrupt.")
+
+(defun +pilish--session-settled-p (chat-buf)
+  "Return non-nil when CHAT-BUF has no run, abort or transition in flight.
+An aborted turn still owns the session while `pilish--aborted' is set, and
+a prompt sent then is queued and then discarded by the abort's settle."
+  (with-current-buffer chat-buf
+    (and (not (pilish--session-busy-p))
+         (not pilish--aborted)
+         (not (pilish--session-transition-active-p)))))
+
+(defun +pilish--return-text-to-input (chat-buf text)
+  "Put TEXT back at the top of CHAT-BUF's input buffer.
+`pilish--restore-input-text' finds the input buffer through the chat
+buffer, so this has to run in CHAT-BUF, not in the input buffer."
+  (when (buffer-live-p chat-buf)
+    (with-current-buffer chat-buf
+      (pilish--restore-input-text text))))
+
+(defun +pilish--deliver-when-idle (chat-buf input-buf text attempts)
+  "Send TEXT once CHAT-BUF settles, trying ATTEMPTS times.
+The text is sent straight through `pilish--prepare-and-send' rather than
+`pilish-send', which would queue it as a follow-up for a session that is
+still aborting, where the abort's settle clears it.  Give the text back to
+INPUT-BUF rather than drop it when it cannot be sent."
+  (cond
+   ((not (buffer-live-p chat-buf)) nil)
+   ((+pilish--session-settled-p chat-buf)
+    (condition-case err
+        (with-current-buffer chat-buf
+          (pilish--prepare-and-send text))
+      ((error quit)
+       (+pilish--return-text-to-input chat-buf text)
+       (message "Pi: could not send the message (%s); it is in the input"
+                (error-message-string err)))))
+   ((zerop attempts)
+    (+pilish--return-text-to-input chat-buf text)
+    (message "Pi: still running, message returned to the input"))
+   (t (run-at-time +pilish--interrupt-poll-interval nil
+                   #'+pilish--deliver-when-idle
+                   chat-buf input-buf text (1- attempts)))))
+
+(defun +pilish--interrupt-p (chat-buf busy)
+  "Return non-nil when this RET means interrupt the BUSY CHAT-BUF session.
+True when the session is busy, a send queued something within
+`+pilish--interrupt-window', and that queue still has text.  The queue is
+buffer-local in CHAT-BUF, not in the input buffer."
+  (and busy
+       +pilish--queued-at
+       (<= (- (float-time) +pilish--queued-at) +pilish--interrupt-window)
+       (with-current-buffer chat-buf
+         (not (string-empty-p
+               (mapconcat #'identity (pilish--followups-in-fifo-order) ""))))))
+
+(defun +pilish/send-or-interrupt ()
+  "Send the input buffer, interrupting a busy turn on a second RET.
+The first RET against a busy session queues a follow-up, as Pilish always
+did.  A second RET within `+pilish--interrupt-window' takes that text out
+of the queue, aborts the turn, and sends it once Pi settles, so the abort's
+queue clearing cannot lose it."
+  (interactive)
+  (let* ((chat-buf (pilish--get-chat-buffer))
+         (busy (and chat-buf (pilish--session-busy-p chat-buf)))
+         (empty (string-empty-p (string-trim (buffer-string)))))
+    (cond
+     ((+pilish--interrupt-p chat-buf busy)
+      (let ((text (mapconcat #'identity
+                             (with-current-buffer chat-buf
+                               (pilish--followups-in-fifo-order))
+                             "\n\n")))
+        (with-current-buffer chat-buf
+          (pilish--clear-followup-queue))
+        (setq +pilish--queued-at nil)
+        (pilish-abort)
+        (message "Pi: interrupting")
+        (+pilish--deliver-when-idle
+         chat-buf (current-buffer) text
+         (round (/ +pilish--interrupt-timeout +pilish--interrupt-poll-interval)))))
+     (t
+      (setq +pilish--queued-at (when (and busy (not empty)) (float-time)))
+      (pilish-send)))))
+
+;;;; New sessions
+
+(defvar +pilish--session-counter 0
+  "Sessions `+pilish/new' has opened since Emacs started.")
+
+(defun +pilish--free-session-name (directory)
+  "Return a session name in DIRECTORY that no live session uses.
+The session name is part of both buffer names and is what keeps one
+session's chat and input apart from another's, so it has to be free
+before `pilish' creates a new pair instead of focusing the old one."
+  (let (name)
+    (while (progn
+             (setq +pilish--session-counter (1+ +pilish--session-counter)
+                   name (format "pi%d" +pilish--session-counter))
+             (pilish--find-session directory name)))
+    name))
+
+(defun +pilish--session-buffers ()
+  "Return this session's chat and input buffers as a cons.
+Works from either buffer of the pair."
+  (cons (pilish--get-chat-buffer) (pilish--get-input-buffer)))
+
+(defun +pilish--register-session (buffers)
+  "Attach the session BUFFERS pair to the current perspective.
+The pair is made with `generate-new-buffer', which the after-major-mode
+auto-add can miss, so `C-x b' would not find both in this workspace."
+  (when (and (bound-and-true-p persp-mode) (fboundp 'persp-add-buffer))
+    (dolist (buffer buffers)
+      (when (buffer-live-p buffer)
+        (persp-add-buffer buffer)))))
+
+(defun +pilish/new ()
+  "Open a new Pi session: a fresh chat and a fresh input buffer.
+`pilish' without a session name reuses the session this project already
+has, so a new one needs a free name."
+  (interactive)
+  (require 'pilish)
+  (pilish (+pilish--free-session-name (pilish--session-directory)))
+  (+pilish--register-session (+pilish--session-buffers)))
+
+(with-eval-after-load 'evil
+  (evil-ex-define-cmd "pi" #'+pilish/new))
 
 ;;;; Remove Pilish's own prefix keys
 
@@ -319,7 +582,9 @@ TAB folds a tool/thinking block."
         "a" #'pilish-evil-append-input
         (kbd "RET") #'pilish-visit-file
         (kbd "TAB") #'pilish-toggle-tool-section
-        [tab] #'pilish-toggle-tool-section))))
+        [tab] #'pilish-toggle-tool-section)
+      (evil-define-key* 'normal pilish-input-mode-map
+        (kbd "RET") #'+pilish/send-or-interrupt))))
 
 ;;;; Pilish
 
@@ -339,8 +604,8 @@ TAB folds a tool/thinking block."
   ;; each window keeps its own point and scroll.
   (setq pilish-input-window-display 'always
         pilish-input-window-height 0.3)
-  ;; Completed thinking is removed by default (see the stub advice); when
-  ;; shown, Pilish's default visible mode is used.
+  ;; Thinking is removed by default (see the stub and streaming advice);
+  ;; when shown, Pilish's default visible mode is used.
   (setq pilish-thinking-display (if +pilish-show-thinking 'visible 'hidden))
   (defalias 'pi 'pilish)
   (+pilish--strip-default-keys)
@@ -351,6 +616,26 @@ TAB folds a tool/thinking block."
     (+pilish--setup-evil))
   (when (featurep 'pilish-evil)
     (+pilish--setup-evil)))
+
+;;;; Pi's own terminal UI
+
+(defun +pilish/cli ()
+  "Start or focus the `pi' CLI in a dedicated vterm buffer.
+This runs Pi's own terminal UI, not Pilish's Emacs-native frontend; Pi
+applies the provider and model remembered in its settings.  Like
+`+vterm/new', the buffer starts in the Emacs launch directory."
+  (interactive)
+  (require 'vterm)
+  (let ((buffer-name "*pi*"))
+    (if-let ((buffer (get-buffer buffer-name)))
+        (switch-to-buffer buffer)
+      (let ((buffer (generate-new-buffer buffer-name)))
+        (switch-to-buffer buffer)
+        (vterm-mode)
+        (vterm-send-string "pi")
+        (vterm-send-return)))))
+
+(keymap-global-set "C-c m t" #'+pilish/cli)
 
 (provide 'init-pilish)
 ;;; init-pilish.el ends here
