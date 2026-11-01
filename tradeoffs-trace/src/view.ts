@@ -779,23 +779,22 @@ function failedCheckCommands(runDir: string, phase: PhaseState): string[] | unde
   }
 }
 
-/** 07g2 (R9): the failing step's own output, from the same check record the
- * status reads its step name from. Undefined when the record names none (a
- * silent step's output is empty, and the status marks it `silent` instead). */
-function failingStepOutput(runDir: string, phase: PhaseState): string | undefined {
+/** R9: each blocker names its own command's last shell step and output.
+ * Never substitute the phase's first-failure summary for another command. */
+function failingStepNote(runDir: string, phase: PhaseState, command: string): string {
   const candidateSha = phase.checks?.candidateSha ?? phase.candidate?.sha;
-  if (!candidateSha) return undefined;
+  if (!candidateSha) return "";
   try {
     const record = parseCheckRecord(
       JSON.parse(fs.readFileSync(path.join(runPaths(runDir).checks, candidateSha, "record.json"), "utf8")),
     );
-    if (!record) return undefined;
-    if (record.tier !== (phase.checks?.tier ?? "round")) return undefined;
-    const failed = record.commands.find((c) => !c.passed && typeof c.failingStepOutput === "string");
-    const output = failed?.failingStepOutput?.trim();
-    return output && output.length > 0 ? output.split("\n")[0] : undefined;
+    if (!record || record.tier !== (phase.checks?.tier ?? "round")) return "";
+    const failed = record.commands.find((c) => !c.passed && c.command === command);
+    if (!failed?.failingStep) return "";
+    const output = failed.failingStepOutput?.trim().split("\n")[0];
+    return ` (failing step: \`${failed.failingStep}\`${failed.failingStepSilent ? ", silent" : output ? `, output: ${output}` : ""})`;
   } catch {
-    return undefined;
+    return "";
   }
 }
 
@@ -840,7 +839,11 @@ export function whyReport(runDir: string, plan: RunPlanFile): WhyReport {
     phase: phase.phase,
     accepted: blockers.length === 0,
     ...(phase.candidate ? { candidate: phase.candidate.sha } : {}),
-    blockers: blockers.map((b) => ({ kind: b.kind, detail: b.detail, command: b.command })),
+    blockers: blockers.map((b) => ({
+      kind: b.kind,
+      detail: b.detail + (b.kind === "check" ? failingStepNote(runDir, phase, b.command) : ""),
+      command: b.command,
+    })),
     exceptions: evaluationExceptions(phase).map((e) => `${e.kind}: ${e.detail}`),
     followUpNotes: isStructured(phase.contract)
       ? phaseItemOutcomes(phase).flatMap((o) =>
@@ -904,13 +907,8 @@ export function buildView(
   // simple command the shell ran last before the non-zero exit) and marks a
   // step that printed nothing as silent. The step comes from the check record
   // the conductor wrote, never from re-running the check here.
-  const failingStep = phase.checks?.passed === false ? phase.checks?.failingStep : undefined;
-  const stepOutput = failingStep ? failingStepOutput(runDir, phase) : undefined;
-  const stepNote = failingStep
-    ? ` (failing step: \`${failingStep}\`${phase.checks?.failingStepSilent ? ", silent" : stepOutput ? `, output: ${stepOutput}` : ""})`
-    : "";
   const reasons = acceptanceBlockers(phase, failedCheckCommands(runDir, phase)).map(
-    (b) => `${b.detail}${b.kind === "check" ? stepNote : ""} — ${b.command}`,
+    (b) => `${b.detail}${b.kind === "check" ? failingStepNote(runDir, phase, b.command) : ""} — ${b.command}`,
   );
   // Plan 06n (A6): the header's round is the round of the last ROUND_STARTED,
   // so it always equals the events. The old `timeline.rounds.length + 1`

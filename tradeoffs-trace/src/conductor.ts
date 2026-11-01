@@ -14617,8 +14617,9 @@ export class Conductor {
       } else if (passed) {
         this.#applyEvent({ type: "CHECKS_PASSED" });
       } else {
-        // 07g2 (A4/R9): the failing command's own record names the step the
-        // shell ran last; the status line reads it from the phase's checks.
+        // Compatibility summary for event-log readers. Per-command step and
+        // output live in recordCommands; blocker lines read those records,
+        // never this first-failure summary.
         const failedCommand = recordCommands.find((c) => !c.passed && c.failingStep);
         this.#applyEvent({
           type: "CHECKS_FAILED",

@@ -200,6 +200,58 @@ test("a silent failing check step is named with its output", async () => {
   }
 });
 
+test("two failing check commands each name their own failing step", async () => {
+  const commands = ["true && test -z x && true", "true && sh -c 'echo second-boom >&2; exit 4'"];
+  for (const [index, command] of commands.entries()) {
+    const setup = await setupConductor({
+      checks: [command, "echo MUST_NOT_RUN"],
+      phaseChecks: ["true"],
+      rounds: 1,
+      stubReviews: true,
+      deadlines: { ...FAST, checkMs: 10_000 },
+      workerScript: () => quickWorker(),
+      reviewerScriptFor: (seat, state) => stubReviewer(seat, state),
+    });
+    try {
+      await setup.conductor.start();
+      await waitFor(() => setup.conductor.state.phase.checks?.passed === false, 60_000, 100, setup.runDir);
+      await setup.conductor.stop();
+      const record = checkRecords(setup.runDir).find((r) => r.candidateSha === setup.conductor.state.phase.checks?.candidateSha)!;
+      const recorded = record.commands as Array<Record<string, unknown>>;
+      assert.equal(recorded.length, 1, "stop at the first failure; later checks cost nothing");
+      const failed = recorded[0]!;
+      assert.equal(failed.command, command);
+      assert.equal(failed.failingStep, index === 0 ? "test -z x" : "sh -c echo second-boom >&2; exit 4");
+      if (index === 0) {
+        assert.equal(failed.failingStepOutput, "");
+        assert.equal(failed.failingStepSilent, true);
+      } else {
+        assert.match(String(failed.failingStepOutput), /second-boom/);
+      }
+      // The command record, not the optional phase-wide compatibility
+      // summary, is authoritative. Replay also supports logs lacking that
+      // summary (or carrying a stale first-step summary from older code).
+      const log = path.join(setup.runDir, "events.jsonl");
+      const rows = fs.readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      for (const row of rows) {
+        if (row.kind === "event" && row.event?.type === "CHECKS_FAILED") {
+          row.event.failingStep = "old unrelated step";
+          row.event.failingStepSilent = true;
+        }
+      }
+      fs.writeFileSync(log, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+      const view = buildView(setup.runDir, setup.plan, false);
+      const status = [view.verdict ?? "", ...(view.addressing ?? [])].join("\n");
+      assert.match(status, index === 0
+        ? /failing step: `test -z x`, silent/
+        : /failing step: `sh -c echo second-boom >&2; exit 4`, output: second-boom/);
+      assert.doesNotMatch(status, /old unrelated step/);
+    } finally {
+      await teardown(setup);
+    }
+  }
+});
+
 test("a failing check step's own output is named in the status line", async () => {
   // R9: a step that prints its failure is named with that output too — the
   // record keeps it and the status line shows it.
