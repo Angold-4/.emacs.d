@@ -230,6 +230,7 @@ import {
   evidenceHasAnchor,
   itemsFromPhase,
   itemTestVerifies,
+  parseVerify,
   requirementAndConstraintItems,
   phaseItemOutcomes,
   repairItemLines,
@@ -1645,6 +1646,72 @@ export function parseOwnerPointFields(text: string): { fields: Partial<OwnerPoin
   }
   const missing = (["domain", "where", "expected", "doneWhen"] as const).filter((k) => !fields[k]);
   return { fields, missing };
+}
+
+/** A repair ruling becomes ordinary finding work before MAP. The same path
+ * mapping as a red REDUCE check owns it; the owner's choice and the rejecting
+ * seats supply its expected outcome. No evaluator triage or new phase state
+ * is needed. A missing domain is an exception, never an empty repair. */
+export function ownerRepairPointFor(
+  phase: PhaseState,
+  request: PhaseState["ownerRequests"][number],
+  declared: DeclaredTestCommands,
+): { finding: Finding; replaces?: string } | { reason: string } | undefined {
+  if (request.status !== "resolved" || !request.resolution ||
+    !isRepairForcingOption(request.origin, request.resolution.option)) return undefined;
+  const id = `F-${phase.phaseId}-owner-repair-${request.id}`;
+  const correction = phase.corrections.find((c) => c.id === request.linkedCorrectionId);
+  const target = correction?.targetRecordId;
+  const finding = phase.findings.find((f) => f.id === (request.linkedFindingId ?? target));
+  const decision = phase.decisions.find((d) => d.id === (request.linkedDecisionId ?? finding?.linkedDecisionId ?? target));
+  const existing = phase.findings.find((f) => f.id === id);
+  if (existing) return { finding: existing, ...(finding?.status === "open" ? { replaces: finding.id } : {}) };
+  const message = phase.messages?.find((m) => m.id === request.linkedMessageId);
+  const ballots = (request.relatedBallots ?? phase.ballots.filter((b) => b.decisionId === decision?.id))
+    .filter((b) => b.vote === "reject");
+  const evidence = [
+    finding?.where, finding?.evidence, finding?.expected,
+    decision?.choice, decision?.whyItMatters, decision?.recommendation.choice, decision?.recommendation.reason,
+    ...(decision?.alternatives.map((a) => `${a.option}: ${a.consequence}`) ?? []),
+    ...ballots.flatMap((b) => [...b.evidence, b.rationale]),
+    correction?.correctionText, message?.context, ...(message?.evidence ?? []),
+    request.reason, request.resolution.note,
+  ].filter((s): s is string => typeof s === "string" && s.length > 0).join("\n");
+  const owner = failingDomainOf(evidence, phase.contract.domains ?? []);
+  if (!owner) return { reason: `owner repair ${request.id} names no file owned by a declared domain; the lead must rewrite the point` };
+  const fields = parseOwnerPointFields(evidence).fields;
+  const anchor = evidenceFileAnchors(evidence).find((a) => a.path === owner.path);
+  const where = finding?.where && domainOf(whereKey(finding.where).split(" ")[0], phase.contract.domains) === owner.domain
+    ? finding.where : `${owner.path}:${anchor?.start ?? 1}`;
+  const itemId = finding?.itemId ?? finding?.item ?? decision?.itemId ?? fields.item;
+  const item = flatItems(itemsFromPhase(phase.contract)).find((i) => i.id === itemId);
+  const tests: TestVerify[] = [];
+  for (const citation of evidence.matchAll(/\btest\s+(?:final\s+)?(?:"[^"]+"|[\w./:-]+::[\w.:-]+)/g)) {
+    for (const verify of parseVerify(citation[0])) if (verify.kind === "test") tests.push(verify);
+  }
+  if (item) tests.push(...itemTestVerifies(item));
+  const doneWhen = finding?.doneWhen ?? fields.doneWhen ??
+    (finding?.reproduction?.result === "reproduced" ? finding.reproduction.command : undefined) ??
+    lostTestsDoneWhen(tests, declared);
+  if (tests.length > 0 && !doneWhen) return { reason: `owner repair ${request.id} names a test with no declared command; the lead must supply its doneWhen` };
+  const option = request.resolution.option;
+  const label = request.options.find((o) => o.id === option)?.label ?? option;
+  return {
+    finding: {
+      id, version: 1, phaseId: phase.phaseId, kind: "defect", severity: "blocking",
+      raisedBy: "conductor", status: "open", boundCandidateSha: phase.candidate?.sha ?? request.boundCandidateSha ?? "",
+      domain: owner.domain, where, evidence,
+      expected: [
+        `Owner ${request.id}: ${option} (${label}). ${request.resolution.note ?? ""}`.trim(),
+        finding?.expected,
+        ...ballots.map((b) => `${b.reviewer} rejected: ${b.rationale}`),
+      ].filter(Boolean).join("\n"),
+      ...(decision ? { linkedDecisionId: decision.id } : {}),
+      ...(itemId ? { itemId, item: itemId } : {}),
+      ...(doneWhen ? { doneWhen } : {}),
+    },
+    ...(finding?.status === "open" ? { replaces: finding.id } : {}),
+  };
 }
 
 /** Plan 07f (A3/§3.2/§3.3): what an owner correction does, whichever state it
@@ -9787,11 +9854,11 @@ export class Conductor {
         ...f,
         ...(inferred ? { domain: inferred } : {}),
         disposition: triageRecordFor(this.#state.phase.triage, f.id)?.disposition ??
-          (f.raisedBy === "conductor" ? { kind: "fix" as const, reason: "a final check failure is fixed in its file's domain" } : undefined),
+          (f.raisedBy === "conductor" ? { kind: "fix" as const, reason: "a conductor point is fixed in its file's domain" } : undefined),
       };
     });
-    // 07g1: only points are fixer work. A voted-down or vetoed decision goes
-    // to the seats (or the owner), never to a fixer.
+    // Only points are fixer work. An owner repair resolution has already
+    // materialized its decision or finding as a point before this MAP.
     const open = new Set(this.#openPointsOn(record.base));
     const points: FixTask["findings"] = findings.filter((f) => open.has(f.id));
     const cap = this.#state.phase.contract.fixers ?? DEFAULT_FIXERS;
@@ -9978,11 +10045,11 @@ export class Conductor {
       .map((f) => f.id);
   }
 
-  /** §7a.3: a mechanical item point without a command closes by an approved
+  /** §7a.3: a conductor point without a command closes by an approved
    * domain review with green fix checks. Read only replayed checkpoints and
    * require that the reviewed head actually merged into this candidate. */
   #approvedItemPointReview(finding: Finding, candidateSha: string): string | undefined {
-    if (finding.raisedBy !== "conductor" || !finding.itemId || finding.doneWhen || candidateSha === finding.boundCandidateSha) return undefined;
+    if (finding.raisedBy !== "conductor" || finding.doneWhen || candidateSha === finding.boundCandidateSha) return undefined;
     for (const round of this.#state.phase.rounds ?? []) {
       for (const pass of round.fixed?.domains ?? []) {
         if (!pass.sha || !pass.facts?.checkPassed || !pass.review?.quality.ok ||
@@ -12011,10 +12078,27 @@ export class Conductor {
     if (!last) return;
     if (last.lanes.length > 0) this.#recordRegression(last);
     const limit = this.#state.phase.contract.roundsAllowed ?? this.#plan.rounds ?? boundDefinition("rounds").defaultValue;
+    // Materialize resolved owner work before reading the MAP checkpoint. A
+    // stable finding id makes a crash between this event and MAP replay-safe.
+    for (const request of this.#state.phase.ownerRequests) {
+      if (request.resolvedBinding?.candidateSha !== this.#state.phase.candidate?.sha) continue;
+      const point = ownerRepairPointFor(this.#state.phase, request, this.#declaredTestCommands());
+      if (!point) continue;
+      if ("reason" in point) {
+        this.#parkMergedCheck(last.round, point.reason);
+        return;
+      }
+      if (!this.#state.phase.findings.some((f) => f.id === point.finding.id)) this.#applyEvent({ type: "FINDING_RAISED", finding: point.finding });
+      if (point.replaces) this.#applyEvent({ type: "FINDING_MERGED", findingId: point.replaces, into: point.finding.id, byReviewer: "owner" });
+    }
     // A completed acceptance hand-off that was rejected starts another loop.
     // A stopped REDUCE reuses the existing fixed checkpoint and its base.
     let resume = last.lanes.length === 0 &&
       !(last.fixed?.candidate && last.fixed.candidate === this.#state.phase.candidate?.sha);
+    // A REDUCE checkpoint cannot consume a point the owner added after MAP.
+    // Keep the integrated work as the next base and give that point a new MAP.
+    if (last.fixed && this.#openPointsOn(last.fixed.candidate ?? last.base)
+      .some((id) => !last.fixed!.tasks.some((t) => t.findingIds.includes(id)))) resume = false;
     let base = last.picked?.sha ?? last.fixed?.candidate ?? last.base;
     for (;;) {
       const round = resume ? last.round : last.round + 1;

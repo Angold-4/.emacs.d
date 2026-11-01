@@ -1120,3 +1120,88 @@ test("a failing final check becomes a point in the failing file's domain", async
     await teardown(setup);
   }
 });
+
+
+/** Resolve through the same bound inbox command the owner UI writes. */
+function resolveRepair(setup: TestConductorSetup, request: import("../../src/core/types.ts").OwnerRequest): void {
+  fs.writeFileSync(path.join(runPaths(setup.runDir).inbox, `resolve-${request.id}.json`), JSON.stringify({
+    commandId: `resolve-${request.id}`,
+    type: "resolve",
+    recordKind: "request",
+    option: "reject_and_repair",
+    binding: {
+      runId: setup.conductor.state.phase.runId,
+      phaseId: "p1",
+      candidateSha: setup.conductor.state.phase.candidate!.sha,
+      contractVersion: setup.conductor.state.phase.contract.contractVersion,
+      recordId: request.id,
+      recordVersion: request.version,
+    },
+  }));
+}
+
+for (const namesTest of [true, false]) test(namesTest
+  ? "an owner reject_and_repair on a failed vote dispatches that domain's fixer"
+  : "an owner repair without a named test closes through its domain review", async () => {
+  const promptDir = fs.mkdtempSync("/tmp/tt-owner-repair-prompts-");
+  const promptLog = path.join(promptDir, "prompts.txt");
+  const setup = await setupConductor({
+    phase: fixPhase(),
+    checks: ["true"],
+    stubReviews: true,
+    deadlines: { ...FAST, inboxPollMs: 40 },
+    rerun: BOOKING_DONE,
+    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
+    workerScript: () => laneWorkerWithDecision(1, "a", "delegated"),
+    laneWorkerScriptFor: (lane, round) => laneWorkerWithDecision(round, lane, "delegated"),
+    laneReviewerScriptFor: (seat, candidate, state) => {
+      const review = reviewerVetoing(seat, candidate, state);
+      if (seat === "M" && namesTest) {
+        const submit = review.steps[2] as { args: { ballots: Array<{ rationale: string }> } };
+        submit.args.ballots[0].rationale += '; test "booking/cache.test.ts::rejects unsafe prices"';
+      }
+      return review;
+    },
+    pickScriptFor: (seat, state) => pickVote(seat, state.phase.rounds?.length ?? 1, "a"),
+    fixerScriptFor: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: "printf 'fixed\\n' > booking-fixed.txt" },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (seat, state) => laneReview(seat, state.phase.contract.contractVersion),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 90_000, 50, setup.runDir);
+    const request = setup.conductor.state.phase.ownerRequests.find((r) => r.status === "open" && r.origin === "failed_vote");
+    assert.ok(request, "a failed vote asks the owner to rule");
+    const before = readEvents(setup.runDir).length;
+    const original = setup.conductor.state.phase.candidate!.sha;
+    resolveRepair(setup, request);
+    await waitFor(() => readEvents(setup.runDir).slice(before).some((r) =>
+      r.kind === "event" && (r.event as { type?: string }).type === "OWNER_REQUEST_RESOLVED"), 20_000, 50, setup.runDir);
+    await waitFor(() => fixerIntents(setup.runDir).length > 0 || setup.conductor.state.phase.phase === "AWAITING_OWNER" ||
+      readEvents(setup.runDir).slice(before).some((r) => r.kind === "event" && (r.event as { type?: string }).type === "FREEZE_COMPLETED"),
+      90_000, 50, setup.runDir);
+    assert.equal(fixerIntents(setup.runDir).length, 1, "the owner's ruling dispatches a fixer before another review");
+    const point = setup.conductor.state.phase.findings.find((f) => f.linkedDecisionId === request.linkedDecisionId && f.domain === "booking");
+    assert.ok(point, "the rejected decision became a booking point");
+    assert.equal(point.doneWhen, namesTest ? BOOKING_DONE : undefined, "a named test gets the plan's declared rerun command");
+    assert.match(point.expected ?? "", /reject_and_repair/);
+    assert.match(point.expected ?? "", /VETO_REASON/);
+    await waitFor(() => fs.existsSync(promptLog) && fs.readFileSync(promptLog, "utf8").includes(point.id), 20_000, 50, setup.runDir);
+    const prompt = fs.readFileSync(promptLog, "utf8").split("\n=====\n").find((p) => p.includes(point.id));
+    assert.match(prompt ?? "", /domain booking/);
+    assert.match(prompt ?? "", /VETO_REASON/);
+    assert.match(prompt ?? "", /reject_and_repair/);
+    await waitFor(() => setup.conductor.state.phase.candidate!.sha !== original, 90_000, 50, setup.runDir);
+    const fixed = setup.conductor.state.phase.rounds!.find((r) => r.fixed?.tasks.some((t) => t.findingIds.includes(point.id)));
+    assert.deepEqual(fixed?.fixed?.tasks.map((t) => t.domain), ["booking"]);
+    assert.notEqual(fixed?.fixed?.candidate, original, "the repair reached the candidate");
+  } finally {
+    await teardown(setup);
+    cleanupDir(promptDir);
+  }
+});

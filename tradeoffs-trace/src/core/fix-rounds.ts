@@ -1,8 +1,8 @@
 // 07g1 (design A3): the fix-round task rule. A fix round takes POINTS only —
 // an open finding triaged `fix`, with the domain of the files it cites — and
 // groups them by domain, one fixer per domain. A decision the seats vetoed or
-// the evaluator triaged is never fixer work: it goes to the seats' vote or to
-// the owner. This module is the ONE place that decides those tasks; the
+// the evaluator triaged is never fixer work by itself: it goes to the seats'
+// vote or the owner. An owner repair ruling creates a finding before MAP. This module is the ONE place that decides those tasks; the
 // conductor only runs what it returns. It is pure: no clock, no I/O, no model.
 
 import { domainOf, whereKey, type Domain } from "./domains.ts";
@@ -44,7 +44,8 @@ export interface FixTask {
  * Exported so the conductor's prompt and its tests name exactly one text. */
 export const FIXER_DUTY =
   "You are a fixer. You fix exactly the points below and nothing else: change only what they need. " +
-  "A voted-down or vetoed decision is never your task — it goes to the seats or the owner; you still decide no trade-off yourself. " +
+  "An owner repair ruling reaches you as a point; carry out its expected outcome. " +
+  "A voted-down or vetoed decision alone goes to the seats or the owner; you still decide no trade-off yourself. " +
   "If you meet a decision that changes scope, behaviour or cost, report it as a disclosure in submit_phase instead of deciding it. " +
   "When you are done, call submit_phase with your decisions, assumptions and deviations; you owe no item coverage and no answers to other findings.";
 
