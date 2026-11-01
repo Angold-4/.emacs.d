@@ -17,6 +17,13 @@
 // The prune is deliberately conservative about what counts as a build target:
 // only the well-known directories in `BUILD_TARGET_DIRS`, only inside this
 // run's own directory, and never a path the caller did not name.
+//
+// A repository is not flat, so the walk is not depth-limited: a node's build
+// target may sit under a package directory (`crates/api/target`,
+// `packages/web/node_modules`) as easily as at the checkout's root. The walk
+// therefore visits every directory of a candidate checkout, never descends
+// into `.git` or a symbolic link (so it cannot loop), and still removes only
+// the names in `BUILD_TARGET_DIRS`.
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -27,10 +34,11 @@ import * as path from "node:path";
  * worktrees it is about to delete anyway. */
 export const BUILD_TARGET_DIRS = ["target", "node_modules", "dist", "build", ".next", "coverage", "__pycache__", ".pytest_cache"] as const;
 
-/** How deep under a candidate checkout the prune looks. A build target is a
- * top-level or one-level directory in practice; a deeper walk would risk
- * deleting a checked-in directory that happens to share a name. */
-const MAX_DEPTH = 2;
+/** How many directories one candidate checkout's walk may visit. A bound on
+ * a pathological tree (a checkout is not supposed to contain millions of
+ * directories); it is not a depth limit, so a nested package's target is
+ * reached at any depth. */
+const MAX_VISITED = 200_000;
 
 export interface PruneResult {
   /** Every directory this prune removed, in the order it removed them. */
@@ -83,8 +91,9 @@ function makeWritable(dir: string): void {
   }
 }
 
-function pruneTargetsUnder(dir: string, depth: number, removed: string[]): void {
-  if (depth > MAX_DEPTH) return;
+function pruneTargetsUnder(dir: string, visited: { count: number }, removed: string[]): void {
+  if (visited.count >= MAX_VISITED) return;
+  visited.count += 1;
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -92,13 +101,16 @@ function pruneTargetsUnder(dir: string, depth: number, removed: string[]): void 
     return;
   }
   for (const entry of entries) {
+    // `isDirectory()` is false for a symbolic link, so the walk never follows
+    // one out of the checkout (and never loops through one).
     if (!entry.isDirectory()) continue;
+    if (entry.name === ".git") continue;
     const full = path.join(dir, entry.name);
     if ((BUILD_TARGET_DIRS as readonly string[]).includes(entry.name)) {
       rmDir(full, removed);
       continue;
     }
-    pruneTargetsUnder(full, depth + 1, removed);
+    pruneTargetsUnder(full, visited, removed);
   }
 }
 
@@ -126,6 +138,13 @@ export function pruneRunTargets(
   const lanesDir = path.join(runDir, "worktrees");
   if (fs.existsSync(lanesDir) && fs.readdirSync(lanesDir).length === 0) rmDir(lanesDir, removed);
   const candidates = path.join(runDir, "candidates");
-  if (fs.existsSync(candidates)) pruneTargetsUnder(candidates, 0, removed);
+  if (fs.existsSync(candidates)) {
+    for (const entry of fs.readdirSync(candidates, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      // One visit budget per candidate checkout, so one huge tree does not
+      // starve the next.
+      pruneTargetsUnder(path.join(candidates, entry.name), { count: 0 }, removed);
+    }
+  }
   return { removed };
 }
