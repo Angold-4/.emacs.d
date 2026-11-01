@@ -312,5 +312,4 @@ async function stopLeavesNoSchedulerProcess(): Promise<void> {
   }
 }
 
-test("plan 07h2 (R5, program f345a473): tt program stop leaves no scheduler process, and no node starts afterwards", stopLeavesNoSchedulerProcess);
 test("tt program stop leaves no scheduler process", stopLeavesNoSchedulerProcess);

@@ -22,7 +22,7 @@ import { admit, admitPiCommand } from "./effects/admit.ts";
 import { admitRefusalText } from "./core/admit.ts";
 import { triageRecordFor } from "./core/triage.ts";
 import type { RequirementItem } from "./core/items.ts";
-import { readRunState } from "./effects/runner.ts";
+import { readRunState, installedRunnerRoot } from "./effects/runner.ts";
 import { hasLintErrors, lintPlan } from "./core/plan-lint.ts";
 import { processAlive } from "./effects/sweep.ts";
 import { envBlockedLine } from "./core/env-preflight.ts";
@@ -517,11 +517,14 @@ export interface SchedulerOptions {
   /** Plan 07h2 (A2/R3): the exporter a node's own start re-runs over the
    * program's `--source` file. Injectable, so a test needs no Emacs; the
    * default is `TT_EXPORT_COMMAND <source>`, else the same Emacs batch
-   * exporter `tt program start` is given. Absent (and unconfigured): a node
-   * starts from the snapshot in `program.json`, exactly as on the base. */
+   * exporter `tt program start` is given. With a source file and no exporter
+   * at all a node cannot read the plan file as it is NOW, so it is blocked
+   * with `X:PLAN_DEFECT` instead of running the program-start snapshot (A2). */
   exporter?: ProgramExporter;
   /** Plan 07h2 (A2/R3): the program's current runner, read when a node
-   * starts (never at program start). Defaults to `runnerRevision()`. */
+   * starts (never at program start). Defaults to `currentProgramRunner` — the
+   * copy `tt runner install` last selected (`<root>/runner/current`), else
+   * this process's own revision. */
   runner?: () => string;
 }
 
@@ -545,8 +548,8 @@ function emacsExporterFile(): string {
 /** Plan 07h2 (A2/R3): the exporter a node start uses when the caller passes
  * none. A configured `TT_EXPORT_COMMAND` wins; otherwise this runner's own
  * Emacs exporter is used, when that Emacs is on this host. `undefined` when
- * neither is available — a node then keeps the snapshot's plan (base
- * behaviour, constraint C1). */
+ * neither is available — with a source file that is a node's named
+ * `X:PLAN_DEFECT`, because the plan file as it is NOW cannot be read. */
 function defaultExporter(): ProgramExporter | undefined {
   const command = exporterCommand();
   if (command !== undefined) {
@@ -592,6 +595,28 @@ function findOnPath(name: string): string | undefined {
   return undefined;
 }
 
+/** Plan 07h2 (A2/R3): the runner THIS PROGRAM is on now, as a node's own
+ * start reads it. `tt runner install <sha>` freezes a revision under
+ * `<root>/runner/<sha>/tradeoffs-trace` and points `<root>/runner/current` at
+ * it; that selection — not the revision of the copy the scheduler process
+ * happens to be running — is what a node started after the install must run
+ * under. A root with no selection (or one whose copy is gone) falls back to
+ * this process's own `runnerRevision()`, which is also what a plain checkout
+ * gives. */
+export function currentProgramRunner(root: string, fallback: () => string): string {
+  try {
+    const link = path.join(root, "runner", "current");
+    const target = path.basename(fs.readlinkSync(link).trim());
+    // `runner/current` is a symlink to the revision's directory name, and only
+    // an actual installed copy can serve a run: a dangling selection is not a
+    // runner.
+    if (target.length > 0 && installedRunnerRoot(root, target) !== undefined) return target;
+  } catch {
+    // no runner install here (the usual checkout), or it is not a symlink
+  }
+  return fallback();
+}
+
 /** Plan 07h2 (A2/R3): what a node's start recorded about the plan it ran —
  * the source it was re-exported from, the exporter, the program's current
  * runner and the sha of the plan snapshot the run was created with. Written
@@ -605,13 +630,14 @@ export interface NodeSnapshot {
 }
 
 /** Plan 07h2 (A2/R3): the plan a node starts with, and the snapshot recorded
- * on the node's run. When the program has a `--source` file and an exporter is
- * available, the source is exported NOW — at the node's start, so a plan fixed
- * between nodes applies without restarting the program — linted, and used in
- * place of the snapshot taken when the program started. The program's CURRENT
- * runner is recorded with it. An export or lint failure is the node's named
- * `X:PLAN_DEFECT`, never a silent fall back to the older plan. Without a
- * source or an exporter the snapshot stands (base behaviour, constraint C1). */
+ * on the node's run. The program's `--source` file is exported NOW — at the
+ * node's start, so a plan fixed between nodes applies without restarting the
+ * program — linted, and used in place of the snapshot taken when the program
+ * started; the program's CURRENT runner is resolved and recorded with it. An
+ * export, lint or runner-resolution failure is the node's named
+ * `X:PLAN_DEFECT`, never a silent fall back to the older plan. Only a program
+ * with NO source file starts from the program-start snapshot: there is no
+ * plan file to read, so that snapshot IS the node's plan file. */
 function nodeStartPlan(
   dir: string,
   program: ProgramFile,
@@ -619,11 +645,12 @@ function nodeStartPlan(
   opts: SchedulerOptions,
 ): { ok: true; entryId: string; plan: ProgramFile["entries"][number]["plan"]; snapshot: NodeSnapshot } | { ok: false; reason: string } {
   const entry = program.entries.find((e) => e.id === node.entry)!;
-  // Plan 07h2 (A2): the program's current runner, read NOW — at this node's
-  // start, never cached at the program's — and recorded beside the plan. The
-  // node's run is created under this same value (`createRun`'s `runner`), so
-  // the run's own `meta.json` and this snapshot can never name two runners.
-  const runner = (opts.runner ?? runnerRevision)();
+  // Plan 07h2 (A2): the program's current runner, resolved NOW — at this
+  // node's start, never cached at the program's — and recorded beside the
+  // plan. The node's run is created under this same value (`createRun`'s
+  // `runner`), so the run's own `meta.json` and this snapshot can never name
+  // two runners.
+  const runner = opts.runner !== undefined ? opts.runner() : currentProgramRunner(path.dirname(path.dirname(dir)), runnerRevision);
   const source = readProgramSource(dir);
   const exporter = opts.exporter ?? defaultExporter();
   const exporterLabel: NodeSnapshot["exporter"] =
@@ -642,7 +669,16 @@ function nodeStartPlan(
     };
   };
   if (source === undefined) return kept("the program has no source file");
-  if (exporter === undefined) return kept("no exporter is configured");
+  // A2: the node's plan is its own plan FILE, read at its start. With a source
+  // and no way to export it, the node cannot read that file, so it must not
+  // run the program-start snapshot instead — that is the stale plan the whole
+  // item exists to remove.
+  if (exporter === undefined) {
+    return {
+      ok: false,
+      reason: `X:PLAN_DEFECT: ${source} cannot be re-exported for node ${node.id}: no exporter is configured (set TT_EXPORT_COMMAND, or run on a host with Emacs and the runner's exporter)`,
+    };
+  }
   let fresh: ProgramFile;
   try {
     fresh = exporter(source);
