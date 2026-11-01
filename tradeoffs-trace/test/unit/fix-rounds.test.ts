@@ -10,6 +10,7 @@ import { test } from "node:test";
 
 import { domainReviewBrief, factKeepsOpen, fixTasks, repairProducedNoChange, testRemovalViolations, FIXER_DUTY, type FixFinding, type FixTask } from "../../src/core/fix-rounds.ts";
 import { ownerRepairPointFor } from "../../src/conductor.ts";
+import * as conductor from "../../src/conductor.ts";
 import { domainFactFailure } from "../../src/fix-loop.ts";
 import { lintPlan, lintTestRemovals } from "../../src/core/plan-lint.ts";
 import { reduce } from "../../src/core/reduce.ts";
@@ -473,22 +474,42 @@ function ownerRepairFixture() {
   return { phase, request };
 }
 
-test("an owner repair ruling becomes a domain point before triage", () => {
+test("an owner repair without a proving command is refused as UNPROVABLE before MAP", async () => {
   const { phase, request } = ownerRepairFixture();
-  const point = ownerRepairPointFor(phase, request, { checks: ["true"] });
-  assert.ok(point && "finding" in point);
-  assert.equal(point.finding.domain, "booking");
-  assert.equal(point.finding.where, "booking/cache.ts:12");
-  assert.equal(point.finding.linkedDecisionId, "D1");
-  assert.match(point.finding.expected!, /reject_and_repair/);
-  assert.match(point.finding.expected!, /preserve exact prices/);
-  assert.match(point.finding.expected!, /M: stale price/);
-  assert.match(point.finding.expected!, /A: unsafe integer/);
-  assert.equal(point.finding.doneWhen, undefined, "no test was named");
-  const tasks = fixTasks([{ ...point.finding, disposition: FIX }], DOMAINS, 4);
-  assert.deepEqual(tasks.map((t) => t.domain), ["booking"], "only the owning domain runs");
-  assert.ok(domainReviewBrief(tasks[0], []).includes("preserve exact prices"));
-  assert.deepEqual(phase.findings, [], "projection leaves event application to the conductor");
+  const projected = ownerRepairPointFor(phase, request, { checks: ["true"] });
+  assert.ok(projected && "reason" in projected, "missing doneWhen is refused at projection, before any fact or point");
+  let ran = false;
+  const point = await conductor.admitOwnerRepairPoint(phase, request, { checks: ["true"] }, async () => {
+    ran = true; return { exitCode: 1, timedOut: false };
+  });
+  assert.ok(point && "reason" in point);
+  assert.match(point.reason, /X:UNPROVABLE.*doneWhen/);
+  assert.equal(ran, false);
+  assert.deepEqual(phase.findings, []);
+});
+
+for (const exitCode of [0, 1]) test(`owner repair admission requires a failing base fact (base exit ${exitCode})`, async () => {
+  const { phase, request } = ownerRepairFixture();
+  request.resolution!.note = "doneWhen: test -f booking-fixed.txt";
+  const commands: string[] = [];
+  const point = await conductor.admitOwnerRepairPoint(phase, request, { checks: ["true"] }, async (finding) => {
+    commands.push(finding.doneWhen!);
+    return { exitCode, timedOut: false };
+  });
+  assert.deepEqual(commands, ["test -f booking-fixed.txt"]);
+  assert.ok(point);
+  if (exitCode === 0) {
+    assert.ok("reason" in point);
+    assert.match(point.reason, /X:UNPROVABLE.*already passes on the base/);
+  } else {
+    assert.ok("finding" in point);
+    assert.equal(point.finding.domain, "booking");
+    assert.equal(point.finding.where, "booking/cache.ts:12");
+    assert.match(point.finding.expected!, /reject_and_repair/);
+    const tasks = fixTasks([{ ...point.finding, disposition: FIX }], DOMAINS, 4);
+    assert.deepEqual(tasks.map((t) => t.domain), ["booking"]);
+  }
+  assert.deepEqual(phase.findings, [], "admission precedes event application");
 });
 
 test("a repair ruling takes a named test's doneWhen from the declared rerun", () => {

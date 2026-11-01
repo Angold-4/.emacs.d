@@ -1704,7 +1704,7 @@ export function ownerRepairPointFor(
   const doneWhen = finding?.doneWhen ?? fields.doneWhen ??
     (finding?.reproduction?.result === "reproduced" ? finding.reproduction.command : undefined) ??
     lostTestsDoneWhen(tests, declared);
-  if (tests.length > 0 && !doneWhen) return { reason: `owner repair ${request.id} names a test with no declared command; the lead must supply its doneWhen` };
+  if (!doneWhen?.trim()) return { reason: `X:UNPROVABLE: owner repair ${request.id} ${tests.length ? "names a test with no declared command" : "has no proving command"}; the lead must rewrite the point with doneWhen` };
   const option = request.resolution.option;
   const label = request.options.find((o) => o.id === option)?.label ?? option;
   return {
@@ -1723,6 +1723,26 @@ export function ownerRepairPointFor(
     },
     ...(finding?.status === "open" ? { replaces: finding.id } : {}),
   };
+}
+
+/** Admission precedes FINDING_RAISED and MAP. The caller establishes and
+ * records the command's base result; a green or inconclusive base cannot
+ * prove a repair. Replays reuse that recorded fact. */
+export async function admitOwnerRepairPoint(
+  phase: PhaseState,
+  request: PhaseState["ownerRequests"][number],
+  declared: DeclaredTestCommands,
+  baseFact: (finding: Finding) => Promise<{ exitCode: number | null; timedOut: boolean }>,
+): Promise<ReturnType<typeof ownerRepairPointFor>> {
+  const point = ownerRepairPointFor(phase, request, declared);
+  if (!point || "reason" in point) return point;
+  if (!point.finding.doneWhen?.trim()) return { reason: `X:UNPROVABLE: owner repair ${request.id} has no doneWhen; the lead must rewrite the point` };
+  const fact = await baseFact(point.finding);
+  if (fact.exitCode === 0 && !fact.timedOut) return { reason: `X:UNPROVABLE: owner repair ${request.id} doneWhen already passes on the base; the lead must rewrite the point` };
+  if (fact.timedOut || fact.exitCode === null || fact.exitCode === 126 || fact.exitCode === 127) {
+    return { reason: `X:UNPROVABLE: owner repair ${request.id} has no conclusive failing base result; the lead must rewrite the point` };
+  }
+  return point;
 }
 
 /** Plan 07f (A3/§3.2/§3.3): what an owner correction does, whichever state it
@@ -9108,8 +9128,8 @@ export class Conductor {
    * finished run keeps nothing (its worktrees are pruned, A3/R4) and a single-
    * worker phase has no lane worktrees at all. */
   #recordKeptLaneWorktrees(): void {
-    if (!this.#laneRoundEnabled()) return;
-    const phase = this.#state?.phase.phase;
+    if (!this.#state || !this.#laneRoundEnabled()) return;
+    const phase = this.#state.phase.phase;
     if (phase === "DONE" || phase === "BLOCKED") return;
     for (const lane of this.#lanes()) {
       const worktree = this.#laneWorktree(lane);
@@ -12080,6 +12100,33 @@ export class Conductor {
       });
   }
 
+  /** Establish admission from the candidate the owner rejected, before any
+   * point or fixer is admitted. Keep the full command output in the log. */
+  async #ownerRepairBaseFact(finding: Finding, baseSha: string): Promise<{ exitCode: number | null; timedOut: boolean }> {
+    const command = this.#withValues(finding.doneWhen!);
+    const { records } = readLog(this.#paths.events);
+    const recorded = records.find((r) => r.kind === "done_when_base" &&
+      (r.event as any).findingId === finding.id && (r.event as any).baseSha === baseSha &&
+      (r.event as any).command === command)?.event as { exitCode: number | null; timedOut: boolean } | undefined;
+    if (recorded) return recorded;
+    const checkout = disposableCheckout(this.#plan.repo, baseSha);
+    const startedAt = Date.now();
+    try {
+      const result = await runCommand({
+        command, cwd: checkout.dir, env: this.#checkEnv(),
+        deadlineMs: this.#deadlines.reproductionMs, termGraceMs: this.#deadlines.termGraceMs,
+        onIntent: ({ pgid }) => {
+          this.#onStageShIntent(pgid);
+          this.#log.intent(`owner-repair-base-${finding.id}-${pgid}`, { pgid, findingId: finding.id, baseSha });
+        },
+      }).result;
+      if (result.timedOut) this.#recordBound("fact", `owner-repair:${finding.id}:base`, this.#deadlines.reproductionMs, Date.now() - startedAt);
+      const fact = { findingId: finding.id, baseSha, command, exitCode: result.exitCode, timedOut: result.timedOut, output: result.output };
+      this.#log.append("done_when_base", fact);
+      return fact;
+    } finally { checkout.dispose(); }
+  }
+
   /** After the pick there are no lanes: domain MAP, git/facts REDUCE, then
    * ordinary candidate seats only when every point is closed. Empty-lane
    * RoundRecords are durable loop checkpoints, never candidates to pick. */
@@ -12093,7 +12140,8 @@ export class Conductor {
     // stable finding id makes a crash between this event and MAP replay-safe.
     for (const request of this.#state.phase.ownerRequests) {
       if (request.resolvedBinding?.candidateSha !== this.#state.phase.candidate?.sha) continue;
-      const point = ownerRepairPointFor(this.#state.phase, request, this.#declaredTestCommands());
+      const point = await admitOwnerRepairPoint(this.#state.phase, request, this.#declaredTestCommands(),
+        (finding) => this.#ownerRepairBaseFact(finding, this.#state.phase.candidate!.sha));
       if (!point) continue;
       if ("reason" in point) {
         this.#parkMergedCheck(last.round, point.reason);

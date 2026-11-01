@@ -1142,7 +1142,7 @@ function resolveRepair(setup: TestConductorSetup, request: import("../../src/cor
 
 for (const namesTest of [true, false]) test(namesTest
   ? "an owner reject_and_repair on a failed vote dispatches that domain's fixer"
-  : "an owner repair without a named test closes through its domain review", async () => {
+  : "an owner repair without a named test calls the lead as UNPROVABLE", async () => {
   const promptDir = fs.mkdtempSync("/tmp/tt-owner-repair-prompts-");
   const promptLog = path.join(promptDir, "prompts.txt");
   const setup = await setupConductor({
@@ -1150,7 +1150,7 @@ for (const namesTest of [true, false]) test(namesTest
     checks: ["true"],
     stubReviews: true,
     deadlines: { ...FAST, inboxPollMs: 40 },
-    rerun: BOOKING_DONE,
+    rerun: `${BOOKING_DONE} # {name}`,
     extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
     workerScript: () => laneWorkerWithDecision(1, "a", "delegated"),
     laneWorkerScriptFor: (lane, round) => laneWorkerWithDecision(round, lane, "delegated"),
@@ -1185,10 +1185,28 @@ for (const namesTest of [true, false]) test(namesTest
     await waitFor(() => fixerIntents(setup.runDir).length > 0 || setup.conductor.state.phase.phase === "AWAITING_OWNER" ||
       readEvents(setup.runDir).slice(before).some((r) => r.kind === "event" && (r.event as { type?: string }).type === "FREEZE_COMPLETED"),
       90_000, 50, setup.runDir);
+    if (!namesTest) {
+      await waitFor(() => readEvents(setup.runDir).slice(before).some((r) => r.kind === "lead_called" &&
+        /X:UNPROVABLE.*doneWhen/.test((r.event as { reason: string }).reason)), 20_000, 50, setup.runDir);
+      assert.equal(fixerIntents(setup.runDir).length, 0);
+      assert.equal(setup.conductor.state.phase.findings.some((f) => f.id.includes("owner-repair")), false);
+      return;
+    }
     assert.equal(fixerIntents(setup.runDir).length, 1, "the owner's ruling dispatches a fixer before another review");
     const point = setup.conductor.state.phase.findings.find((f) => f.linkedDecisionId === request.linkedDecisionId && f.domain === "booking");
     assert.ok(point, "the rejected decision became a booking point");
-    assert.equal(point.doneWhen, namesTest ? BOOKING_DONE : undefined, "a named test gets the plan's declared rerun command");
+    assert.equal(point.doneWhen, `test -f booking-fixed.txt # 'rejects unsafe prices'`, "a named test gets the plan's declared rerun command");
+    const records = readEvents(setup.runDir);
+    const baseFactIndex = records.findIndex((r) => r.kind === "done_when_base" && (r.event as { findingId?: string }).findingId === point.id);
+    const raisedIndex = records.findIndex((r) => r.kind === "event" && (r.event as { type?: string; finding?: { id: string } }).type === "FINDING_RAISED" &&
+      (r.event as { finding: { id: string } }).finding.id === point.id);
+    assert.ok(baseFactIndex >= before && baseFactIndex < raisedIndex, "a recorded failing base fact precedes point admission");
+    const baseFact = records[baseFactIndex].event as { baseSha: string; command: string; exitCode: number; timedOut: boolean; output: string };
+    assert.equal(baseFact.baseSha, original);
+    assert.equal(baseFact.command, point.doneWhen);
+    assert.equal(baseFact.exitCode, 1);
+    assert.equal(baseFact.timedOut, false);
+    assert.equal(typeof baseFact.output, "string", "the admission fact records the command output");
     assert.match(point.expected ?? "", /reject_and_repair/);
     assert.match(point.expected ?? "", /VETO_REASON/);
     await waitFor(() => fs.existsSync(promptLog) && fs.readFileSync(promptLog, "utf8").includes(point.id), 20_000, 50, setup.runDir);
