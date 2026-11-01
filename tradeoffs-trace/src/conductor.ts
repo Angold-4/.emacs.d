@@ -1319,7 +1319,16 @@ export function restartInstants(records: readonly LogRecord[]): string[] {
   return out;
 }
 
+/** Stored reviews already passed candidate-anchor validation at ingestion.
+ * Live execution and replay must use the same rule: checking a recorded
+ * file:line against the reader's cwd can reject FINAL_CHECK_REQUIRED and
+ * strand a successfully published run in RESOLVING during lenient replay. */
+function installRecordedSeatAnchorRule(): void {
+  setSeatAnchorResolver((evidence) => evidenceHasAnchor(evidence));
+}
+
 function timelineFromRecords(records: readonly LogRecord[], plan: RunPlanFile): Timeline {
+  installRecordedSeatAnchorRule();
   const init = records.find((r) => r.kind === "init")?.event as { runId: string; integrationHead: string; seats?: Seats } | undefined;
   let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "", plan.ownerDirectives ?? [], init?.seats, plan);
   const phases: Timeline["phases"] = [];
@@ -1376,6 +1385,7 @@ export function rebuildTimelineWithEvents(runDir: string, plan: RunPlanFile): { 
  * `rebuildState`'s doc comment for why that is always a bug, not something
  * to paper over. */
 function foldEvents(base: State, records: readonly LogRecord[], lenient = false): State {
+  installRecordedSeatAnchorRule();
   let state = base;
   for (let i = 0; i < records.length; i++) {
     const record = records[i];
@@ -2160,7 +2170,7 @@ export class Conductor {
     // test name, or a command the reviewer ran) as the resolver acceptance
     // reads. It is stateless, so it stays installed after the conductor stops:
     // a logged ACCEPTED event must still reduce when replayed (rebuildState).
-    setSeatAnchorResolver((evidence) => evidenceHasAnchor(evidence));
+    installRecordedSeatAnchorRule();
   }
 
   get state(): State {
