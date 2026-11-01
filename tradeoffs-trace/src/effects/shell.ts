@@ -31,7 +31,7 @@ import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from "node:c
 // A2/C3 (plan 06e): the sweep owns the signalling decision. This module asks
 // it to signal the groups it recorded at spawn; it never calls `process.kill`
 // with a signal itself.
-import { groupAlive, signalGroup } from "./sweep.ts";
+import { groupAlive, groupHasRecordedMember, groupMemberIdentities, signalGroup } from "./sweep.ts";
 
 /** Plan 06l (A2) / 07h2 (C3, R12): the bound ONE worker `sh` command runs
  * under. The policy lives here, with the module that spawns the command, not in
@@ -189,6 +189,9 @@ export interface RunCommandResult {
   cancelled: boolean;
   output: string;
   signalsSent: string[];
+  /** Grace elapsed with a group present, but no original live member could
+   * establish ownership. Fail closed rather than signal a recycled pgid. */
+  escalationSkipped?: "group ownership unproven";
   /** 07g2 (A4/R9): every simple command the shell ran, in order, when the
    * command was step-traced. The trace lines themselves are not in `output`. */
   steps?: CommandStep[];
@@ -261,6 +264,7 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
   let termTimer: NodeJS.Timeout | undefined;
   let afterTermination: (() => void) | undefined;
   const signalsSent: string[] = [];
+  let escalationSkipped: RunCommandResult["escalationSkipped"];
   let output = "";
   let child: ChildProcessWithoutNullStreams | undefined;
   let resolvedPgid: number | undefined;
@@ -320,11 +324,18 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
     if (reason === "timeout") timedOut = true;
     if (reason === "cancelled") cancelRequested = true;
     if (signalsSent.includes("SIGTERM") || resolvedPgid === undefined || !groupAlive(resolvedPgid)) return;
+    // Capture births BEFORE TERM can remove the leader. A surviving child
+    // proves ownership too; existence of the numeric pgid alone never does.
+    const membersAtTerm = groupMemberIdentities(resolvedPgid);
     if (!signalGroup(resolvedPgid, "SIGTERM")) return;
     signalsSent.push("SIGTERM");
     termTimer = setTimeout(() => {
-      if (resolvedPgid !== undefined && groupAlive(resolvedPgid) && signalGroup(resolvedPgid, "SIGKILL")) {
-        signalsSent.push("SIGKILL");
+      if (resolvedPgid !== undefined && groupAlive(resolvedPgid)) {
+        if (!groupHasRecordedMember(resolvedPgid, membersAtTerm)) {
+          escalationSkipped = "group ownership unproven";
+        } else if (signalGroup(resolvedPgid, "SIGKILL")) {
+          signalsSent.push("SIGKILL");
+        }
       }
       termTimer = undefined;
       afterTermination?.();
@@ -431,6 +442,7 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
         cancelled: cancelRequested,
         output: visibleOutput(output),
         signalsSent,
+        ...(escalationSkipped ? { escalationSkipped } : {}),
         ...(stepsForResult ? { steps: stepsForResult } : {}),
         ...(sampled ? { resourceSample: { peakRssMB, freeMemMB } } : {}),
       });

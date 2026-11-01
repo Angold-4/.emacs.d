@@ -145,6 +145,58 @@ test("a worker command's child that ignores SIGTERM is killed after the grace", 
   }
 });
 
+test("a grace-expiry kill never signals a recycled process group", { skip: process.platform !== "linux" || !fs.existsSync("/proc/self/stat") }, async () => {
+  const marker = path.join(dir, "recycled-child");
+  const originalKill = process.kill;
+  let group: number | undefined;
+  let childPid: number | undefined;
+  let reused = false;
+  const foreignSignals: unknown[] = [];
+  const script = "import os,signal,time; signal.signal(signal.SIGTERM,lambda *_: None); " +
+    `open(${JSON.stringify(marker)},"w").write(str(os.getpid())); time.sleep(0.8)`;
+  // Delegate real signals until BOTH the real group and child are gone.
+  // Thereafter emulate OS reuse of just the numeric pgid, intercepting any
+  // destructive signal so the probe never harms an unrelated process.
+  process.kill = function (pid, signal) {
+    if (group !== undefined && pid === -group) {
+      if (signal === 0 && !reused) {
+        try { return originalKill.call(process, pid, signal); }
+        catch (err) {
+          if (childPid && !fs.existsSync(`/proc/${childPid}`)) reused = true;
+          else throw err;
+        }
+      }
+      if (reused) {
+        if (signal !== 0) foreignSignals.push(signal);
+        return true;
+      }
+    }
+    return originalKill.call(process, pid, signal);
+  };
+  try {
+    const running = runCommand({
+      command: `python3 -c '${script}' </dev/null >/dev/null 2>&1 & wait`,
+      deadlineMs: 400,
+      termGraceMs: 1200,
+      sampler: () => ({ rssMB: 0, freeMemMB: 0 }),
+    });
+    group = await running.pgid;
+    await waitFor(() => fs.existsSync(marker));
+    childPid = Number(fs.readFileSync(marker, "utf8"));
+    const outcome = await running.result;
+    assert.equal(reused, true, "reuse injected only after the original group died");
+    assert.deepEqual(foreignSignals, [], "no signal may target the replacement group");
+    assert.deepEqual(outcome.signalsSent, ["SIGTERM"]);
+    assert.equal(outcome.escalationSkipped, "group ownership unproven");
+  } finally {
+    process.kill = originalKill;
+    // Never signal the numeric pgid after simulated reuse, even in cleanup.
+    if (group !== undefined && !reused) {
+      try { originalKill.call(process, -group, "SIGKILL"); } catch { /* gone */ }
+    }
+  }
+});
+
 test("a command that honors SIGTERM does not escalate to SIGKILL", async () => {
   // Plan 06k2 (A3): a loaded host can delay the trap's own handling; a
   // larger term grace keeps this from flaking (it was the 06i load-only
