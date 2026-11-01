@@ -260,6 +260,7 @@ import { validate } from "./core/schema.ts";
 
 import { EventLog, readLog, type LogRecord } from "./effects/log.ts";
 import { acquireCheckSlot, acquireLock, acquireWaitingLock, DEFAULT_CHECK_SLOTS, openCheckWindow, otherCheckWindowOwner, PausableTimer, type Lock } from "./effects/lock.ts";
+import { resumeKeptWorktree } from "./effects/kept-worktree.ts";
 import { childEnv, runCommand, shBoundFor, type CommandStep, type RunCommandResult } from "./effects/shell.ts";
 // 07 design A1: ADMIT — the one gate start, resume and a program node's own
 // start run before any event.
@@ -9318,15 +9319,6 @@ export class Conductor {
         `A lane whose unsubmitted work could not be saved to a ref keeps its worktree, so its earlier work is still in it: ${retained.join(", ")}.`,
       );
     }
-    // Plan 07h2 (R11, exex 01c3b): a lane worktree kept across an owner stop is
-    // UNCHANGED — the resumed worker is told so, instead of assuming its earlier
-    // edits were reset to the base and redoing them.
-    const kept = this.#lanes().filter((l) => this.#keptLaneWorktrees.has(l));
-    if (kept.length > 0) {
-      lines.push(
-        `This run was stopped and resumed: the worktree of lane ${kept.join(", ")} is unchanged, so the edits you had not submitted are still in it (uncommitted). Continue from them; do not start over.`,
-      );
-    }
     // Plan 06k1 (A1): when a majority of the previous round's seats said the
     // losing lane had something the winner lacked, the losing lane's anchors
     // are carried into this round's prompt, so both lanes can take them on.
@@ -9397,12 +9389,18 @@ export class Conductor {
     // `--continue`.
     this.#log.append("lane_session", { lane, round, continueSession: !freshSession });
     const worktree = this.#laneWorktree(lane);
+    let keptWorktreeNote: string | undefined;
     // Plan 06k2 (A4, finding M-1): a lane worktree create/remove that throws
     // is recorded as THIS lane attempt's failure, exactly like the
     // single-worker reset — never a bare throw the round swallows without a
     // lane-specific reason.
     try {
-      if (fix && fs.existsSync(worktree) && headOf(worktree) === fix.of) {
+      if (this.#keptLaneWorktrees.has(lane) && fs.existsSync(worktree)) {
+        const ref = `refs/tt/${this.#state.phase.runId}/kept/${lane}/${randomUUID()}`;
+        keptWorktreeNote = `This run was stopped and resumed: the worktree of lane ${lane} ${resumeKeptWorktree(this.#plan.repo, worktree, fix?.of ?? base, ref)}`;
+        this.#keptLaneWorktrees.delete(lane);
+        this.#log.append("lane_worktree_reused", { lane, round, reason: keptWorktreeNote });
+      } else if (fix && fs.existsSync(worktree) && headOf(worktree) === fix.of) {
         // exex 01a2: the worktree already holds the red candidate (its
         // freeze commit); the worker fixes it in place.
         this.#log.append("lane_worktree_reused", { lane, round, reason: `fixing its red candidate ${fix.of}` });
@@ -9411,12 +9409,6 @@ export class Conductor {
         // could not be written to a ref, so its dirty worktree is kept as-is
         // and the worker continues in it.
         this.#log.append("lane_worktree_reused", { lane, round, reason: "unsubmitted work was not saved to a ref" });
-      } else if (this.#keptLaneWorktrees.has(lane) && fs.existsSync(worktree) && headOf(worktree) === base) {
-        // Plan 07h2 (R11): the run was stopped with this lane's edits still
-        // uncommitted. Its worktree is unchanged, so the resumed worker
-        // continues in it — it is never reset to the base.
-        this.#keptLaneWorktrees.delete(lane);
-        this.#log.append("lane_worktree_reused", { lane, round, reason: "the run stopped with uncommitted work; the worktree is unchanged" });
       } else {
         if (fs.existsSync(worktree)) removeWorktree(this.#plan.repo, worktree);
         crashAt("before_create_worktree");
@@ -9477,7 +9469,7 @@ export class Conductor {
         this.#log.completion(actionId, { lane, round, outcome: "no-candidate", reason: note });
         return { lane, note };
       }
-      await handle.agent.prompt(prompt);
+      await handle.agent.prompt(keptWorktreeNote === undefined ? prompt : `${prompt}\n\n${keptWorktreeNote}`);
       // Plan 06k1 (A5, finding D-M-63): a queued correction counts as
       // delivered only now that a lane worker that STARTED received the
       // prompt carrying it. Both lanes send the same prompt; the first to get

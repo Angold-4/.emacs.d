@@ -605,7 +605,7 @@ async function resumedRunKeepsEachLanesChanges(): Promise<void> {
       gateLockPath: path.join(setup.runRoot, "gate.lock"),
     });
     await resumed.start();
-    await waitFor(() => fs.existsSync(promptLog), 60_000, 50, setup.runDir);
+    await waitFor(() => fs.existsSync(promptLog) && ["a", "b"].every((lane) => fs.readFileSync(promptLog, "utf8").includes(`worktree of lane ${lane} is unchanged`)), 60_000, 50, setup.runDir);
     const prompts = fs.readFileSync(promptLog, "utf8");
     assert.match(prompts, /worktree of lane [a-z, ]+ is unchanged/, "each resumed worker is told its worktree is unchanged");
     for (const lane of ["a", "b"] as const) {
@@ -633,6 +633,66 @@ test(
   resumedRunKeepsEachLanesChanges,
 );
 test("a resumed run keeps each lane's uncommitted changes", resumedRunKeepsEachLanesChanges);
+
+test("a resumed run keeps a lane's uncommitted changes when its base moved", async (t) => {
+  for (const conflict of [false, true]) await t.test(conflict ? "conflicting base" : "clean new base", async () => {
+    const scripts = shortTmp("tt-moved-base");
+    const promptLog = path.join(scripts, "prompts.log");
+    const setup = await setupConductor({
+      checks: ["true"], deadlines: FAST,
+      phase: { id: "p1", goal: "keep edits", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [], workers: 2 },
+      // Model the kept checkout's old base. The round now starts on a newer
+      // integration commit; the lane still has edits against its earlier HEAD.
+      workerScript: ({ repo }) => ({ hello: defaultWorkerHello(), steps: [
+        { kind: "call-sh", command: `git checkout -q --detach ${repo.head}; printf 'worker edit\\n' > README.md; printf 'new file\\n' > untracked.txt` },
+        { kind: "hang-until-abort" },
+      ] }),
+    });
+    let resumed: Conductor | undefined;
+    try {
+      fs.writeFileSync(path.join(setup.repo.dir, conflict ? "README.md" : "new-base.txt"), "new base\n");
+      execFileSync("git", ["-C", setup.repo.dir, "add", "-A"]);
+      execFileSync("git", ["-C", setup.repo.dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "moved base"]);
+      const base = execFileSync("git", ["-C", setup.repo.dir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+      await setup.conductor.start();
+      const lanes = ["a", "b"].map((lane) => path.join(setup.runDir, "worktrees", `lane-${lane}`));
+      await waitFor(() => lanes.every((dir) => fs.existsSync(path.join(dir, "untracked.txt"))), 60_000, 50, setup.runDir);
+      await setup.conductor.stop();
+      const script = writeScript(scripts, "resume", { hello: defaultWorkerHello(), steps: [{ kind: "hang-until-abort" }] });
+      resumed = new Conductor({
+        runDir: setup.runDir, plan: setup.plan, piCommand: process.execPath, piArgsPrefix: [FAKE_PI_PATH],
+        piEnvFor: () => ({ FAKE_PI_SCRIPT: script, FAKE_PI_PROMPT_LOG: promptLog }),
+        stubReviews: true, deadlines: FAST,
+        checkLockPath: path.join(setup.runRoot, "check.lock"), gateLockPath: path.join(setup.runRoot, "gate.lock"),
+      });
+      await resumed.start();
+      await waitFor(() => fs.existsSync(promptLog) && fs.readFileSync(promptLog, "utf8").split("\n=====\n").length >= 3, 60_000, 50, setup.runDir);
+      for (const dir of lanes) assert.match(fs.readFileSync(path.join(dir, "README.md"), "utf8"), /worker edit/, "the lane's dirty edit survived the base change");
+      const prompts = fs.readFileSync(promptLog, "utf8");
+      assert.doesNotMatch(prompts, /worktree of lane [ab] is unchanged/);
+      assert.match(prompts, conflict ? /edits did not apply cleanly/ : /uncommitted edits were re-applied/);
+      const refs = [...new Set(prompts.match(/refs\/tt\/[^\s"\\;]+\/kept\/[ab]\/[a-f0-9-]+/g) ?? [])];
+      assert.equal(refs.length, 2, "each lane's exact durable ref is in its prompt");
+      for (const ref of refs) {
+        assert.equal(execFileSync("git", ["-C", setup.repo.dir, "show", `${ref}:untracked.txt`], { encoding: "utf8" }), "new file\n");
+        assert.equal(execFileSync("git", ["-C", setup.repo.dir, "show", `${ref}:README.md`], { encoding: "utf8" }), "worker edit\n");
+      }
+      for (const dir of lanes) {
+        assert.equal(execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), base);
+        const status = execFileSync("git", ["-C", dir, "status", "--porcelain"], { encoding: "utf8" });
+        assert.match(status, /README.md/);
+        if (!conflict) {
+          assert.equal(fs.readFileSync(path.join(dir, "README.md"), "utf8"), "worker edit\n");
+          assert.equal(fs.readFileSync(path.join(dir, "untracked.txt"), "utf8"), "new file\n");
+        }
+      }
+    } finally {
+      await resumed?.stop();
+      await setup.conductor.stop();
+      cleanupDir(scripts); cleanupDir(setup.runRoot); cleanupDir(setup.scriptsDir); cleanupDir(setup.repo.dir);
+    }
+  });
+});
 
 async function workerCommandPastShMinutesIsKilled(): Promise<void> {
   const scripts = shortTmp("tt-07h2-sh");
