@@ -1123,12 +1123,13 @@ test("a failing final check becomes a point in the failing file's domain", async
 
 
 /** Resolve through the same bound inbox command the owner UI writes. */
-function resolveRepair(setup: TestConductorSetup, request: import("../../src/core/types.ts").OwnerRequest): void {
+function resolveRepair(setup: TestConductorSetup, request: import("../../src/core/types.ts").OwnerRequest, note?: string): void {
   fs.writeFileSync(path.join(runPaths(setup.runDir).inbox, `resolve-${request.id}.json`), JSON.stringify({
     commandId: `resolve-${request.id}`,
     type: "resolve",
     recordKind: "request",
     option: "reject_and_repair",
+    ...(note ? { note } : {}),
     binding: {
       runId: setup.conductor.state.phase.runId,
       phaseId: "p1",
@@ -1140,9 +1141,10 @@ function resolveRepair(setup: TestConductorSetup, request: import("../../src/cor
   }));
 }
 
-for (const namesTest of [true, false]) test(namesTest
+for (const mode of ["named", "missing", "green"]) test(mode === "named"
   ? "an owner reject_and_repair on a failed vote dispatches that domain's fixer"
-  : "an owner repair without a named test calls the lead as UNPROVABLE", async () => {
+  : `an owner repair ${mode === "missing" ? "without a named test" : "with a green base"} calls the lead as UNPROVABLE and accepts a rewrite`, async () => {
+  const namesTest = mode === "named";
   const promptDir = fs.mkdtempSync("/tmp/tt-owner-repair-prompts-");
   const promptLog = path.join(promptDir, "prompts.txt");
   const setup = await setupConductor({
@@ -1170,18 +1172,28 @@ for (const namesTest of [true, false]) test(namesTest
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
       ],
     }),
-    reviewerScriptFor: (seat, state) => laneReview(seat, state.phase.contract.contractVersion),
+    reviewerScriptFor: (seat, state) => {
+      // Stub candidate seats have no discovery/prompt turn. Keep the veto
+      // live if an older runner re-reviews the unrepaired candidate, so the
+      // base fails on missing repair work, not a fixture waiting for a prompt.
+      const review = laneReview(seat, state.phase.contract.contractVersion);
+      review.steps = review.steps.slice(2);
+      (review.steps[0] as { args: Record<string, unknown> }).args.ballots = state.phase.decisions
+        .filter((d) => !d.supersededBy && d.boundCandidateSha === state.phase.candidate?.sha)
+        .map((d) => ({ decisionId: d.id, vote: "reject", rationale: VETO_REASON, evidence: ["booking/cache.ts:12 price"] }));
+      return review;
+    },
   });
   try {
     await setup.conductor.start();
     await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 90_000, 50, setup.runDir);
     assert.equal(setup.conductor.state.phase.inFlight.dispatch_worker, undefined,
       "parking finishes the domain driver so an owner resolution can dispatch MAP again");
-    const request = setup.conductor.state.phase.ownerRequests.find((r) => r.status === "open" && r.origin === "failed_vote");
+    let request = setup.conductor.state.phase.ownerRequests.find((r) => r.status === "open" && r.origin === "failed_vote");
     assert.ok(request, "a failed vote asks the owner to rule");
     const before = readEvents(setup.runDir).length;
     const original = setup.conductor.state.phase.candidate!.sha;
-    resolveRepair(setup, request);
+    resolveRepair(setup, request, mode === "green" ? "doneWhen: true" : undefined);
     await waitFor(() => readEvents(setup.runDir).slice(before).some((r) =>
       r.kind === "event" && (r.event as { type?: string }).type === "OWNER_REQUEST_RESOLVED"), 20_000, 50, setup.runDir);
     await waitFor(() => fixerIntents(setup.runDir).length > 0 || setup.conductor.state.phase.phase === "AWAITING_OWNER" ||
@@ -1192,12 +1204,21 @@ for (const namesTest of [true, false]) test(namesTest
         /X:UNPROVABLE.*doneWhen/.test((r.event as { reason: string }).reason)), 20_000, 50, setup.runDir);
       assert.equal(fixerIntents(setup.runDir).length, 0);
       assert.equal(setup.conductor.state.phase.findings.some((f) => f.id.includes("owner-repair")), false);
-      return;
+      const failed = request;
+      request = setup.conductor.state.phase.ownerRequests.find((r) => r.status === "open" && r.linkedDecisionId === failed.linkedDecisionId);
+      assert.ok(request, "UNPROVABLE offers a rewrite of the same linked work");
+      const replayed = rebuildState(setup.runDir, setup.plan);
+      assert.deepEqual(JSON.parse(JSON.stringify(replayed.phase.ownerRequests)), JSON.parse(JSON.stringify(setup.conductor.state.phase.ownerRequests)));
+      resolveRepair(setup, request, `doneWhen: ${BOOKING_DONE}`);
+      await waitFor(() => fixerIntents(setup.runDir).length > 0, 20_000, 50, setup.runDir);
     }
     assert.equal(fixerIntents(setup.runDir).length, 1, "the owner's ruling dispatches a fixer before another review");
     const point = setup.conductor.state.phase.findings.find((f) => f.linkedDecisionId === request.linkedDecisionId && f.domain === "booking");
     assert.ok(point, "the rejected decision became a booking point");
-    assert.equal(point.doneWhen, `test -f booking-fixed.txt # 'rejects unsafe prices'`, "a named test gets the plan's declared rerun command");
+    assert.equal(point.doneWhen, namesTest ? `test -f booking-fixed.txt # 'rejects unsafe prices'` : BOOKING_DONE,
+      "admission uses the effective resolution's proving command");
+    assert.deepEqual(rebuildState(setup.runDir, setup.plan).phase.findings.find((f) => f.id === point.id), point,
+      "strict recovery preserves the admitted replacement point");
     const records = readEvents(setup.runDir);
     const baseFactIndex = records.findIndex((r) => r.kind === "done_when_base" && (r.event as { findingId?: string }).findingId === point.id);
     const raisedIndex = records.findIndex((r) => r.kind === "event" && (r.event as { type?: string; finding?: { id: string } }).type === "FINDING_RAISED" &&

@@ -1656,6 +1656,21 @@ export function parseOwnerPointFields(text: string): { fields: Partial<OwnerPoin
   return { fields, missing };
 }
 
+/** Requests opened by a later exception rewrite the same work at the same
+ * binding. Derive its identity through corrections and materialized repair
+ * points, rather than treating every request as a new piece of work. */
+function ownerRepairWorkKey(phase: PhaseState, request: PhaseState["ownerRequests"][number]): string {
+  const correction = phase.corrections.find((c) => c.id === request.linkedCorrectionId);
+  const target = request.linkedFindingId ?? correction?.targetRecordId;
+  const source = target && phase.ownerRequests.find((r) => `F-${phase.phaseId}-owner-repair-${r.id}` === target);
+  if (source && source !== request) return ownerRepairWorkKey(phase, source);
+  if (target) return `${phase.decisions.some((d) => d.id === target) ? "decision" : "finding"}:${target}`;
+  if (request.linkedDecisionId) return `decision:${request.linkedDecisionId}`;
+  if (request.linkedCorrectionId) return `correction:${request.linkedCorrectionId}`;
+  if (request.linkedMessageId) return `message:${request.linkedMessageId}`;
+  return `request:${request.id}`;
+}
+
 /** A repair ruling becomes ordinary finding work before MAP. The same path
  * mapping as a red REDUCE check owns it; the owner's choice and the rejecting
  * seats supply its expected outcome. No evaluator triage or new phase state
@@ -1665,15 +1680,28 @@ export function ownerRepairPointFor(
   request: PhaseState["ownerRequests"][number],
   declared: DeclaredTestCommands,
 ): { finding: Finding; replaces?: string } | { reason: string } | undefined {
-  if (request.status !== "resolved" || !request.resolution ||
-    !isRepairForcingOption(request.origin, request.resolution.option)) return undefined;
-  const id = `F-${phase.phaseId}-owner-repair-${request.id}`;
+  if (request.status !== "resolved" || !request.resolution) return undefined;
+  const key = ownerRepairWorkKey(phase, request);
+  const sameWork = phase.ownerRequests.filter((r) => r.status === "resolved" && r.resolution &&
+    r.resolvedBinding?.candidateSha === request.resolvedBinding?.candidateSha &&
+    sameVersion(r.resolvedBinding?.contractVersion, request.resolvedBinding?.contractVersion) &&
+    ownerRepairWorkKey(phase, r) === key);
+  // Append order is durable: a replacement or a later drop/ruling supersedes
+  // an earlier unmaterialized repair. It must be checked before admission.
+  if (sameWork.at(-1)?.id !== request.id || !isRepairForcingOption(request.origin, request.resolution.option)) return undefined;
+  // Already admitted work is reused, never duplicated by a fresh request.
+  const materialized = sameWork.map((r) => phase.findings.find((f) => f.id === `F-${phase.phaseId}-owner-repair-${r.id}`)).find(Boolean);
+  const id = materialized?.id ?? `F-${phase.phaseId}-owner-repair-${request.id}`;
   const correction = phase.corrections.find((c) => c.id === request.linkedCorrectionId);
   const target = correction?.targetRecordId;
   const finding = phase.findings.find((f) => f.id === (request.linkedFindingId ?? target));
   const decision = phase.decisions.find((d) => d.id === (request.linkedDecisionId ?? finding?.linkedDecisionId ?? target));
+  // Direct record-level withdrawals and final owner rulings also settle the
+  // work; an old repair request cannot recreate a point after that exit.
+  if (correction?.status === "withdrawn" || finding?.status === "accepted" ||
+    (decision && phase.ruledDecisions?.some((r) => r.id === decision.id && r.choice === decision.choice))) return undefined;
   const existing = phase.findings.find((f) => f.id === id);
-  if (existing) return { finding: existing, ...(finding?.status === "open" ? { replaces: finding.id } : {}) };
+  if (existing) return { finding: existing, ...(finding?.status === "open" && finding.id !== existing.id ? { replaces: finding.id } : {}) };
   const message = phase.messages?.find((m) => m.id === request.linkedMessageId);
   const ballots = (request.relatedBallots ?? phase.ballots.filter((b) => b.decisionId === decision?.id))
     .filter((b) => b.vote === "reject");
@@ -1698,7 +1726,7 @@ export function ownerRepairPointFor(
     for (const verify of parseVerify(citation[0])) if (verify.kind === "test") tests.push(verify);
   }
   if (item) tests.push(...itemTestVerifies(item));
-  const doneWhen = finding?.doneWhen ?? fields.doneWhen ??
+  const doneWhen = fields.doneWhen ?? finding?.doneWhen ??
     (finding?.reproduction?.result === "reproduced" ? finding.reproduction.command : undefined) ??
     lostTestsDoneWhen(tests, declared);
   if (!doneWhen?.trim()) return { reason: `X:UNPROVABLE: owner repair ${request.id} ${tests.length ? "names a test with no declared command" : "has no proving command"}; the lead must rewrite the point with doneWhen` };
