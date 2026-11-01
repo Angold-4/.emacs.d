@@ -25,13 +25,15 @@
 // into `.git` or a symbolic link (so it cannot loop), and still removes only
 // the names in `BUILD_TARGET_DIRS`.
 
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
 /** Directory names that hold only build products in the ecosystems tradeoffs
  * trace runs (rust, node, python, go, java). A name match alone is not enough
  * — `pruneRunTargets` only ever looks inside `<run>/candidates/<sha>` and the
- * worktrees it is about to delete anyway. */
+ * worktrees it is about to delete anyway. Candidate folders holding tracked
+ * files are always kept. */
 export const BUILD_TARGET_DIRS = ["target", "node_modules", "dist", "build", ".next", "coverage", "__pycache__", ".pytest_cache"] as const;
 
 /** How many directories one candidate checkout's walk may visit. A bound on
@@ -91,7 +93,7 @@ function makeWritable(dir: string): void {
   }
 }
 
-function pruneTargetsUnder(dir: string, visited: { count: number }, removed: string[]): void {
+function pruneTargetsUnder(checkout: string, dir: string, visited: { count: number }, removed: string[], log: (line: string) => void): void {
   if (visited.count >= MAX_VISITED) return;
   visited.count += 1;
   let entries: fs.Dirent[];
@@ -107,10 +109,22 @@ function pruneTargetsUnder(dir: string, visited: { count: number }, removed: str
     if (entry.name === ".git") continue;
     const full = path.join(dir, entry.name);
     if ((BUILD_TARGET_DIRS as readonly string[]).includes(entry.name)) {
+      const relative = path.relative(checkout, full);
+      try {
+        const tracked = execFileSync("git", ["-C", checkout, "ls-files", "-z", "--", relative], { stdio: ["ignore", "pipe", "pipe"] });
+        if (tracked.length > 0) {
+          log(`kept ${full}: holds tracked files`);
+          continue;
+        }
+      } catch {
+        // If git cannot establish that a folder is generated, keep it.
+        log(`kept ${full}: could not check tracked files`);
+        continue;
+      }
       rmDir(full, removed);
       continue;
     }
-    pruneTargetsUnder(full, visited, removed);
+    pruneTargetsUnder(checkout, full, visited, removed, log);
   }
 }
 
@@ -125,6 +139,13 @@ export function pruneRunTargets(
   removeWorktree: (dir: string) => void = (dir) => fs.rmSync(dir, { recursive: true, force: true }),
 ): PruneResult {
   const removed: string[] = [];
+  const log = (line: string): void => {
+    try {
+      fs.appendFileSync(path.join(runDir, "conductor.log"), `${new Date().toISOString()} prune ${line}\n`);
+    } catch {
+      // Logging is best effort; preserving tracked content is not.
+    }
+  };
   for (const worktree of [worktrees.run, ...(worktrees.lanes ?? [])]) {
     if (worktree === undefined || !fs.existsSync(worktree)) continue;
     try {
@@ -143,7 +164,8 @@ export function pruneRunTargets(
       if (!entry.isDirectory()) continue;
       // One visit budget per candidate checkout, so one huge tree does not
       // starve the next.
-      pruneTargetsUnder(path.join(candidates, entry.name), { count: 0 }, removed);
+      const checkout = path.join(candidates, entry.name);
+      pruneTargetsUnder(checkout, checkout, { count: 0 }, removed, log);
     }
   }
   return { removed };

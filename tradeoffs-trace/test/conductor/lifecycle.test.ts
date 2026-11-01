@@ -479,20 +479,19 @@ async function conductorAtDoneExitsAndPrunes(): Promise<void> {
     for (const sha of candidatesAfter) {
       assert.equal(
         fs.existsSync(path.join(paths.candidates, sha, "packages", "web", "target")),
-        false,
-        `the nested package target is pruned from candidate ${sha}`,
+        true,
+        `the tracked package target is kept in candidate ${sha}`,
       );
-      assert.equal(fs.existsSync(path.join(paths.candidates, sha, "packages", "web", "target", "bundle.js")), false);
+      assert.equal(fs.existsSync(path.join(paths.candidates, sha, "packages", "web", "target", "bundle.js")), true);
     }
     assert.equal(fs.existsSync(paths.events), true, "the control log is kept");
     // The conductor's own log says what it pruned (so an owner can tell a
     // finished run's clean exit from a crashed one).
     assert.match(fs.readFileSync(paths.log, "utf8"), /pruned \d+ director(y|ies) after DONE/, "the prune is recorded in the conductor's log");
     assert.ok(readEvents(runDir).length > 0);
-    // Nothing named `target`/`node_modules` survives anywhere in the run
-    // directory, at any depth.
-    const leftovers = execFileSync("find", [runDir, "(", "-name", "target", "-o", "-name", "node_modules", ")", "-type", "d"], { encoding: "utf8" }).trim();
-    assert.equal(leftovers, "", `no target directory survives:\n${leftovers}`);
+    // Generated output is pruned, but a name alone cannot authorize deleting
+    // tracked content from the saved evidence.
+    assert.match(fs.readFileSync(paths.log, "utf8"), /kept .*packages\/web\/target: holds tracked files/);
   } finally {
     try {
       if (runId) execFileSync(process.execPath, [CLI_PATH, "stop", runId, "--root", root], { env });
@@ -523,6 +522,7 @@ test("the prune reaches a build target nested in a package directory", () => {
     fs.writeFileSync(path.join(candidate, "README.md"), "kept\n");
     // `.git` is never walked: a repository's own directory is not a build
     // target and may hold anything.
+    execFileSync("git", ["init", "-q", candidate]);
     fs.mkdirSync(path.join(candidate, ".git", "target"), { recursive: true });
     const result = pruneRunTargets(runDir, { run: worktree });
     assert.equal(fs.existsSync(path.join(nested, "target")), false, "the nested package target is pruned");
