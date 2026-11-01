@@ -562,6 +562,9 @@ async function twoRunningNodesCheckWithoutPausingEachOther(): Promise<void> {
   }
 }
 
+// The phase contract's own name for this behaviour, registered beside the
+// packet's descriptive one: both drive the same end-to-end body once each.
+test("plan 07h2 (R10, exex 01c3): two running nodes of one program each have their own check slot, and neither run's workers are paused by the other's check", twoRunningNodesCheckWithoutPausingEachOther);
 test("two running nodes of one program check without pausing each other's workers", twoRunningNodesCheckWithoutPausingEachOther);
 
 test("plan 07h2 (A2): a failed re-export blocks the node with X:PLAN_DEFECT instead of running a stale plan", async () => {
