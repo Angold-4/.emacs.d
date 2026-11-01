@@ -34,7 +34,7 @@ import { namedCandidate } from "./core/ruling-picks.ts";
 // Plan 06g: the round's only decision points — `pickWinner`, `blocksAcceptance`
 // and `roundBudget` (architecture A3 and A6). Nothing in this file decides a
 // winner or whether a finding blocks by itself.
-import { advisoryReason, bestCandidate, blocksAcceptance, candidateLabel, carryBallotsForward, carryDecisionsForward, laneMetItems, losingLanes, loserAnchors, roundBudget, type AcceptanceGate, type FindingGround, type PickGuard } from "./core/rounds.ts";
+import { advisoryReason, bestCandidate, blocksAcceptance, candidateLabel, carryBallotsForward, carryDecisionsForward, laneMetItems, losingLanes, loserAnchors, roundBudget, repairBudgetRemains, type AcceptanceGate, type FindingGround, type PickGuard } from "./core/rounds.ts";
 // Plan 06g2 (A1): `runRound` is the round's only orchestrator. The conductor
 // implements its `LaneHost` with the worktree, agent, check, review and vote
 // machinery below and calls it; it decides nothing about lanes itself.
@@ -12135,7 +12135,6 @@ export class Conductor {
     let last = this.#state.phase.rounds?.at(-1);
     if (!last) return;
     if (last.lanes.length > 0) this.#recordRegression(last);
-    const limit = this.#state.phase.contract.roundsAllowed ?? this.#plan.rounds ?? boundDefinition("rounds").defaultValue;
     // Materialize resolved owner work before reading the MAP checkpoint. A
     // stable finding id makes a crash between this event and MAP replay-safe.
     for (const request of this.#state.phase.ownerRequests) {
@@ -12161,7 +12160,7 @@ export class Conductor {
     let base = last.picked?.sha ?? last.fixed?.candidate ?? last.base;
     for (;;) {
       const round = resume ? last.round : last.round + 1;
-      if (round > limit) {
+      if (!resume && !repairBudgetRemains(this.#state.phase, round)) {
         this.#parkOpenPoints(last.round, "the fix loop's round bound was reached", this.#openPointsOn(base));
         return;
       }
@@ -12244,7 +12243,7 @@ export class Conductor {
         return;
       }
       this.#log.append("fix_loop_chained", { round, candidate, openPoints });
-      if (round >= limit) {
+      if (!repairBudgetRemains(this.#state.phase)) {
         this.#parkOpenPoints(round, `the fix loop's bound was reached with points still open: ${openPoints.join(", ")}`, openPoints);
         return;
       }

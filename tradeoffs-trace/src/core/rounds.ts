@@ -33,6 +33,7 @@ import type {
   FindingSeverity,
   LaneCandidateRecord,
   PhaseContract,
+  PhaseState,
   PickVote,
   PriorDecisionStatement,
   RoundRecord,
@@ -169,6 +170,24 @@ export function roundBudget(contract: Pick<PhaseContract, "roundsAllowed"> | und
   const n = contract?.roundsAllowed;
   if (typeof n !== "number" || !Number.isFinite(n) || n < 1) return DEFAULT_ROUND_BUDGET;
   return Math.floor(n);
+}
+
+/** All repair entry points spend the same log-derived allowance. The first
+ * round is free. Historical round checkpoints also count, including logs
+ * written before lane-free ROUND_STARTED charged repairRoundsUsed. */
+export function repairRoundsSpent(phase: PhaseState): number {
+  return Math.max(phase.repairRoundsUsed, ...(phase.rounds ?? []).map((r) => r.round - 1));
+}
+
+export function repairBudgetRemains(phase: PhaseState, nextRound = repairRoundsSpent(phase) + 2): boolean {
+  // The absolute ceiling is one initial round plus all recorded grants.
+  return Math.max(repairRoundsSpent(phase) + 1, nextRound - 1) <= phase.repairRoundsGranted;
+}
+
+/** After the first pick, ROUND_STARTED owns the charge. The phase entry
+ * event only changes phase; resuming a checkpoint spends nothing. */
+export function hasDomainRounds(phase: PhaseState): boolean {
+  return (phase.rounds ?? []).some((r) => r.picked !== undefined || r.lanes.length === 0);
 }
 
 /** The candidates of a round that passed their checks: the only ones that are

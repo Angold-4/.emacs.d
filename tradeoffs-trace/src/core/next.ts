@@ -18,6 +18,7 @@
 // exactly, and calling next() again after the matching ACTION_STARTED
 // returns [] (no double dispatch) for the dispatch-shaped ones.
 
+import { repairBudgetRemains } from "./rounds.ts";
 import { finalCheckOf } from "./checks.ts";
 import { gateCommandOf } from "./gate.ts";
 import { seatsOf } from "./seats.ts";
@@ -207,7 +208,7 @@ export function next(state: State): Action[] {
         : [{ type: "publish_cas", expectedHead: p.integrationHead, candidateI: p.probe.probedI }];
 
     case "REPAIRING":
-      return p.repairRoundsUsed < p.repairRoundsGranted
+      return repairBudgetRemains(p)
         ? [{ type: "repair_attempt_started" }]
         : [{ type: "repair_budget_exhausted" }];
 
