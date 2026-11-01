@@ -92,6 +92,12 @@
 (declare-function pilish--get-input-buffer "pilish-ui")
 (declare-function pilish--display-buffers "pilish-ui")
 (declare-function pilish--rebalance-input-window "pilish-ui")
+(declare-function pilish--session-busy-p "pilish-ui")
+(declare-function pilish--followups-in-fifo-order "pilish-ui")
+(declare-function pilish--clear-followup-queue "pilish-ui")
+(declare-function pilish--restore-input-text "pilish-ui")
+(declare-function pilish-send "pilish-input")
+(declare-function pilish-abort "pilish-input")
 (declare-function pilish-open-session-file "pilish")
 (declare-function pilish--display-startup-header "pilish-ui")
 (declare-function pilish--append-to-chat "pilish-ui")
@@ -354,6 +360,81 @@ started."
     (pilish))
   (pilish-session-browser))
 
+;;;; Interrupting a busy turn
+
+(defconst +pilish--interrupt-window 3
+  "Seconds after a queued send in which a second RET interrupts instead.")
+
+(defconst +pilish--interrupt-poll-interval 0.2
+  "Seconds between checks that an aborted turn has settled.")
+
+(defconst +pilish--interrupt-timeout 10
+  "Seconds to wait for an aborted turn before the message goes back to input.")
+
+(defvar +pilish--queued-at nil
+  "Time a send queued a follow-up for a busy session, or nil.
+Only a send made that recently makes the next RET mean interrupt.")
+
+(defun +pilish--deliver-when-idle (chat-buf input-buf text attempts)
+  "Send TEXT in INPUT-BUF once CHAT-BUF settles, trying ATTEMPTS times.
+Give the text back to INPUT-BUF rather than drop it when the session never
+settles."
+  (cond
+   ((not (buffer-live-p chat-buf)) nil)
+   ((not (pilish--session-busy-p chat-buf))
+    (with-current-buffer input-buf
+      (when (derived-mode-p 'pilish-input-mode)
+        (pilish--restore-input-text text)
+        (pilish-send))))
+   ((zerop attempts)
+    (with-current-buffer input-buf
+      (when (derived-mode-p 'pilish-input-mode)
+        (pilish--restore-input-text text)))
+    (message "Pi: still running, message returned to the input"))
+   (t (run-at-time +pilish--interrupt-poll-interval nil
+                   #'+pilish--deliver-when-idle
+                   chat-buf input-buf text (1- attempts)))))
+
+(defun +pilish--interrupt-p (chat-buf busy)
+  "Return non-nil when this RET means interrupt the BUSY CHAT-BUF session.
+True when the session is busy, a send queued something within
+`+pilish--interrupt-window', and that queue still has text.  The queue is
+buffer-local in CHAT-BUF, not in the input buffer."
+  (and busy
+       +pilish--queued-at
+       (<= (- (float-time) +pilish--queued-at) +pilish--interrupt-window)
+       (with-current-buffer chat-buf
+         (not (string-empty-p
+               (mapconcat #'identity (pilish--followups-in-fifo-order) ""))))))
+
+(defun +pilish/send-or-interrupt ()
+  "Send the input buffer, interrupting a busy turn on a second RET.
+The first RET against a busy session queues a follow-up, as Pilish always
+did.  A second RET within `+pilish--interrupt-window' takes that text out
+of the queue, aborts the turn, and sends it once Pi settles, so the abort's
+queue clearing cannot lose it."
+  (interactive)
+  (let* ((chat-buf (pilish--get-chat-buffer))
+         (busy (and chat-buf (pilish--session-busy-p chat-buf)))
+         (empty (string-empty-p (string-trim (buffer-string)))))
+    (cond
+     ((+pilish--interrupt-p chat-buf busy)
+      (let ((text (mapconcat #'identity
+                             (with-current-buffer chat-buf
+                               (pilish--followups-in-fifo-order))
+                             "\n\n")))
+        (with-current-buffer chat-buf
+          (pilish--clear-followup-queue))
+        (setq +pilish--queued-at nil)
+        (pilish-abort)
+        (message "Pi: interrupting")
+        (+pilish--deliver-when-idle
+         chat-buf (current-buffer) text
+         (round (/ +pilish--interrupt-timeout +pilish--interrupt-poll-interval)))))
+     (t
+      (setq +pilish--queued-at (when (and busy (not empty)) (float-time)))
+      (pilish-send)))))
+
 ;;;; New sessions
 
 (defvar +pilish--session-counter 0
@@ -444,7 +525,9 @@ TAB folds a tool/thinking block."
         "a" #'pilish-evil-append-input
         (kbd "RET") #'pilish-visit-file
         (kbd "TAB") #'pilish-toggle-tool-section
-        [tab] #'pilish-toggle-tool-section))))
+        [tab] #'pilish-toggle-tool-section)
+      (evil-define-key* 'normal pilish-input-mode-map
+        (kbd "RET") #'+pilish/send-or-interrupt))))
 
 ;;;; Pilish
 
