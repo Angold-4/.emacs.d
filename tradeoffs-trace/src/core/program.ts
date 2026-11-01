@@ -36,6 +36,15 @@ export interface ProgramFile {
    * this file, two digits). Written once by `createProgram`, so the owner can
    * name a phase (and `tt` accept it wherever it accepts a run id). */
   readableIds?: Record<string, string>;
+  /** 07h3 (H2): `#+TT_BASE` — the program's root base. Every root node is
+   * cut from this branch (and names it as its PR base) instead of its own
+   * entry's `TT_BRANCH`. Absent: each root node is cut from its plan's
+   * integration branch, exactly as before. */
+  base?: string;
+  /** 07h3 (H3): `#+TT_PROGRAM_FINAL_CHECKS` — one command, run once after
+   * every node is DONE, on the last node's branch, bounded by the final-check
+   * bound. Absent: a program has no final gate and ends as it did before. */
+  programFinalChecks?: string;
 }
 
 export interface ProgramNode {
@@ -83,6 +92,14 @@ export interface ProgramState {
   /** Plan 01i: program-wide owner directives in force, in the order the owner
    * sent them. Rebuilt by folding the program's own event log. */
   directives?: ProgramDirective[];
+  /** 07h3 (H3): the program's one final gate, once it has run: it runs at
+   * most once per ending (a retried node clears it, so the gate runs again on
+   * the new ending). Absent while it has not run — or when the program
+   * declares no `#+TT_PROGRAM_FINAL_CHECKS`. */
+  final?: { passed: boolean; durationMs: number };
+  /** 07h3 (H3): why the lead was called, from the LEAD_CALLED event (today
+   * the failed program final gate). */
+  leadCalled?: { reasons: string[] };
 }
 
 export type ProgramEvent =
@@ -100,6 +117,12 @@ export type ProgramEvent =
   /** Plan 06i: the carried items a dependency's accepted run wrote into this
    * node's contract (visible, never silent). */
   | { type: "NODE_CARRIED_ITEMS"; node: string; items: string[] }
+  /** 07h3 (H3): the program's one final gate ran (once, after the last node).
+   * `passed` false is the program's stuck condition. */
+  | { type: "PROGRAM_FINAL"; passed: boolean; durationMs: number }
+  /** 07h3 (H3): the program needs the lead — today a failed final gate, with
+   * the gate's own reasons. */
+  | { type: "LEAD_CALLED"; reasons: string[] }
   | { type: "PROGRAM_STOPPED" };
 
 /** Expands entries into phase nodes and validates the graph: unique ids,
@@ -237,7 +260,16 @@ export function reduceProgram(state: ProgramState, event: ProgramEvent): Program
     case "NODE_RETRY": {
       const prev = state.nodes[event.node];
       if (!prev || prev.status === "done" || prev.status === "running") return state;
-      return { ...state, nodes: { ...state.nodes, [event.node]: { status: "waiting", branch: prev.branch, base: prev.base } } };
+      // 07h3 (H3): a retried node means the program is no longer finished, so
+      // the final gate's record is cleared with it — the gate runs again, once,
+      // on the ending this retry produces.
+      const next: ProgramState = {
+        ...state,
+        nodes: { ...state.nodes, [event.node]: { status: "waiting", branch: prev.branch, base: prev.base } },
+      };
+      delete next.final;
+      delete next.leadCalled;
+      return next;
     }
     case "NODE_RESUMED": {
       const prev = state.nodes[event.node];
@@ -256,6 +288,12 @@ export function reduceProgram(state: ProgramState, event: ProgramEvent): Program
         directives: (state.directives ?? []).map((d) => (d.id === event.directiveId ? { ...d, withdrawn: true } : d)),
       };
     }
+    case "PROGRAM_FINAL":
+      // 07h3 (H3): record-only; the scheduler records it once, so a second
+      // fold never sees a second event.
+      return { ...state, final: { passed: event.passed, durationMs: event.durationMs } };
+    case "LEAD_CALLED":
+      return { ...state, leadCalled: { reasons: event.reasons } };
     case "NODE_CARRIED_ITEMS": {
       // Plan 06i: record-only; the carried requirement ids are visible on the
       // node so the status can name what a dependency passed on.
@@ -288,7 +326,10 @@ export type ProgramOutcome = "running" | "done" | "stuck" | "stopped" | "paused"
  * paused the program and no node is running any more — the scheduler can exit
  * without starting another node, and `tt program resume` starts the next. */
 export function programOutcome(nodes: ProgramNode[], state: ProgramState): ProgramOutcome {
-  if (nodes.every((n) => state.nodes[n.id].status === "done")) return "done";
+  // 07h3 (H3): a failed program final gate leaves the program stuck, exactly
+  // as a blocked node does — it is not a refusal of any candidate, so it is
+  // never `done`.
+  if (nodes.every((n) => state.nodes[n.id].status === "done")) return state.final && !state.final.passed ? "stuck" : "done";
   if (state.stopped) return "stopped";
   const anyActive = nodes.some((n) => ACTIVE.includes(state.nodes[n.id].status));
   // A pause keeps the scheduler watching while a node still runs (so its
@@ -297,6 +338,12 @@ export function programOutcome(nodes: ProgramNode[], state: ProgramState): Progr
   if (state.paused) return "paused";
   const startable = nextStarts(nodes, state, Number.MAX_SAFE_INTEGER).length > 0;
   return startable ? "running" : "stuck";
+}
+
+/** 07h3 (H2): the branch a root node is cut from — the program's
+ * `#+TT_BASE`, else the node's own plan's integration branch. */
+export function rootBase(program: ProgramFile, node: ProgramNode): string {
+  return program.base ?? program.entries.find((e) => e.id === node.entry)!.plan.integrationBranch;
 }
 
 /** The branch a node publishes to. Stack mode: "<TT_BRANCH>--<node>"
@@ -308,11 +355,12 @@ export function nodeBranch(program: ProgramFile, node: ProgramNode): string {
   return `${entry.plan.integrationBranch}--${node.id.replace(/\//g, "-")}`;
 }
 
-/** The branches a node's branch is cut from: its dependencies' branches, or
- * its plan's TT_BRANCH for a node with none. Several bases are merged. */
+/** The branches a node's branch is cut from: its dependencies' branches, or,
+ * for a root node, the program's `#+TT_BASE` (07h3 H2) — the plan's TT_BRANCH
+ * when the program names none. Several bases are merged. */
 export function nodeBases(program: ProgramFile, nodes: ProgramNode[], node: ProgramNode): string[] {
   if (node.deps.length === 0) {
-    return [program.entries.find((e) => e.id === node.entry)!.plan.integrationBranch];
+    return [rootBase(program, node)];
   }
   return node.deps.map((d) => nodeBranch(program, nodes.find((n) => n.id === d)!));
 }

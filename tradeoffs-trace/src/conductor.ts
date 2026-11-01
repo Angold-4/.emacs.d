@@ -589,6 +589,17 @@ export interface RunPlanFile {
   /** Plan 07e (E4/A5): `#+TT_CHECK_WINDOW: exclusive`. Off by default: a run
    * pauses its own workers for another run's check only when it opts in. */
   checkWindow?: "exclusive" | "off";
+  /** 07h3 (R8): `#+TT_DELIVER_AUDIT` — the principle audit `tt deliver` runs
+   * on the accepted node before it delivers it (a removed or changed test, a
+   * spec line, a protocol-crate function). The plan names the command;
+   * `tt deliver` runs it on the node's own tree and records what it printed.
+   * A non-zero exit is the delivery's `audit` exception — nothing is pushed. */
+  deliverAudit?: string;
+  /** 07h3 (R8): `#+TT_DELIVER_BRANCH` — the branch a node is delivered into:
+   * `tt deliver` audits the accepted node, test-merges it into this branch,
+   * runs the merge check on the merged tree and pushes the branch fast
+   * forward. Absent: today's stacked per-node delivery, unchanged. */
+  deliverBranch?: string;
   /** Documents the plan cites that live outside the repository (absolute
    * paths; Emacs collects them from #+TT_REFS and from the plan text). They
    * are copied into <run>/refs at creation, so a run keeps the version it

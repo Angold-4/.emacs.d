@@ -1182,6 +1182,14 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                   ,@(let ((cw (+tt--keyword-at "TT_CHECK_WINDOW")))
                       (and cw (list (cons 'checkWindow (string-trim (car cw)))
                                     (cons 'checkWindowLine (cdr cw)))))
+                  ;; 07h3 (R8): #+TT_DELIVER_AUDIT / #+TT_DELIVER_BRANCH — the
+                  ;; principle audit and the branch `tt deliver' merges the
+                  ;; accepted node into and pushes fast forward. Absent: the
+                  ;; plan delivers exactly as it did before.
+                  ,@(let ((a (+tt--keyword-at "TT_DELIVER_AUDIT")))
+                      (and a (list (cons 'deliverAudit (string-trim (car a))))))
+                  ,@(let ((d (+tt--keyword-at "TT_DELIVER_BRANCH")))
+                      (and d (list (cons 'deliverBranch (string-trim (car d))))))
                   ,@(let ((r (+tt--plan-references dir)))
                       (and r `((references . ,(vconcat r)))))
                   ,@(let ((s (+tt--plan-secrets)))
@@ -1351,6 +1359,8 @@ continues.  FILE names the Org file for the errors buffer."
 ;;   #+TITLE: plan 13
 ;;   #+TT_PROGRAM: 4                  max phases in parallel
 ;;   #+TT_BRANCHES: stack             or "shared": all publish to TT_BRANCH
+;;   07h3: #+TT_BASE: <branch>        the branch every root node is cut from
+;;   07h3: #+TT_PROGRAM_FINAL_CHECKS: <cmd>   one gate, after the last node
 ;;   * 13a
 ;;     :PROPERTIES:
 ;;     :PLAN:   13a_shared_markets.org
@@ -1491,6 +1501,15 @@ several phases runs them in order."
                              ;; rather than the temporary JSON copy.
                              (sourceFile . ,file)
                              (maxParallel . ,max) (branches . ,branches)
+                             ;; 07h3 (H2/H3): #+TT_BASE is the branch every
+                             ;; root node is cut from (and its PR base), and
+                             ;; #+TT_PROGRAM_FINAL_CHECKS is the one gate run
+                             ;; after the last node. Absent: the program runs
+                             ;; exactly as it did before.
+                             ,@(let ((b (+tt--keyword "TT_BASE")))
+                                 (and b (list (cons 'base (string-trim b)))))
+                             ,@(let ((f (+tt--keyword "TT_PROGRAM_FINAL_CHECKS")))
+                                 (and f (list (cons 'programFinalChecks (string-trim f)))))
                              (entries . ,(vconcat (nreverse entries))))
                            ;; The program file's own #+TT_MODELS, for `tt lint'
                            ;; (the entries already carry the merged form).

@@ -2252,6 +2252,8 @@ async function cmdDeliver(rest: string[], root: string): Promise<void> {
   }
   const result = deliver({ programDir, runRoot: root, apply });
   for (const m of result.messages) process.stdout.write(`${m}\n`);
+  // 07h3 (R8): a conflict or an audit flag stopped the delivery; the message
+  // already names it and its output, and the command exits non-zero.
   if (!result.ok) process.exitCode = 1;
 }
 

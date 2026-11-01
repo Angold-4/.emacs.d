@@ -19,7 +19,7 @@ import { openCheckWindow } from "../../src/effects/lock.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import { Conductor, createRun, contractVersionFor, runnerRevision, type RunPlanFile } from "../../src/conductor.ts";
 import type { ProgramFile } from "../../src/core/program.ts";
-import { appendProgramEvent, createProgram, recordProgramSource, schedulerTick } from "../../src/program.ts";
+import { appendProgramEvent, createProgram, recordProgramSource, runScheduler, schedulerTick } from "../../src/program.ts";
 
 const FAKE_PI_PATH = fileURLToPath(new URL("../fake-pi/fake-pi.ts", import.meta.url));
 const CLI_PATH = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
@@ -955,4 +955,111 @@ test("plan 07h2 (A2): a node that cannot re-export its source is blocked instead
   cleanupDir(root);
   cleanupDir(scriptsDir);
   cleanupDir(repo.dir);
+});
+
+/** 07h3 (H3/R7): the program's ONE final gate. It runs after the last node is
+ * DONE, on that node's own branch, exactly once, and its result is recorded as
+ * `PROGRAM_FINAL`. A failing gate leaves the program `stuck` — never refused,
+ * never silently done — with `LEAD_CALLED` naming the gate and its output, and
+ * the owner is notified. A program that declares no gate is unchanged. */
+test("the program final gate runs once after the last node and calls the lead on failure", async () => {
+  const repo = makeRepo();
+  const root = shortTmp("tt-07h3-final-root");
+  const scriptsDir = shortTmp("tt-07h3-final-scripts");
+  const git = (...args: string[]) => execFileSync("git", ["-C", repo.dir, ...args], { encoding: "utf8" }).trim();
+  const phase = { id: "p1", goal: "g", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [] };
+  const plan = (title: string): RunPlanFile => ({ title, repo: repo.dir, integrationBranch: "main", checks: ["true"], phases: [phase] });
+  const entries = [
+    { id: "a", after: [], plan: plan("a") },
+    { id: "b", after: ["a"], plan: plan("b") },
+  ];
+  /** Both nodes already ran and finished, and each published its branch. */
+  const programFinished = (dir: string): void => {
+    appendProgramEvent(dir, { type: "NODE_STARTED", node: "a", runId: "run-a", branch: "main--a", base: "main" });
+    appendProgramEvent(dir, { type: "NODE_STATUS", node: "a", status: "done" });
+    appendProgramEvent(dir, { type: "NODE_STARTED", node: "b", runId: "run-b", branch: "main--b", base: "main--a" });
+    appendProgramEvent(dir, { type: "NODE_STATUS", node: "b", status: "done" });
+  };
+  const programEvents = (dir: string): Array<{ type: string; passed?: boolean; durationMs?: number; reasons?: string[] }> =>
+    fs
+      .readFileSync(path.join(dir, "events.jsonl"), "utf8")
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+      .map((l) => (JSON.parse(l) as { event: { type: string } }).event as { type: string; passed?: boolean; durationMs?: number; reasons?: string[] });
+  const marker = path.join(scriptsDir, "gate-ran.txt");
+  try {
+    // The last node's branch carries the program's final result: the gate must
+    // run on THAT tree.
+    git("branch", "main--a", repo.head);
+    git("checkout", "-q", "-b", "main--b", "main--a");
+    fs.writeFileSync(path.join(repo.dir, "b.txt"), "b\n");
+    git("add", "-A");
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "b result");
+    const lastTip = git("rev-parse", "main--b");
+    git("checkout", "-q", "main");
+
+    // 1. A passing gate: recorded once, on the last node's branch.
+    const passing = createProgram(root, { title: "final", maxParallel: 1, programFinalChecks: `test -f b.txt && git rev-parse HEAD > ${marker}`, entries }, "finalpass");
+    programFinished(passing);
+    const firstOutcome = schedulerTick(passing, { runRoot: root, launch: () => undefined });
+    assert.equal(firstOutcome, "done", "a passing gate leaves the program done");
+    const finals = programEvents(passing).filter((e) => e.type === "PROGRAM_FINAL");
+    assert.equal(finals.length, 1, "PROGRAM_FINAL is recorded once");
+    assert.equal(finals[0].passed, true);
+    assert.equal(typeof finals[0].durationMs, "number", "the gate's duration is recorded");
+    assert.equal(fs.readFileSync(marker, "utf8").trim(), lastTip, "the gate ran on the last node's branch, after the last node");
+    // A second tick must not run the gate again.
+    assert.equal(schedulerTick(passing, { runRoot: root, launch: () => undefined }), "done");
+    assert.equal(programEvents(passing).filter((e) => e.type === "PROGRAM_FINAL").length, 1, "a later tick never records a second PROGRAM_FINAL");
+    assert.equal(programEvents(passing).filter((e) => e.type === "LEAD_CALLED").length, 0, "a passing gate calls no lead");
+
+    // 2. A failing gate: PROGRAM_FINAL says so, the lead is called with the
+    // gate's own output, and the program is stuck (never done, never refused).
+    const failing = createProgram(
+      root,
+      { title: "final-fail", maxParallel: 1, programFinalChecks: 'echo "the final gate says no"; exit 4', entries },
+      "finalfail",
+    );
+    programFinished(failing);
+    assert.equal(schedulerTick(failing, { runRoot: root, launch: () => undefined }), "stuck", "a failing gate leaves the program stuck");
+    const failedEvents = programEvents(failing);
+    const failedFinal = failedEvents.filter((e) => e.type === "PROGRAM_FINAL");
+    assert.equal(failedFinal.length, 1);
+    assert.equal(failedFinal[0].passed, false);
+    const leadCalled = failedEvents.filter((e) => e.type === "LEAD_CALLED");
+    assert.equal(leadCalled.length, 1, "a failing gate records LEAD_CALLED");
+    const reasons = (leadCalled[0].reasons ?? []).join("\n");
+    assert.match(reasons, /program final gate failed/, `the lead is told the gate failed:\n${reasons}`);
+    assert.match(reasons, /the final gate says no/, `the lead gets the gate's own output:\n${reasons}`);
+    // The scheduler reports it and notifies the owner, as it does for a
+    // blocked node (the outcome already says "stuck" above).
+    assert.equal(schedulerTick(failing, { runRoot: root, launch: () => undefined }), "stuck", "a later tick does not re-run the gate");
+    const savedNotify = process.env.TT_NOTIFY_COMMAND;
+    process.env.TT_NOTIFY_COMMAND = ":";
+    try {
+      const outcome = await runScheduler(failing, { runRoot: root, launch: () => undefined, pollMs: 5, notifyReminderMs: 20 });
+      assert.equal(outcome, "stuck");
+    } finally {
+      if (savedNotify === undefined) delete process.env.TT_NOTIFY_COMMAND;
+      else process.env.TT_NOTIFY_COMMAND = savedNotify;
+    }
+    const notifications = fs
+      .readFileSync(path.join(root, "notifications.jsonl"), "utf8")
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+      .map((l) => JSON.parse(l) as { id: string; reason: string });
+    const stuckRecord = notifications.find((n) => n.id === "finalfail" && n.reason.startsWith("program stuck"));
+    assert.ok(stuckRecord, `the owner is notified that the program is stuck:\n${JSON.stringify(notifications)}`);
+    assert.match(stuckRecord!.reason, /final gate failed/, "the notification names the failed gate");
+
+    // 3. A program without the keyword is unchanged: no gate, no event.
+    const plain = createProgram(root, { title: "no-final", maxParallel: 1, entries }, "nofinal");
+    programFinished(plain);
+    assert.equal(schedulerTick(plain, { runRoot: root, launch: () => undefined }), "done");
+    assert.equal(programEvents(plain).filter((e) => e.type === "PROGRAM_FINAL").length, 0, "no #+TT_PROGRAM_FINAL_CHECKS, no gate");
+  } finally {
+    cleanupDir(root);
+    cleanupDir(scriptsDir);
+    cleanupDir(repo.dir);
+  }
 });

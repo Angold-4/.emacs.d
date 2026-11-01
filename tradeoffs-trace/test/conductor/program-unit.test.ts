@@ -22,6 +22,9 @@ import { test } from "node:test";
 
 import { cleanupDir, makeRepo } from "./harness.ts";
 import { admitCommands } from "../../src/core/admit.ts";
+import { appendProgramEvent, createProgram, foldProgram, programStatusLines, schedulerTick } from "../../src/program.ts";
+import type { ProgramFile } from "../../src/core/program.ts";
+import type { RunPlanFile } from "../../src/conductor.ts";
 
 const CLI_PATH = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
 const FAKE_PI_PATH = fileURLToPath(new URL("../fake-pi/fake-pi.ts", import.meta.url));
@@ -175,4 +178,86 @@ test("ADMIT parses every declared command: the checks, the final checks and the 
     }),
     ["plan-check", "phase-check", "final-check", "gate-cmd", "cleanup-cmd"],
   );
+});
+
+/** 07h3 (H2/R6): `#+TT_BASE: B` on a program is the branch EVERY root node is
+ * cut from — not each entry's own `TT_BRANCH` — and it is the branch the nodes
+ * name as their PR base. Two root nodes (no dependency between them, so the
+ * base cannot come from a sibling) prove "every root node"; a program without
+ * the keyword is the control, cutting from its plan's own branch as before. */
+test("TT_BASE sets every root node's base and the PR base", () => {
+  const repo = makeRepo();
+  const root = shortTmp("tt-07h3-base-root");
+  const scriptsDir = shortTmp("tt-07h3-base-scripts");
+  const phase = { id: "p1", goal: "g", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [] };
+  const plan = (title: string): RunPlanFile => ({ title, repo: repo.dir, integrationBranch: "main", checks: ["true"], phases: [phase] });
+  // Branch B (`release`) is a commit ahead of main, so "cut from B" is a fact
+  // about the node branches' content, not only their name.
+  execFileSync("git", ["-C", repo.dir, "checkout", "-q", "-b", "release"], { encoding: "utf8" });
+  fs.writeFileSync(path.join(repo.dir, "release-only.txt"), "release\n");
+  execFileSync("git", ["-C", repo.dir, "add", "-A"], { encoding: "utf8" });
+  execFileSync("git", ["-C", repo.dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "release"], { encoding: "utf8" });
+  const releaseHead = execFileSync("git", ["-C", repo.dir, "rev-parse", "release"], { encoding: "utf8" }).trim();
+  execFileSync("git", ["-C", repo.dir, "checkout", "-q", "main"], { encoding: "utf8" });
+
+  const withBase = (ids: string[]): ProgramFile => ({
+    title: "base-program",
+    maxParallel: 2,
+    base: "release",
+    entries: ids.map((id) => ({ id, after: [], plan: plan(id) })),
+  });
+  const source = path.join(scriptsDir, "source.json");
+  fs.writeFileSync(source, JSON.stringify(withBase(["a", "b"])));
+  const dir = createProgram(root, withBase(["a", "b"]), "baseprog");
+  try {
+    const launched: string[] = [];
+    schedulerTick(dir, {
+      runRoot: root,
+      launch: (runDir) => launched.push(runDir),
+      exporter: (file) => JSON.parse(fs.readFileSync(file, "utf8")) as ProgramFile,
+      runner: () => "test-runner",
+    });
+    assert.equal(launched.length, 2, "both root nodes started (neither depends on the other)");
+    // Every root node's branch is cut from B, and its recorded base is B.
+    for (const id of ["a", "b"]) {
+      assert.equal(
+        execFileSync("git", ["-C", repo.dir, "rev-parse", `main--${id}`], { encoding: "utf8" }).trim(),
+        releaseHead,
+        `${id}'s branch starts at #+TT_BASE, not at its plan's TT_BRANCH`,
+      );
+      assert.match(
+        execFileSync("git", ["-C", repo.dir, "ls-tree", "--name-only", `main--${id}`], { encoding: "utf8" }),
+        /^release-only\.txt$/m,
+        `${id}'s branch carries B's own commit`,
+      );
+    }
+    // ...and the program names B as the PR base of both nodes.
+    const { state } = foldProgram(dir);
+    assert.equal(state.nodes.a.base, "release");
+    assert.equal(state.nodes.b.base, "release");
+    const status = programStatusLines(dir, new Date(), { nodeDetail: false }).join("\n");
+    assert.match(status, /branch main--a\s+\(PR base: release\)/, `status names the PR base B:\n${status}`);
+    assert.match(status, /branch main--b\s+\(PR base: release\)/, `status names the PR base B:\n${status}`);
+    assert.match(status, /^base {6}release$/m, `status also names the program's root base:\n${status}`);
+
+    // The control: without #+TT_BASE the same graph is cut from its plan's
+    // own TT_BRANCH, exactly as on the base.
+    const plain = createProgram(root, { title: "no-base", maxParallel: 2, entries: [{ id: "c", after: [], plan: plan("c") }] }, "nobaseprog");
+    schedulerTick(plain, {
+      runRoot: root,
+      launch: () => undefined,
+      exporter: () => ({ title: "no-base", maxParallel: 2, entries: [{ id: "c", after: [], plan: plan("c") }] }),
+      runner: () => "test-runner",
+    });
+    assert.equal(
+      execFileSync("git", ["-C", repo.dir, "rev-parse", "main--c"], { encoding: "utf8" }).trim(),
+      repo.head,
+      "without the keyword a root node is cut from its plan's TT_BRANCH",
+    );
+    assert.equal(foldProgram(plain).state.nodes.c.base, "main");
+  } finally {
+    cleanupDir(root);
+    cleanupDir(scriptsDir);
+    cleanupDir(repo.dir);
+  }
 });

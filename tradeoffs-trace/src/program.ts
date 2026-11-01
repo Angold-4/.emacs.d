@@ -27,6 +27,8 @@ import { readRunState, installedRunnerRoot } from "./effects/runner.ts";
 import { planForNodeStart, planSha256 } from "./effects/node-plan.ts";
 import { processAlive } from "./effects/sweep.ts";
 import { envBlockedLine } from "./core/env-preflight.ts";
+// 07h3 (H3): the program final gate is bounded by the final-check bound.
+import { boundDefaultMs } from "./core/bounds.ts";
 import { execFileSync } from "node:child_process";
 import { acquireLock, type Lock } from "./effects/lock.ts";
 
@@ -666,6 +668,89 @@ function nodeStartPlan(
   return result;
 }
 
+/** 07h3 (H3): the one program final gate. `#+TT_PROGRAM_FINAL_CHECKS` runs
+ * once, after every node is DONE, on the last node's branch, bounded by the
+ * final-check bound. Its result is recorded as `PROGRAM_FINAL`; a failure
+ * also records `LEAD_CALLED` with the gate's own output, and the program is
+ * `stuck` (never refused, never retried behind the owner's back). A program
+ * that declares no gate, or that has not finished every node, does nothing. */
+function runProgramFinalGate(
+  program: ProgramFile,
+  nodes: ProgramNode[],
+  state: ProgramState,
+  record: (event: ProgramEvent) => void,
+): void {
+  const command = program.programFinalChecks?.trim();
+  if (!command || command.length === 0) return;
+  if (state.final !== undefined || state.stopped) return;
+  if (nodes.length === 0 || !nodes.every((n) => state.nodes[n.id]?.status === "done")) return;
+  const last = nodes[nodes.length - 1];
+  const entry = program.entries.find((e) => e.id === last.entry);
+  const repo = entry?.plan.repo ?? "";
+  // The last node's own published branch: the gate runs on the program's
+  // final result, not on some earlier head.
+  const branch = state.nodes[last.id]?.branch ?? nodeBranch(program, last);
+  const limitMs = entry?.plan.deadlines?.finalCheckMs ?? boundDefaultMs("final-check");
+  const startedAt = Date.now();
+  const result = runFinalGateCommand(repo, branch, command, limitMs);
+  const durationMs = Date.now() - startedAt;
+  record({ type: "PROGRAM_FINAL", passed: result.passed, durationMs });
+  if (!result.passed) {
+    record({
+      type: "LEAD_CALLED",
+      reasons: [
+        `program final gate failed on ${branch}: ${command}`,
+        ...(result.timedOut ? [`it reached the final-check bound (${Math.round(limitMs / 60_000)}m)`] : []),
+        `output: ${oneLine(result.output.length > 0 ? result.output : "(no output)")}`,
+      ],
+    });
+  }
+}
+
+/** 07h3 (H3): run the program final gate on BRANCH in a detached worktree of
+ * REPO, so the command sees the tree that branch publishes. A worktree that
+ * cannot be created is a failed gate with that reason, never a silent pass. */
+function runFinalGateCommand(
+  repo: string,
+  branch: string,
+  command: string,
+  limitMs: number,
+): { passed: boolean; output: string; timedOut: boolean } {
+  const worktree = fs.mkdtempSync(path.join("/tmp", "tt-program-final-"));
+  try {
+    try {
+      git(repo, ["worktree", "add", "-q", "--detach", worktree, branch]);
+    } catch (err) {
+      const e = err as { stdout?: string; stderr?: string };
+      return { passed: false, output: String(e.stderr ?? e.stdout ?? (err as Error)?.message ?? err).trim(), timedOut: false };
+    }
+    try {
+      const stdout = execFileSync("/bin/sh", ["-c", command], {
+        cwd: worktree,
+        encoding: "utf8",
+        maxBuffer: 64 * 1024 * 1024,
+        timeout: limitMs,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      return { passed: true, output: stdout, timedOut: false };
+    } catch (err) {
+      const e = err as { status?: number; stdout?: string; stderr?: string; signal?: string; killed?: boolean };
+      const output = `${e.stdout ?? ""}${e.stderr ?? ""}`.trim() || `${(err as Error)?.message ?? err}`;
+      // `execFileSync` kills the command at its timeout (SIGTERM); a command
+      // killed at the bound is reported as timed out, not as a silent failure.
+      const timedOut = e.signal === "SIGTERM" || e.killed === true;
+      return { passed: false, output, timedOut };
+    }
+  } finally {
+    try {
+      git(repo, ["worktree", "remove", "--force", worktree]);
+    } catch {
+      // the worktree may never have been created
+    }
+    fs.rmSync(worktree, { recursive: true, force: true });
+  }
+}
+
 /** One scheduler step: observe active nodes, start ready ones. Returns the
  * program outcome after the step. */
 export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutcome {
@@ -783,6 +868,10 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
     });
     opts.launch(runDir);
   }
+  // 07h3 (H3): once every node is DONE, the program's ONE final gate runs
+  // (on the last node's branch, recorded once). Its failure makes the program
+  // `stuck` with LEAD_CALLED, which the outcome below reports.
+  runProgramFinalGate(program, nodes, state, record);
   // Plan 03c: keep `views/program.txt` current after every status change.
   writeProgramChart(dir);
   // Plan 06f (A2): the scheduler is `live.json`'s node writer, on the same
@@ -970,10 +1059,13 @@ export function notifyProgramOutcome(dir: string, outcome: "done" | "stuck", opt
     // so the notification must name its `env blocked · …` reason, not omit
     // the tool.
     const stuck = nodes.find((n) => state.nodes[n.id].status === "blocked" || state.nodes[n.id].status === "env-blocked");
+    const finalFailed = state.final && !state.final.passed ? state.leadCalled?.reasons?.[0] : undefined;
     const reason =
       outcome === "done"
         ? "program done"
-        : `program stuck${stuck ? `: ${oneLine(state.nodes[stuck.id].reason ?? `${stuck.id} ${state.nodes[stuck.id].status}`)}` : ""}`;
+        : `program stuck${
+            stuck ? `: ${oneLine(state.nodes[stuck.id].reason ?? `${stuck.id} ${state.nodes[stuck.id].status}`)}` : finalFailed ? `: ${oneLine(finalFailed)}` : ""
+          }`;
     notify(
       { id, kind: "program", title: program.title, reason, waitKey: `program:${id}:${outcome}` },
       { root: path.dirname(path.dirname(dir)), ...(opts.reminderMs !== undefined ? { reminderMs: opts.reminderMs } : {}), onError: (message) => log(`notify: ${message}`) },
@@ -1149,7 +1241,13 @@ export function programStatusLines(dir: string, now: Date = new Date(), opts: { 
   const lines = [
     `${program.title}`,
     `program ${path.basename(dir)} · scheduler ${alive ? "running" : "stopped"} · ${outcome} · max ${program.maxParallel} in parallel`,
+    ...(program.base ? [`base      ${program.base}`] : []),
     ...(modelsCheck ? [`models    ${modelsCheck}`] : []),
+    // 07h3 (H3): the program's one final gate, when it has run — once.
+    ...(state.final
+      ? [`final     ${state.final.passed ? "passed" : "failed"} (${Math.round(state.final.durationMs / 1000)}s)`]
+      : []),
+    ...(state.leadCalled ? state.leadCalled.reasons.map((r) => `lead      ${oneLine(r)}`) : []),
     "",
   ];
   const mark: Record<NodeStatus, string> = {
