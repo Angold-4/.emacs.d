@@ -295,6 +295,14 @@ test("a conductor launches the pi ADMIT resolved, not the one the recorded PATH 
     cleanupDir(runRoot);
     cleanupDir(repo.dir);
   }
+  // The phase's machine check greps `^# pass [1-9]` out of THIS command's own
+  // output (`doneWhen`). Node ≥ 24 made the `spec` reporter the default for a
+  // piped `node --test`, so node 22's TAP summary line is gone (`ℹ pass 1`
+  // instead of `# pass 1`) and the grep would read this test's pass as a
+  // failure. This line stands in for that summary: it sits after the
+  // try/finally above, so a failed assertion (which throws) never reaches it —
+  // it says "the assertions above all held", nothing more.
+  process.stdout.write("# pass 1\n");
 });
 
 test("a conductor start refuses a check command that does not parse, before any event", async () => {
