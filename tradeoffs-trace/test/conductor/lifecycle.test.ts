@@ -19,7 +19,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { AdmitRefusal, Conductor, contractVersionFor, createRun, runPaths, type RunPlanFile } from "../../src/conductor.ts";
+import { AdmitRefusal, Conductor, contractVersionFor, createRun, runPaths, runnerRevision, type RunPlanFile } from "../../src/conductor.ts";
 import { ADMIT_PINNED_PI } from "../../src/core/admit.ts";
 import { pruneRunTargets } from "../../src/effects/prune.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
@@ -168,6 +168,8 @@ test("a resume re-resolves the pinned pi and refuses a wrong one with X:ENV_FAUL
       resumedBefore + 1,
       "the resumed conductor drove the run (a RUN_RESUMED was recorded), so it started",
     );
+    assert.equal((eventsOfType(runDir, "RUN_RESUMED").at(-1) as { runnerRevision?: string }).runnerRevision,
+      runnerRevision(), "the resume stamps this writer, not the init's runner");
     assert.ok(readEvents(runDir).length > eventsBefore, "the resume appended its own events");
     // What ADMIT saw is recorded for the owner — and it is this start's pi.
     const admit = JSON.parse(fs.readFileSync(path.join(runDir, "admit.json"), "utf8")) as {

@@ -2486,6 +2486,8 @@ export interface EvRunBudgetExceeded {
 }
 export interface EvRunResumed {
   type: "RUN_RESUMED";
+  /** Actual writer of this segment; absent on historical resume records. */
+  runnerRevision?: string;
 }
 /** Phase 1b addition (pure, additive — round of review item 4): a launch
  * failure (design §2.1: "a mismatch is a launch failure, not a warning") for

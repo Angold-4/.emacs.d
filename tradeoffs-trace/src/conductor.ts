@@ -2380,7 +2380,7 @@ export class Conductor {
     ) {
       this.#driveSuspended = true;
       try {
-        this.#applyEvent({ type: "RUN_RESUMED" });
+        this.#applyEvent({ type: "RUN_RESUMED", runnerRevision: runnerRevision() });
       } finally {
         this.#driveSuspended = false;
       }
@@ -13881,7 +13881,7 @@ export class Conductor {
       // run is still ENV_BLOCKED would otherwise be the state the auto-stop
       // sees, freezing the log before `RUN_RESUMED` could be applied.
       if (result.missing.length === 0 && this.#state.run === "ENV_BLOCKED") {
-        this.#applyEvent({ type: "RUN_RESUMED" });
+        this.#applyEvent({ type: "RUN_RESUMED", runnerRevision: runnerRevision() });
       }
       // No declared command means no tool to record; skip the (otherwise
       // empty) record so an unchanged run's log stays quiet.

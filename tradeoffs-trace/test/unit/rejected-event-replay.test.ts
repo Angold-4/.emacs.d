@@ -21,12 +21,16 @@ function fixture(runnerRevision: string) {
     get live() { return live; },
     apply(event: Event) { const result = reduce(live, event); assert.ok(result.ok); live = result.state; record("event", event); },
     reject(event: Event) { const result = reduce(live, event); assert.equal(result.ok, false); record("rejected", { event, reason: result.reason }); },
-    verify(expected: State = live) {
+    verify(expected: State = live, projection: "all" | "recovery" | "timeline" = "all") {
       fs.writeFileSync(path.join(runDir, "events.jsonl"), records.map((r) => JSON.stringify(r)).join("\n") + "\n");
-      assert.deepEqual(rebuildState(runDir, plan), expected, "strict recovery equals live");
-      assert.deepEqual(rebuildState(runDir, plan, { lenient: true }), expected, "lenient recovery equals live");
-      assert.deepEqual(rebuildTimeline(runDir, plan).state, expected, "timeline equals live");
-      assert.deepEqual(rebuildTimelineWithEvents(runDir, plan).timeline.state, expected);
+      if (projection !== "timeline") {
+        assert.deepEqual(rebuildState(runDir, plan), expected, "strict recovery equals live");
+        assert.deepEqual(rebuildState(runDir, plan, { lenient: true }), expected, "lenient recovery equals live");
+      }
+      if (projection !== "recovery") {
+        assert.deepEqual(rebuildTimeline(runDir, plan).state, expected, "timeline equals live");
+        assert.deepEqual(rebuildTimelineWithEvents(runDir, plan).timeline.state, expected);
+      }
     },
     cleanup() { fs.rmSync(runDir, { recursive: true, force: true }); },
   };
@@ -69,4 +73,24 @@ test("historical poisoned logs suppress only the matching legacy attempt in reco
       f.verify();
     } finally { f.cleanup(); }
   }
+});
+
+for (const projection of ["recovery", "timeline"] as const)
+for (const resumeRevision of [undefined, current, "future-runner"]) test(`a legacy init followed by current resume (${resumeRevision ?? "unstamped"}) preserves an accepted duplicate in ${projection}`, () => {
+  const f = fixture(legacy);
+  try {
+    const poisoned: Event = { type: "CHECKS_PASSED" };
+    f.record("event", poisoned);
+    f.record("rejected", { event: poisoned, reason: "legacy refused attempt" });
+    f.apply({ type: "RUN_RESUMED", ...(resumeRevision ? { runnerRevision: resumeRevision } : {}) });
+    const event: Event = { type: "ATTEMPT_STARTED", attempt: 1 };
+    f.apply(event);
+    f.reject(event);
+    assert.equal(f.live.phase.phase, "IMPLEMENTING");
+    f.verify(f.live, projection);
+    const { timeline, events } = rebuildTimelineWithEvents(f.runDir, f.plan);
+    assert.equal(events.filter((e) => e.type === "CHECKS_PASSED").length, 0, "legacy suppression stays in the legacy segment");
+    assert.equal(events.filter((e) => e.type === "ATTEMPT_STARTED").length, 1, "current rejection never erases its accepted predecessor");
+    assert.equal(timeline.restarts.length, 1, "the resume boundary remains visible");
+  } finally { f.cleanup(); }
 });

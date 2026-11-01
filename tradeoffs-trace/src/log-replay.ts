@@ -28,12 +28,18 @@ const logBeforeRejectionRunners = new Set([
  * exactly the same payload. Legacy suppression requires both provenance and
  * an exact match to the rejection's own attempted event. */
 export function* acceptedReplayRecords(records: readonly LogRecord[]): Generator<LogRecord> {
-  const init = records.find((r) => r.kind === "init")?.event as { runnerRevision?: string } | undefined;
-  // No revision is the historical, pre-provenance log format. Unknown named
-  // runners are never assumed legacy.
-  const legacy = init?.runnerRevision === undefined || logBeforeRejectionRunners.has(init.runnerRevision);
+  // Format belongs to a writer segment, not the run's original writer.
+  // RUN_RESUMED first appeared after the successful-events-only logger, so
+  // even an unstamped historical resume marks a current-format boundary.
+  let legacy = true;
   for (let i = 0; i < records.length; i++) {
     const record = records[i];
+    const writer = record.event as { type?: string; runnerRevision?: string } | undefined;
+    if (record.kind === "init") {
+      legacy = writer?.runnerRevision === undefined || logBeforeRejectionRunners.has(writer.runnerRevision);
+    } else if (record.kind === "event" && writer?.type === "RUN_RESUMED") {
+      legacy = writer.runnerRevision !== undefined && logBeforeRejectionRunners.has(writer.runnerRevision);
+    }
     const next = records[i + 1];
     if (legacy && record.kind === "event" && next?.kind === "rejected" &&
       isDeepStrictEqual(record.event, (next.event as { event?: unknown })?.event)) continue;
