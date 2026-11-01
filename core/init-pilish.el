@@ -18,6 +18,9 @@
 ;;   C-c m a   pick the agent's model
 ;;   C-c m t   run the `pi' CLI itself in a terminal (vterm)
 ;;
+;; `:pi' opens a new session, a fresh chat and input buffer; `C-c m c'
+;; reuses the session this project already has.
+;;
 ;; Pilish's own `C-c C-*' bindings are removed so this config's global
 ;; `C-c' bindings apply inside its buffers; sending is RET in the input
 ;; buffer's normal state (type, ESC, RET), which is also how a prompt is
@@ -83,6 +86,10 @@
 (declare-function pilish--browse-switch-session "pilish-browse")
 (declare-function pilish--session-live-process-p "pilish-ui")
 (declare-function pilish-project-buffers "pilish-ui")
+(declare-function pilish--session-directory "pilish-ui")
+(declare-function pilish--find-session "pilish-ui")
+(declare-function pilish--get-chat-buffer "pilish-ui")
+(declare-function pilish--get-input-buffer "pilish-ui")
 (declare-function pilish-open-session-file "pilish")
 (declare-function pilish--display-startup-header "pilish-ui")
 (declare-function pilish--append-to-chat "pilish-ui")
@@ -300,6 +307,49 @@ started."
   (unless (pilish-project-buffers)
     (pilish))
   (pilish-session-browser))
+
+;;;; New sessions
+
+(defvar +pilish--session-counter 0
+  "Sessions `+pilish/new' has opened since Emacs started.")
+
+(defun +pilish--free-session-name (directory)
+  "Return a session name in DIRECTORY that no live session uses.
+The session name is part of both buffer names and is what keeps one
+session's chat and input apart from another's, so it has to be free
+before `pilish' creates a new pair instead of focusing the old one."
+  (let (name)
+    (while (progn
+             (setq +pilish--session-counter (1+ +pilish--session-counter)
+                   name (format "pi%d" +pilish--session-counter))
+             (pilish--find-session directory name)))
+    name))
+
+(defun +pilish--session-buffers ()
+  "Return this session's chat and input buffers as a cons.
+Works from either buffer of the pair."
+  (cons (pilish--get-chat-buffer) (pilish--get-input-buffer)))
+
+(defun +pilish--register-session (buffers)
+  "Attach the session BUFFERS pair to the current perspective.
+The pair is made with `generate-new-buffer', which the after-major-mode
+auto-add can miss, so `C-x b' would not find both in this workspace."
+  (when (and (bound-and-true-p persp-mode) (fboundp 'persp-add-buffer))
+    (dolist (buffer buffers)
+      (when (buffer-live-p buffer)
+        (persp-add-buffer buffer)))))
+
+(defun +pilish/new ()
+  "Open a new Pi session: a fresh chat and a fresh input buffer.
+`pilish' without a session name reuses the session this project already
+has, so a new one needs a free name."
+  (interactive)
+  (require 'pilish)
+  (pilish (+pilish--free-session-name (pilish--session-directory)))
+  (+pilish--register-session (+pilish--session-buffers)))
+
+(with-eval-after-load 'evil
+  (evil-ex-define-cmd "pi" #'+pilish/new))
 
 ;;;; Remove Pilish's own prefix keys
 
