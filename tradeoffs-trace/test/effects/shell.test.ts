@@ -116,6 +116,35 @@ test("deadline escalation: a TERM-ignoring command ends in SIGKILL", async () =>
   assert.equal(outcome.signal, "SIGKILL");
 });
 
+test("a worker command's child that ignores SIGTERM is killed after the grace", async () => {
+  const pidFile = path.join(dir, "term-ignoring-child");
+  const script = "import os, signal, time\n" +
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" +
+    `open(${JSON.stringify(pidFile)}, 'w').write(str(os.getpid()))\n` +
+    "while True: time.sleep(0.01)\n";
+  // The shell leader honors TERM; only its child ignores it. The leader's
+  // exit must not cancel escalation or remove the group from bookkeeping.
+  const command = `python3 -c '${script.replaceAll("'", "'\\''")}' & wait`;
+  const running = runCommand({ command, deadlineMs: 1000, termGraceMs: 200 });
+  try {
+    await waitFor(() => fs.existsSync(pidFile), 3000);
+    const pid = Number(fs.readFileSync(pidFile, "utf8"));
+    const outcome = await running.result;
+    assert.equal(outcome.timedOut, true);
+    assert.equal(outcome.signal, "SIGTERM", "the leader exited on TERM");
+    assert.deepEqual(outcome.signalsSent, ["SIGTERM", "SIGKILL"]);
+    await waitFor(() => {
+      try {
+        const state = execFileSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" }).trim();
+        return state.length === 0 || state.startsWith("Z");
+      } catch { return true; }
+    });
+  } finally {
+    // Also clean up when testing the broken revision, whose child survives.
+    await killGroup(await running.pgid, { termGraceMs: 50 });
+  }
+});
+
 test("a command that honors SIGTERM does not escalate to SIGKILL", async () => {
   // Plan 06k2 (A3): a loaded host can delay the trap's own handling; a
   // larger term grace keeps this from flaking (it was the 06i load-only

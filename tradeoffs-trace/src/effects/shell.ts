@@ -259,6 +259,7 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
   let timedOut = false;
   let deadlineTimer: NodeJS.Timeout | undefined;
   let termTimer: NodeJS.Timeout | undefined;
+  let afterTermination: (() => void) | undefined;
   const signalsSent: string[] = [];
   let output = "";
   let child: ChildProcessWithoutNullStreams | undefined;
@@ -318,13 +319,15 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
   function terminate(reason: EndReason): void {
     if (reason === "timeout") timedOut = true;
     if (reason === "cancelled") cancelRequested = true;
-    if (resolvedPgid === undefined || !groupAlive(resolvedPgid)) return;
+    if (signalsSent.includes("SIGTERM") || resolvedPgid === undefined || !groupAlive(resolvedPgid)) return;
     if (!signalGroup(resolvedPgid, "SIGTERM")) return;
     signalsSent.push("SIGTERM");
     termTimer = setTimeout(() => {
       if (resolvedPgid !== undefined && groupAlive(resolvedPgid) && signalGroup(resolvedPgid, "SIGKILL")) {
         signalsSent.push("SIGKILL");
       }
+      termTimer = undefined;
+      afterTermination?.();
     }, termGraceMs);
   }
 
@@ -405,11 +408,21 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
     // once the pipes closed too (`close`), or STDIO_DRAIN_MS after `exit`.
     let exited: { code: number | null; signal: NodeJS.Signals | null } | undefined;
     let closed = false;
+    let drained = false;
     let drainTimer: NodeJS.Timeout | undefined;
     let settled = false;
     const settle = (): void => {
-      if (settled || exited === undefined) return;
+      if (settled || exited === undefined || (!closed && !drained)) return;
+      // The leader exiting is NOT evidence that its group is gone. Keep the
+      // escalation live until the group dies, or the grace expires and KILL
+      // has been sent, even if every output pipe has already closed.
+      if (termTimer !== undefined) {
+        if (resolvedPgid !== undefined && groupAlive(resolvedPgid)) return;
+        clearTimeout(termTimer);
+        termTimer = undefined;
+      }
       settled = true;
+      stopSampling();
       if (drainTimer) clearTimeout(drainTimer);
       resolveResult({
         exitCode: exited.code,
@@ -422,13 +435,12 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
         ...(sampled ? { resourceSample: { peakRssMB, freeMemMB } } : {}),
       });
     };
+    afterTermination = settle;
     c.once("exit", (code, signal) => {
       if (deadlineTimer) clearTimeout(deadlineTimer);
-      if (termTimer) clearTimeout(termTimer);
-      stopSampling();
       exited = { code, signal: signal as NodeJS.Signals | null };
       if (closed) settle();
-      else drainTimer = setTimeout(settle, STDIO_DRAIN_MS);
+      else drainTimer = setTimeout(() => { drained = true; settle(); }, STDIO_DRAIN_MS);
     });
     c.once("close", () => {
       closed = true;

@@ -735,11 +735,15 @@ while True: pass  # ${marker}'`,
     assert.deepEqual(pidsWith(marker), [], "no process of the killed command survives, child included");
     // The worker got the note: its command, the bound, and that it was killed.
     const streamDir = path.join(setup.runDir, "stream");
-    const streams = fs
+    const workerStreams = () => fs
       .readdirSync(streamDir)
       .filter((name) => name.startsWith("worker-"))
       .map((name) => fs.readFileSync(path.join(streamDir, name), "utf8"))
       .join("\n");
+    // Process death can precede completion of the group kill grace and the
+    // worker's socket reply. Wait for delivery, not merely the leader's exit.
+    await waitFor(() => workerStreams().includes("killed after 3 s"), 30_000, 50, setup.runDir);
+    const streams = workerStreams();
     assert.match(streams, /killed after 3 s/, "the note names the bound that killed it");
     assert.match(streams, /process group/, "the note says the whole process group was killed");
     assert.ok(streams.includes("python3 -c"), `the note names the command the worker ran:\n${streams.slice(-2000)}`);
