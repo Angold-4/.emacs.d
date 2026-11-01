@@ -26,6 +26,8 @@
 // the names in `BUILD_TARGET_DIRS`.
 
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { saveWorktreeState } from "./kept-worktree.ts";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -132,11 +134,13 @@ function pruneTargetsUnder(checkout: string, dir: string, visited: { count: numb
  * `runWorktree`/`laneWorktrees` are the worktree paths the conductor itself
  * created (it passes `runPaths(runDir).worktree` and `<run>/worktrees/*`);
  * `removeWorktree` is the git-aware remover, injected so this module never has
- * to know the plan's repo. Idempotent: a missing path is simply skipped. */
+ * to know the plan's repo. `preservation` publishes backups from independent
+ * candidate clones into the run's repo too. Idempotent: missing paths skip. */
 export function pruneRunTargets(
   runDir: string,
   worktrees: { run?: string; lanes?: string[] },
   removeWorktree: (dir: string) => void = (dir) => fs.rmSync(dir, { recursive: true, force: true }),
+  preservation?: { repo: string; runId: string },
 ): PruneResult {
   const removed: string[] = [];
   const log = (line: string): void => {
@@ -146,8 +150,21 @@ export function pruneRunTargets(
       // Logging is best effort; preserving tracked content is not.
     }
   };
+  const preserve = (checkout: string): boolean => {
+    const name = path.basename(checkout).replace(/[^a-zA-Z0-9_-]/g, "_");
+    const ref = `refs/tt/${preservation?.runId ?? path.basename(runDir)}/pruned/${name}/${randomUUID()}`;
+    try {
+      const saved = saveWorktreeState(preservation?.repo ?? checkout, checkout, ref);
+      if (saved) log(`saved ${checkout} as ${saved.kind} to ${ref}`);
+      return true;
+    } catch (err) {
+      log(`kept ${checkout}: could not save uncommitted state (${String((err as Error)?.message ?? err)})`);
+      return false;
+    }
+  };
   for (const worktree of [worktrees.run, ...(worktrees.lanes ?? [])]) {
     if (worktree === undefined || !fs.existsSync(worktree)) continue;
+    if (!preserve(worktree)) continue;
     try {
       removeWorktree(worktree);
       removed.push(worktree);
@@ -165,6 +182,7 @@ export function pruneRunTargets(
       // One visit budget per candidate checkout, so one huge tree does not
       // starve the next.
       const checkout = path.join(candidates, entry.name);
+      if (!preserve(checkout)) continue;
       pruneTargetsUnder(checkout, checkout, { count: 0 }, removed, log);
     }
   }

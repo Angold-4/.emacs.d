@@ -20,6 +20,7 @@ test("prune keeps a build-output-named folder that holds tracked files", () => {
     fs.writeFileSync(path.join(tracked, "generated.txt"), "also keep the whole folder\n");
     fs.writeFileSync(path.join(generated, "output.bin"), "generated\n");
     execFileSync("git", ["-C", checkout, "add", "packages/web/target/source.txt"]);
+    execFileSync("git", ["-C", checkout, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "tracked target"]);
     const result = pruneRunTargets(run, {});
     assert.equal(fs.readFileSync(path.join(tracked, "source.txt"), "utf8"), "tracked content\n");
     assert.equal(fs.existsSync(path.join(tracked, "generated.txt")), true);

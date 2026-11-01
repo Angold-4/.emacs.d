@@ -523,6 +523,9 @@ test("the prune reaches a build target nested in a package directory", () => {
     // `.git` is never walked: a repository's own directory is not a build
     // target and may hold anything.
     execFileSync("git", ["init", "-q", candidate]);
+    execFileSync("git", ["-C", candidate, "add", "README.md"]);
+    execFileSync("git", ["-C", candidate, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"]);
+    execFileSync("git", ["init", "-q", worktree]);
     fs.mkdirSync(path.join(candidate, ".git", "target"), { recursive: true });
     const result = pruneRunTargets(runDir, { run: worktree });
     assert.equal(fs.existsSync(path.join(nested, "target")), false, "the nested package target is pruned");

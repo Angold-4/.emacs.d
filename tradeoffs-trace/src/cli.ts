@@ -1297,7 +1297,9 @@ async function runConductorProcess(runDir: string): Promise<void> {
     }
     let removed: string[] = [];
     try {
-      removed = pruneRunTargets(runDir, { run: p.worktree, lanes }, (dir) => removeWorktree(plan.repo, dir)).removed;
+      removed = pruneRunTargets(runDir, { run: p.worktree, lanes }, (dir) => removeWorktree(plan.repo, dir), {
+        repo: plan.repo, runId: conductor.state.phase.runId,
+      }).removed;
     } catch (err) {
       process.stderr.write(`could not prune ${runDir}: ${String((err as Error)?.message ?? err)}\n`);
     }
