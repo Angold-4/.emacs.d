@@ -22,6 +22,7 @@ import {
   applyOverrideCast,
   applyOwnerRequestResolved,
   autoResolveLinkedRequest,
+  mapOwnerRequestsInResolutionOrder,
   awaitingOwnerTarget,
   ownerParkCleared,
   checkFindingAcceptedByOwner,
@@ -160,7 +161,7 @@ function applyRecheck(s: State, ev: Event, to: "CHECKING" | "FINAL_CHECKING", re
       repairRoundsUsed: Math.max(0, s.phase.repairRoundsUsed - (hasDomainRounds(s.phase) ? 0 : 1)),
       worktreeTainted: true,
     } : {}),
-    ownerRequests: s.phase.ownerRequests.map((r) =>
+    ownerRequests: mapOwnerRequestsInResolutionOrder(s.phase.ownerRequests, (r) =>
       r.status === "open" && isBudgetGateRequest(r)
         ? { ...r, status: "resolved" as const, resolution: { option: "recheck", note: e.reason } }
         : r,
@@ -1497,7 +1498,7 @@ addRow({
   apply: (s) =>
     withPhase(s, {
       phase: "RESOLVING",
-      ownerRequests: s.phase.ownerRequests.map((r) =>
+      ownerRequests: mapOwnerRequestsInResolutionOrder(s.phase.ownerRequests, (r) =>
         r.status === "open" && r.reason.startsWith("the owner must record evidence for")
           ? {
               ...r,
@@ -1612,7 +1613,7 @@ function applyAmend(s: State, ev: Event): State {
       ? { ...f, status: "accepted" as const, acceptedScope: `amended to v${e.newContractVersion.snapshot}` }
       : f,
   );
-  const ownerRequests = s.phase.ownerRequests.map((r) =>
+  const ownerRequests = mapOwnerRequestsInResolutionOrder(s.phase.ownerRequests, (r) =>
     r.status === "open" && r.boundContractVersion && sameVersion(r.boundContractVersion, e.replacingContractVersion)
       ? { ...r, status: "resolved" as const, resolution: { option: "superseded_by_amend" } }
       : r,
@@ -1691,7 +1692,7 @@ function applyCriterionReverted(s: State, ev: Event): State {
   );
   // An open request bound to the wording just replaced is superseded; it is
   // re-evaluated under the restored contract version.
-  const ownerRequests = s.phase.ownerRequests.map((r) =>
+  const ownerRequests = mapOwnerRequestsInResolutionOrder(s.phase.ownerRequests, (r) =>
     r.status === "open" && r.boundContractVersion && sameVersion(r.boundContractVersion, s.phase.contract.contractVersion)
       ? { ...r, status: "resolved" as const, resolution: { option: "superseded_by_amendment_revert" } }
       : r,
@@ -1838,7 +1839,7 @@ function applyOwnerCorrection(s: State, ev: Event): State {
   const e = ev as Extract<Event, { type: "OWNER_CORRECTION" }>;
   const C = s.phase.candidate?.sha;
   const K = s.phase.contract.contractVersion;
-  const ownerRequests = s.phase.ownerRequests.map((r) =>
+  const ownerRequests = mapOwnerRequestsInResolutionOrder(s.phase.ownerRequests, (r) =>
     r.status === "open"
       ? {
           ...r,

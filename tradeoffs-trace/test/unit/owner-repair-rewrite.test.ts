@@ -95,6 +95,73 @@ for (const original of [undefined, "true"]) test(`UNPROVABLE ${original ?? "miss
   }
 });
 
+function findingCorrectionFixture() {
+  const { state: initial } = fixture();
+  initial.phase.decisions = [];
+  initial.phase.ballots = [];
+  initial.phase.findings = [{ id: "F1", version: 1, phaseId: "p1", kind: "defect", severity: "blocking", raisedBy: "M", status: "open",
+    boundCandidateSha: "C1", domain: "booking", where: "booking/cache.ts:12", evidence: "booking/cache.ts:12 stale price", expected: "fresh price" }];
+  const events: Event[] = [], order: string[] = [];
+  const d = driver(initial, events, order);
+  const binding = { boundCandidateSha: "C1", boundContractVersion: initial.phase.contract.contractVersion, boundRecordVersion: 1 };
+  d.send({ type: "REVISE", correctionId: "C1", targetRecordId: "F1", correctionText: "booking/cache.ts:12 must return fresh price", contractChange: false, ...binding });
+  d.send({ type: "REPAIR_ATTEMPT_STARTED" });
+  d.send({ type: "ACTION_STARTED", action: "dispatch_worker", key: "correction-map" });
+  d.send({ type: "LOOP_BOUND_REACHED", reason: "domain repair needs owner clarification" });
+  const requests = d.conductor.test_state.phase.ownerRequests;
+  assert.deepEqual(requests.map((r) => r.origin), ["open_finding", "unaddressed_correction"]);
+  return { initial, events, d, binding, requests };
+}
+
+for (const correctionFirst of [true, false]) test(`finding/correction resolutions use accepted order (correction first: ${correctionFirst}), live and replayed`, async () => {
+  const { initial, events, d, binding, requests } = findingCorrectionFixture();
+  const resolutionOrder = correctionFirst ? [...requests].reverse() : requests;
+  for (const [i, request] of resolutionOrder.entries()) {
+    d.send({ type: "OWNER_REQUEST_RESOLVED", requestId: request.id,
+      option: request.origin === "open_finding" ? "repair" : "grant_correction",
+      note: `doneWhen: ${i === 0 ? "true" : "test -f booking-fixed.txt"}`, ...binding });
+  }
+  assert.equal(d.conductor.test_state.phase.phase, "REPAIRING");
+  d.send({ type: "REPAIR_ATTEMPT_STARTED" });
+  d.send({ type: "ACTION_STARTED", action: "dispatch_worker", key: "replacement-map" });
+  const replayed = events.reduce(apply, initial);
+  assert.deepEqual(replayed, d.conductor.test_state);
+  for (const state of [d.conductor.test_state, replayed]) {
+    const writes: Event[] = [], trace: string[] = [];
+    const resumed = driver(state, writes, trace);
+    await resumed.run();
+    assert.deepEqual(trace.filter((s) => s.startsWith("done_when_base:")), ["done_when_base:test -f booking-fixed.txt"], trace.join("\n"));
+    assert.ok(trace.indexOf("done_when_base:test -f booking-fixed.txt") < trace.indexOf("FINDING_RAISED"), trace.join("\n"));
+    assert.ok(trace.indexOf("FINDING_RAISED") < trace.indexOf("dispatch"), trace.join("\n"));
+    const raised = writes.filter((e) => e.type === "FINDING_RAISED");
+    assert.equal(raised.length, 1);
+    assert.equal(raised[0].finding.doneWhen, "test -f booking-fixed.txt");
+    assert.equal(raised[0].finding.id, `F-p1-owner-repair-${resolutionOrder[1].id}`);
+    assert.ok(!trace.some((s) => s.startsWith("lead_called")), trace.join("\n"));
+    await resumed.run();
+    assert.equal(writes.filter((e) => e.type === "FINDING_RAISED").length, 1, "restart reuses materialized point");
+  }
+});
+
+for (const automatic of [false, true]) test(`later ${automatic ? "automatic acceptance" : "withdrawal"} supersedes finding/correction repair, live and replayed`, () => {
+  const { initial, events, d, binding, requests: [finding, correction] } = findingCorrectionFixture();
+  const repair = automatic ? correction : finding;
+  const final = automatic ? finding : correction;
+  d.send({ type: "OWNER_REQUEST_RESOLVED", requestId: repair.id,
+    option: automatic ? "grant_correction" : "repair", note: "doneWhen: false", ...binding });
+  if (automatic) {
+    d.send({ type: "FINDING_ACCEPTED_BY_OWNER", findingId: "F1", by: "owner", scope: "accept stale price for this phase", ...binding });
+  } else {
+    d.send({ type: "OWNER_REQUEST_RESOLVED", requestId: final.id, option: "withdraw", ...binding });
+  }
+  const replayed = events.reduce(apply, initial);
+  assert.deepEqual(replayed, d.conductor.test_state);
+  for (const state of [d.conductor.test_state, replayed]) {
+    assert.deepEqual(state.phase.ownerRequests.map((r) => r.id), [repair.id, final.id]);
+    for (const request of state.phase.ownerRequests) assert.equal(ownerRepairPointFor(state.phase, request, { checks: [] }), undefined);
+  }
+});
+
 test("a later ruling supersedes an unmaterialized repair, only at its binding", () => {
   const { state, request } = fixture();
   const K = state.phase.contract.contractVersion;

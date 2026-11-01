@@ -1686,8 +1686,9 @@ export function ownerRepairPointFor(
     r.resolvedBinding?.candidateSha === request.resolvedBinding?.candidateSha &&
     sameVersion(r.resolvedBinding?.contractVersion, request.resolvedBinding?.contractVersion) &&
     ownerRepairWorkKey(phase, r) === key);
-  // Append order is durable: a replacement or a later drop/ruling supersedes
-  // an earlier unmaterialized repair. It must be checked before admission.
+  // Resolution writers move newly resolved requests to the end, so this is
+  // accepted resolution order, even when requests were created in the opposite
+  // order. A later repair/drop/ruling supersedes unmaterialized work before admission.
   if (sameWork.at(-1)?.id !== request.id || !isRepairForcingOption(request.origin, request.resolution.option)) return undefined;
   // Already admitted work is reused, never duplicated by a fresh request.
   const materialized = sameWork.map((r) => phase.findings.find((f) => f.id === `F-${phase.phaseId}-owner-repair-${r.id}`)).find(Boolean);
