@@ -16,6 +16,7 @@
 ;;   C-c m c   create (start or focus) a session in this workspace
 ;;   C-c m m   browse every previous session (all projects)
 ;;   C-c m a   pick the agent's model
+;;   C-c m t   run the `pi' CLI itself in a terminal (vterm)
 ;;
 ;; Pilish's own `C-c C-*' bindings are removed so this config's global
 ;; `C-c' bindings apply inside its buffers; sending is RET in the input
@@ -26,8 +27,9 @@
 ;; the rest of the Pi harness.  Disable with `+pilish-keep-menu' nil; the
 ;; rest of Pilish is on `M-x pilish-*'.  Pilish's startup header is
 ;; suppressed (`+pilish-startup-header' nil) because it advertises the
-;; stripped keys; completed thinking is removed (`+pilish-show-thinking'
-;; nil) so the transcript stays on prompts, answers, and tool output.
+;; stripped keys; thinking is removed (`+pilish-show-thinking' nil), live
+;; as well as completed, so the transcript stays on prompts, answers, and
+;; tool output.
 ;;
 ;; Chat buffer: Pilish's optional Evil integration normally puts the
 ;; read-only transcript in *motion* state.  We use the normal state instead
@@ -86,7 +88,13 @@
 (declare-function pilish--append-to-chat "pilish-ui")
 (declare-function pilish--format-startup-banner-compact "pilish-ui")
 (declare-function pilish--thinking-hidden-stub "pilish-render")
+(declare-function pilish--display-thinking-start "pilish-render")
+(declare-function pilish--display-thinking-delta "pilish-render")
+(declare-function pilish--display-thinking-end "pilish-render")
 (declare-function evil-define-key* "evil-core")
+(declare-function vterm-mode "vterm")
+(declare-function vterm-send-string "vterm")
+(declare-function vterm-send-return "vterm")
 
 ;; Native Evil state for the chat buffer, set before `pilish-evil' loads.
 (setq pilish-evil-chat-state 'normal)
@@ -120,14 +128,14 @@ session."
   :group 'tools)
 
 (defcustom +pilish-show-thinking nil
-  "When non-nil, show completed assistant thinking in the transcript.
-The default removes completed thinking blocks entirely, so the chat stays
-on prompts, answers, and tool output.  Pilish itself would render them as
-a `> Thinking hidden...' stub; this module advises
-`pilish--thinking-hidden-stub' to render nothing instead, which Pilish's
-renderer supports as a block removal.  Live thinking is still streamed
-while the agent works (Pilish always shows that), and it disappears when
-the turn completes."
+  "When non-nil, show assistant thinking in the transcript.
+The default removes thinking entirely, so the chat stays on prompts,
+answers, and tool output.  Live streaming is suppressed by advising
+`pilish--display-thinking-start', `pilish--display-thinking-delta' and
+`pilish--display-thinking-end' to do nothing; that is the only live path,
+so nothing is written while the agent works.  Completed thinking and
+history reloads are suppressed by advising `pilish--thinking-hidden-stub'
+to render nothing, which Pilish's renderer supports as a block removal."
   :type 'boolean
   :group 'tools)
 
@@ -228,6 +236,15 @@ stub line."
       (funcall orig normalized)
     ""))
 
+(defun +pilish--hide-streaming-thinking (orig &rest args)
+  "Skip live thinking rendering when `+pilish-show-thinking' is nil.
+Runs as :around advice on the streaming thinking display functions, the
+only path that writes live thinking: start opens the block, delta fills
+it, end closes it.  Suppressing all three leaves the transcript untouched
+while the agent works."
+  (when +pilish-show-thinking
+    (apply orig args)))
+
 (defun +pilish--install-advice ()
   "Install the Pilish advices this module relies on."
   (unless (advice-member-p #'+pilish--remember-model
@@ -238,6 +255,11 @@ stub line."
                            'pilish--thinking-hidden-stub)
     (advice-add 'pilish--thinking-hidden-stub
                 :around #'+pilish--thinking-hidden-stub))
+  (dolist (function '(pilish--display-thinking-start
+                      pilish--display-thinking-delta
+                      pilish--display-thinking-end))
+    (unless (advice-member-p #'+pilish--hide-streaming-thinking function)
+      (advice-add function :around #'+pilish--hide-streaming-thinking)))
   (unless (advice-member-p #'+pilish--display-startup-header
                            'pilish--display-startup-header)
     (advice-add 'pilish--display-startup-header
@@ -346,8 +368,8 @@ TAB folds a tool/thinking block."
   ;; each window keeps its own point and scroll.
   (setq pilish-input-window-display 'always
         pilish-input-window-height 0.3)
-  ;; Completed thinking is removed by default (see the stub advice); when
-  ;; shown, Pilish's default visible mode is used.
+  ;; Thinking is removed by default (see the stub and streaming advice);
+  ;; when shown, Pilish's default visible mode is used.
   (setq pilish-thinking-display (if +pilish-show-thinking 'visible 'hidden))
   (defalias 'pi 'pilish)
   (+pilish--strip-default-keys)
@@ -358,6 +380,26 @@ TAB folds a tool/thinking block."
     (+pilish--setup-evil))
   (when (featurep 'pilish-evil)
     (+pilish--setup-evil)))
+
+;;;; Pi's own terminal UI
+
+(defun +pilish/cli ()
+  "Start or focus the `pi' CLI in a dedicated vterm buffer.
+This runs Pi's own terminal UI, not Pilish's Emacs-native frontend; Pi
+applies the provider and model remembered in its settings.  Like
+`+vterm/new', the buffer starts in the Emacs launch directory."
+  (interactive)
+  (require 'vterm)
+  (let ((buffer-name "*pi*"))
+    (if-let ((buffer (get-buffer buffer-name)))
+        (switch-to-buffer buffer)
+      (let ((buffer (generate-new-buffer buffer-name)))
+        (switch-to-buffer buffer)
+        (vterm-mode)
+        (vterm-send-string "pi")
+        (vterm-send-return)))))
+
+(keymap-global-set "C-c m t" #'+pilish/cli)
 
 (provide 'init-pilish)
 ;;; init-pilish.el ends here
