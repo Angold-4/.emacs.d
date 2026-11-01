@@ -648,14 +648,6 @@ function nodeStartPlan(
   const runner = opts.runner !== undefined ? opts.runner() : currentProgramRunner(path.dirname(path.dirname(dir)), runnerRevision);
   const source = readProgramSource(dir);
   const exporter = opts.exporter ?? defaultExporter();
-  // A2: a source file must be read now, never replaced by the old snapshot.
-  // The shared effect still supports snapshot-only callers without exporters.
-  if (source !== undefined && exporter === undefined) {
-    return {
-      ok: false,
-      reason: `X:PLAN_DEFECT: ${source} cannot be re-exported for node ${node.id}: no exporter is configured (set TT_EXPORT_COMMAND, or run on a host with Emacs and the runner's exporter)`,
-    };
-  }
   const result = planForNodeStart({
     nodeId: node.id,
     entryId: entry.id,

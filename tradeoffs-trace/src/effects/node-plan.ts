@@ -14,9 +14,9 @@
 //     count and must lint — the same lint `tt program start` runs;
 //   - an export or lint failure is the node's named `X:PLAN_DEFECT`, never a
 //     silent fall back to the older plan;
-//   - without a source or an exporter the snapshot the program was started
-//     with stands, and the program log says so (07h C1: a program without
-//     these options runs exactly as before).
+//   - only without a source the snapshot the program was started with stands,
+//     and the program log says so (07h C1). A source without an exporter is
+//     a plan defect, never a stale-plan fallback.
 //
 // What the node's run records about all this is `NodeSnapshot`: the source, the
 // exporter, the program's CURRENT runner and a fingerprint of the plan.
@@ -89,7 +89,12 @@ export function planForNodeStart(inputs: NodeStartInputs): NodeStartPlan {
     return snapshotOf(recorded, false, source ?? "", "snapshot");
   };
   if (source === undefined) return kept("the program has no source file");
-  if (exporter === "snapshot" || inputs.reexport === undefined) return kept("no exporter is configured");
+  if (exporter === "snapshot" || inputs.reexport === undefined) {
+    return {
+      ok: false,
+      reason: `X:PLAN_DEFECT: ${source} cannot be re-exported for node ${nodeId}: no exporter is configured (set TT_EXPORT_COMMAND, or run on a host with Emacs and the runner's exporter)`,
+    };
+  }
   let fresh: ProgramFile;
   try {
     fresh = inputs.reexport(source);
