@@ -43,8 +43,6 @@ import {
   laneFailureLines,
   lanesOfContract,
   runRound,
-  fixRoundCandidate,
-  isFixRound,
   type LaneBuild,
   type LaneCheck,
   type LaneHost,
@@ -1755,10 +1753,6 @@ export class Conductor {
    * persisted in its `record.json`. Only the picked candidate's are emitted as
    * events; a loser's never repair anything. */
   #laneFacts = new Map<string, FindingFact[]>();
-  /** 07g2 (A2): the checks the fix loop already ran on an integrated head, so
-   * the acceptance round's synthetic lane reuses them instead of running the
-   * same checks twice. Consumed by `#checkLaneCandidate`. */
-  #integratedChecks = new Map<string, LaneCheck>();
   /** 07g2 (R7): item ids whose evaluator disagreement was already reported for
    * this phase, so LEAD_CALLED names each one once. */
   #itemDisagreements: Set<string> | undefined;
@@ -1963,12 +1957,6 @@ export class Conductor {
    * `#runLaneRound` reads and clears this before emitting any attempt-failure
    * event, so the stopped round never fights the recheck. */
   #recheckCancelledLaneRound = false;
-  /** 07g2 (A2/R3): a red merged candidate whose failing file no domain loop can
-   * take (no declared domain owns it, or that domain has no open point).
-   * `#fixLane` records it here and answers with no candidate; `#runLaneRound`
-   * parks the phase for the lead once the round has returned, so the phase
-   * never leaves IMPLEMENTING in the middle of a round. */
-  #mergedCheckNoLoop: { round: number; sha: string; reason: string } | undefined;
 
   constructor(opts: ConductorOptions) {
     this.#runDir = opts.runDir;
@@ -4937,7 +4925,9 @@ export class Conductor {
         // and `core/lanes.ts`'s `runRound` orchestrates it. The conductor
         // decides nothing about lanes beyond calling it.
         if (this.#laneRoundEnabled()) {
-          void this.#runLaneRound(actionId).catch((err) => this.#logUnexpected("run_round", err));
+          const picked = (this.#state.phase.rounds ?? []).some((r) => r.picked);
+          const run = picked ? this.#runDomainRounds(actionId) : this.#runLaneRound(actionId);
+          void run.catch((err) => this.#logUnexpected("run_round", err));
           return;
         }
         void this.#runWorkerAttempt(actionId).catch((err) => this.#logUnexpected("dispatch_worker", err));
@@ -9405,68 +9395,6 @@ export class Conductor {
     }
     const digest = this.#laneCheckFailureDigest(sha);
     this.#log.append("lane_fix_started", { lane, round, sha, remainingMs });
-    // Packet X: a fix round's synthetic lane holds the fixers' merge, not
-    // this lane worker's own work. Its first fix starts a FRESH session with
-    // a prompt that names the merge; a later fix (of that fix's own commit)
-    // continues that session as usual.
-    const fixRound = lane === "a" ? fixRoundCandidate(this.#state.phase.rounds, round) : undefined;
-    if (fixRound && fixRound.candidate === sha) {
-      // 07g2 (A2/R3): a red merged candidate goes back to the loop of the DOMAIN
-      // that owns the failing file, with the check's output. A check naming no
-      // declared domain's file (or a domain with no open point to loop on) has
-      // no loop to go back to: design G3 puts it on the lead (LEAD_CALLED), so
-      // no lane round and no fresh merge fix starts. The fresh merge fix below
-      // stays only for the case of an owning domain whose loop failed to
-      // produce a commit.
-      const domains = this.#state.phase.contract.domains ?? [];
-      const output = digest || this.#laneCheckFailureDigest(sha);
-      const owner = failingDomainOf(output, domains);
-      const ownerTask = owner ? this.#ownerTaskFor(owner.domain) : undefined;
-      if (owner && ownerTask) {
-        this.#log.append("merged_check_reentered", { lane, round, sha, domain: owner.domain, path: owner.path, points: ownerTask.findingIds });
-        const reentered = await this.#runFixer(ownerTask, round, sha);
-        if (reentered.ok && typeof reentered.sha === "string" && reentered.sha.length > 0) {
-          return {
-            lane,
-            sha: reentered.sha,
-            ...(reentered.disclosures ? { disclosures: reentered.disclosures } : {}),
-            ...(reentered.added ? { added: reentered.added } : {}),
-          };
-        }
-        this.#log.append("merged_check_reentry_failed", { lane, round, sha, domain: owner.domain, reason: reentered.reason ?? reentered.note });
-      } else {
-        const reason = owner
-          ? `the merged candidate ${sha.slice(0, 7)} is red in ${owner.path} (domain ${owner.domain}), which has no open point to loop on`
-          : `the merged candidate ${sha.slice(0, 7)} is red and its check output names no file of a declared domain`;
-        this.#log.append("merged_check_no_loop", {
-          lane,
-          round,
-          sha,
-          reason,
-          ...(owner ? { domain: owner.domain, path: owner.path } : {}),
-        });
-        this.#mergedCheckNoLoop = { round, sha, reason };
-        return { lane, note: reason };
-      }
-    }
-    if (fixRound && fixRound.candidate === sha) {
-      const mergePrompt = [
-        `Commit ${sha.slice(0, 7)} is the fixers' merge: the previous round's fixer commits merged onto base ${fixRound.base.slice(0, 7)}. It FAILED the round checks, so its reviews were cancelled. A lane never hands in a red tree.`,
-        "",
-        "This worktree holds that merge; you did not write it, and this is a fresh session. Fix exactly what fails. Keep the fixers' work; do not delete, skip or #[ignore] a test, weaken an assertion, or remove required work to make a check pass (ODP-2) — if the failure is a real limit, raise it as a BLOCKER with the exact error instead.",
-        "Run the failing command yourself until it passes, then run the full round checks, then call submit_coverage and submit_phase with your complete payload (your disclosures, the coverage of the commit as it stands, and your answers).",
-        `You have about ${Math.max(1, Math.floor(remainingMs / 60_000))} minutes of this attempt left.`,
-        "",
-        `The failure: ${failure}`,
-        ...(digest ? ["", "Its output (errors first):", "```", digest, "```"] : []),
-      ].join("\n");
-      const fixed = await this.#buildLane(lane, round, sha, mergePrompt, { of: sha, timeoutMs: remainingMs, freshSession: true });
-      if (fixed.sha && treeOf(this.#plan.repo, fixed.sha) === treeOf(this.#plan.repo, sha)) {
-        this.#log.append("lane_fix_unchanged", { lane, round, sha, fixedSha: fixed.sha });
-        return { lane, note: `the lane's fix of ${sha.slice(0, 7)} changed nothing` };
-      }
-      return fixed;
-    }
     const prompt = [
       `Your round-${round} candidate ${sha.slice(0, 7)} FAILED the round checks, so its reviews were cancelled. A lane never hands in a red tree: a candidate's reviews count only once its checks pass.`,
       "",
@@ -9642,27 +9570,14 @@ export class Conductor {
   // Plan 07c (D4): fix rounds
   // -------------------------------------------------------------------------
 
-  /** Plan 07c (D4): the fix step after `roundNo`'s pick was evaluated and not
-   * accepted. Every open finding triaged `fix` with a domain becomes a task
-   * (`fixTasks`); one fixer per task runs in parallel from the same base B =
-   * the round's consolidated base or its pick. Each green fixer commit is
-   * merged into a fresh worktree at B in task order; a conflict or a red
-   * fixer skips that fixer with a note. ROUND_FIXED records the result either
-   * way. Returns "stopped" when the owner's stop or a recheck ended it before
-   * the record — the fix step then re-runs on resume. */
+  /** MAP and git integration for one lane-free loop. Points are grouped by
+   * domain on the loop's recorded base; each domain has its own sticky fixer
+   * and stateless review. ROUND_FIXED checkpoints the integrated head and
+   * domain outcomes before REDUCE checks, so resume never repeats this merge.
+   * A stop before the checkpoint resumes the bounded domain work. */
   async #fixRound(roundNo: number): Promise<"stopped" | "parked" | undefined> {
     const record = (this.#state.phase.rounds ?? []).find((r) => r.round === roundNo);
-    if (!record?.picked || record.fixed || record.regressed) return undefined;
-    if (this.#state.phase.contract.fixRounds !== "domains") return undefined;
-    // Only a pick the phase adopted and evaluated is fixed (a round that was
-    // handed off and then not accepted). 07g1b (R12): a ruling's pick is
-    // adopted without the seats' hand-off, so it is fixed from the candidate
-    // the ruling named, whatever the phase's own candidate is.
-    // 07g1b (R12): a ruling's pick is adopted without the seats' hand-off, so
-    // it is fixed from the candidate the ruling named, whatever the phase's
-    // own candidate is. 07g2 (A2/R4): a loop round picks the merged candidate
-    // without a seat review, so its fix also runs from that candidate.
-    if (this.#state.phase.candidate?.sha !== record.picked.sha && !record.picked.ruling && !this.#isFixLoopRound(roundNo)) return undefined;
+    if (!record || record.lanes.length > 0 || record.fixed) return undefined;
     const domains = this.#state.phase.contract.domains ?? [];
     if (domains.length === 0) return undefined;
     const findings: FixFinding[] = this.#state.phase.findings.map((f) => {
@@ -9677,11 +9592,12 @@ export class Conductor {
     });
     // 07g1: only points are fixer work. A voted-down or vetoed decision goes
     // to the seats (or the owner), never to a fixer.
-    const points: FixTask["findings"] = findings;
+    const open = new Set(this.#openPointsOn(record.base));
+    const points: FixTask["findings"] = findings.filter((f) => open.has(f.id));
     const cap = this.#state.phase.contract.fixers ?? DEFAULT_FIXERS;
     const tasks = fixTasks(points, domains, cap);
     if (tasks.length === 0) return undefined;
-    const base = record.picked.sha;
+    const base = record.base;
     const stopped = (): boolean => this.#stopRequested || this.#recheckCancelledLaneRound;
     this.#log.append("fix_round_started", { round: roundNo, base, tasks: tasks.map((t) => ({ domain: t.domain, findingIds: t.findingIds })) });
     const taskRecords: FixTaskRecord[] = tasks.map((t) => ({ domain: t.domain, findingIds: [...t.findingIds] }));
@@ -9777,9 +9693,6 @@ export class Conductor {
       this.#log.append("fix_merge_unchanged", { round: roundNo, base, candidate });
       candidate = undefined;
     }
-    // 07g2 (A2/R3): a merge that is red re-enters the loop of the domain that
-    // owns the failing file (`#fixLane`'s synthetic branch), so the round check
-    // stays where Plan 07c (A4) puts it: in the next round's lane check.
     // Plan 07c (C3): the fixers' own decision disclosures and notes, unioned in
     // task order, so the merged candidate's hand-off records them (a fixer
     // decides no trade-off but may report one; that report must reach the
@@ -9791,9 +9704,7 @@ export class Conductor {
     const disclosures = speaking.flatMap((r) => r.disclosures ?? []);
     const added = speaking.flatMap((r) => r.added ?? []);
     const domainRecords = results.flatMap((r) => r.domainRecords ?? []);
-    // The merged candidate is the next round's candidate: materialize its
-    // read-only checkout now, before the next round's lane reviews (which run
-    // in it) start.
+    // Materialize the integrated candidate for facts and acceptance.
     if (candidate) {
       const candidateDir = path.join(this.#paths.candidates, candidate);
       if (!fs.existsSync(candidateDir)) materializeCandidate(this.#plan.repo, candidate, candidateDir);
@@ -9819,28 +9730,6 @@ export class Conductor {
       ...(added.length > 0 ? { added } : {}),
       ...(domainRecords.length > 0 ? { domains: domainRecords } : {}),
     });
-    // 07g2 (A2/R4): a domain whose loop bound was reached leaves its points
-    // open. The round budget and the domain loop are spent, so the phase parks
-    // for the lead — no acceptance round and no seat review starts on a
-    // candidate that still has open points.
-    const bound = results.find((r) => r.status === "dropped" && /domain loop bound was reached/.test(r.reason ?? ""));
-    if (bound) {
-      const open = tasks.flatMap((t) => t.findingIds);
-      const loops = this.#state.phase.contract.domainLoopMax ?? 3;
-      const reason = `the fix loop's bound was reached with points still open: ${open.join(", ")}`;
-      this.#log.append("lead_called", { round: roundNo, reason, points: open });
-      this.#applyEvent({
-        type: "BOUND_REACHED",
-        kind: "rounds",
-        scope: `round ${roundNo} fix loop`,
-        limitMs: 0,
-        elapsedMs: 0,
-        action: "the phase parks for the lead",
-      });
-      this.#applyEvent({ type: "LEAD_CALLED", reasons: [reason] });
-      this.#applyEvent({ type: "LOOP_BOUND_REACHED", round: roundNo, loops, reason });
-      return "parked";
-    }
     // Packet X: once ROUND_FIXED records every fixer's outcome and the merged
     // candidate has its own checkout, the fix worktrees are spent. Only the
     // worktrees go; every commit stays (the record names them).
@@ -9887,38 +9776,6 @@ export class Conductor {
         return !closedEarlier;
       })
       .map((f) => f.id);
-  }
-
-  /** 07g2 (A2/R3): the fix task of one domain for the CURRENT open points, as
-   * `#fixRound` builds its tasks — the owning domain's loop re-entry takes the
-   * same task a fix round would have given it. */
-  #ownerTaskFor(domain: string): FixTask | undefined {
-    const domains = this.#state.phase.contract.domains ?? [];
-    if (domains.length === 0) return undefined;
-    const findings: FixFinding[] = this.#state.phase.findings.map((f) => {
-      const path = f.where ? whereKey(f.where).split(" ")[0] : "";
-      const inferred = f.domain ? undefined : domainOf(path, domains);
-      return {
-        ...f,
-        ...(inferred ? { domain: inferred } : {}),
-        disposition: triageRecordFor(this.#state.phase.triage, f.id)?.disposition ??
-          (f.raisedBy === "conductor" ? { kind: "fix" as const, reason: "a final check failure is fixed in its file's domain" } : undefined),
-      };
-    });
-    const cap = this.#state.phase.contract.fixers ?? DEFAULT_FIXERS;
-    return fixTasks(findings, domains, cap).find((t) => t.domain === domain);
-  }
-
-  /** 07g2 (A2/R4): whether a round picked a loop candidate (no seat review),
-   * from the durable log, so a fix step after a restart still fixes it. */
-  #isFixLoopRound(round: number): boolean {
-    try {
-      return readLog(this.#paths.events).records.some(
-        (rec) => rec.kind === "fix_loop_chained" && (rec.event as { round?: unknown }).round === round,
-      );
-    } catch {
-      return false;
-    }
   }
 
   /** 07g2 (A2/R4): the merged candidate's red check with points still open on
@@ -10474,10 +10331,8 @@ export class Conductor {
         const ms = remaining();
         if (ms < Math.min(60_000, this.#deadlines.fixerAttemptMs / 10)) {
           this.#log.append("fixer_fix_skipped", { round, domain: task.domain, sha, reason: "no attempt time left" });
-          // 07g1b (R14): no fix ran, so the head is unchanged. With its fix
-          // check green the loop ends `open` (its commit may merge, its points
-          // stay open) exactly as when a fix changes nothing — never dropped
-          // just because the first build used most of the attempt.
+          // No fix ran: the unchanged head remains open on its domain branch,
+          // never approved for integration merely because its check is green.
           return { lane, unchanged: true, note: "its attempt time is spent" };
         }
         this.#log.append("fixer_fix_started", { round, domain: task.domain, sha, remainingMs: ms });
@@ -10495,13 +10350,9 @@ export class Conductor {
     };
     const outcome = await runDomainLoop(task, host);
     const outcomeSha = outcome.sha;
-    // 07g1b (A2): only a fresh domain review approves a domain. An `open` loop
-    // ended with its fixer unchanged and its fix check green, so no review ran
-    // and its points stay open; its head commit still joins the round's
-    // candidate, where the next loop's facts judge those points. A dropped
-    // domain's commit never merges.
+    // Only an approved domain may merge (§5). An unchanged fixer with a red
+    // point remains open on its domain branch; it is not an integration vote.
     const approved = outcome.status === "approved";
-    const mergeable = approved || outcome.status === "open";
     // 07g1 (A2): a quality problem already sent the work back to the same
     // fixer, so an approved domain's review is quality-ok. Keep its notes for
     // the next fixer on DOMAIN_APPROVED so the record still carries them.
@@ -10523,7 +10374,7 @@ export class Conductor {
       reviews: outcome.reviews,
       fixes: outcome.fixes,
     });
-    if (mergeable && outcomeSha) return { lane, ok: true, sha: outcomeSha, fixes: outcome.fixes, status: outcome.status, domainRecords: outcome.records, ...(allDisclosures.length > 0 ? { disclosures: allDisclosures } : {}), ...(allAdded.length > 0 ? { added: allAdded } : {}) };
+    if (approved && outcomeSha) return { lane, ok: true, sha: outcomeSha, fixes: outcome.fixes, status: outcome.status, domainRecords: outcome.records, ...(allDisclosures.length > 0 ? { disclosures: allDisclosures } : {}), ...(allAdded.length > 0 ? { added: allAdded } : {}) };
     return {
       lane,
       ok: false,
@@ -10886,21 +10737,6 @@ export class Conductor {
       build = { ...(done.build ?? {}), lane, sha, ...(done.tainted !== undefined ? { tainted: done.tainted } : {}) };
       break;
     }
-    // Plan 07c (D4.7): a resumed fix round's synthetic lane has no worker
-    // completion to restore from, so its check base, start time and
-    // disclosures come from the previous round's recorded ROUND_FIXED, exactly
-    // as the fresh path sets them. The base is B even for a lane-fix commit of
-    // the merged candidate (whose own intent names the round base C), so a
-    // resumed check never diffs against the wrong base (or misses the final
-    // tier a wide path selects).
-    const fix = lane === "a" ? fixRoundCandidate(this.#state.phase.rounds, round) : undefined;
-    const fixRecord = fix ? (this.#state.phase.rounds ?? []).find((r) => r.fixed?.candidate === fix.candidate)?.fixed : undefined;
-    if (fix && fixRecord) {
-      this.#laneCheckBases.set(key, fix.base);
-      if (!this.#laneStartedAt.has(key)) this.#laneStartedAt.set(key, Date.now());
-      if (build.disclosures === undefined && fixRecord.disclosures) build = { ...build, disclosures: fixRecord.disclosures };
-      if (build.added === undefined && fixRecord.added) build = { ...build, added: fixRecord.added };
-    }
     this.#laneBuilds.set(key, build);
     // A candidate checked before the stop: its output (for the hand-off's
     // test-verify resolution) is the check's own per-command logs.
@@ -10918,14 +10754,6 @@ export class Conductor {
 
   /** One candidate's checks, run under the machine-wide lock (C2). */
   async #checkLaneCandidate(round: number, lane: string, sha: string): Promise<LaneCheck> {
-    // 07g2 (A2): the fix loop already checked this integrated head; the
-    // acceptance round reuses that result instead of running it twice.
-    const cached = this.#integratedChecks.get(sha);
-    if (cached) {
-      this.#integratedChecks.delete(sha);
-      this.#log.append("lane_check_reused", { round, lane, candidateSha: sha, passed: cached.ok });
-      return cached;
-    }
     const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
     // Plan 06k1 (A4): the check holds the host-wide window for its duration,
     // so every other run's workers are paused while it runs.
@@ -11091,22 +10919,22 @@ export class Conductor {
         if (!firstFailure) firstFailure = `the check \`${command}\` ${result.timedOut ? "timed out" : `exited ${result.exitCode}`}`;
         passed = false;
       }
-      // Plan 07b (D3): after a candidate's checks pass, run each open
-      // domain-mode finding's doneWhen in THIS checkout with the check
-      // environment, one at a time, bounded by the reproduction deadline. The
+      // Every open point gets its own fact, even when another file's round
+      // check is red. That failure goes only to its owning domain; it must
+      // not erase the proving facts of unrelated approved domains. The
       // results stay with the candidate (persisted in its record) so a resumed
       // round reads them; only the picked candidate's become events.
       // Packet X: each doneWhen that passes here also runs on the round's base
       // (the lane's start), so a command that passes there too repairs
       // nothing.
       const facts =
-        passed && (this.#state.phase.contract.domains?.length ?? 0) > 0
+        (this.#state.phase.contract.domains?.length ?? 0) > 0 && !this.#stopRequested
           ? await this.#runDoneWhenFacts(lane, candidateSha, checkoutDir.dir, laneBase ?? this.#baselineBaseSha())
           : [];
       this.#laneFacts.set(candidateSha, facts);
       const recordWritten = this.#writeCheckRecord(outDir, {
         candidateSha,
-        ...(this.#baselineBaseSha() ? { baseSha: this.#baselineBaseSha() } : {}),
+        ...((laneBase ?? this.#baselineBaseSha()) ? { baseSha: laneBase ?? this.#baselineBaseSha() } : {}),
         tier,
         passed,
         commands: recordCommands,
@@ -11956,12 +11784,166 @@ export class Conductor {
       });
   }
 
-  /** The round's own orchestration: `runRound` (core/lanes.ts) is the only
-   * module that decides the sequence; this implements its host callbacks. */
+  /** After the pick there are no lanes: domain MAP, git/facts REDUCE, then
+   * ordinary candidate seats only when every point is closed. Empty-lane
+   * RoundRecords are durable loop checkpoints, never candidates to pick. */
+  async #runDomainRounds(actionId: string): Promise<void> {
+    this.#resumeStoppedRound = false;
+    let last = this.#state.phase.rounds?.at(-1);
+    if (!last) return;
+    if (last.lanes.length > 0) this.#recordRegression(last);
+    const limit = this.#state.phase.contract.roundsAllowed ?? this.#plan.rounds ?? boundDefinition("rounds").defaultValue;
+    // A completed acceptance hand-off that was rejected starts another loop.
+    // A stopped REDUCE reuses the existing fixed checkpoint and its base.
+    let resume = last.lanes.length === 0 &&
+      !(last.fixed?.candidate && last.fixed.candidate === this.#state.phase.candidate?.sha);
+    let base = last.picked?.sha ?? last.fixed?.candidate ?? last.base;
+    for (;;) {
+      const round = resume ? last.round : last.round + 1;
+      if (round > limit) {
+        this.#parkOpenPoints(last.round, "the fix loop's round bound was reached", this.#openPointsOn(base));
+        return;
+      }
+      if (!resume) this.#applyEvent({ type: "ROUND_STARTED", round, base, lanes: [] });
+      this.#log.intent(actionId, { round, base, domains: true });
+      const status = await this.#fixRound(round);
+      if (status === "stopped" || this.#stopRequested || this.#recheckCancelledLaneRound) return;
+      if (status === "parked") return;
+      const record = this.#state.phase.rounds!.find((r) => r.round === round)!;
+      const candidate = record.fixed?.candidate ?? record.base;
+      const kept = resume ? this.#readCheckRecord(candidate)?.record : undefined;
+      const expected = kept ? checkCommands(this.#plan.checks, this.#state.phase.contract.checks, this.#state.phase.contract.finalChecks, kept.tier).map((c) => this.#withValues(c)) : [];
+      const factIds = new Set(kept?.facts?.map((f) => f.findingId));
+      const coversPoints = this.#state.phase.findings.filter((f) => f.status === "open" && f.domain && f.doneWhen).every((f) => factIds.has(f.id));
+      let check: LaneCheck;
+      if (kept?.passed && kept.baseSha === record.base && coversPoints && expected.length === kept.commands.length && expected.every((c, i) => c === kept.commands[i].command)) {
+        check = { ok: true };
+        this.#log.append("integrated_check_reused", { round, candidateSha: candidate, base: record.base });
+      } else {
+        const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
+        const window = this.#openCheckWindow();
+        try {
+          this.#log.append("integrated_check_started", { round, candidateSha: candidate, base: record.base });
+          check = await this.#runLaneChecks("integrated", candidate, record.base);
+          this.#log.append("integrated_check_finished", { round, candidateSha: candidate, passed: check.ok });
+        } finally {
+          window.release();
+          await lock.release();
+        }
+      }
+      if (this.#stopRequested || this.#recheckCancelledLaneRound) return;
+      if (!check.ok) {
+        const result = this.#readCheckRecord(candidate);
+        const output = result?.output ?? check.note ?? "";
+        const owner = failingDomainOf(output, this.#state.phase.contract.domains ?? []);
+        if (!owner) {
+          const reason = `the merged candidate ${candidate.slice(0, 7)} is red and its check output names no file of a declared domain`;
+          this.#log.append("merged_check_no_loop", { round, sha: candidate, reason });
+          this.#parkMergedCheck(round, reason);
+          return;
+        }
+        const command = result?.record.commands.find((c) => !c.passed)?.command;
+        if (!command) {
+          this.#parkMergedCheck(round, "the merged check has no reproducible command for its owning domain");
+          return;
+        }
+        // Even a domain with no existing task gets the failing fact as a
+        // point. The next MAP uses precisely that domain, never a lane repair.
+        const existing = this.#state.phase.findings.find((f) => f.status === "open" && f.domain === owner.domain && f.doneWhen === command);
+        if (!existing) this.#applyEvent({
+          type: "FINDING_RAISED",
+          finding: {
+            id: `F-${this.#state.phase.phaseId}-round-check-${round}`,
+            version: 1, phaseId: this.#state.phase.phaseId, kind: "defect", severity: "blocking",
+            raisedBy: "conductor", status: "open", boundCandidateSha: candidate,
+            domain: owner.domain, where: `${owner.path}:1`, doneWhen: command,
+            expected: "the round check passes (conceptual integrity §5)", evidence: output,
+          },
+        });
+        this.#log.append("merged_check_reentered", { round, sha: candidate, domain: owner.domain, path: owner.path });
+      }
+      this.#recordIntegratedRegressions(round, candidate);
+      for (const fact of this.#factsFor(candidate)) this.#applyEvent({ type: "FINDING_FACT", ...fact });
+      const openPoints = this.#openPointsOn(candidate);
+      if (check.ok && openPoints.length === 0) {
+        this.#log.completion(actionId, { round, base: record.base, candidate });
+        await this.#handOffIntegratedCandidate(record, candidate);
+        return;
+      }
+      if (!record.fixed && check.ok) {
+        this.#parkMergedCheck(round, "open points have no declared domain task; the lead must rewrite the points");
+        return;
+      }
+      this.#log.append("fix_loop_chained", { round, candidate, openPoints });
+      if (round >= limit) {
+        this.#parkOpenPoints(round, `the fix loop's bound was reached with points still open: ${openPoints.join(", ")}`, openPoints);
+        return;
+      }
+      base = candidate;
+      last = record;
+      resume = false;
+    }
+  }
+
+  /** Losing a required test is a point, never a lane restart. Review-only
+   * votes are not facts and cannot create regression work inside a fix loop. */
+  #recordIntegratedRegressions(round: number, candidate: string): void {
+    const best = this.#pickGuard(round)?.best;
+    if (!best || best.sha === candidate) return;
+    const before = this.#checkOutputFor(best.sha);
+    const after = this.#checkOutputFor(candidate);
+    const declared = this.#declaredTestCommands();
+    for (const item of flatItems(this.#planItems())) {
+      const lost = itemTestVerifies(item).filter((v) => testOutcomeIn(before, v.name) === "passed" && testOutcomeIn(after, v.name) !== "passed");
+      if (lost.length === 0) continue;
+      const doneWhen = this.#lostTestsDoneWhen(item, lost, declared);
+      this.#raiseLostItemPoint({ item, sha: best.sha, paths: this.#changedPaths(best.sha, candidate), pickSha: candidate,
+        evidence: `${item.id}: ${lost.map((v) => `test "${v.name}"`).join(", ")} passed on ${best.sha.slice(0, 7)} and does not pass on integrated candidate ${candidate.slice(0, 7)}`,
+        ...(doneWhen ? { doneWhen } : {}),
+      });
+    }
+  }
+
+  /** Adopt REDUCE's checked candidate. No lane candidate, lane review, pick,
+   * or pending-lane winner is created: PROBING leads to the ordinary ACCEPT
+   * reviewers, each receiving the recorded domain commits and verdicts. */
+  async #handOffIntegratedCandidate(record: RoundRecord, sha: string): Promise<void> {
+    if (fs.existsSync(this.#paths.worktree)) removeWorktree(this.#plan.repo, this.#paths.worktree);
+    createWorktree(this.#plan.repo, this.#paths.worktree, sha);
+    const dir = path.join(this.#paths.candidates, sha);
+    if (!fs.existsSync(dir)) materializeCandidate(this.#plan.repo, sha, dir);
+    fs.writeFileSync(path.join(this.#runDir, "candidate-sha.txt"), sha);
+    let decisions: Decision[] = [];
+    this.#driveSuspended = true;
+    try {
+      this.#applyEvent({ type: "SUBMIT_PHASE", disclosures: record.fixed?.disclosures ?? [] });
+      decisions = this.#assembleDecisions(sha);
+      this.#applyEvent({ type: "FREEZE_COMPLETED", candidateSha: sha, decisions, tainted: false });
+      this.#applyEvent({ type: "CHECKS_PASSED" });
+      for (const fact of this.#factsFor(sha)) {
+        if (fact.timedOut || fact.exitCode !== 0) continue;
+        const proven = fact.passesOnBase === false || (this.#state.phase.doneWhenFacts ?? []).some(
+          (f) => f.findingId === fact.findingId && f.passesOnBase === false && f.exitCode === 0 && !f.timedOut,
+        );
+        const finding = this.#state.phase.findings.find((f) => f.id === fact.findingId && f.status === "open");
+        if (finding && proven) this.#applyEvent({ type: "FINDING_CONFIRMED_REPAIRED", findingId: finding.id, byReviewer: finding.raisedBy, candidateSha: sha });
+      }
+      if (this.#itemsEnforced()) {
+        this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: this.#resolveVerifies(this.#checkOutputFor(sha)) });
+        this.#applyTestVerifyFindings(sha);
+      }
+    } finally {
+      this.#driveSuspended = false;
+    }
+    this.#carryMessages(sha);
+    for (const decision of decisions) this.#raiseMessage("tradeoff", decision.id, this.#decisionContent(decision), sha);
+    this.#recordBoundaryDataAndSample(sha);
+    this.drive();
+  }
+
+  /** Loop 1's BUILD and REVIEW only. */
   async #runLaneRound(actionId: string): Promise<void> {
-    // Plan 07c (D4.7): a fix round's next round runs one lane on the merged
-    // candidate, so `lanes` is recomputed per round, not fixed at the top.
-    let lanes = this.#lanes();
+    const lanes = this.#lanes();
     let loggedIntent = false;
     // Plan 06k3 (A1): a round that fails only because a lane review or pick
     // vote is still missing after its retry is repeated in place WITHOUT
@@ -11996,39 +11978,6 @@ export class Conductor {
       // pick is adopted as the base or, when it lost a met item in code it
       // changed, recorded as a regression (ITEMS_REGRESSED).
       if (!unfinished) this.#recordRegression(last);
-      // Plan 07c (D4): the fix step for a pick the phase did not accept. One
-      // fixer per domain runs from the same base; a merged candidate makes
-      // this round a single-lane round on it. Recorded as ROUND_FIXED, so a
-      // restart never redoes it.
-      if (!unfinished && last?.picked) {
-        const fixed = await this.#fixRound(last.round);
-        if (fixed === "stopped") {
-          // The owner stopped the run or a recheck stopped it: nothing was
-          // recorded, and the next start fixes again.
-          this.#recheckCancelledLaneRound = false;
-          return;
-        }
-        // 07g2 (A2/R4): the loop bound ran out with points still open (or a red
-        // check named no declared domain). The phase is parked for the lead;
-        // no acceptance round and no seat review starts.
-        if (fixed === "parked") {
-          this.#recheckCancelledLaneRound = false;
-          return;
-        }
-      }
-      // Plan 07c (D4.7): the fix candidate is read for an unfinished round
-      // too, so a resumed synthetic lane still knows its base and disclosures.
-      const fix = fixRoundCandidate(this.#state.phase.rounds, round);
-      // 07g1: lanes run only in round 1. After a pick is adopted, exactly one
-      // lane runs on that pick (or on the fix round's merged candidate); the
-      // old combine/consolidation step is gone.
-      lanes = unfinished
-        ? last!.lanes
-        : round === 1
-          ? this.#lanes()
-          : last && !last.picked
-            ? last.lanes
-            : ["a"];
       const previous = last ? (this.#state.phase.rounds ?? []).find((r) => r.round === last.round) : undefined;
       // An unfinished round resumes from its own base. A new round starts from
       // the phase's candidate — the last adopted pick. 07g1b (A4): a lost item
@@ -12038,20 +11987,7 @@ export class Conductor {
       // pick, so the next repair builds on the named candidate even though the
       // adopted candidate (phase.candidate) is another one.
       const ruled = previous?.picked?.ruling ? previous.picked.sha : undefined;
-      // 07g2 (A2/R4): a loop round whose fix produced no merge candidate
-      // chains on the candidate the loop round picked, never on the older pick
-      // it was based on. Nothing changed relative to that loop candidate, so
-      // the next loop must judge it again — not restart from the original pick.
-      const chainedLoop = previous && this.#isFixLoopRound(previous.round) ? previous.picked?.sha : undefined;
-      const base = unfinished
-        ? last!.base
-        : fix
-          ? fix.candidate
-          : chainedLoop
-            ? chainedLoop
-            : round === 1
-              ? this.#state.phase.integrationHead
-              : (ruled ?? this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
+      const base = unfinished ? last!.base : (ruled ?? this.#state.phase.integrationHead);
       // 02k: a repeat of a round that failed only for a missing review or vote
       // restarts each lane that passed its checks from its own candidate.
       const continuedStarts = previous && previous.round === round - 1 ? this.#continuedLaneStarts(previous) : undefined;
@@ -12100,21 +12036,6 @@ export class Conductor {
         },
         lanePrompt: (r, at) => this.#laneWorkerPrompt(r, at),
         buildLane: async (lane, r, at, prompt) => {
-          // Plan 07c (D4.7): a fix round's lane is its merged candidate; no
-          // worker runs. Its check base is the fix round's base B.
-          if (fix && r === round && lane === "a") {
-            this.#laneCheckBases.set(`${r}-${lane}`, fix.base);
-            this.#laneStartedAt.set(`${r}-${lane}`, Date.now());
-            const fixRecord = (this.#state.phase.rounds ?? []).find((x) => x.fixed?.candidate === fix.candidate)?.fixed;
-            const built: LaneBuild = {
-              lane,
-              sha: fix.candidate,
-              ...(fixRecord?.disclosures && fixRecord.disclosures.length > 0 ? { disclosures: fixRecord.disclosures } : {}),
-              ...(fixRecord?.added && fixRecord.added.length > 0 ? { added: fixRecord.added } : {}),
-            };
-            this.#laneBuilds.set(`${r}-${lane}`, built);
-            return built;
-          }
           const built = await this.#buildLane(lane, r, at, prompt);
           // Kept for the lane review prompts, which need the lane's own
           // disclosures before the winner's hand-off assembles them.
@@ -12142,29 +12063,11 @@ export class Conductor {
         stopLane: (r, lane) => this.#stopLane(r, lane),
         // Plan 06n (A3): the round records nothing after a requested stop.
         stopRequested: () => this.#stopRequested,
-        // 07g2 (A2/R4): the seats review only once every point is closed. A fix
-        // round's merged candidate with points still open is picked without a
-        // seat review; the next loop starts on it at once.
-        reviewGate: (sha: string): boolean => {
-          const loop = fixRoundCandidate(this.#state.phase.rounds, round);
-          // A loop round whose fix produced no merge candidate still chains on
-          // the candidate it picked; it gates exactly like a fresh fix round.
-          const chained = previous !== undefined && this.#isFixLoopRound(previous.round);
-          if (!loop && !chained) return true;
-          // The gate is about the candidate the lane submits, not the fix
-          // base: a lane may repair a red merged candidate before the pick, and
-          // that repaired sha must still wait for every point to close.
-          return this.#openPointsOn(sha).length === 0;
-        },
       };
-      // A fresh attempt consumes only its own ownerless red check: a flag a
-      // stopped attempt left behind must never park this one.
-      this.#mergedCheckNoLoop = undefined;
       const outcome = await runRound(host, { round, base, lanes, ...(laneBases ? { laneBases } : {}) });
       // Plan 06n (A3): a clean stop left the round in place; the next start
       // resumes it. Nothing further is recorded here.
       if (outcome.stopped) {
-        this.#mergedCheckNoLoop = undefined;
         try {
           this.#log.append("round_stopped", { round, reason: "the owner stopped the run" });
         } catch {
@@ -12181,50 +12084,6 @@ export class Conductor {
         ...(outcome.missingVotes ? { missingVotes: outcome.missingVotes } : {}),
         candidates: outcome.builds.map((b) => ({ lane: b.lane, sha: b.sha, note: b.note })),
       });
-      // 07g2 (A2/R3): the merged candidate's red check named no domain loop to
-      // re-enter. Design G3 puts that on the lead, so the phase parks now — no
-      // lane round, no fresh merge fix and no seat review follows. A recheck
-      // that already stopped the round is the phase's, not this park's.
-      const noLoop = this.#mergedCheckNoLoop;
-      this.#mergedCheckNoLoop = undefined;
-      if (noLoop && !this.#recheckCancelledLaneRound) {
-        this.#parkMergedCheck(noLoop.round, noLoop.reason);
-        this.#clearLaneRound(round);
-        return;
-      }
-      // 07g2 (A2/R4): the round picked a loop candidate with no seat review.
-      // The loop chains on it (the next iteration's `#fixRound` fixes it); the
-      // round budget is what stops the chain, and the last loop with points
-      // still open parks for the lead.
-      if (outcome.loopOnly) {
-        const chained = outcome.winner?.sha;
-        // Plan 07b (D3): a loop candidate's doneWhen facts are recorded like
-        // any picked candidate's — the record shows them, and a timed-out fact
-        // stays visible — while the loop below chains without a seat review or
-        // a hand-off.
-        const winnerFacts = chained ? this.#factsFor(chained) : [];
-        for (const fact of winnerFacts) {
-          this.#applyEvent({
-            type: "FINDING_FACT",
-            findingId: fact.findingId,
-            candidateSha: fact.candidateSha,
-            exitCode: fact.exitCode,
-            timedOut: fact.timedOut,
-            outputTail: fact.outputTail,
-            ...(fact.passesOnBase !== undefined ? { passesOnBase: fact.passesOnBase } : {}),
-          });
-        }
-        const openPoints = chained ? this.#openPointsOn(chained) : [];
-        this.#log.append("fix_loop_chained", { round, ...(chained ? { candidate: chained } : {}), openPoints });
-        this.#clearLaneRound(round);
-        const limit = this.#state.phase.contract.roundsAllowed ?? this.#plan.rounds ?? boundDefinition("rounds").defaultValue;
-        if (round + 1 > limit) {
-          this.#parkOpenPoints(round, `the fix loop's bound was reached with points still open: ${openPoints.join(", ")}`, openPoints);
-          return;
-        }
-        this.#recheckCancelledLaneRound = false;
-        continue;
-      }
       if (outcome.missingVotes) this.#log.append("pick_votes_missing", { round, seats: outcome.missingVotes, winner: outcome.winner?.lane });
       if (!outcome.winner) {
         // Plan 06j (A3/OD-5(3)): a recheck stopped this round's lane workers;
@@ -15461,7 +15320,7 @@ export class Conductor {
 
       if (this.#stubReviews) {
         await agent.prompt(
-          this.#agentPrompt(buildReviewerPrompt(this.#state.phase, reviewer, this.#secretNames, this.#state.phase.ownerDirectives)),
+          this.#agentPrompt([buildReviewerPrompt(this.#state.phase, reviewer, this.#secretNames, this.#state.phase.ownerDirectives), ...this.#acceptanceDomainLines()].join("\n")),
         );
         const outcome = await Promise.race([donePromise.then(() => "submitted" as const), reviewTimeout.promise]);
         reviewTimeout.cancel();
@@ -16918,6 +16777,14 @@ export class Conductor {
    * review EXCEPT the worker's own disclosure (`source === "worker"`) — a
    * reviewer must discover its own choices from the diff before ever seeing
    * what the worker disclosed. */
+  #acceptanceDomainLines(): string[] {
+    const loops = (this.#state.phase.rounds ?? []).filter((r) => r.lanes.length === 0);
+    if (loops.length === 0) return [];
+    return ["Acceptance review: the integrated domains, their points and verdicts:",
+      ...loops.map((r) => JSON.stringify({ round: r.round, base: r.base, ...r.fixed })),
+      "A fact-closed point stays closed unless its fact fails on this candidate (conceptual integrity §5)."];
+  }
+
   #buildReviewerTurn1Prompt(reviewer: Reviewer, phaseOverride?: PhaseState, candidateDirOverride?: string): string {
     const phase = phaseOverride ?? this.#state.phase;
     const candidateDir = candidateDirOverride ?? this.#candidateDir();
@@ -16938,6 +16805,7 @@ export class Conductor {
       // turn 1 too, so a reviewer discovers against the same point shape it
       // will submit in turn 2; empty outside domain mode.
       ...domainPromptLines(phase.contract.domains),
+      ...this.#acceptanceDomainLines(),
       `Candidate checkout (read-only): ${candidateDir}`,
       ...referenceLines(runReferences(this.#runDir)),
       ...directiveLines(phase.ownerDirectives),

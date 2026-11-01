@@ -371,7 +371,7 @@ function reviewerWithPoints(doneWhen: string) {
           item: "R2",
           where: "gates/b.ts:1 fn",
           expected: "GATES_EXPECTED",
-          doneWhen,
+          doneWhen: doneWhen === BOOKING_DONE ? "test -f gates-fixed.txt" : doneWhen,
         },
       ]);
     }
@@ -457,8 +457,8 @@ test("a fixer that exceeds its attempt bound records BOUND_REACHED and its task 
   });
   try {
     await setup.conductor.start();
-    await waitFor(() => setup.conductor.state.phase.rounds?.[0]?.fixed !== undefined, 240_000, 50, setup.runDir);
-    const fixed = setup.conductor.state.phase.rounds![0].fixed!;
+    await waitFor(() => setup.conductor.state.phase.rounds?.[1]?.fixed !== undefined, 240_000, 50, setup.runDir);
+    const fixed = setup.conductor.state.phase.rounds![1].fixed!;
     const booking = fixed.tasks.find((t) => t.domain === "booking")!;
     const gates = fixed.tasks.find((t) => t.domain === "gates")!;
     assert.match(String(booking.note), /bound: fixer-attempt/, JSON.stringify(fixed.tasks));
@@ -506,14 +506,14 @@ exec "${realGit}" "$@"
   const setup = await setupFixRun(BOOKING_DONE, { deadlines: { mergeMs: 1_500 } });
   try {
     await setup.conductor.start();
-    await waitFor(() => setup.conductor.state.phase.rounds?.[0]?.fixed !== undefined, 240_000, 50, setup.runDir);
-    const fixed = setup.conductor.state.phase.rounds![0].fixed!;
+    await waitFor(() => setup.conductor.state.phase.rounds?.[1]?.fixed !== undefined, 240_000, 50, setup.runDir);
+    const fixed = setup.conductor.state.phase.rounds![1].fixed!;
     const bound = coreEvents(setup.runDir).find((e) => e.type === "BOUND_REACHED" && e.kind === "merge")!;
     assert.ok(bound, "the merge bound is recorded");
     assert.equal(bound.limitMs, 1_500);
     const timedOutTask = fixed.tasks.find((t) => /bound: merge/.test(String(t.note)));
     assert.ok(timedOutTask, `the timed-out merge is noted: ${JSON.stringify(fixed.tasks)}`);
-    assert.match(String(bound.scope), new RegExp(`round 1 fixer ${timedOutTask!.domain}`));
+    assert.match(String(bound.scope), new RegExp(`round 2 fixer ${timedOutTask!.domain}`));
     // The OTHER fixer's merge landed first and is the candidate.
     const mergedTask = fixed.tasks.find((t) => t.domain !== timedOutTask!.domain && typeof t.sha === "string" && t.sha.length > 0);
     assert.ok(mergedTask, `the first fixer merged: ${JSON.stringify(fixed.tasks)}`);
@@ -702,8 +702,8 @@ exec "${realGit}" "$@"
   const setup = await setupFixRun(BOOKING_DONE, { deadlines: { mergeMs: 1_500 } });
   try {
     await setup.conductor.start();
-    await waitFor(() => setup.conductor.state.phase.rounds?.[0]?.fixed !== undefined, 240_000, 50, setup.runDir);
-    const fixed = setup.conductor.state.phase.rounds![0].fixed!;
+    await waitFor(() => setup.conductor.state.phase.rounds?.[1]?.fixed !== undefined, 240_000, 50, setup.runDir);
+    const fixed = setup.conductor.state.phase.rounds![1].fixed!;
     const mergeBounds = coreEvents(setup.runDir).filter((e) => e.type === "BOUND_REACHED" && e.kind === "merge");
     const abortBound = mergeBounds.find((b) => /merge --abort/.test(String(b.scope)));
     assert.ok(abortBound, `the abort command's timeout is recorded: ${JSON.stringify(mergeBounds)}`);

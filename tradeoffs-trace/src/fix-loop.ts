@@ -5,8 +5,8 @@
 // problem) goes back to the SAME fixer session; a review that fixes them all
 // with quality ok approves the domain. A domain that spends its review bound
 // is dropped, never allowed to hold another domain. 07g1b (A2): a domain whose
-// fixer has nothing left to change with its check green ends `open` — its head
-// may merge, but no review ran, so it is not approved and its points stay open.
+// fixer has nothing left to change with its check green ends `open` — no
+// review approved it, so its head cannot merge and its points stay open.
 //
 // This module owns only the sequence. Every effect (building the fixer,
 // running the facts, reviewing, fixing, emitting events) is a host callback,
@@ -57,9 +57,8 @@ export interface DomainLoopHost {
 export interface DomainLoopOutcome {
   /** 07g1b (A2/R14): `open` is a loop that ended because its fixer had nothing
    * left to change while its fix check was green, with a point still open. It
-   * is NOT an approval — no domain review ran, so its points stay open — but
-   * its head commit may still merge into the round's candidate, where the next
-   * loop's facts judge those points. */
+   * is NOT an approval — no domain review ran, so its points stay open and
+   * its head remains on the domain branch, never in the integrated candidate. */
   status: "approved" | "open" | "dropped" | "stopped";
   sha?: string;
   reason?: string;
@@ -210,12 +209,9 @@ export async function runDomainLoop(task: FixTask, host: DomainLoopHost): Promis
       fixes += 1;
       if (typeof fixed.sha !== "string" || fixed.sha.length === 0 || fixed.sha === sha) {
         const note = fixed.note ?? `the fix of ${sha.slice(0, 9)} changed nothing`;
-        // 07g1b (A2/R14): a fixer that reports it changed nothing has nothing
-        // left to repair here, and its check is green, so its head commit may
-        // still merge into the round's candidate. That is not an approval: a
-        // domain is approved only after clean facts and an approving fresh
-        // domain review, and no review runs on a red fact. The loop ends `open`
-        // and its points stay open for the next loop's facts to judge.
+        // An unchanged fixer with a green check and a red point ends open,
+        // not approved. No review runs on a red fact, and the conductor may
+        // merge only approved domains; these points wait for the next loop.
         if (fixed.unchanged === true && facts.checkPassed && (facts.testRemovals?.length ?? 0) === 0) {
           const reason = `${note}: the domain ends open, not approved, and its points stay open`;
           record({ iteration, sha, facts, note: reason });

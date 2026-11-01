@@ -21,7 +21,7 @@ import {
   defaultWorkerHello,
   FAKE_PI_PATH,
   readEvents,
-  setupConductor,
+  setupConductor as setupBaseConductor,
   waitFor,
   writeScript,
   type FakePiStep,
@@ -47,6 +47,20 @@ const DOMAINS: Domain[] = [
   { name: "gates", globs: ["test/**"] },
 ];
 
+/** These fact scenarios' later mutations now run as a domain fixer, not a
+ * second lane worker. The acceptance seats use the fixture's review script. */
+function setupConductor(opts: NonNullable<Parameters<typeof setupBaseConductor>[0]>) {
+  return setupBaseConductor({
+    ...opts,
+    fixerScriptFor: opts.fixerScriptFor ?? ((_domain, round, _n, state) =>
+      opts.laneWorkerScriptFor?.("a", round, state) ?? laneWorker(round, "a")),
+    reviewerScriptFor: opts.reviewerScriptFor ?? ((seat, state) => {
+      const script = opts.laneReviewerScriptFor?.(seat, state.phase.candidate!.sha, state, "a") ?? laneReview(seat, state.phase.contract.contractVersion);
+      return { ...script, steps: (opts.stubReviews ?? true) ? script.steps.slice(2) : script.steps };
+    }),
+  });
+}
+
 /** A two-lane, domain-mode phase. `consolidate: "off"` keeps the next round
  * on the picked candidate (never a combined commit), so the fact is run in the
  * picked candidate's own checkout. */
@@ -60,6 +74,8 @@ function lanePhase(overrides: Partial<import("../../src/conductor.ts").RunPlanPh
     reserved: [],
     workers: 2,
     domains: DOMAINS,
+    fixRounds: "domains",
+    fixChecks: "true",
     consolidate: "off",
     ...overrides,
   };
@@ -185,6 +201,11 @@ function resumeConductor(setup: TestConductorSetup): Conductor {
       const laneMatch = agentId.match(/^lane-review-(\d+)-([a-z])-([A-Za-z0-9_]+)-/);
       if (role === "reviewer" && laneMatch) {
         return { FAKE_PI_SCRIPT: scriptFor(`resume-lane-review-${laneMatch[3]}`, laneReview(laneMatch[3] as Reviewer, K)) };
+      }
+      const reviewer = agentId.match(/^reviewer-([A-Za-z0-9_]+)-/);
+      if (role === "reviewer" && reviewer) {
+        const script = laneReview(reviewer[1] as Reviewer, K);
+        return { FAKE_PI_SCRIPT: scriptFor(`resume-review-${reviewer[1]}`, { ...script, steps: script.steps.slice(2) }) };
       }
       const pick = agentId.match(/^(?:pick|revote)-(\d+)-([A-Za-z0-9_]+)-/);
       if (role === "picker" && pick) {
@@ -367,26 +388,20 @@ test("a doneWhen that passes only on the lane that is not picked repairs nothing
     stubReviews: true,
     deadlines: FAST,
     workerScript: () => laneWorker(1, "a"),
-    // Round 2: only lane b creates fixed-a; lane a is picked.
-    laneWorkerScriptFor: (lane, round) =>
-      round === 1 ? laneWorker(round, lane) : lane === "a" ? laneWorker(round, lane) : laneWorker(round, lane, ["fixed-a"]),
+    // Only BUILD's losing lane contains the proving file. The pick and
+    // subsequent domain fixer never acquire it from that other lane.
+    laneWorkerScriptFor: (lane, round) => laneWorker(round, lane, lane === "b" ? ["fixed-a"] : []),
     laneReviewerScriptFor: (seat, candidate, state) => reviewerWithPoint(doneWhen)(seat, candidate, state),
     pickScriptFor: (seat, state) => pickVote(seat, state.phase.rounds?.length ?? 1, "a"),
   });
   try {
     await setup.conductor.start();
-    await waitFor(
-      () => setup.conductor.state.phase.rounds?.find((r) => r.round === 2)?.picked?.lane === "a",
-      150_000,
-      50,
-      setup.runDir,
-    );
-    const round2 = setup.conductor.state.phase.rounds!.find((r) => r.round === 2)!;
-    const laneASha = round2.candidates.find((c) => c.lane === "a")!.sha;
-    // 07g1: after the pick only one lane runs, so there is no losing lane's
-    // fact to inspect; the picked candidate's fact is the only one.
-    assert.deepEqual(round2.lanes, ["a"], "round 2 is one lane on the pick");
-    await waitFor(() => coreEvents(setup.runDir).some((e) => e.type === "FINDING_FACT" && e.candidateSha === laneASha), 150_000, 50, setup.runDir);
+    await waitFor(() => coreEvents(setup.runDir).some((e) => e.type === "FINDING_FACT"), 150_000, 50, setup.runDir);
+    const first = setup.conductor.state.phase.rounds![0];
+    assert.equal(first.picked?.lane, "a");
+    const loser = first.candidates.find((c) => c.lane === "b")!;
+    assert.deepEqual(setup.conductor.state.phase.rounds![1].lanes, [], "the fix loop contains no lane");
+    assert.ok(!coreEvents(setup.runDir).some((e) => e.type === "FINDING_FACT" && e.candidateSha === loser.sha), "the loser's proving file never closes the pick's point");
     const events = coreEvents(setup.runDir);
     assert.ok(!events.some((e) => e.type === "FINDING_CONFIRMED_REPAIRED"), "a passing fact alone repairs nothing");
     assert.equal(setup.conductor.state.phase.findings.find((f) => f.doneWhen === doneWhen)!.status, "open");
@@ -442,8 +457,7 @@ test("a round resumed after its check reads the persisted facts instead of runni
     deadlines: FAST,
     workerScript: () => laneWorker(1, "a"),
     laneWorkerScriptFor: (lane, round) => (lane === "b" ? crashedLane() : laneWorker(round, lane)),
-    // The first conductor's reviews are slow, so the stop lands after round
-    // 2's check (the fact has run) but while its reviews still run.
+    // Stop after REDUCE's fact is recorded while ACCEPT's seats still run.
     laneReviewerScriptFor: (seat, candidate, state) => {
       const review = reviewerWithPoint(doneWhen)(seat, candidate, state);
       review.steps.splice(2, 0, { kind: "sleep", ms: 5_000 });
@@ -454,15 +468,14 @@ test("a round resumed after its check reads the persisted facts instead of runni
   try {
     await setup.conductor.start();
     await waitFor(
-      () => setup.conductor.state.phase.rounds?.find((r) => r.round === 2)?.candidates.some((c) => c.ok === true) === true,
-      150_000,
-      50,
-      setup.runDir,
+      () => setup.conductor.state.phase.phase === "REVIEWING" && setup.conductor.state.phase.rounds?.[1]?.fixed?.candidate !== undefined,
+      150_000, 50, setup.runDir,
     );
     await setup.conductor.stop();
     const counterLines = () => fs.readFileSync(counter, "utf8").split("\n").filter((l) => l.length > 0);
-    assert.equal(counterLines().length, 2, "the doneWhen ran once on the candidate and once on the base before the stop");
-    assert.ok(!coreEvents(setup.runDir).some((e) => e.type === "FINDING_FACT"), "no fact is recorded before the hand-off");
+    const runsBeforeResume = counterLines().length;
+    assert.ok(runsBeforeResume >= 2, "the domain and integrated candidate have their own facts");
+    assert.equal(coreEvents(setup.runDir).filter((e) => e.type === "FINDING_FACT").length, 1, "REDUCE records the integrated fact before acceptance");
 
     resumed = resumeConductor(setup);
     await resumed.start();
@@ -472,7 +485,7 @@ test("a round resumed after its check reads the persisted facts instead of runni
       50,
       setup.runDir,
     );
-    assert.equal(counterLines().length, 2, "the resumed round did not run the doneWhen again");
+    assert.equal(counterLines().length, runsBeforeResume, "the resumed acceptance did not run the doneWhen again");
     const facts = coreEvents(setup.runDir).filter((e) => e.type === "FINDING_FACT");
     assert.equal(facts.length, 1, "the fact is recorded exactly once");
   } finally {
@@ -490,7 +503,7 @@ test("the evaluator prompt lists the picked candidate's done-when facts", async 
     phase: lanePhase(),
     checks: ["true"],
     phaseChecks: ["true"],
-    stubReviews: true,
+    stubReviews: false,
     deadlines: FAST,
     extraEnv: { FAKE_PI_PROMPT_LOG: promptLog },
     workerScript: () => laneWorker(1, "a"),
@@ -600,10 +613,8 @@ test("a plan without TT_DOMAINS runs no doneWhen and records no FINDING_FACT", a
   try {
     await setup.conductor.start();
     await waitFor(
-      () => setup.conductor.state.phase.rounds?.find((r) => r.round === 2)?.candidates.some((c) => c.ok === true) === true,
-      150_000,
-      50,
-      setup.runDir,
+      () => coreEvents(setup.runDir).some((e) => e.type === "LEAD_CALLED"),
+      150_000, 50, setup.runDir,
     );
     const finding = setup.conductor.state.phase.findings.find((f) => f.evidence === "the point is not fixed");
     assert.ok(finding, "the reviewer's point was raised");

@@ -147,11 +147,6 @@ export interface LaneHost {
    * checks it before lane checks, reviews and the pick, and records nothing
    * after it. */
   stopRequested?(): boolean;
-  /** 07g2 (A2/R4): the seats review only once every point is closed. When this
-   * returns false for a passing candidate, its reviews are never started: the
-   * round picks it as a loop candidate and the conductor starts the next fix
-   * loop on it at once (no seat review, no pick vote, no evaluator). */
-  reviewGate?(sha: string): boolean;
 }
 
 export interface RoundContext {
@@ -190,10 +185,6 @@ export interface RoundOutcome {
    * adopted. Their later submissions are never read; the work they landed
    * green before the stop is the conductor's to turn into points. */
   stoppedLanes?: readonly string[];
-  /** 07g2 (A2/R4): the round picked a loop candidate without a seat review
-   * because points were still open; the conductor chains the loop instead of
-   * handing the candidate to the acceptance review. */
-  loopOnly?: boolean;
 }
 
 /** exex 01a2: at most this many fixes of a red candidate per lane per round;
@@ -228,17 +219,8 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
   // reviews), and the lane's fixed candidate gets a fresh set at its own
   // submission. The pick still waits for every passing candidate's set.
   const reviewSets = new Map<string, { sha: string; done: Promise<string | undefined> }>();
-  /** 07g2 (A2/R4): lanes whose candidate is picked without a seat review. */
-  const loopOnly = new Map<string, string>();
   const cancelled: Promise<unknown>[] = [];
   const startReviews = (lane: string, sha: string): void => {
-    // 07g2 (A2/R4): points still open on this candidate: no seat review starts,
-    // and the round picks it as a loop candidate instead.
-    if (host.reviewGate && !host.reviewGate(sha)) {
-      loopOnly.set(lane, sha);
-      bump();
-      return;
-    }
     const done = Promise.all(
       // The three seats review a candidate IN PARALLEL (the discovery
       // barrier needs all three in flight).
@@ -363,13 +345,9 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
       // (the conductor turns it into points), never a late candidate.
       if (stopped.has(build.lane)) return markDone(lane, build);
       emit(build.lane, { type: "CANDIDATE_SUBMITTED", round: ctx.round, lane: build.lane, sha: build.sha });
-      // 07g2 (A2/R4): when the gate decides whether the seats review at all, the
-      // check runs FIRST — its facts are the gate's input.
-      const gateFirst = host.reviewGate !== undefined && lanes.length === 1;
-      if (!gateFirst) startReviews(build.lane, build.sha);
+      startReviews(build.lane, build.sha);
       let check = await checkWithReviews(build.lane, build.sha);
       noteCheck(build.lane, check);
-      if (gateFirst && check.ok) startReviews(build.lane, build.sha);
       if (host.stopRequested?.()) return markDone(lane, build);
       emit(build.lane, {
         type: "CANDIDATE_CHECKED",
@@ -400,10 +378,9 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
         build = fixed;
         if (host.stopRequested?.()) return markDone(lane, build);
         emit(build.lane, { type: "CANDIDATE_SUBMITTED", round: ctx.round, lane: build.lane, sha: build.sha! });
-        if (!gateFirst) startReviews(build.lane, build.sha!);
+        startReviews(build.lane, build.sha!);
         check = await checkWithReviews(build.lane, build.sha!);
         noteCheck(build.lane, check);
-        if (gateFirst && check.ok) startReviews(build.lane, build.sha!);
         if (host.stopRequested?.()) return markDone(lane, build);
         emit(build.lane, {
           type: "CANDIDATE_CHECKED",
@@ -489,21 +466,6 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
     held ? { ...held, candidates: held.candidates.filter((candidate) => frozen.has(candidate.lane)) } : undefined;
   const frozenRecord = frozenView(host.rounds().find((r) => r.round === ctx.round));
   const passing = frozenRecord ? passingCandidates(frozenRecord) : [];
-
-  // 07g2 (A2/R4): a loop candidate — points still open on it — is the round's
-  // pick with no seat review and no pick vote; the next loop starts on it.
-  const looped = passing.filter((c) => typeof c.sha === "string" && loopOnly.get(c.lane) === c.sha);
-  if (looped.length > 0) {
-    const pick = looped[0];
-    host.emit({ type: "CANDIDATE_PICKED", round: ctx.round, lane: pick.lane, sha: pick.sha as string, votes: 0 });
-    return await finish({
-      round: ctx.round,
-      base: ctx.base,
-      lanes,
-      winner: { lane: pick.lane, sha: pick.sha as string, votes: 0 },
-      loopOnly: true,
-    });
-  }
 
   // 3. M, A and B each review every passing candidate — K × N reviews. A
   //    review that cannot be taken is NOT a candidate with fewer reviews: the
@@ -650,43 +612,6 @@ export function laneFailureLines(round: RoundRecord | undefined): string[] {
     if (candidate.ok === true) out.push(`${label} (lane ${lane}) passed its checks`);
   }
   return out;
-}
-
-/** Plan 07c (D4.7): the fix round that repairs `beforeRound`'s predecessor,
- * when its merged candidate exists: the latest picked round before
- * `beforeRound` whose fix step produced a candidate, and only when no round
- * lies between it and `beforeRound`. Only the round IMMEDIATELY after the
- * fixed round is a single-lane round on that candidate, checked from the fix
- * round's base. A later round never replays it (packet X, B1): once a round
- * ran on the candidate and picked nothing, the next is today's two-lane
- * round from today's base. Undefined when the latest pick was not fixed, its
- * fixers all failed, the pick regressed, or a round ran since. */
-export function fixRoundCandidate(
-  rounds: readonly RoundRecord[] | undefined,
-  beforeRound = Number.POSITIVE_INFINITY,
-): { candidate: string; base: string } | undefined {
-  let latest: RoundRecord | undefined;
-  for (const r of rounds ?? []) {
-    if (r.round >= beforeRound || !r.picked) continue;
-    if (!latest || r.round > latest.round) latest = r;
-  }
-  if (!latest || latest.regressed) return undefined;
-  const fixedRound = latest.round;
-  if ((rounds ?? []).some((r) => r.round > fixedRound && r.round < beforeRound)) return undefined;
-  const fixed = latest.fixed;
-  if (!fixed || typeof fixed.candidate !== "string" || fixed.candidate.length === 0) return undefined;
-  return { candidate: fixed.candidate, base: fixed.base };
-}
-
-/** 07 (reduce by facts, G2): true when `round` ran on a fix round's merged
- * candidate — the round right after a fixed round. The regression guard never
- * undoes such a round's pick: the fixers repaired points from the same base,
- * and an item a seat now marks unmet is a point for the next fix round, not a
- * reason to restart every lane from an older candidate (exex 01b3p1, run
- * cb38791b: ITEMS_REGRESSED threw away a green fix round that added every
- * missing test). */
-export function isFixRound(rounds: readonly RoundRecord[] | undefined, round: number): boolean {
-  return fixRoundCandidate(rounds, round) !== undefined;
 }
 
 /** How a consolidated commit is named in the views: `C2-a+b` (round 2's

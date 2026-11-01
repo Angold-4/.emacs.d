@@ -264,6 +264,42 @@ async function teardown(setup: TestConductorSetup): Promise<void> {
   cleanupDir(setup.scriptsDir);
 }
 
+async function laneFreeFixLoop(fixRounds?: "domains"): Promise<void> {
+  const setup = await setupConductor({
+    phase: { id: "p1", goal: "lane-free fix loop", acceptance: ["it works"], checks: ["true"], finalChecks: ["true"],
+      boundaries: [], reserved: [], workers: 2, domains: FIX_DOMAINS, rounds: 3, ...(fixRounds ? { fixRounds } : {}), fixers: 4, fixChecks: "true" },
+    checks: ["true"], phaseChecks: ["true"], stubReviews: true, deadlines: FAST,
+    workerScript: () => laneWorker("a", 1),
+    laneWorkerScriptFor: (lane, round) => laneWorker(lane, round),
+    laneReviewerScriptFor: (seat, candidate, state) => reviewerWithPoints()(seat as Reviewer, candidate, state),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1),
+    fixerScriptFor: (domain) => ({ hello: defaultWorkerHello(), steps: [
+      { kind: "call-sh", command: `echo fixed > ${domain}-fixed.txt` },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+    ] }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
+    const events = readEvents(setup.runDir).filter((r) => r.kind === "event").map((r) => r.event as Record<string, unknown>);
+    assert.ok(events.some((e) => e.type === "ROUND_FIXED"), "a domain loop actually ran");
+    const later = events.filter((e) => Number(e.round) >= 2);
+    assert.ok(later.filter((e) => e.type === "ROUND_STARTED").every((e) => (e.lanes as unknown[]).length === 0));
+    assert.ok(!later.some((e) => ["CANDIDATE_SUBMITTED", "CANDIDATE_CHECKED", "CANDIDATE_PICKED", "PICK_VOTE"].includes(String(e.type))), "no loop candidate goes through lanes or a pick");
+    const agents = readEvents(setup.runDir).filter((r) => r.kind === "intent").map((r) => String((r.event as { agentId?: string }).agentId ?? ""));
+    assert.ok(!agents.some((id) => /^lane-(?:review-)?[2-9]-|^pick-[2-9]-/.test(id)), `no later lane agent: ${agents}`);
+    assert.ok(agents.some((id) => id.startsWith("fix-2-booking-")));
+    assert.ok(agents.some((id) => id.startsWith("fix-2-gates-")));
+    assert.equal(events.filter((e) => e.type === "REVIEW_SUBMITTED" && !e.promotedFrom).length, 3, "three ordinary acceptance seats review once");
+  } finally { await teardown(setup); }
+}
+
+test("a fix loop starts no lane and picks no lane candidate", async () => {
+  await laneFreeFixLoop("domains");
+  // Domain loops are the only post-pick runtime, not an opt-in alternative.
+  await laneFreeFixLoop();
+});
+
 test("a conflicted merge is resolved by the fenced integrate duty and retried when it leaves the fence", async () => {
   // A1/C4: git merges both approved domains; the add/add conflict on
   // `shared.txt` starts the integrate duty. Its first attempt also edits an
@@ -315,8 +351,8 @@ test("a conflicted merge is resolved by the fenced integrate duty and retried wh
   });
   try {
     await setup.conductor.start();
-    await waitFor(() => setup.conductor.state.phase.rounds?.[0]?.fixed !== undefined, 120_000, 20, setup.runDir);
-    const record = setup.conductor.state.phase.rounds![0].fixed!;
+    await waitFor(() => setup.conductor.state.phase.rounds?.[1]?.fixed !== undefined, 120_000, 20, setup.runDir);
+    const record = setup.conductor.state.phase.rounds![1].fixed!;
     assert.equal(record.merges.length, 2, "both domains merged after the integrate duty resolved the conflict");
     // A1: the candidate is ONE merge commit whose direct parents are the pick and
     // each domain commit, in task order — not a chain of per-domain merges.
@@ -331,7 +367,7 @@ test("a conflicted merge is resolved by the fenced integrate duty and retried wh
     assert.deepEqual((refusals[0].event as { outside: string[] }).outside, ["booking-fixed.txt"], "the refusal names the unconflicted file");
     assert.equal(git(setup.repo.dir, "show", `${record.candidate}:booking-fixed.txt`), "booking fixed", "the refused edit did not survive");
     const agents = readLog(runPaths(setup.runDir).events).records
-      .filter((r) => r.kind === "intent" && String((r.event as { agentId?: string }).agentId ?? "").startsWith("integrate-1-"));
+      .filter((r) => r.kind === "intent" && String((r.event as { agentId?: string }).agentId ?? "").startsWith("integrate-2-"));
     assert.ok(agents.length >= 2, "the refused resolution was retried");
   } finally {
     await teardown(setup);
@@ -390,8 +426,8 @@ test("the integrate duty is fenced by files even when its edit is staged", async
   });
   try {
     await setup.conductor.start();
-    await waitFor(() => setup.conductor.state.phase.rounds?.[0]?.fixed !== undefined, 120_000, 20, setup.runDir);
-    const record = setup.conductor.state.phase.rounds![0].fixed!;
+    await waitFor(() => setup.conductor.state.phase.rounds?.[1]?.fixed !== undefined, 120_000, 20, setup.runDir);
+    const record = setup.conductor.state.phase.rounds![1].fixed!;
     assert.equal(record.merges.length, 2, "both domains merged after the staged out-of-fence edit was refused");
     assert.equal(git(setup.repo.dir, "show", `${record.candidate}:shared.txt`), "booking\ngates", "the conflicted file carries both sides");
     const refusals = readEvents(setup.runDir).filter((r) => r.kind === "integrate_refused");
@@ -408,7 +444,7 @@ test("the integrate duty is fenced by files even when its edit is staged", async
   }
 });
 
-test("the loop chains on the candidate it picked and the third loop with a point open parks with no seat review", async () => {
+test("open points chain domain loops on the integrated candidate and park at the third loop", async () => {
   // R4: while points stay open the loop re-enters the owning domain and no
   // reviewer agent starts. Each loop starts on the candidate the round before
   // it picked — never on the older pick that candidate was based on — and the
@@ -445,7 +481,7 @@ test("the loop chains on the candidate it picked and the third loop with a point
       steps: [
         {
           kind: "call-sh",
-          command: domain === "booking" ? "printf 'booking fixed\\n' > booking-fixed.txt" : round === 1 ? "printf 'gates\\n' > gates.txt" : "true",
+          command: domain === "booking" ? "printf 'booking fixed\\n' > booking-fixed.txt" : round === 2 ? "printf 'gates\\n' > gates.txt" : "true",
         },
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
       ],
@@ -460,15 +496,17 @@ test("the loop chains on the candidate it picked and the third loop with a point
     await waitFor(() => events().some((e) => e.type === "LOOP_BOUND_REACHED"), 180_000, 50, setup.runDir);
     const rounds = setup.conductor.state.phase.rounds ?? [];
     const [first, second, third] = [rounds[0], rounds[1], rounds[2]];
-    assert.ok(first?.picked && second?.picked && third?.picked, "the three loop rounds each picked their candidate");
-    const firstFix = first.fixed;
-    assert.ok(firstFix?.candidate, "the first fix merged a candidate");
-    assert.equal(second.base, firstFix.candidate, "the first loop starts on the merged candidate");
-    assert.equal(third.base, second.picked.sha, "the later loop chains on the candidate the previous loop picked");
+    assert.ok(first?.picked && second?.fixed && third?.fixed, "BUILD picked once; domain loops record their own reductions");
+    assert.ok(second.fixed.candidate, "the first domain loop merged a candidate");
+    assert.equal(second.fixed.merges.length, 1, "only the approved domain merges; an open head is not an approval");
+    assert.equal(second.base, first.picked.sha, "the first domain loop starts on the pick");
+    assert.equal(third.base, second.fixed.candidate, "the later loop chains on the integrated candidate");
     assert.notEqual(third.base, first.picked.sha, "the chain never falls back to the original pick");
     for (const round of [second, third]) {
+      assert.deepEqual(round.lanes, [], "a fix loop contains no lanes");
+      assert.equal(round.picked, undefined, "a fix loop picks no candidate");
       assert.equal(round.votes.length, 0, `loop round ${round.round} takes no pick vote`);
-      assert.equal(round.candidates[0]?.reviews, undefined, `loop round ${round.round} starts no seat review`);
+      assert.equal(round.candidates.length, 0, `loop round ${round.round} starts no lane review`);
     }
     assert.deepEqual(
       readEvents(setup.runDir)
@@ -492,6 +530,37 @@ test("the loop chains on the candidate it picked and the third loop with a point
   } finally {
     await teardown(setup);
   }
+});
+
+test("a red integrated check creates a point for an owning domain with no existing task", async () => {
+  const check = "if [ -f poison.txt ]; then echo 'error: gates/b.ts:1: merged failure'; exit 1; fi";
+  const setup = await setupConductor({
+    phase: { id: "p1", goal: "route a newly red file", acceptance: ["it works"], checks: [check], finalChecks: ["true"],
+      boundaries: [], reserved: [], workers: 2, domains: FIX_DOMAINS, rounds: 3, fixRounds: "domains", fixers: 4, fixChecks: "true" },
+    checks: [check], phaseChecks: [check], stubReviews: true, deadlines: FAST,
+    workerScript: () => laneWorker("a", 1), laneWorkerScriptFor: (lane, round) => laneWorker(lane, round),
+    laneReviewerScriptFor: (seat, candidate, state) => reviewerWithBookingPoint()(seat as Reviewer, candidate, state),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1),
+    fixerScriptFor: (domain) => ({ hello: defaultWorkerHello(), steps: [
+      { kind: "call-sh", command: domain === "booking" ? "echo fixed > booking-fixed.txt; echo poison > poison.txt" : "rm poison.txt; echo fixed > gates-fixed.txt" },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+    ] }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
+    const point = setup.conductor.state.phase.findings.find((f) => f.raisedBy === "conductor" && f.domain === "gates");
+    assert.ok(point, "the owning domain receives a new point even without a prior task");
+    assert.equal(point.where, "gates/b.ts:1");
+    assert.equal(point.doneWhen, check);
+    const rounds = setup.conductor.state.phase.rounds!;
+    assert.deepEqual(rounds[1].fixed!.tasks.map((t) => t.domain), ["booking"]);
+    assert.deepEqual(rounds[2].fixed!.tasks.map((t) => t.domain), ["gates"], "only the newly failing domain goes back to MAP");
+    assert.equal(rounds[2].base, rounds[1].fixed!.candidate);
+    const events = readEvents(setup.runDir).filter((r) => r.kind === "event").map((r) => r.event as Record<string, unknown>);
+    assert.ok(!events.some((e) => e.type === "LEAD_CALLED"), "known ownership is not an exception");
+    assert.ok(!events.some((e) => Number(e.round) >= 2 && e.type === "CANDIDATE_PICKED"));
+  } finally { await teardown(setup); }
 });
 
 test("a red merged check that names no declared domain parks for the lead with no lane round", async () => {
@@ -607,10 +676,10 @@ test("a point proven by an earlier loop does not keep the seats from reviewing o
           kind: "call-sh",
           command:
             domain === "booking"
-              ? round === 1
+              ? round === 2
                 ? "printf 'booking fixed\n' > booking-fixed.txt"
                 : "true"
-              : round === 1
+              : round === 2
                 ? "printf 'gates\n' > gates.txt"
                 : "printf 'gates fixed\n' > gates-fixed.txt",
         },
@@ -628,7 +697,7 @@ test("a point proven by an earlier loop does not keep the seats from reviewing o
         .filter((r) => r.kind === "intent")
         .map((r) => String((r.event as { agentId?: string }).agentId ?? ""));
     await setup.conductor.start();
-    await waitFor(() => intents().some((id) => id.startsWith("lane-review-3-a-")), 120_000, 20, setup.runDir);
+    await waitFor(() => intents().filter((id) => id.startsWith("reviewer-")).length === 3, 120_000, 20, setup.runDir);
     assert.ok(
       !events().some((e) => e.type === "LEAD_CALLED"),
       "a point closed on an earlier candidate never parks the phase",
@@ -642,7 +711,7 @@ test("a point proven by an earlier loop does not keep the seats from reviewing o
       "only the first loop with a point still open chains",
     );
     assert.ok(
-      intents().some((id) => id.startsWith("lane-review-3-a-")),
+      intents().filter((id) => id.startsWith("reviewer-")).length === 3,
       "the seats review the candidate on which every point closed",
     );
   } finally {

@@ -1530,6 +1530,7 @@ export interface RoundRevote {
 export interface RoundRecord {
   round: number;
   base: string;
+  /** BUILD/REVIEW lanes; empty after the pick for a domain FIX/REDUCE loop. */
   lanes: string[];
   candidates: LaneCandidateRecord[];
   votes: PickVote[];
@@ -1548,10 +1549,10 @@ export interface RoundRecord {
    * not. `ok` with a `sha` makes that commit the next round's base for every
    * lane; `ok` false records why the next round starts from the winner. */
   consolidated?: RoundConsolidation;
-  /** Plan 07c (D4): set by ROUND_FIXED once the round's open fix findings
-   * were grouped by domain and one fixer per domain ran from the same base.
-   * With a `candidate`, the next round is a single-lane round on that merged
-   * commit; without one it is today's two-lane round. */
+  /** Set by ROUND_FIXED once the domain MAP and integration finish. In a
+   * lane-free loop, `base` is the loop's start and `candidate` is its integrated
+   * head (absent when the tree is unchanged). No lane pick is needed. Old
+   * lane-only logs retain their original fixed record unchanged. */
   fixed?: RoundFixed;
 }
 

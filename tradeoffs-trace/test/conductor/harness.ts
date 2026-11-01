@@ -614,6 +614,27 @@ export async function setupConductor(opts: {
         const script = opts.reviewerScriptFor(reviewer, conductor.state);
         reviewerScriptPaths.set(agentId, writeScript(scriptsDir, agentId, script));
       }
+      // Domain loops now use ordinary candidate seats at ACCEPT, not a
+      // synthetic lane review. Lane-oriented fixtures get an empty acceptance
+      // review unless they explicitly script the acceptance seats themselves.
+      if (!reviewerScriptPaths.has(agentId) && opts.laneReviewerScriptFor && conductor.state.phase.rounds?.at(-1)?.lanes.length === 0) {
+        const phase = conductor.state.phase;
+        reviewerScriptPaths.set(agentId, writeScript(scriptsDir, agentId, {
+          hello: defaultReviewerHello(),
+          steps: [
+            ...((opts.stubReviews ?? true) ? [] : [
+              { kind: "call-submit" as const, tool: "submit_discovery", args: { discoveries: [] } },
+              { kind: "wait-for-prompt" as const },
+            ]),
+            { kind: "call-tool", tool: "read", args: { path: "README.md" } },
+            { kind: "call-submit", tool: "submit_review", args: {
+            reviewer, phaseId: phase.phaseId, candidateSha: phase.candidate?.sha,
+            contractVersion: phase.contract.contractVersion, correctionStatements: [], findingStatements: [], ballots: [], findings: [],
+            items: [...(phase.contract.requirements ?? []), ...(phase.contract.constraints ?? [])].map((item) => ({ id: item.id, verdict: "met", evidence: "README.md:1" })),
+            arch: (phase.contract.architecture ?? []).map((item) => ({ id: item.id, verdict: "fits", evidence: "README.md:1" })),
+          } }],
+        }));
+      }
       const p = reviewerScriptPaths.get(agentId);
       return p ? { FAKE_PI_SCRIPT: p, ...(opts.extraReviewerEnv?.(reviewer) ?? {}) } : undefined;
     },

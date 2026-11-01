@@ -586,7 +586,7 @@ test("owner-directives: the correction's point starts its domain's repair, whose
 
     await waitFor(() => setup.conductor.state.phase.phase === "DONE", 240_000, 50, setup.runDir);
     const phase = setup.conductor.state.phase;
-    const fixed = phase.rounds?.[0]?.fixed;
+    const fixed = phase.rounds?.[1]?.fixed;
     assert.ok(fixed?.candidate, "the fix round produced a candidate");
     const started = readEvents(setup.runDir).find((r) => r.kind === "fix_round_started");
     const tasks = (started?.event as { tasks?: Array<{ domain: string; findingIds: string[] }> } | undefined)?.tasks ?? [];

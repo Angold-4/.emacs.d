@@ -9,7 +9,6 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import { domainReviewBrief, factKeepsOpen, fixTasks, testRemovalViolations, FIXER_DUTY, type FixFinding, type FixTask } from "../../src/core/fix-rounds.ts";
-import { fixRoundCandidate, isFixRound } from "../../src/core/lanes.ts";
 import { domainFactFailure } from "../../src/fix-loop.ts";
 import { lintPlan, lintTestRemovals } from "../../src/core/plan-lint.ts";
 import { reduce } from "../../src/core/reduce.ts";
@@ -160,12 +159,13 @@ test("ROUND_FIXED validates and makes the merged candidate the next round's sing
     merges: [{ sha: "b1" }],
     candidate: "C",
   });
-  assert.deepEqual(fixRoundCandidate(applied.state.phase.rounds, 3), { candidate: "C", base: "B" });
-  // Without a candidate the next round is today's; a fix step for a round
-  // with no pick is refused.
+  assert.equal(applied.state.phase.rounds![0].fixed?.candidate, "C");
+  assert.equal(applied.state.phase.rounds![0].fixed?.base, "B");
+  // Legacy replay keeps an absent integrated candidate absent. A fix step
+  // cannot attach to an unstarted lane round.
   const none = reduce(state, { ...event, candidate: undefined } as never);
   assert.ok(none.ok);
-  assert.equal(fixRoundCandidate(none.state.phase.rounds, 3), undefined);
+  assert.equal(none.state.phase.rounds![0].fixed?.candidate, undefined);
   const noPick = reduce(baseState({ phase: "IMPLEMENTING" }), event as never);
   assert.equal(noPick.ok, false, "a round with no pick cannot be fixed");
 });
@@ -186,20 +186,6 @@ test("tt lint refuses TT_FIX_ROUNDS without TT_DOMAINS", () => {
   const badFixers = lintPlan({ fixers: 0, phases: [] }).filter((f) => f.rule === "fix-rounds");
   assert.equal(badFixers.length, 1);
   assert.match(badFixers[0].problem, /whole number of 1 or more/);
-});
-
-test("fixRoundCandidate serves only the round right after the fixed round, never a later one", () => {
-  const picked = (round: number, sha: string) => ({ round, base: "B0", lanes: ["a", "b"], candidates: [], picked: { lane: "a", sha, votes: 3 } });
-  const fixedRound = { ...picked(2, "P2"), fixed: { base: "B", tasks: [], merges: [{ sha: "f1" }], candidate: "C" } };
-  const rounds = [fixedRound, { round: 3, base: "C", lanes: ["a"], candidates: [] }] as never;
-  // Round 3 (right after the fixed round 2) runs on the merged candidate.
-  assert.deepEqual(fixRoundCandidate(rounds, 3), { candidate: "C", base: "B" });
-  // Round 3 ran on C and picked nothing: round 4 is today's round, not a
-  // replay of C (which would throw away round 3's lane-fix commit).
-  assert.equal(fixRoundCandidate(rounds, 4), undefined, "round 4 is not a synthetic round on C");
-  assert.equal(fixRoundCandidate(rounds, 5), undefined);
-  // A resumed, unfinished round 3 still reads its fix candidate.
-  assert.deepEqual(fixRoundCandidate([fixedRound] as never, 3), { candidate: "C", base: "B" });
 });
 
 test("tt lint refuses TT_FIX_ROUNDS with fewer than two workers", () => {
@@ -362,22 +348,6 @@ test("factKeepsOpen keeps a domain point open while its doneWhen fact fails on t
   assert.equal(factKeepsOpen({ ...point, doneWhen: undefined }, [fact(1)], "c1"), false, "not a domain point: as before");
   assert.equal(factKeepsOpen({ ...point, domain: undefined }, [fact(1)], "c1"), false, "no domain: as before");
   assert.equal(factKeepsOpen(point, [fact(1)], undefined), false, "no candidate: as before");
-});
-
-// exex 01b3p1 (2026-10-27, run cb38791b): ITEMS_REGRESSED undid a green fix
-// round's merged candidate and restarted every lane from round 1's pick.
-test("isFixRound marks the round that ran on a fix round's candidate, whose pick the regression guard never undoes", () => {
-  const picked = (round: number, sha: string, lanes = ["a", "b"]) => ({ round, base: "B0", lanes, candidates: [], picked: { lane: "a", sha, votes: 3 } });
-  const fixed1 = { ...picked(1, "P1"), fixed: { base: "P1", tasks: [], merges: [{ sha: "f1" }], candidate: "C" } };
-  // Round 2 ran on round 1's merged fixers: it is a fix round.
-  assert.equal(isFixRound([fixed1, picked(2, "C", ["a"])] as never, 2), true);
-  // A round after a round that was not fixed is an ordinary round.
-  assert.equal(isFixRound([picked(1, "P1"), picked(2, "P2")] as never, 2), false);
-  // A fix step with no merged candidate leaves the next round ordinary.
-  const noCandidate = { ...picked(1, "P1"), fixed: { base: "P1", tasks: [], merges: [] } };
-  assert.equal(isFixRound([noCandidate, picked(2, "P2")] as never, 2), false);
-  // Round 3, after the fix round, is ordinary again.
-  assert.equal(isFixRound([fixed1, picked(2, "C", ["a"]), picked(3, "P3")] as never, 3), false);
 });
 
 test("a resumed domain review gets the same brief", () => {

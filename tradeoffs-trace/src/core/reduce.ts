@@ -541,8 +541,8 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
     }
 
     case "ROUND_STARTED": {
-      if (event.round < 1 || event.lanes.length === 0) {
-        return rejected(state, "ROUND_STARTED needs a round number and at least one lane");
+      if (event.round < 1) {
+        return rejected(state, "ROUND_STARTED needs a positive round number");
       }
       const others = (p.rounds ?? []).filter((r) => r.round !== event.round);
       return ok({
@@ -718,7 +718,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // two-lane round), and to never re-run the fixers after it.
       const round = (p.rounds ?? []).find((r) => r.round === event.round);
       if (!round) return rejected(state, `ROUND_FIXED for round ${event.round}, which has not started`);
-      if (!round.picked) return rejected(state, `ROUND_FIXED for round ${event.round}, which picked no lane`);
+      if (round.lanes.length > 0 && !round.picked) return rejected(state, `ROUND_FIXED for round ${event.round}, which picked no lane`);
       if (event.tasks.length === 0) return rejected(state, `ROUND_FIXED for round ${event.round} names no task`);
       const fixed: import("./types.ts").RoundFixed = {
         base: event.base,

@@ -225,7 +225,7 @@ test("a domain review that marks a point not fixed sends it back to the same fix
   });
   try {
     await setup.conductor.start();
-    const fixed = () => setup.conductor.state.phase.rounds?.[0]?.fixed;
+    const fixed = () => setup.conductor.state.phase.rounds?.[1]?.fixed;
     await waitFor(() => fixed() !== undefined, 180_000, 50, setup.runDir);
     assert.ok(domainReviewLaunches >= 2, "the reviewer ran again after the rejected point");
     const events = coreEvents(setup.runDir);
@@ -241,7 +241,7 @@ test("a domain review that marks a point not fixed sends it back to the same fix
     );
     assert.equal(intents.length, 2, "the same domain fixer was launched twice");
     assert.equal((intents[1].event as { fixOf?: string }).fixOf, firstSha, "the second launch continued the first commit's session");
-    assert.ok(fs.existsSync(path.join(runPaths(setup.runDir).sessions, "fix-1-booking")), "both fixer turns use one session directory");
+    assert.ok(fs.existsSync(path.join(runPaths(setup.runDir).sessions, "fix-2-booking")), "both fixer turns use one session directory");
     const candidate = fixed()!.candidate!;
     const candidateDir = path.join(runPaths(setup.runDir).candidates, candidate);
     assert.ok(fs.existsSync(path.join(candidateDir, "second-attempt.txt")), "the second fixer attempt is in the merged candidate");
@@ -289,7 +289,7 @@ test("a domain review session has read-only tools and adds no commit", async () 
   });
   try {
     await setup.conductor.start();
-    const fixed = () => setup.conductor.state.phase.rounds?.[0]?.fixed;
+    const fixed = () => setup.conductor.state.phase.rounds?.[1]?.fixed;
     await waitFor(() => fixed() !== undefined, 180_000, 50, setup.runDir);
     assert.ok(reviewLaunches >= 1, "the stateless domain review script was launched");
     const approved = coreEvents(setup.runDir).find((e) => e.type === "DOMAIN_APPROVED");
@@ -347,7 +347,7 @@ test("a domain loop at its bound is dropped while the approved domain merges", a
   });
   try {
     await setup.conductor.start();
-    const fixed = () => setup.conductor.state.phase.rounds?.[0]?.fixed;
+    const fixed = () => setup.conductor.state.phase.rounds?.[1]?.fixed;
     await waitFor(() => fixed() !== undefined, 180_000, 50, setup.runDir);
     const record = fixed()!;
     assert.deepEqual(record.tasks.map((t) => t.domain), ["booking", "gates"], "both domains ran");
@@ -634,7 +634,7 @@ test("a resumed conductor rebuilds the domain brief from its log and continues t
       );
     await waitFor(reviewed, 180_000, 25, setup.runDir);
     await setup.conductor.stop();
-    assert.equal(setup.conductor.state.phase.rounds?.[0]?.fixed, undefined, "the stopped fix round is not recorded");
+    assert.equal(setup.conductor.state.phase.rounds?.[1]?.fixed, undefined, "the stopped fix round is not recorded");
     const passes = readLog(runPaths(setup.runDir).events).records
       .filter((r) => r.kind === "domain_loop_pass")
       .map((r) => r.event as DomainLoopRecord);
@@ -703,7 +703,7 @@ test("a resumed conductor rebuilds the domain brief from its log and continues t
       },
     });
     await resumed.start();
-    const fixed = () => resumed!.state.phase.rounds?.[0]?.fixed;
+    const fixed = () => resumed!.state.phase.rounds?.[1]?.fixed;
     await waitFor(() => fixed() !== undefined, 180_000, 50, setup.runDir);
 
     const reviews = coreEvents(setup.runDir).filter(

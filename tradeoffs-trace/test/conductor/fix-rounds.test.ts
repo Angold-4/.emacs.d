@@ -275,7 +275,7 @@ test("a fix round starts one fixer per domain from the same base and they overla
   });
   try {
     await setup.conductor.start();
-    const fixed = () => setup.conductor.state.phase.rounds?.[0]?.fixed;
+    const fixed = () => setup.conductor.state.phase.rounds?.[1]?.fixed;
     await waitFor(() => fixed() !== undefined, 180_000, 50, setup.runDir);
     const record = fixed()!;
     assert.equal(record.tasks.length, 2, "one task per domain");
@@ -323,7 +323,7 @@ test("a fixer's submit_phase without item coverage or answers to other findings 
   });
   try {
     await setup.conductor.start();
-    const fixed = () => setup.conductor.state.phase.rounds?.[0]?.fixed;
+    const fixed = () => setup.conductor.state.phase.rounds?.[1]?.fixed;
     await waitFor(() => fixed() !== undefined, 180_000, 50, setup.runDir);
     const record = fixed()!;
     assert.equal(record.merges.length, 2, "both bare submissions merged");
@@ -357,7 +357,7 @@ test("a fixer's out-of-task decision disclosure reaches the phase record", async
   try {
     await setup.conductor.start();
     await waitFor(() => setup.conductor.state.phase.phase === "DONE", 240_000, 50, setup.runDir);
-    const fixed = setup.conductor.state.phase.rounds?.[0]?.fixed;
+    const fixed = setup.conductor.state.phase.rounds?.[1]?.fixed;
     assert.ok(fixed?.candidate, "the fix round merged a candidate");
     // ROUND_FIXED keeps every fixer's decisions, in task order (booking, gates).
     assert.deepEqual(
@@ -407,7 +407,7 @@ test("the fixers' commits are merged in task order into the next round's single 
   });
   try {
     await setup.conductor.start();
-    const fixed = () => setup.conductor.state.phase.rounds?.[0]?.fixed;
+    const fixed = () => setup.conductor.state.phase.rounds?.[1]?.fixed;
     await waitFor(() => fixed() !== undefined, 180_000, 50, setup.runDir);
     const record = fixed()!;
     const booking = record.tasks.find((t) => t.domain === "booking")!;
@@ -417,22 +417,17 @@ test("the fixers' commits are merged in task order into the next round's single 
     const git = (...args: string[]) => execFileSync("git", args, { cwd: setup.repo.dir, encoding: "utf8" }).trim();
     assert.equal(git("show", `${record.candidate}:booking-fixed.txt`), "booking fixed", "the candidate carries booking's work");
     assert.equal(git("show", `${record.candidate}:gates-fixed.txt`), "gates fixed", "the candidate carries gates' work");
-    // The next round is one lane on the candidate; its checks run on it and
-    // the reviewers review it.
-    await waitFor(() => (setup.conductor.state.phase.rounds?.length ?? 0) >= 2, 120_000, 50, setup.runDir);
-    assert.equal(record.candidate, setup.conductor.state.phase.rounds![1].base, "the next round's base is the candidate");
-    const second = () => setup.conductor.state.phase.rounds![1];
-    assert.deepEqual(second().lanes, ["a"], "the next round has one lane");
-    assert.equal(second().candidates[0].sha, record.candidate, "its candidate is the recorded merge");
-    await waitFor(() => (second().candidates[0].reviews ?? []).length === 3, 120_000, 50, setup.runDir);
+    const second = setup.conductor.state.phase.rounds![1];
+    assert.deepEqual(second.lanes, [], "the fix loop has no lanes");
+    assert.equal(second.fixed?.candidate, record.candidate, "its candidate is the recorded merge");
+    await waitFor(() => Object.values(setup.conductor.state.phase.reviews).filter((r) => r?.review?.candidateSha === record.candidate).length === 3, 120_000, 50, setup.runDir);
     const { records } = readLog(runPaths(setup.runDir).events);
     assert.ok(
-      records.some((r) => r.kind === "lane_check_started" && (r.event as { candidateSha?: string }).candidateSha === record.candidate),
+      records.some((r) => r.kind === "integrated_check_started" && (r.event as { candidateSha?: string }).candidateSha === record.candidate),
       "the round checks ran on the candidate",
     );
-    assert.equal((second().candidates[0].reviews ?? []).length, 3, "the reviewers reviewed the candidate");
     const rebuilt = rebuildState(setup.runDir, setup.plan);
-    assert.deepEqual(rebuilt.phase.rounds![0].fixed, record, "the record replays from the log");
+    assert.deepEqual(rebuilt.phase.rounds![1].fixed, record, "the record replays from the log");
   } finally {
     await teardown(setup);
   }
@@ -466,7 +461,7 @@ test("a fixer whose commit conflicts is skipped with a note, the other fixer's w
   });
   try {
     await setup.conductor.start();
-    const fixed = () => setup.conductor.state.phase.rounds?.[0]?.fixed;
+    const fixed = () => setup.conductor.state.phase.rounds?.[1]?.fixed;
     await waitFor(() => fixed() !== undefined, 180_000, 50, setup.runDir);
     const record = fixed()!;
     // Fix packet Z: only the merged fixer speaks for the candidate. The
@@ -492,12 +487,12 @@ test("a fixer whose commit conflicts is skipped with a note, the other fixer's w
     // handed off. The skipped fixer's disclosure still never reaches the phase
     // record, because its code is not in any candidate.
     await waitFor(
-      () => (setup.conductor.state.phase.rounds ?? []).some((r) => r.round === 2 && r.picked?.sha === record.candidate),
+      () => (setup.conductor.state.phase.rounds ?? []).some((r) => r.round === 3 && r.base === record.candidate),
       180_000,
       50,
       setup.runDir,
     );
-    const loopRound = (setup.conductor.state.phase.rounds ?? []).find((r) => r.round === 2)!;
+    const loopRound = (setup.conductor.state.phase.rounds ?? []).find((r) => r.round === 3)!;
     assert.equal(loopRound.base, record.candidate, "the next loop starts on the merged candidate at once");
     assert.equal(loopRound.votes.length, 0, "a loop round takes no pick vote");
     assert.equal(loopRound.candidates[0]?.reviews, undefined, "a loop round starts no seat review");
@@ -535,7 +530,7 @@ test("a fixer that stays red on TT_FIX_CHECKS is skipped and its findings stay o
   });
   try {
     await setup.conductor.start();
-    const fixed = () => setup.conductor.state.phase.rounds?.[0]?.fixed;
+    const fixed = () => setup.conductor.state.phase.rounds?.[1]?.fixed;
     await waitFor(() => fixed() !== undefined, 180_000, 50, setup.runDir);
     const record = fixed()!;
     const booking = record.tasks.find((t) => t.domain === "booking")!;
@@ -577,12 +572,12 @@ test("a phase with domain findings reaches acceptance through a fix round", asyn
     await setup.conductor.start();
     await waitFor(() => setup.conductor.state.phase.phase === "DONE", 240_000, 50, setup.runDir);
     const phase = setup.conductor.state.phase;
-    assert.ok(phase.rounds?.[0]?.fixed?.candidate, "the fix round produced a candidate");
+    assert.ok(phase.rounds?.[1]?.fixed?.candidate, "the fix round produced a candidate");
     const events = coreEvents(setup.runDir);
     const facts = events.filter((e) => e.type === "FINDING_FACT");
     assert.equal(facts.length, 2, `two facts on the merged candidate: ${JSON.stringify(facts)}`);
     assert.ok(facts.every((f) => f.exitCode === 0 && f.timedOut === false), "both facts pass");
-    assert.ok(facts.every((f) => f.candidateSha === phase.rounds![0].fixed!.candidate), "the facts name the merged candidate");
+    assert.ok(facts.every((f) => f.candidateSha === phase.rounds![1].fixed!.candidate), "the facts name the merged candidate");
     assert.equal(events.filter((e) => e.type === "FINDING_CONFIRMED_REPAIRED").length, 2, "both points are repaired");
     assert.ok(events.some((e) => e.type === "FINAL_CHECKS_PASSED"), "the final checks ran");
     assert.equal(phase.phase, "DONE");
@@ -627,13 +622,13 @@ test("a fix round resumed after ROUND_FIXED starts the next round from the recor
   });
   const roundTwoCheckStarts = () =>
     readLog(runPaths(setup.runDir).events).records.filter(
-      (r) => r.kind === "lane_check_started" && (r.event as { round?: number }).round === 2,
+      (r) => r.kind === "integrated_check_started" && (r.event as { round?: number }).round === 2,
     );
   let resumed: Conductor | undefined;
   try {
     await setup.conductor.start();
-    await waitFor(() => setup.conductor.state.phase.rounds?.[0]?.fixed !== undefined, 180_000, 50, setup.runDir);
-    const fixed = setup.conductor.state.phase.rounds![0].fixed!;
+    await waitFor(() => setup.conductor.state.phase.rounds?.[1]?.fixed !== undefined, 180_000, 50, setup.runDir);
+    const fixed = setup.conductor.state.phase.rounds![1].fixed!;
     const candidate = fixed.candidate!;
     assert.notEqual(fixed.base, candidate, "the fix base B is not the merged candidate");
     // The next round has started and is checking the merged candidate (held).
@@ -643,18 +638,18 @@ test("a fix round resumed after ROUND_FIXED starts the next round from the recor
     const before = runs().length;
     assert.equal(before, 2, "two fixers ran before the stop");
     const stoppedRound = setup.conductor.state.phase.rounds![1];
-    assert.equal(stoppedRound.candidates[0]?.sha, candidate, "the stopped round's candidate is the merged one");
-    assert.equal(stoppedRound.candidates[0]?.ok, undefined, "the stop left the next round unfinished (its candidate unchecked)");
+    assert.equal(stoppedRound.fixed?.candidate, candidate, "the stopped loop's candidate is the integrated one");
+    assert.deepEqual(stoppedRound.lanes, [], "stop preserves a lane-free loop checkpoint");
     const startsBefore = roundTwoCheckStarts().length;
 
     fs.writeFileSync(release, "go\n");
     resumed = resumeConductor(setup);
     await resumed.start();
-    await waitFor(() => resumed!.state.phase.rounds?.[1]?.candidates[0]?.ok !== undefined, 180_000, 50, setup.runDir);
+    await waitFor(() => readEvents(setup.runDir).some((r) => r.kind === "integrated_check_finished" && (r.event as { round?: number; passed?: boolean }).round === 2 && (r.event as { passed?: boolean }).passed === true), 180_000, 50, setup.runDir);
     assert.equal(runs().length, before, "no fixer started again after the resume");
     const second = resumed!.state.phase.rounds![1];
-    assert.equal(second.base, candidate, "the next round's base is the recorded candidate");
-    assert.equal(second.candidates[0].sha, candidate, "the next round's candidate is the recorded one");
+    assert.equal(second.base, fixed.base, "the resumed loop keeps its original base");
+    assert.equal(second.fixed?.candidate, candidate, "the resumed loop keeps its integrated candidate");
     // Plan 07c (A4): the resumed (unfinished) round's check of the synthetic
     // lane uses the recorded fix base B, exactly as the fresh check did.
     const starts = roundTwoCheckStarts();
@@ -704,11 +699,11 @@ test("a fix round removes its merge and fixer worktrees once ROUND_FIXED is reco
   try {
     await setup.conductor.start();
     // Round 2 has started, so the fix step (and its clean-up) is done.
-    await waitFor(() => (setup.conductor.state.phase.rounds?.length ?? 0) >= 2, 180_000, 50, setup.runDir);
-    const record = setup.conductor.state.phase.rounds![0].fixed!;
+    await waitFor(() => setup.conductor.state.phase.rounds?.[1]?.fixed !== undefined, 180_000, 50, setup.runDir);
+    const record = setup.conductor.state.phase.rounds![1].fixed!;
     assert.ok(record.candidate, "the fix round merged a candidate");
     const worktrees = path.join(setup.runDir, "worktrees");
-    assert.equal(fs.existsSync(path.join(worktrees, "fix-merge-1")), false, "the merge worktree is gone");
+    assert.equal(fs.existsSync(path.join(worktrees, "fix-merge-2")), false, "the merge worktree is gone");
     assert.equal(fs.existsSync(path.join(worktrees, "fix-booking")), false, "the booking fixer's worktree is gone");
     assert.equal(fs.existsSync(path.join(worktrees, "fix-gates")), false, "the gates fixer's worktree is gone");
     // The commits stay.
@@ -748,7 +743,7 @@ test("a red fixer's fix prompt carries its fix check's output", async () => {
   });
   try {
     await setup.conductor.start();
-    await waitFor(() => setup.conductor.state.phase.rounds?.[0]?.fixed !== undefined, 180_000, 50, setup.runDir);
+    await waitFor(() => setup.conductor.state.phase.rounds?.[1]?.fixed !== undefined, 180_000, 50, setup.runDir);
     const { records } = readLog(runPaths(setup.runDir).events);
     const red = records.find(
       (r) => r.kind === "fixer_check_finished" && (r.event as { domain?: string; passed?: boolean }).domain === "booking" && (r.event as { passed?: boolean }).passed === false,
@@ -765,7 +760,7 @@ test("a red fixer's fix prompt carries its fix check's output", async () => {
     const fixPrompt = prompts.find((p) => p.includes(`Your fixer commit ${redSha.slice(0, 7)} is not accepted in domain booking`));
     assert.ok(fixPrompt, "the red fixer was asked to fix it");
     assert.ok(fixPrompt!.includes("error: RED_MARKER_PRESENT"), "the fix prompt carries the failure output");
-    const booking = setup.conductor.state.phase.rounds![0].fixed!.tasks.find((t) => t.domain === "booking")!;
+    const booking = setup.conductor.state.phase.rounds![1].fixed!.tasks.find((t) => t.domain === "booking")!;
     assert.ok(booking.sha && booking.sha !== redSha, "the fixed commit is the one merged");
   } finally {
     await teardown(setup);
@@ -773,7 +768,7 @@ test("a red fixer's fix prompt carries its fix check's output", async () => {
   }
 });
 
-test("a fixers' merge whose tree is the base's records no candidate and the next round is today's", async () => {
+test("an unchanged domain merge chains on the same base with no lane repair", async () => {
   // Packet X: the gates fixer changes nothing; the booking fixer's red commit
   // adds a marker and its fix removes it again, so its green commit — and
   // the merge — has B's own tree.
@@ -797,14 +792,17 @@ test("a fixers' merge whose tree is the base's records no candidate and the next
   });
   try {
     await setup.conductor.start();
-    await waitFor(() => setup.conductor.state.phase.rounds?.[0]?.fixed !== undefined, 180_000, 50, setup.runDir);
-    const record = setup.conductor.state.phase.rounds![0].fixed!;
+    await waitFor(() => setup.conductor.state.phase.rounds?.[1]?.fixed !== undefined, 180_000, 50, setup.runDir);
+    const record = setup.conductor.state.phase.rounds![1].fixed!;
     assert.equal(record.merges.length, 1, `the booking fixer's green commit merged: ${JSON.stringify(record)}`);
     assert.equal(record.candidate, undefined, "a merge with the base's tree is no candidate");
     const { records } = readLog(runPaths(setup.runDir).events);
     assert.ok(records.some((r) => r.kind === "fix_merge_unchanged"), "the unchanged merge is logged");
-    await waitFor(() => (setup.conductor.state.phase.rounds?.length ?? 0) >= 2, 120_000, 50, setup.runDir);
-    assert.deepEqual(setup.conductor.state.phase.rounds![1].lanes, ["a"], "the next round is one lane on the pick");
+    await waitFor(() => (setup.conductor.state.phase.rounds?.length ?? 0) >= 3, 120_000, 50, setup.runDir);
+    const next = setup.conductor.state.phase.rounds![2];
+    assert.equal(next.base, record.base, "an unchanged reduction keeps its base");
+    assert.deepEqual(next.lanes, [], "the next loop has no lane");
+    assert.equal(next.picked, undefined);
   } finally {
     await teardown(setup);
   }
@@ -912,7 +910,7 @@ test("a vetoed reserved (owner) decision is never a fixer task", async () => {
     const decision = setup.conductor.state.phase.decisions.find((d) => d.id === `D-p1-${picked.slice(0, 8)}-1`);
     assert.equal(decision?.class, "reserved", "the vetoed decision is reserved");
     assert.equal(rounds[0].fixed, undefined, "no fix round for a reserved decision");
-    assert.deepEqual(rounds[1].lanes, ["a"], "the next round is one lane on the pick");
+    assert.deepEqual(rounds[1].lanes, [], "the next loop has no lane");
     assert.equal(fixerIntents(setup.runDir).length, 0, "no fixer started");
   } finally {
     await teardown(setup);
@@ -957,7 +955,7 @@ test("an unclassified domain-mode point with a doneWhen becomes a fixer task, no
   });
   try {
     await setup.conductor.start();
-    const fixed = () => setup.conductor.state.phase.rounds?.[0]?.fixed;
+    const fixed = () => setup.conductor.state.phase.rounds?.[1]?.fixed;
     await waitFor(() => fixed() !== undefined, 180_000, 50, setup.runDir);
     const phase = setup.conductor.state.phase;
     const points = phase.findings.filter((f) => f.domain === "booking" || f.domain === "gates");
@@ -1023,7 +1021,7 @@ test("fixers launch on the worker model, not the consolidator's", async () => {
   });
   try {
     await setup.conductor.start();
-    const fixed = () => setup.conductor.state.phase.rounds?.[0]?.fixed;
+    const fixed = () => setup.conductor.state.phase.rounds?.[1]?.fixed;
     await waitFor(() => fixed() !== undefined, 180_000, 50, setup.runDir);
     assert.deepEqual(fixed()!.tasks.map((t) => t.domain), ["booking", "gates"], "two fixers ran");
     const launches = fs
@@ -1117,7 +1115,7 @@ test("a failing final check becomes a point in the failing file's domain", async
     const point = setup.conductor.state.phase.findings.find((f) => f.raisedBy === "conductor" && f.domain === "core")!;
     assert.equal(point.status, "open");
     assert.match(point.where, /^src\/core\/x\.ts:1/);
-    assert.ok(!setup.conductor.state.phase.rounds!.some((r) => r.round > 1), `no lane round starts after the final failure: ${JSON.stringify(setup.conductor.state.phase.rounds!.map((r) => ({ round: r.round, lanes: r.lanes, fixed: !!r.fixed, picked: !!r.picked })))}`);
+    assert.ok(!setup.conductor.state.phase.rounds!.some((r) => r.round > 1 && r.lanes.length > 0), `no lane round starts after the final failure: ${JSON.stringify(setup.conductor.state.phase.rounds!.map((r) => ({ round: r.round, lanes: r.lanes, fixed: !!r.fixed, picked: !!r.picked })))}`);
   } finally {
     await teardown(setup);
   }

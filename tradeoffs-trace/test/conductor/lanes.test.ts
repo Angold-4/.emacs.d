@@ -579,10 +579,6 @@ test("plan 06g: one lane crashing leaves the other candidate checked, reviewed a
 });
 
 // exex 01a2 (replaces plan 06g's "repeats from the same base"): both lanes'
-// round-1 candidates are red, and each lane's fix changes nothing, so the
-// round ends with no passing candidate. Round 2 keeps the round's base but
-// each lane continues from ITS OWN red candidate (never thrown away), carries
-// both lanes' failures in its prompt, fixes the tree and passes.
 test("plan 06k2: a two-lane winner's boundary-trigger decisions are balloted by its lane reviews and settle", async () => {
   // Scenario 1: the winner touches an uncited boundary path.
   const setup = await setupConductor({
@@ -630,7 +626,8 @@ test("plan 06k2: a two-lane winner's boundary-trigger decisions are balloted by 
   // Scenario 2: a repair round whose own disclosure cites only its new path
   // raises no trigger for the paths an earlier round's decision cited.
   const setup2 = await setupConductor({
-    phase: { id: "p1", goal: "build two candidates", acceptance: ["it works"], checks: ["true"], boundaries: ["src/**"], reserved: [], workers: 2, rounds: 10 },
+    phase: { id: "p1", goal: "build two candidates", acceptance: ["it works"], checks: ["true"], boundaries: ["src/**"], reserved: [], workers: 2, rounds: 10,
+      domains: [{ name: "core", globs: ["src/**"] }], fixRounds: "domains", fixChecks: "true" },
     checks: ["true"],
     phaseChecks: ["true"],
     stubReviews: true,
@@ -673,20 +670,30 @@ test("plan 06k2: a two-lane winner's boundary-trigger decisions are balloted by 
           },
         ],
         ...(round === 1 && seat === "M"
-          ? { findings: [{ kind: "defect", severity: "blocking", evidence: "src/a.txt:1 the earlier change is wrong" }] }
+          ? { findings: [{ kind: "defect", severity: "blocking", evidence: "src/a.txt:1 the earlier change is wrong",
+              domain: "core", item: "R1", where: "src/a.txt:1", expected: "add the missing c path", doneWhen: "test -f src/c.txt" }] }
           : {}),
         ...(round >= 2 ? { findingStatements: open.map((f) => ({ findingId: f.id, status: "withdraw", evidence: "fixed" })) } : {}),
       });
     },
     pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), seat === "B" ? "a" : "b", `${seat} picks`),
+    fixerScriptFor: () => ({ hello: defaultWorkerHello(), steps: [
+      { kind: "call-sh", command: "mkdir -p src; echo c > src/c.txt" },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: [{
+        classProposal: "delegated", choice: "Files changed: src/c.txt",
+        whyItMatters: "the added boundary path needs review",
+        alternatives: [{ option: "leave it uncited", consequence: "unreviewed change" }],
+        recommendation: { choice: "cite it", reason: "the boundary rule requires a disposition" },
+      }], assumptions: [], deviations: [] } },
+    ] }),
   });
   try {
     await setup2.conductor.start();
     await waitFor(() => setup2.conductor.state.phase.phase === "DONE", 180_000, 50, setup2.runDir);
     const phase = setup2.conductor.state.phase;
     assert.ok((phase.rounds?.length ?? 0) >= 2, "the phase ran a repair round");
-    const winner = phase.rounds![phase.rounds!.length - 1].picked!;
-    const triggers = phase.decisions.filter((d) => d.source === "trigger" && d.boundCandidateSha === winner.sha);
+    const candidate = phase.rounds!.at(-1)!.fixed!.candidate!;
+    const triggers = phase.decisions.filter((d) => d.source === "trigger" && d.boundCandidateSha === candidate);
     assert.deepEqual(triggers, [], "an earlier round's cited paths are not re-triggered");
     assert.equal(phase.phase, "DONE");
   } finally {
@@ -979,7 +986,7 @@ test("09-2: a lane's reviews are dispatched before its check finishes, and the r
   }
 });
 
-test("the round after an adopted pick runs one loop on the pick and starts no second lane", async () => {
+test("a post-pick blocker without a domain task calls the lead and starts no lane", async () => {
   const setup = await setupConductor({
     phase: lanePhase(),
     checks: ["true"],
@@ -1014,78 +1021,17 @@ test("the round after an adopted pick runs one loop on the pick and starts no se
     await waitFor(() => (setup.conductor.state.phase.rounds?.length ?? 0) >= 2, 150_000, 50, setup.runDir);
     const rounds = setup.conductor.state.phase.rounds!;
     assert.equal(rounds[0].picked?.lane, "a");
-    assert.deepEqual(rounds[1].lanes, ["a"], "the round after the pick has one lane");
+    assert.deepEqual(rounds[1].lanes, [], "the round after the pick has no lane");
     assert.equal(rounds[1].base, rounds[0].picked!.sha, "its base is the pick");
     assert.equal(rounds[1].candidates.length <= 1, true);
     const { records } = readLog(runPaths(setup.runDir).events);
     const round2Lanes = records.filter(
       (r) => r.kind === "lane_session" && (r.event as { round?: number; lane?: string }).round === 2,
     );
-    assert.ok(round2Lanes.every((r) => (r.event as { lane?: string }).lane !== "b"), "no lane b worker starts after the pick");
+    assert.equal(round2Lanes.length, 0, "no lane worker starts after the pick");
+    await waitFor(() => readEvents(setup.runDir).some((r) => r.kind === "event" && (r.event as { type?: string }).type === "LEAD_CALLED"), 30_000, 50, setup.runDir);
   } finally {
     await teardown(setup);
-  }
-});
-
-test("exex 01a2: when both lanes are still red, the repeat continues each lane from its own candidate with both failures", async () => {
-  const promptLog = fs.mkdtempSync("/tmp/tt-06g2-prompts-");
-  const setup = await setupConductor({
-    phase: lanePhase(),
-    checks: ["test ! -f lane-marker.txt"],
-    phaseChecks: ["test ! -f lane-marker.txt"],
-    stubReviews: true,
-    deadlines: FAST,
-    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: path.join(promptLog, "prompts.txt") },
-    workerScript: () => laneWorker("a"),
-    laneWorkerScriptFor: (lane, round) =>
-      round === 1
-        ? {
-            hello: defaultWorkerHello(),
-            steps: [
-              { kind: "call-sh", command: "printf 'broken\n' > lane-marker.txt" },
-              { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
-            ],
-          }
-        : {
-            hello: defaultWorkerHello(),
-            steps: [
-              { kind: "call-sh", command: `rm -f lane-marker.txt && printf 'lane ${lane}\n' > lane-${lane}.txt` },
-              { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
-            ],
-          },
-    laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion),
-    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", "the only candidate"),
-  });
-  try {
-    await setup.conductor.start();
-    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
-    const phase = setup.conductor.state.phase;
-    assert.equal(phase.rounds?.length, 2, "the round repeated");
-    const [first, second] = phase.rounds!;
-    assert.deepEqual(first.candidates.map((c) => c.ok), [false, false], "round 1: both candidates stayed red");
-    const { records } = readLog(runPaths(setup.runDir).events);
-    assert.equal(records.filter((r) => r.kind === "lane_fix_unchanged").length, 2, "each lane's fix changed nothing, so its loop ended");
-    assert.equal(second.base, first.base, "the round's base is unchanged");
-    const roundTwo = records.find((r) => r.kind === "intent" && (r.event as { round?: number }).round === 2 && (r.event as { laneBases?: unknown }).laneBases);
-    assert.deepEqual(
-      (roundTwo!.event as { laneBases: Record<string, string> }).laneBases,
-      Object.fromEntries(first.candidates.map((c) => [c.lane, c.sha])),
-      "each lane continues from its own red candidate",
-    );
-    assert.deepEqual(second.candidates.map((c) => c.ok), [true, true], "round 2 fixed both trees");
-    // A round costs ONE attempt, whatever its lanes: round 1 failed, round 2 ran.
-    assert.equal(phase.repairRoundsUsed, 1);
-    // Both lanes' prompts of round 2 carry both failures of round 1.
-    const prompts = fs.readFileSync(path.join(promptLog, "prompts.txt"), "utf8");
-    const secondRound = prompts.split("=====").filter((p) => p.includes("Round 2 of this phase"));
-    assert.equal(secondRound.length, 2, "both lanes were prompted in round 2");
-    for (const prompt of secondRound) {
-      assert.match(prompt, /C1-a \(lane a\) failed its checks/);
-      assert.match(prompt, /C1-b \(lane b\) failed its checks/);
-    }
-  } finally {
-    await teardown(setup);
-    cleanupDir(promptLog);
   }
 });
 
@@ -1539,11 +1485,11 @@ test("a lead ruling makes the next repair build on the named candidate (SHA in t
     // the ruling is a pick, not a retroactive rebuild.)
     const fixStarted = records.find((r) => r.kind === "fix_round_started");
     if (fixStarted && Date.parse(fixStarted.ts) > Date.parse(adoptedRecord!.ts)) {
-      await waitFor(() => setup.conductor.state.phase.rounds?.[0]?.fixed !== undefined, 240_000, 20, setup.runDir);
-      const fixed = setup.conductor.state.phase.rounds![0].fixed!;
+      await waitFor(() => setup.conductor.state.phase.rounds?.[1]?.fixed !== undefined, 240_000, 20, setup.runDir);
+      const fixed = setup.conductor.state.phase.rounds![1].fixed!;
       assert.equal(fixed.base, b.sha, "the repair built on the candidate the ruling named");
       assert.deepEqual(fixed.tasks.map((t) => t.domain), ["gates"], "the ruled point is settled; only the other domain is fixer work");
-    } else if (setup.conductor.state.phase.rounds?.[0]?.fixed) {
+    } else if (setup.conductor.state.phase.rounds?.[1]?.fixed) {
       // A repair was already recorded from the pick the seats made; the
       // ruling stands on the round either way.
       assert.equal(setup.conductor.state.phase.rounds[0].picked?.ruling !== undefined, true);
@@ -1634,13 +1580,15 @@ function regressionSetup(r1Round2: "met" | "unmet"): Promise<TestConductorSetup>
         text: "R1 holds",
         arch: [],
         verify: ["test \"test/r1.test.ts::R1 one\"", "test \"test/r1b.test.ts::R1 two\""],
+        domain: "booking",
       },
     ],
     architecture: [],
-    constraints: [{ id: "C2", title: "C2 is kept", text: "C2 is kept", arch: [], verify: ["review"] }],
+    constraints: [{ id: "C2", title: "C2 is kept", text: "C2 is kept", arch: [], verify: ["review"], domain: "booking" }],
   };
   return setupConductor({
-    phase: lanePhase({ requirements: items.requirements, constraints: items.constraints, checks: [gate] }),
+    phase: lanePhase({ requirements: items.requirements, constraints: items.constraints, checks: [gate],
+      domains: [{ name: "booking", globs: ["**"] }], fixRounds: "domains", fixChecks: "true", rounds: 3 }),
     items,
     checks: [gate],
     phaseChecks: ["true"],
@@ -1698,7 +1646,8 @@ function regressionSetup(r1Round2: "met" | "unmet"): Promise<TestConductorSetup>
         seat !== "M"
           ? {}
           : {
-              findings: [{ kind: "defect", severity: "blocking", evidence: `${read}:1 it works is unmet` }],
+              findings: [{ kind: "defect", severity: "blocking", evidence: `${read}:1 it works is unmet`,
+                domain: "booking", item: "C2", where: "booking/a.ts:1", expected: "fix the declared point", doneWhen: "test -f booking-fixed.txt" }],
               ...(open.length > 0
                 ? { findingStatements: open.map((f) => ({ findingId: f.id, status: "withdraw", evidence: "fixed" })) }
                 : {}),
@@ -1706,6 +1655,17 @@ function regressionSetup(r1Round2: "met" | "unmet"): Promise<TestConductorSetup>
       return laneReview(seat as Reviewer, state.phase.contract.contractVersion, { read, items: verdicts, ...extra });
     },
     pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", `${seat} picks a`),
+    fixerScriptFor: () => ({ hello: defaultWorkerHello(), steps: [
+      { kind: "call-sh", command: `echo fixed > booking-fixed.txt; echo delta > round2.txt${r1Round2 === "met" ? "; rm -f r1b.txt" : ""}` },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+    ] }),
+    reviewerScriptFor: (seat, state) => {
+      const script = laneReview(seat, state.phase.contract.contractVersion, { read: "README.md", items: [
+        { id: "R1", verdict: "met", evidence: "README.md:1" },
+        { id: "C2", verdict: "unmet", evidence: "README.md:1 C2 is broken" },
+      ] });
+      return { ...script, steps: script.steps.slice(2) };
+    },
     rerun: REGRESSION_RERUN,
   });
 }
@@ -1720,24 +1680,26 @@ test("a review-only item that flips between candidates makes no regression point
   const setup = await regressionSetup("unmet");
   try {
     await setup.conductor.start();
-    await waitFor(() => (setup.conductor.state.phase.rounds?.length ?? 0) >= 3, 150_000, 50, setup.runDir);
+    await waitFor(() => {
+      const phase = setup.conductor.state.phase;
+      const found = phase.findings.some((f) => f.raisedBy === "conductor" && f.itemId === "C2");
+      if (!found && ["AWAITING_OWNER", "BLOCKED", "DONE"].includes(phase.phase)) {
+        assert.fail(`acceptance did not raise the unmet review-only item: ${JSON.stringify(phase)}`);
+      }
+      return found;
+    }, 10_000, 50, setup.runDir);
     const rounds = setup.conductor.state.phase.rounds!;
-    const best = rounds[0].picked!;
-    const lost = rounds[1].picked!;
-    assert.notEqual(lost.sha, best.sha, "round 2's pick is a different candidate");
+    const candidate = rounds[1].fixed!.candidate!;
+    assert.notEqual(candidate, rounds[0].picked!.sha, "the domain loop produced a different candidate");
+    assert.equal(rounds[1].picked, undefined, "an integrated candidate is never picked through a lane");
     const points = setup.conductor.state.phase.findings.filter((f) => f.status === "open" && f.severity === "blocking" && f.from);
-    const r1 = points.filter((f) => f.itemId === "R1");
-    assert.equal(r1.length, 1, "exactly one point for the test-verified item");
-    assert.equal(r1[0].from?.sha, best.sha, "it names the candidate whose test passed");
-    // The second verification the pick lost is the fact, by the plan's own
-    // declared command; the first still passes, so it is no part of it.
-    assert.equal(r1[0].doneWhen, "./run-one 'test/r1b.test.ts' -- 'R1 two'", "the LOST test's declared command is the doneWhen");
+    assert.ok(setup.conductor.state.phase.findings.some((f) => f.itemId === "C2" && !f.from), "the unanimous unmet acceptance vote is an ordinary point, not a regression fact");
     assert.equal(
       points.some((f) => f.itemId === "C2"),
       false,
       "a review-only item makes no regression point",
     );
-    assert.equal(rounds[2].base, lost.sha, "no restart: the next round still builds on the pick");
+    assert.equal(setup.conductor.state.phase.candidate?.sha, candidate, "the review-only vote never restarts from an older candidate");
     const { records } = readLog(runPaths(setup.runDir).events);
     assert.equal(
       records.filter((r) => r.kind === "event" && (r.event as { type?: string }).type === "ITEMS_REGRESSED").length,
@@ -1757,14 +1719,15 @@ test("07g1b R13: a test-verified item the seats rate met on the pick still regre
     await waitFor(() => (setup.conductor.state.phase.rounds?.length ?? 0) >= 3, 150_000, 50, setup.runDir);
     const rounds = setup.conductor.state.phase.rounds!;
     const best = rounds[0].picked!;
-    assert.notEqual(rounds[1].picked!.sha, best.sha, "round 2's pick is a different candidate");
+    assert.notEqual(rounds[1].fixed!.candidate, best.sha, "the domain loop produced a different candidate");
+    assert.equal(rounds[1].picked, undefined, "the fix loop makes no lane pick");
     const r1 = setup.conductor.state.phase.findings.filter(
       (f) => f.status === "open" && f.severity === "blocking" && f.from && f.item === "R1",
     );
     assert.equal(r1.length, 1, "the seats' met does not hide the lost test: one point for R1");
     assert.equal(r1[0].from?.sha, best.sha);
     assert.equal(r1[0].doneWhen, "./run-one 'test/r1b.test.ts' -- 'R1 two'", "its doneWhen is the lost test's declared command");
-    assert.equal(rounds[2].base, rounds[1].picked!.sha, "no restart: the next round still builds on the pick");
+    assert.equal(rounds[2].base, rounds[1].fixed!.candidate, "no restart: the next loop still builds on the integrated candidate");
   } finally {
     await teardown(setup);
   }
