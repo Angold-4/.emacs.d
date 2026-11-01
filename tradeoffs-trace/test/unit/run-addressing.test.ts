@@ -79,3 +79,44 @@ test("a printed owner command applies when pasted", async () => {
     fs.rmSync(cwd, { recursive: true, force: true });
   }
 });
+
+test("tt input refuses an id that names no run and creates nothing", async () => {
+  const cwd = fs.mkdtempSync("/tmp/tt-unknown-");
+  try {
+    const root = path.join(cwd, "absent-root");
+    // A fully bound command reaches the old inbox writer without needing a
+    // plan, reproducing the silent creation and false queued response.
+    fs.writeFileSync(path.join(cwd, "command.json"), JSON.stringify({ type: "note", text: "owner ruling", binding: { runId: "unknown-id", phaseId: "p1" } }));
+    const before = fs.readdirSync(cwd);
+    const out = await shell('"$TT_TEST_NODE" "$TT_TEST_CLI" input unknown-id command.json --root "$TT_TEST_ROOT"', cwd,
+      { TT_TEST_NODE: process.execPath, TT_TEST_CLI: CLI, TT_TEST_ROOT: root });
+    assert.notEqual(out.code, 0, out.output);
+    assert.ok(out.output.includes(`no run unknown-id under ${root}`), out.output);
+    assert.doesNotMatch(out.output, /queued/);
+    assert.deepEqual(fs.readdirSync(cwd), before);
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("all run writers refuse missing ids and paths before creating anything", async () => {
+  const cwd = fs.mkdtempSync("/tmp/tt-writers-");
+  try {
+    const root = path.join(cwd, "root");
+    const args: Record<string, string> = {
+      input: "", steer: "text", note: "text", correct: "text", evidence: "I1 text", verdict: "T-1 accept",
+      withdraw: "OD-1", defer: "F-1", recheck: "--reason machine", stop: "", resume: "",
+    };
+    for (const id of ["unknown-id", path.join(cwd, "missing", "run"), cwd]) {
+      for (const [cmd, extra] of Object.entries(args)) {
+        const out = await shell(`"$TT_TEST_NODE" "$TT_TEST_CLI" ${cmd} "$TT_TEST_ID" ${extra} --root "$TT_TEST_ROOT"`, cwd,
+          { TT_TEST_NODE: process.execPath, TT_TEST_CLI: CLI, TT_TEST_ROOT: root, TT_TEST_ID: id });
+        assert.notEqual(out.code, 0, `${cmd}: ${out.output}`);
+        assert.ok(out.output.includes(`no run ${id} under ${root}`), `${cmd}: ${out.output}`);
+        assert.deepEqual(fs.readdirSync(cwd), [], `${cmd} created nothing`);
+      }
+    }
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+});

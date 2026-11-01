@@ -2710,6 +2710,15 @@ async function main(): Promise<void> {
   }
   const { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source, skipModelsCheck, envFile, toPhase, deferTest, deferOwnerRuling } = parseArgs(rest);
   const runRoot = root ?? DEFAULT_ROOT;
+  // Resolve before any writer reads input, creates an inbox, signals a
+  // process or launches a conductor. The read-only path fallback stays as-is.
+  const runWriters = ["input", "steer", "note", "correct", "evidence", "verdict", "withdraw", "defer", "recheck", "stop", "resume", "carry", "entry"];
+  if (runWriters.includes(cmd) && positional[0]) {
+    const runDir = resolveRunDir(positional[0], runRoot);
+    if (!existsSync(path.join(runDir, "meta.json"))) {
+      throw new Error(`no run ${positional[0]} under ${runRoot}`);
+    }
+  }
   if (cmd === "test") {
     // Plan 06l (A2): the narrow worker test loop. Its own flags (`--changed`,
     // `--run`, `--plan`, `--base`, `--budget`) are parsed by the handler, not
