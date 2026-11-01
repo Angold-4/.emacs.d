@@ -92,6 +92,8 @@
 (declare-function pilish--get-input-buffer "pilish-ui")
 (declare-function pilish--display-buffers "pilish-ui")
 (declare-function pilish--rebalance-input-window "pilish-ui")
+(declare-function pilish--window-can-split-for-input-p "pilish-ui")
+(declare-function pilish--split-input-below-chat "pilish-ui")
 (declare-function pilish--session-busy-p "pilish-ui")
 (declare-function pilish--followups-in-fifo-order "pilish-ui")
 (declare-function pilish--clear-followup-queue "pilish-ui")
@@ -300,8 +302,41 @@ the frame, so the displayed pair is rebalanced to the configured ratio."
     (when (and chat-win input-win)
       (pilish--rebalance-input-window chat-win input-win))))
 
+(defun +pilish--display-in-selected-window (orig chat-buf input-buf &optional chat-only)
+  "Show the session in the selected window, not the tallest one.
+Runs as :around advice on `pilish--display-buffers', which bases the
+layout on the tallest splittable window: a session opened from a small
+window then takes over some other window's buffer.  Splitting the
+selected window keeps every other window, including the previous
+session's chat and input, exactly as it is.  An input window is too short
+to split, so it gives up its place to the window next to it, which keeps
+the previous session's region."
+  (let ((window (selected-window)))
+    (when (and (not chat-only)
+               (with-current-buffer (window-buffer window)
+                 (derived-mode-p 'pilish-input-mode))
+               (eq t (window-deletable-p window)))
+      (let ((next (or (window-in-direction 'above window)
+                      (window-in-direction 'below window))))
+        (delete-window window)
+        (when (window-live-p next)
+          (setq window next))))
+    (if (and (not chat-only)
+             (pilish--window-can-split-for-input-p window))
+        (with-selected-window window
+          (switch-to-buffer chat-buf)
+          (with-current-buffer chat-buf
+            (goto-char (point-max)))
+          (when-let* ((input-win (pilish--split-input-below-chat chat-buf input-buf)))
+            (select-window input-win)))
+      (funcall orig chat-buf input-buf chat-only))))
+
 (defun +pilish--install-advice ()
   "Install the Pilish advices this module relies on."
+  (unless (advice-member-p #'+pilish--display-in-selected-window
+                           'pilish--display-buffers)
+    (advice-add 'pilish--display-buffers
+                :around #'+pilish--display-in-selected-window))
   (unless (advice-member-p #'+pilish--drop-orphan-input-windows
                            'pilish--display-buffers)
     (advice-add 'pilish--display-buffers
