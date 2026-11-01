@@ -125,6 +125,22 @@ Nil (the default) lets Pi apply the model remembered in its settings."
   :type '(choice (const :tag "Use remembered model" nil) string)
   :group 'tools)
 
+(defcustom +pilish-thinking nil
+  "Thinking level passed to the `pi' CLI as `--thinking'.
+Nil (the default) lets Pi apply the level its settings remember, which
+is the `defaultThinkingLevel' key Pi's own TUI writes.  Pi does not
+persist a level set over RPC, so without this every session starts on
+the remembered one again."
+  :type '(choice (const :tag "Use remembered level" nil)
+                 (const :tag "Off" "off")
+                 (const :tag "Minimal" "minimal")
+                 (const :tag "Low" "low")
+                 (const :tag "Medium" "medium")
+                 (const :tag "High" "high")
+                 (const :tag "Extra high" "xhigh")
+                 (const :tag "Max" "max"))
+  :group 'tools)
+
 (defcustom +pilish-remember-model t
   "When non-nil, remember the last model picked as Pi's next default.
 The provider and model are written to Pi's global
@@ -164,13 +180,15 @@ hints."
   :group 'tools)
 
 (defun +pilish--extra-args ()
-  "Return the `--provider'/`--model' args for `pilish-extra-args'.
+  "Return the startup args for `pilish-extra-args'.
 Pi requires `--model' whenever `--provider' is given, so with
-`+pilish-model' nil nothing is returned and Pi applies the model its
+`+pilish-model' nil the provider is omitted and Pi applies the model its
 settings remember."
-  (when +pilish-model
-    (append (when +pilish-provider (list "--provider" +pilish-provider))
-            (list "--model" +pilish-model))))
+  (append (when +pilish-thinking (list "--thinking" +pilish-thinking))
+          (when +pilish-model
+            (append (when +pilish-provider
+                      (list "--provider" +pilish-provider))
+                    (list "--model" +pilish-model)))))
 
 ;;;; Pi's data directory and the remembered model
 
