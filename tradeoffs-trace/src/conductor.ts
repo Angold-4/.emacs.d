@@ -1718,6 +1718,13 @@ export class Conductor {
   /** 07 design A1: the PATH ADMIT resolves the pinned pi against — the shell's
    * own, captured before a recorded path is adopted. */
   #admitPath: string | undefined;
+  /** 07 design A1 (07f1): the pi binary ADMIT resolved on `#admitPath`, set by
+   * `#admitRun` before any agent can launch. Every agent runs THIS binary, so a
+   * resume whose process PATH still carries the run's recorded (stale) entries
+   * — `adoptRecordedPath` prepends them — cannot launch a different pi than the
+   * one ADMIT checked (exex 07f1: a bare `pi` picked up the recorded brew 1.4.0
+   * and crashed the first agent). */
+  #admitPiPath: string | undefined;
   #piEnvFor: ((role: Role, agentId: string) => NodeJS.ProcessEnv | undefined) | undefined;
   #stubReviews: boolean;
   #briefsEnabled: boolean;
@@ -2055,7 +2062,18 @@ export class Conductor {
     return Object.fromEntries(this.#agentTokenTotals);
   }
 
+  /** The binary an agent of this role is spawned as: a test's injected fake-pi
+   * first, else the pi ADMIT resolved on the shell's PATH (07 design A1), else
+   * `undefined` — the production shape before ADMIT has run, where the spawn
+   * falls back to a bare `pi`. */
   #resolvePiCommand(role: Role): string | undefined {
+    return this.#piInjectedCommand(role) ?? this.#admitPiPath;
+  }
+
+  /** Only a test's own injected binary; `undefined` for a real pi (ADMIT's
+   * resolved path is NOT an injection — `launchArgs`' `noSession`, a flag for
+   * fake-pi, must not follow from it). */
+  #piInjectedCommand(role: Role): string | undefined {
     return this.#piCommandFor?.(role) ?? this.#piCommand;
   }
 
@@ -7754,6 +7772,7 @@ export class Conductor {
       });
 
       const workerPiCommand = this.#resolvePiCommand("worker");
+      const workerPiInjected = this.#piInjectedCommand("worker") !== undefined;
       const workerProviderModel = this.#providerModelFor?.("worker");
       const agent = spawnPiAgent({
         command: workerPiCommand,
@@ -7762,7 +7781,7 @@ export class Conductor {
           ...launchArgs("worker", {
             sessionDir,
             continueSession,
-            noSession: workerPiCommand !== undefined,
+            noSession: workerPiInjected,
             provider: workerProviderModel?.provider,
             model: workerProviderModel?.model,
             // `#+TT_WORKER_PROMPT`: a single worker takes lane a's files.
@@ -9021,6 +9040,7 @@ export class Conductor {
         : // A pick seat runs on its own reviewer seat's model.
           this.#providerModelFor?.(opts.role === "picker" ? "reviewer" : opts.role, opts.seat);
     const command = this.#resolvePiCommand(opts.role);
+    const piInjected = this.#piInjectedCommand(opts.role) !== undefined;
     const streamFile = path.join(this.#paths.stream, `${opts.agentId}.jsonl`);
     // Declared before the spawn so the event callback below can never see it
     // in its temporal dead zone.
@@ -9032,7 +9052,7 @@ export class Conductor {
         ...launchArgs(opts.role, {
           sessionDir: opts.sessionDir,
           continueSession: opts.freshSession === true ? false : hasSessionFile(opts.sessionDir),
-          noSession: command !== undefined,
+          noSession: piInjected,
           provider: providerModel?.provider,
           model: providerModel?.model,
           // `#+TT_WORKER_PROMPT`: only a lane WORKER gets its lane's files;
@@ -13472,12 +13492,16 @@ export class Conductor {
    * machine's pi (the rule `assertPiVersion` always had). */
   #admitRun(): AdmitFacts {
     const resolvedPath = this.#admitPath ?? process.env.PATH ?? "";
-    const realPi = this.#resolvePiCommand("worker") === undefined || this.#resolvePiCommand("reviewer") === undefined;
+    const realPi = this.#piInjectedCommand("worker") === undefined || this.#piInjectedCommand("reviewer") === undefined;
     const facts = admitOrRefuse(this.#plan, {
       path: resolvedPath,
       cwd: this.#plan.repo,
       ...(realPi ? { pi: "pi" } : {}),
     });
+    // 07 design A1 (07f1): the pi every agent of this start launches is the one
+    // ADMIT just resolved on the shell's PATH — never whatever a bare `pi`
+    // would find on a PATH a recorded run's environment was prepended to.
+    this.#admitPiPath = facts.pi.path;
     try {
       fs.writeFileSync(path.join(this.#runDir, "admit.json"), `${JSON.stringify(facts, null, 2)}\n`);
     } catch {
@@ -15285,6 +15309,7 @@ export class Conductor {
     // crash-recovered attempt. `noSession` (no persistence at all) only for
     // fake-pi, which does not understand sessions.
     const reviewerPiCommand = this.#resolvePiCommand("reviewer");
+    const reviewerPiInjected = this.#piInjectedCommand("reviewer") !== undefined;
     const sessionDir = path.join(this.#paths.sessions, `reviewer-${reviewer}`);
     fs.mkdirSync(sessionDir, { recursive: true });
     // design §2: M keeps one session for the run; A and B are kept across
@@ -15301,7 +15326,7 @@ export class Conductor {
         ...launchArgs("reviewer", {
           sessionDir,
           continueSession,
-          noSession: reviewerPiCommand !== undefined,
+          noSession: reviewerPiInjected,
           provider: reviewerProviderModel?.provider,
           model: reviewerProviderModel?.model,
         }),
@@ -15915,12 +15940,13 @@ export class Conductor {
     const nextSettle = () => new Promise<"settled">((resolve) => settleWaiters.push(() => resolve("settled")));
     let fallbackReason = "the brief writer did not run";
     const evaluatorPiCommand = this.#resolvePiCommand("evaluator");
+    const evaluatorPiInjected = this.#piInjectedCommand("evaluator") !== undefined;
     const providerModel = this.#providerModelFor?.("evaluator");
     const agent = spawnPiAgent({
       command: evaluatorPiCommand,
       args: [
         ...this.#resolvePiArgsPrefix("evaluator"),
-        ...launchArgs("evaluator", { noSession: evaluatorPiCommand !== undefined, provider: providerModel?.provider, model: providerModel?.model }),
+        ...launchArgs("evaluator", { noSession: evaluatorPiInjected, provider: providerModel?.provider, model: providerModel?.model }),
       ],
       cwd: candidateDir,
       env,
@@ -16099,6 +16125,7 @@ export class Conductor {
     });
 
     const evaluatorPiCommand = this.#resolvePiCommand("evaluator");
+    const evaluatorPiInjected = this.#piInjectedCommand("evaluator") !== undefined;
     const providerModel = this.#providerModelFor?.("evaluator");
     // An evaluator that settles without an ACCEPTED submission fails fast
     // (that type times out and publishes unevaluated); waiting out the whole
@@ -16110,7 +16137,7 @@ export class Conductor {
       args: [
         ...this.#resolvePiArgsPrefix("evaluator"),
         ...launchArgs("evaluator", {
-          noSession: evaluatorPiCommand !== undefined,
+          noSession: evaluatorPiInjected,
           provider: providerModel?.provider,
           model: providerModel?.model,
         }),
@@ -16400,6 +16427,7 @@ export class Conductor {
     });
 
     const panelPiCommand = this.#resolvePiCommand("panel");
+    const panelPiInjected = this.#piInjectedCommand("panel") !== undefined;
     // #+TT_MODELS per-seat: `panel.N` first, else the reviewer of this
     // position when panel=reviewers, else the shared `panel` model.
     const providerModel = this.#providerModelFor?.("panel", seat);
@@ -16410,7 +16438,7 @@ export class Conductor {
       args: [
         ...this.#resolvePiArgsPrefix("panel"),
         ...launchArgs("panel", {
-          noSession: panelPiCommand !== undefined,
+          noSession: panelPiInjected,
           provider: providerModel?.provider,
           model: providerModel?.model,
         }),
@@ -16599,6 +16627,7 @@ export class Conductor {
     });
 
     const panelPiCommand = this.#resolvePiCommand("panel");
+    const panelPiInjected = this.#piInjectedCommand("panel") !== undefined;
     const providerModel = this.#providerModelFor?.("panel", seat);
     const settleWaiters: Array<() => void> = [];
     const nextSettle = () => new Promise<"settled">((resolve) => settleWaiters.push(() => resolve("settled")));
@@ -16607,7 +16636,7 @@ export class Conductor {
       args: [
         ...this.#resolvePiArgsPrefix("panel"),
         ...launchArgs("panel", {
-          noSession: panelPiCommand !== undefined,
+          noSession: panelPiInjected,
           provider: providerModel?.provider,
           model: providerModel?.model,
         }),

@@ -58,6 +58,22 @@ function writePiShim(dir: string, version: string): string {
   return file;
 }
 
+/** A `pi` on a PATH that first records WHICH binary a spawn picked ($0 into
+ * `marker`), then runs fake-pi — so a test can tell which pi an agent
+ * launched, not merely that one did. */
+function writeMarkingPiShim(dir: string, version: string, marker: string): string {
+  const file = path.join(dir, "pi");
+  fs.writeFileSync(
+    file,
+    "#!/bin/sh\n" +
+      `if [ "$1" = "--version" ]; then printf '%s\\n' '${version}'; exit 0; fi\n` +
+      `printf '%s\\n' "$0" >> '${marker}'\n` +
+      `exec '${process.execPath}' '${FAKE_PI_PATH}' "$@"\n`,
+  );
+  fs.chmodSync(file, 0o755);
+  return file;
+}
+
 function shortTmp(prefix: string): string {
   return fs.mkdtempSync(path.join("/tmp", `${prefix}-`));
 }
@@ -189,6 +205,92 @@ test("a resume re-resolves the pinned pi and refuses a wrong one with X:ENV_FAUL
     process.env.PATH = shellPath;
     cleanupDir(binRight);
     cleanupDir(binWrong);
+    cleanupDir(scripts);
+    cleanupDir(runRoot);
+    cleanupDir(repo.dir);
+  }
+});
+
+/** 07 design A1 (exex 07f1's own crash, one step later than ADMIT): ADMIT
+ * resolved the pinned pi on the shell's PATH, but `adoptRecordedPath` prepends
+ * the PATH the run recorded at its first start to this process's own — so a
+ * bare `pi` on the next agent launch picks the RECORDED one up (a brew 1.4.0
+ * in 07f1) and the agent crashes on a binary ADMIT never checked. Every agent
+ * must launch the pi ADMIT resolved, whatever the process PATH leads to. */
+test("a conductor launches the pi ADMIT resolved, not the one the recorded PATH leads to", async () => {
+  const repo = makeRepo();
+  const runRoot = makeRunRoot();
+  const scripts = shortTmp("tt-07h1-scripts");
+  const binRecorded = shortTmp("tt-07h1-pi-recorded");
+  const binShell = shortTmp("tt-07h1-pi-shell");
+  const shellPath = process.env.PATH ?? "";
+  const recordedMarker = path.join(scripts, "recorded-pi-launched.txt");
+  const shellMarker = path.join(scripts, "shell-pi-launched.txt");
+  const recordedPi = writeMarkingPiShim(binRecorded, "1.4.0", recordedMarker);
+  const shellPi = writeMarkingPiShim(binShell, ADMIT_PINNED_PI, shellMarker);
+
+  const plan: RunPlanFile = {
+    title: "admit launch",
+    repo: repo.dir,
+    integrationBranch: "main",
+    checks: ["true"],
+    phases: [{ id: "p1", goal: "do the thing", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [] }],
+  };
+  const runDir = createRun(runRoot, plan);
+  const worker = writeScript(scripts, "worker", { hello: defaultWorkerHello(), steps: [{ kind: "hang-until-abort" }] });
+  const reviewer = writeScript(scripts, "reviewer", {
+    hello: { role: "reviewer" as const, tools: ["read", "grep", "glob", "ls", "bash"] },
+    steps: [],
+  });
+  const piEnvFor = (role: Reviewer | string): NodeJS.ProcessEnv | undefined => {
+    if (role === "worker") return { FAKE_PI_SCRIPT: worker };
+    if (role === "reviewer") return { FAKE_PI_SCRIPT: reviewer };
+    return undefined;
+  };
+  let conductor: Conductor | undefined;
+  try {
+    // A resume's process PATH: `adoptRecordedPath` has already prepended the
+    // PATH the run recorded — which here leads to a pi that is NOT the pinned
+    // one. The shell this resumed from resolves the pinned pi, and that is the
+    // PATH ADMIT is handed (`admitPath`).
+    process.env.PATH = `${binRecorded}:${binShell}:${shellPath}`;
+    conductor = new Conductor({
+      runDir,
+      plan,
+      // No `piCommand`: this conductor launches `pi` as a production run does.
+      piArgsPrefix: [],
+      piEnvFor,
+      stubReviews: true,
+      deadlines: FAST,
+      checkLockPath: path.join(runRoot, "check.lock"),
+      gateLockPath: path.join(runRoot, "gate.lock"),
+      admitPath: `${binShell}:${shellPath}`,
+    });
+    await conductor.start();
+    await waitFor(() => conductor!.agentPgids.length > 0, 20_000, 25, runDir);
+
+    // ADMIT resolved the shell's pi...
+    const admit = JSON.parse(fs.readFileSync(path.join(runDir, "admit.json"), "utf8")) as {
+      pi: { path?: string; version?: string };
+    };
+    assert.equal(admit.pi.path, shellPi, "ADMIT resolved the pinned pi the shell's PATH leads to");
+    assert.equal(admit.pi.version, ADMIT_PINNED_PI);
+    // ...and the agent process that just launched IS that binary: its own
+    // shim recorded the launch, the recorded PATH's pi recorded nothing.
+    assert.ok(fs.existsSync(shellMarker), "the launched agent ran the pi ADMIT resolved");
+    assert.deepEqual(
+      fs.readFileSync(shellMarker, "utf8").trim().split("\n"),
+      [shellPi],
+      "every launch so far is the pi ADMIT resolved on the shell's PATH",
+    );
+    assert.equal(fs.existsSync(recordedMarker), false, `no agent ran the recorded PATH's pi (${recordedPi})`);
+    await conductor.stop();
+    conductor = undefined;
+  } finally {
+    if (conductor) await conductor.stop().catch(() => undefined);
+    process.env.PATH = shellPath;
+    cleanupDir(binRecorded);
+    cleanupDir(binShell);
     cleanupDir(scripts);
     cleanupDir(runRoot);
     cleanupDir(repo.dir);
