@@ -119,8 +119,8 @@ test("a red round check sends the owning domain back to its loop", () => {
 
 test("the seats review only once every point is closed", () => {
   // R4: while points stay open the loop re-enters the owning domain and no
-  // reviewer agent starts; the seats' single review is the synthetic lane round
-  // that runs only when every point closed. The bound is the round budget, so
+  // reviewer agent starts; the ordinary acceptance seats review the integrated
+  // candidate only when every point is closed. The bound is the round budget, so
   // the third loop with points still open parks instead of starting a fourth.
   const open = (facts: Array<{ id: string; exitCode: number; passesOnBase: boolean }>) =>
     facts.filter((f) => !(f.exitCode === 0 && !f.passesOnBase));
@@ -616,7 +616,8 @@ test("a red merged check that names no declared domain parks for the lead with n
       "LEAD_CALLED names the red merge whose output has no declared domain",
     );
     assert.equal(setup.conductor.state.phase.phase, "AWAITING_OWNER", "the phase parks for the lead");
-    assert.ok(events().some((e) => e.type === "LOOP_BOUND_REACHED"), "the park is recorded like the loop bound's");
+    assert.ok(events().some((e) => e.type === "LOOP_BOUND_REACHED" && String(e.reason).includes("names no file")), "the parking transition carries the ownerless-check reason");
+    assert.ok(!events().some((e) => e.type === "BOUND_REACHED"), "an ownerless check is not a reached bound");
     assert.ok(
       !events().some((e) => e.type === "fix_loop_chained"),
       "no loop chains on a red merge with no owning domain",

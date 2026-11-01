@@ -1688,6 +1688,32 @@ test("a review-only item that flips between candidates makes no regression point
       }
       return found;
     }, 10_000, 50, setup.runDir);
+    const acceptanceRecords = () => {
+      const records = readEvents(setup.runDir);
+      const start = records.findIndex((r) => r.kind === "intent" &&
+        (r.event as { agentId?: string }).agentId?.startsWith("reviewer-"));
+      assert.ok(start >= 0, "the ordinary acceptance seats started");
+      return records.slice(start);
+    };
+    await waitFor(() => acceptanceRecords().some((r) => r.kind === "event" &&
+      (r.event as { type?: string }).type === "EVALUATION_COMPLETED"), 20_000, 25, setup.runDir);
+    const reviews = acceptanceRecords().filter((r) => r.kind === "event" &&
+      (r.event as { type?: string }).type === "REVIEW_SUBMITTED");
+    assert.equal(reviews.length, 3, "three acceptance seats submitted");
+    assert.ok(reviews.every((r) => (r.event as { review: { items: Array<{ id: string; verdict: string }> } }).review.items
+      .some((i) => i.id === "C2" && i.verdict === "unmet")), "all three seats voted C2 unmet");
+    assert.equal(acceptanceRecords().filter((r) => r.kind === "intent" &&
+      (r.event as { agentId?: string }).agentId?.startsWith("evaluator-")).length, 0,
+    "unanimous unmet acceptance votes never start an evaluator session");
+    assert.ok(!(setup.conductor.state.phase.itemChecks ?? []).some((c) => c.itemId === "C2"),
+      "a mechanically decided item owes no fabricated unchecked check");
+    const itemPoint = setup.conductor.state.phase.findings.find((f) => f.raisedBy === "conductor" && f.itemId === "C2")!;
+    assert.equal(setup.conductor.state.phase.triage?.find((r) => r.itemId === itemPoint.id)?.disposition?.kind, "fix",
+      "the conductor's non-split item point is mechanically a fix");
+    const acceptanceEvents = acceptanceRecords().filter((r) => r.kind === "event").map((r) => r.event as { type?: string; finding?: { id: string } });
+    const raised = acceptanceEvents.findIndex((e) => e.type === "FINDING_RAISED" && e.finding?.id === itemPoint.id);
+    const skipped = acceptanceEvents.findIndex((e) => e.type === "EVALUATION_SKIPPED");
+    assert.ok(raised >= 0 && skipped > raised, "EVALUATION_SKIPPED is emitted only after the item point exists");
     const rounds = setup.conductor.state.phase.rounds!;
     const candidate = rounds[1].fixed!.candidate!;
     assert.notEqual(candidate, rounds[0].picked!.sha, "the domain loop produced a different candidate");

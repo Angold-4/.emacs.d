@@ -164,6 +164,13 @@ export function pointHasProvingFact(
  * that no approved trade-off closes. This is the ONE rule both the evaluator
  * dispatch list and `evaluationExceptions` read. */
 export function pointNeedsEvaluation(phase: PhaseState, finding: import("./types.ts").Finding): boolean {
+  // §7a: the seats already decided a non-split item. Its conductor point
+  // is a mechanical fix, closed by a proving fact or approved domain review,
+  // not a new unprovable-point exception asking a model to judge that vote.
+  if (finding.raisedBy === "conductor" && finding.itemId) {
+    const outcome = phaseItemOutcomes(phase).find((o) => o.item.id === finding.itemId);
+    if (outcome && !itemIsSplit(outcome)) return false;
+  }
   const classified = recordClassified(phase, "finding", finding.id);
   if (!finding.domain && !finding.doneWhen) return !classified;
   return !(classified && (pointHasProvingFact(phase, finding) || findingDispositionIsTradeoff(phase.triage, finding.id)));

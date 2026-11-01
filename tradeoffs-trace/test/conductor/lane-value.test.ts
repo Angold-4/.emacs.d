@@ -174,7 +174,7 @@ test("a decision a fixer discloses in a fix loop is balloted by the acceptance s
   const promptDir = fs.mkdtempSync("/tmp/tt-fixer-ballots-");
   const promptLog = path.join(promptDir, "prompts.txt");
   const setup = await setupConductor({
-    phase: lanePhase({ domains: [{ name: "booking", globs: ["booking/**"] }], fixChecks: "true", finalChecks: ["true"], rounds: 3 }),
+    phase: lanePhase({ domains: [{ name: "booking", globs: ["booking/**"] }, { name: "gates", globs: ["gates/**"] }], fixChecks: "true", finalChecks: ["true"], rounds: 3, domainLoopMax: 1 }),
     checks: ["true"], phaseChecks: ["true"], stubReviews: false,
     deadlines: { ...FAST, reviewMs: 20_000 },
     extraReviewerEnv: () => ({ FAKE_PI_PROMPT_LOG: promptLog }),
@@ -187,22 +187,26 @@ test("a decision a fixer discloses in a fix loop is balloted by the acceptance s
       const script = laneReview(seat as Reviewer, state.phase.contract.contractVersion, { findings: seat === "M" ? [{
         kind: "defect", severity: "blocking", evidence: "booking/a.txt:1 needs the domain fix",
         domain: "booking", item: "R1", where: "booking/a.txt:1", expected: "the booking fix is present", doneWhen: "test -f booking/fixed.txt",
+      }, {
+        kind: "defect", severity: "blocking", evidence: "booking/a.txt:1 needs the gates fix too",
+        domain: "gates", item: "R1", where: "booking/a.txt:1", expected: "the gates fix is present", doneWhen: "test -f gates/fixed.txt",
       }] : [] });
       script.steps.splice(2, 0, { kind: "call-tool", tool: "read", args: { path: "booking/a.txt" } });
       return script;
     },
     pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", { yes: false, anchors: [] }),
-    fixerScriptFor: () => ({ hello: defaultWorkerHello(), steps: [
-      { kind: "call-sh", command: "echo fixed > booking/fixed.txt" },
-      { kind: "call-submit", tool: "submit_phase", args: { decisions: [{
+    // Loop 2's approved booking fixer discloses. The gates point stays open
+    // until loop 3, whose fixer has no disclosure: hand-off must retain loop 2.
+    fixerScriptFor: (domain, round) => ({ hello: defaultWorkerHello(), steps: [
+      { kind: "call-sh", command: domain === "booking" ? "echo fixed > booking/fixed.txt" : round === 3 ? "mkdir -p gates; echo fixed > gates/fixed.txt" : "true" },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: domain === "booking" ? [{
         choice, whyItMatters: "caching changes when validation runs",
         alternatives: [{ option: "validate every time", consequence: "more work per request" }],
         recommendation: { choice: "cache", reason: "bounded repeated work" }, classProposal: "delegated",
-      }], assumptions: [], deviations: [] } },
+      }] : [], assumptions: [], deviations: [] } },
     ] }),
     reviewerScriptFor: (seat, state) => {
       const decision = state.phase.decisions.find((d) => d.choice === choice)!;
-      assert.ok(decision, "the fixer disclosure exists before acceptance dispatch");
       const args = (ballots: unknown[]) => ({ reviewer: seat, phaseId: "p1", candidateSha: state.phase.candidate!.sha,
         contractVersion: state.phase.contract.contractVersion, correctionStatements: [], findingStatements: [], findings: [], ballots });
       return { hello: defaultReviewerHello(), steps: [
@@ -213,14 +217,17 @@ test("a decision a fixer discloses in a fix loop is balloted by the acceptance s
           { kind: "call-submit" as const, tool: "submit_review", args: args([]) },
           { kind: "sleep" as const, ms: 1_500 },
         ] : []),
-        { kind: "call-submit", tool: "submit_review", args: args([{ decisionId: decision.id, vote: "approve", rationale: "the trade-off is explicit", evidence: ["booking/fixed.txt:1"] }]) },
+        { kind: "call-submit", tool: "submit_review", args: args(decision ? [{ decisionId: decision.id, vote: "approve", rationale: "the trade-off is explicit", evidence: ["booking/fixed.txt:1"] }] : []) },
       ] };
     },
   });
   try {
     await setup.conductor.start();
-    await waitFor(() => readEvents(setup.runDir).some((r) => r.kind === "incomplete_review_rejected"), 60_000, 25, setup.runDir);
+    await waitFor(() => readEvents(setup.runDir).some((r) => r.kind === "intent" &&
+      (r.event as { agentId?: string }).agentId?.startsWith("reviewer-")), 60_000, 25, setup.runDir);
     const decision = setup.conductor.state.phase.decisions.find((d) => d.choice === choice)!;
+    assert.ok(decision, "loop 2's fixer disclosure exists before loop 3's acceptance dispatch");
+    await waitFor(() => readEvents(setup.runDir).some((r) => r.kind === "incomplete_review_rejected"), 60_000, 25, setup.runDir);
     const rejected = readEvents(setup.runDir).find((r) => r.kind === "incomplete_review_rejected")!.event as { missing: string[] };
     assert.ok(rejected.missing.includes(decision.id), "the missing ballot on the fixer decision is rejected");
     assert.ok(!coreAccepted(setup.runDir), "missing ballots never pass acceptance");
@@ -230,6 +237,10 @@ test("a decision a fixer discloses in a fix loop is balloted by the acceptance s
     assert.equal(demands.filter((d) => d.agentId?.startsWith("reviewer-") && d.records?.some((r) => r.id === decision.id)).length, 3, "all acceptance seats demand its ballot");
     await waitFor(() => setup.conductor.state.phase.phase === "DONE", 60_000, 50, setup.runDir);
     assert.equal(setup.conductor.state.phase.ballots.filter((b) => b.decisionId === decision.id && b.vote === "approve").length, 3);
+    assert.equal(setup.conductor.state.phase.rounds!.length, 3, "acceptance waits for the second fix loop");
+    assert.ok(setup.conductor.state.phase.rounds![1].fixed?.disclosures?.some((d) => d.choice === choice), "loop 2 recorded the disclosure");
+    assert.deepEqual(setup.conductor.state.phase.rounds![2].fixed?.disclosures ?? [], [], "loop 3 discloses nothing");
+    assert.equal(setup.conductor.state.phase.decisions.filter((d) => d.choice === choice).length, 1, "the disclosure is balloted once");
     assert.ok(setup.conductor.state.phase.rounds!.slice(1).every((r) => r.lanes.length === 0 && !r.picked), "the entire fix path is lane-free");
   } finally {
     await teardown(setup);

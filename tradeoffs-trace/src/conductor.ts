@@ -246,7 +246,6 @@ import {
   testOutcomeIn,
   testResultLines,
   testVerifyProblems,
-  thinMetItems,
   verdictIssues,
   type Coverage,
   type FlatItem,
@@ -4835,15 +4834,6 @@ export class Conductor {
       case "evaluation_complete":
         // Plan 05e (finding #34): the round's evaluators and panels have
         // settled, so the candidate's final approval state is known.
-        // Plan 07f (F1): when there was no exception to judge, no evaluator
-        // session ran; record that fact (still inside EVALUATING) so the
-        // mechanical verdict is visibly the one that stands.
-        if (evaluationExceptions(this.#state.phase).length === 0 && this.#state.phase.evaluation?.skipped !== true) {
-          this.#applyEvent({
-            type: "EVALUATION_SKIPPED",
-            reason: "every item has a seat majority with resolving anchors and every point is closed by a proving fact",
-          });
-        }
         try {
           // Plan 06b: the item loop settles FIRST — the per-item majority, the
           // evaluator's overturns, and a blocking finding for every item a
@@ -4867,9 +4857,15 @@ export class Conductor {
           this.#applyEvent({ type: "TRIAGE_FAILED", reason });
           return;
         }
-        // Mechanical unmet votes may just have created a point. If that
-        // point has no proving fact, its exception must settle before the
-        // completion event; never emit an event the reducer must reject.
+        // Decide items and triage first: only the resulting exception list
+        // can establish whether evaluation was unnecessary. Mechanical item
+        // points remain fixes; they do not turn a unanimous vote into a call.
+        if (evaluationExceptions(this.#state.phase).length === 0 && this.#state.phase.evaluation?.skipped !== true) {
+          this.#applyEvent({
+            type: "EVALUATION_SKIPPED",
+            reason: "no exception remains after item outcomes and triage; non-split item points require a fix, not evaluation",
+          });
+        }
         if (!evaluationSettled(this.#state.phase)) return;
         try {
           this.#recordCandidateApproval();
@@ -5712,9 +5708,8 @@ export class Conductor {
         return { ok: false, reason: "submit_evaluation needs an evaluations array" };
       }
       // Plan 06b (OD-2 A3): ONE item-check form, submit_evaluation.itemChecks[]
-      // = { id, verdict, evidence }. For every item with a review-only
-      // majority unmet/deviates the evaluator owes a check: a missing one is
-      // re-prompted once, then recorded `unchecked` (visible, never silent).
+      // = { id, verdict, evidence }. Only exception records owe checks;
+      // a missing check is re-prompted once, then recorded `unchecked`.
       // Plan 06i: the same form carries a finding's/discovered decision's
       // impact class. Parsed BEFORE the B-16 whole-submission check, because a
       // triage classification is independent of the message evaluations: a
@@ -8301,11 +8296,9 @@ export class Conductor {
     });
   }
 
-  /** Plan 06b (OD-2 A3, ODP-2): the item ids the evaluator owes a check for.
-   * The duty sits with the FINDING pass only (disc-M-89), and covers every
-   * outcome that is not met/fits (ODP-2: never raise an item blocker without
-   * a check). An architecture deviation the owner already accepted is not a
-   * blocker and owes no check. */
+  /** §7a: checks are owed only for exception records. Item checks belong to
+   * the FINDING pass and only split items qualify; classification checks for
+   * findings/decisions use the same exception list as dispatch and briefs. */
   #owedItemCheckIds(messageType: MessageType): string[] {
     const ids = new Set<string>();
     // Plan 06i (A3): a discovered decision is published as a `tradeoff`
@@ -8316,23 +8309,11 @@ export class Conductor {
       for (const d of discoveredDecisions(this.#state.phase)) {
         if (!recordClassified(this.#state.phase, "decision", d.id)) ids.add(d.id);
       }
-      return [...ids];
+      const exceptions = new Set(evaluationExceptions(this.#state.phase).map((e) => e.id));
+      return [...ids].filter((id) => exceptions.has(id));
     }
     if (messageType !== "finding") return [];
-    if (this.#itemsEnforced() && itemsNeedingEvaluatorReverify(this.#state.phase)) {
-      const accepted = new Set(this.#state.phase.acceptedDeviations ?? []);
-      for (const o of phaseItemOutcomes(this.#state.phase)) {
-        if (o.outcome === "met" || o.outcome === "fits") continue;
-        if (o.item.kind === "architecture" && accepted.has(o.item.id)) continue;
-        ids.add(o.item.id);
-      }
-      // Plan 06c (A4/R9): a unanimous thin met/fits is an OWED item check too.
-      // A missing one is re-prompted once, then recorded `unchecked`; a
-      // `contradicted` check with valid anchors overturns it, and code never
-      // withdraws the verdict on its own.
-      for (const o of thinMetItems(phaseItemOutcomes(this.#state.phase), this.#workerAnchors())) ids.add(o.item.id);
-      // Plan 07f (F0): a split item is an evaluator exception; its check is
-      // owed so the evaluator gets exactly that item in its brief.
+    if (this.#itemsEnforced()) {
       for (const o of phaseItemOutcomes(this.#state.phase)) {
         if (itemIsSplit(o)) ids.add(o.item.id);
       }
@@ -8342,7 +8323,8 @@ export class Conductor {
     for (const f of openFindings(this.#state.phase)) {
       if (!recordClassified(this.#state.phase, "finding", f.id)) ids.add(f.id);
     }
-    return [...ids];
+    const exceptions = new Set(evaluationExceptions(this.#state.phase).map((e) => e.id));
+    return [...ids].filter((id) => exceptions.has(id));
   }
 
   #itemOverturns(outcomes: readonly ItemOutcome[]): import("./core/items.ts").Overturn[] {
@@ -8696,10 +8678,10 @@ export class Conductor {
     }
   }
 
-  /** ODP-2: an item blocker is never raised without an evaluator item check.
-   * When the evaluator gave none (even after its re-prompt), the conductor
-   * records its own `unchecked` check so the blocker is never silent. */
+  /** Only a split item owed an evaluator check. A mechanically decided item
+   * must never acquire a fabricated `unchecked` re-check. */
   #ensureItemCheck(id: string): void {
+    if (!phaseItemOutcomes(this.#state.phase).some((o) => o.item.id === id && itemIsSplit(o))) return;
     if ((this.#state.phase.itemChecks ?? []).some((c) => c.itemId === id)) return;
     this.#applyEvent({ type: "ITEM_CHECK_RECORDED", itemId: id, verdict: "unchecked", evidence: "no evaluator item check was recorded" });
   }
@@ -9762,7 +9744,7 @@ export class Conductor {
       .filter((f) => f.status === "open")
       .filter((f) => {
         const fact = facts.find((x) => x.findingId === f.id);
-        if (fact === undefined) return true;
+        if (fact === undefined) return this.#approvedItemPointReview(f, candidateSha) === undefined;
         // Its fact fails on this candidate: the point is open whatever closed
         // it before.
         if (fact.timedOut || fact.exitCode !== 0) return true;
@@ -9776,6 +9758,28 @@ export class Conductor {
         return !closedEarlier;
       })
       .map((f) => f.id);
+  }
+
+  /** §7a.3: a mechanical item point without a command closes by an approved
+   * domain review with green fix checks. Read only replayed checkpoints and
+   * require that the reviewed head actually merged into this candidate. */
+  #approvedItemPointReview(finding: Finding, candidateSha: string): string | undefined {
+    if (finding.raisedBy !== "conductor" || !finding.itemId || finding.doneWhen || candidateSha === finding.boundCandidateSha) return undefined;
+    for (const round of this.#state.phase.rounds ?? []) {
+      for (const pass of round.fixed?.domains ?? []) {
+        if (!pass.sha || !pass.facts?.checkPassed || !pass.review?.quality.ok ||
+          !pass.review.points.some((p) => p.pointId === finding.id && p.fixed) ||
+          !round.fixed?.tasks.some((t) => t.domain === finding.domain && t.findingIds.includes(finding.id)) ||
+          !round.fixed.merges.some((m) => m.sha === pass.sha)) continue;
+        try {
+          execFileSync("git", ["-C", this.#plan.repo, "merge-base", "--is-ancestor", pass.sha, candidateSha], { stdio: "ignore" });
+          return `domain ${finding.domain} approved point ${finding.id} at ${pass.sha} with green fix checks (round ${round.round}, pass ${pass.iteration})`;
+        } catch {
+          // An approval of a head absent from this candidate proves nothing.
+        }
+      }
+    }
+    return undefined;
   }
 
   /** 07g2 (A2/R4): the merged candidate's red check with points still open on
@@ -9792,7 +9796,6 @@ export class Conductor {
    * lead, exactly as the loop bound does: LEAD_CALLED, never a lane round. */
   #parkMergedCheck(round: number, reason: string): void {
     this.#log.append("lead_called", { round, reason, points: [] });
-    this.#applyEvent({ type: "BOUND_REACHED", kind: "rounds", scope: `round ${round} merged check`, limitMs: 0, elapsedMs: 0, action: "the phase parks for the lead" });
     this.#applyEvent({ type: "LEAD_CALLED", reasons: [reason] });
     this.#applyEvent({ type: "LOOP_BOUND_REACHED", round, loops: this.#state.phase.contract.domainLoopMax ?? 3, reason });
   }
@@ -11916,16 +11919,33 @@ export class Conductor {
     let decisions: Decision[] = [];
     this.#driveSuspended = true;
     try {
-      this.#applyEvent({ type: "SUBMIT_PHASE", disclosures: record.fixed?.disclosures ?? [] });
+      // Every lane-free loop since the previous hand-off speaks for this
+      // candidate, not just the last one. The last disclosure of a choice
+      // wins deterministically if a later fixer reports it again.
+      const rounds = this.#state.phase.rounds ?? [];
+      const previous = rounds.findLastIndex((r) => r.fixed?.candidate === this.#state.phase.candidate?.sha);
+      const disclosures = [...new Map(rounds.slice(previous + 1)
+        .filter((r) => r.lanes.length === 0 && r.round <= record.round)
+        .flatMap((r) => r.fixed?.disclosures ?? [])
+        .map((d) => [d.choice, d] as const)).values()];
+      // FREEZE_COMPLETED historically supersedes conductor item findings.
+      // Keep their actual closure evidence so the hand-off records repair,
+      // not merely supersession by a new candidate.
+      const openPoints = this.#state.phase.findings.filter((f) => f.status === "open");
+      this.#applyEvent({ type: "SUBMIT_PHASE", disclosures });
       decisions = this.#assembleDecisions(sha);
       this.#applyEvent({ type: "FREEZE_COMPLETED", candidateSha: sha, decisions, tainted: false });
       this.#applyEvent({ type: "CHECKS_PASSED" });
+      for (const finding of openPoints) {
+        const evidence = this.#approvedItemPointReview(finding, sha);
+        if (evidence) this.#applyEvent({ type: "FINDING_EVALUATOR_REPAIRED", findingId: finding.id, candidateSha: sha, evidence });
+      }
       for (const fact of this.#factsFor(sha)) {
         if (fact.timedOut || fact.exitCode !== 0) continue;
         const proven = fact.passesOnBase === false || (this.#state.phase.doneWhenFacts ?? []).some(
           (f) => f.findingId === fact.findingId && f.passesOnBase === false && f.exitCode === 0 && !f.timedOut,
         );
-        const finding = this.#state.phase.findings.find((f) => f.id === fact.findingId && f.status === "open");
+        const finding = openPoints.find((f) => f.id === fact.findingId);
         if (finding && proven) this.#applyEvent({ type: "FINDING_CONFIRMED_REPAIRED", findingId: finding.id, byReviewer: finding.raisedBy, candidateSha: sha });
       }
       if (this.#itemsEnforced()) {
@@ -14478,8 +14498,10 @@ export class Conductor {
       } else {
         // Compatibility summary for event-log readers. Per-command step and
         // output live in recordCommands; blocker lines read those records,
-        // never this first-failure summary.
-        const failedCommand = recordCommands.find((c) => !c.passed && c.failingStep);
+        // never this summary. Earlier failures may have been base-excused;
+        // stop-at-first means the last executed command stopped this run
+        // (also when a green command violated checkout integrity).
+        const failedCommand = recordCommands.at(-1);
         this.#applyEvent({
           type: "CHECKS_FAILED",
           ...(checkFailures.length > 0 ? { failures: checkFailures } : {}),
@@ -16191,13 +16213,9 @@ export class Conductor {
         ...refused.map((m) => `- ${m.id} "${m.title}" — refused: ${m.settlement?.reason ?? "no reason given"}`),
       );
     }
-    // Plan 06b (OD-1 R3b): a majority unmet/deviates item needs the
-    // evaluator's substantive re-check against the candidate before it
-    // blocks. The check is recorded with what was checked.
-    // Plan 07f (F0): the brief carries ONLY the records that made this
-    // session necessary — no other item and no other point.
+    // §7a: brief and submission share the same exception-only duty.
     const exceptionIds = new Set(evaluationExceptions(phase).map((e) => e.id));
-    const owedIds = this.#owedItemCheckIds("finding").filter((id) => exceptionIds.has(id));
+    const owedIds = this.#owedItemCheckIds("finding");
     const reverifyItems = itemsNeedingEvaluatorReverify(phase)
       ? phaseItemOutcomes(phase).filter((o) => owedIds.includes(o.item.id))
       : [];
@@ -16777,14 +16795,6 @@ export class Conductor {
    * review EXCEPT the worker's own disclosure (`source === "worker"`) — a
    * reviewer must discover its own choices from the diff before ever seeing
    * what the worker disclosed. */
-  #acceptanceDomainLines(): string[] {
-    const loops = (this.#state.phase.rounds ?? []).filter((r) => r.lanes.length === 0);
-    if (loops.length === 0) return [];
-    return ["Acceptance review: the integrated domains, their points and verdicts:",
-      ...loops.map((r) => JSON.stringify({ round: r.round, base: r.base, ...r.fixed })),
-      "A fact-closed point stays closed unless its fact fails on this candidate (conceptual integrity §5)."];
-  }
-
   #buildReviewerTurn1Prompt(reviewer: Reviewer, phaseOverride?: PhaseState, candidateDirOverride?: string): string {
     const phase = phaseOverride ?? this.#state.phase;
     const candidateDir = candidateDirOverride ?? this.#candidateDir();
@@ -16837,6 +16847,16 @@ export class Conductor {
       ...directiveAnswerLines(phase),
       "Call submit_discovery with at most 5 choices that change behaviour, interfaces, guarantees or cost where the plan left room. Each choice is one plain sentence of at most 20 words. Do not list implementation details (helper structure, naming, file layout) and do not give review advice here — correctness problems are findings, which you raise in turn 2. An empty list is fine.",
     ].join("\n");
+  }
+
+  /** §5: acceptance seats receive the integrated domains' recorded commits,
+   * points, facts and verdicts across the lane-free fix loops. */
+  #acceptanceDomainLines(): string[] {
+    const loops = (this.#state.phase.rounds ?? []).filter((r) => r.lanes.length === 0);
+    if (loops.length === 0) return [];
+    return ["Acceptance review: the integrated domains, their points and verdicts:",
+      ...loops.map((r) => JSON.stringify({ round: r.round, base: r.base, ...r.fixed })),
+      "A fact-closed point stays closed unless its fact fails on this candidate (conceptual integrity §5)."];
   }
 
   /** Turn 2 (design §6.1): every live record on this candidate (the worker's

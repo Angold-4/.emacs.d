@@ -206,6 +206,83 @@ async function itemWithoutSeatMajority(): Promise<void> {
 test("a split item starts the evaluator with only that item in its brief", itemWithoutSeatMajority);
 test("an item with no seat majority starts the evaluator with only that item in its brief", itemWithoutSeatMajority);
 
+test("a mechanical unmet item point closes by approved domain review without a rule evaluator", async () => {
+  const setup = await setupConductor({
+    phase: { id: "p1", goal: "fix the mechanical item point", acceptance: ["R1 proves it"], checks: ["true"],
+      boundaries: [], reserved: [], workers: 2, rounds: 3, fixChecks: "true", finalChecks: ["true"],
+      domains: [{ name: "booking", globs: ["src/**"] }], requirements: [{ ...ITEM("R1"), domain: "booking" }] },
+    checks: ["true"], stubReviews: false, deadlines: FAST,
+    workerScript: () => workerFor("R1"),
+    laneReviewerScriptFor: (seat, candidate, state) => reviewerFor("R1", { M: "unmet", A: "unmet", B: "unmet" })(seat as Reviewer,
+      { phase: { ...state.phase, candidate: { sha: candidate } } }),
+    pickScriptFor: (seat) => ({ hello: { role: "picker", tools: ROLE_TOOLS.picker }, steps: [
+      { kind: "call-submit", tool: "submit_pick_vote", args: { round: 1, seat, lane: "a", inspected: ["a", "b"], why: "same mechanical point", loserHad: { yes: false, anchors: [] } } },
+    ] }),
+    fixerScriptFor: () => ({ hello: defaultWorkerHello(), steps: [
+      { kind: "call-sh", command: "echo fixed >> src/core/rounds.ts" },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+    ] }),
+    reviewerScriptFor: reviewerFor("R1"),
+  });
+  try {
+    const evaluators = () => readEvents(setup.runDir).filter((r) => r.kind === "intent" &&
+      (r.event as { agentId?: string }).agentId?.startsWith("evaluator-"));
+    await setup.conductor.start();
+    await waitFor(() => evaluators().length > 0 || !!setup.conductor.state.phase.rounds?.[1]?.fixed, 30_000, 25, setup.runDir);
+    assert.equal(evaluators().length, 0, "a unanimous unmet item point does not start a rule evaluator");
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 30_000, 25, setup.runDir);
+    const point = setup.conductor.state.phase.findings.find((f) => f.itemId === "R1" && f.raisedBy === "conductor")!;
+    assert.ok(point, "the unanimous unmet item became a point");
+    assert.equal(point.doneWhen, undefined, "this closure must come from domain review, not a command");
+    assert.equal(point.status, "repaired");
+    assert.ok(readEvents(setup.runDir).some((r) => r.kind === "event" &&
+      (r.event as { type?: string; findingId?: string; evidence?: string }).type === "FINDING_EVALUATOR_REPAIRED" &&
+      (r.event as { findingId?: string }).findingId === point.id &&
+      (r.event as { evidence?: string }).evidence?.includes("green fix checks")), "the recorded domain approval closes the point");
+    assert.equal(evaluators().length, 0, "only the domain-review duty ran, never a rule evaluator");
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("a split item owes a check but a unanimous unmet item in the same evaluation does not", async () => {
+  const setup = await setupConductor({
+    items: { requirements: [ITEM("R2"), ITEM("R5")] },
+    checks: ["true"], phaseChecks: ["true"], stubReviews: false, deadlines: FAST,
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [
+      { kind: "call-sh", command: WRITE_ROUNDS },
+      { kind: "call-submit", tool: "submit_coverage", args: { items: ["R2", "R5"].map((id) => COVERAGE(id).items[0]), arch: [] } },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+    ] }),
+    reviewerScriptFor: (seat, state) => {
+      const script = reviewerFor("R2", { A: "partial", B: "unmet" })(seat, state);
+      const submission = script.steps.at(-1) as { args: { items: unknown[] } };
+      submission.args.items.push({ id: "R5", verdict: "unmet", evidence: "src/core/rounds.ts:1 README.md:1" });
+      return script;
+    },
+    evaluatorScriptFor: () => ({ hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator }, steps: [
+      { kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [], itemChecks: [
+        { id: "R2", verdict: "contradicted", evidence: "src/core/rounds.ts:1 contradicts R2" },
+      ] } },
+    ] }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => readEvents(setup.runDir).some((r) => r.kind === "item_check_rejected" ||
+      (r.kind === "event" && (r.event as { type?: string }).type === "EVALUATOR_FINISHED")), 30_000, 25, setup.runDir);
+    assert.equal(readEvents(setup.runDir).filter((r) => r.kind === "item_check_rejected").length, 0,
+      "a submission checking the only split item is not refused for the unanimous item");
+    await waitFor(() => readEvents(setup.runDir).some((r) => r.kind === "event" &&
+      (r.event as { type?: string }).type === "EVALUATION_COMPLETED"), 20_000, 25, setup.runDir);
+    assert.ok(setup.conductor.state.phase.findings.some((f) => f.itemId === "R5"), "unanimous unmet still becomes a blocking point");
+    assert.equal(readEvents(setup.runDir).filter((r) => r.kind === "event" &&
+      (r.event as { type?: string; itemId?: string }).type === "ITEM_CHECK_RECORDED" &&
+      (r.event as { itemId?: string }).itemId === "R5").length, 0, "no item check is fabricated for R5");
+  } finally {
+    await teardown(setup);
+  }
+});
+
 // -- plan 07f (F1/R5): a failing doneWhen fact cannot be closed by a drop ----
 
 const DOMAINS: Domain[] = [

@@ -1020,8 +1020,10 @@ test("plan 06b: an item blocker is never raised without an evaluator item check"
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
       ],
     }),
-    // R2 is only partial: it blocks, and ODP-2 requires a check even then.
-    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: "partial" })),
+    // Keep the legacy test name, but exercise its remaining §7a duty: a
+    // genuinely split item owes a check even when the majority is partial.
+    // A unanimous partial vote is mechanical and must not fabricate one.
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: reviewer === "A" ? "met" : "partial" })),
     evaluatorScriptFor: () => ({
       hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
       steps: [

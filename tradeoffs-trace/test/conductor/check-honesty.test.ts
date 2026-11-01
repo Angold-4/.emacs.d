@@ -78,6 +78,29 @@ function checkRecords(runDir: string): Array<Record<string, unknown>> {
   return out;
 }
 
+test("CHECKS_FAILED names the stopping command rather than a base-excused failure", async () => {
+  const excused = "printf 'not ok 1 - base failure\\n'; exit 1";
+  const stopping = "test ! -f marker.txt";
+  const setup = await setupConductor({
+    checks: [excused, stopping, "echo should-not-run"], phaseChecks: [], rounds: 1,
+    stubReviews: true, deadlines: { ...FAST, checkMs: 10_000 },
+    workerScript: () => quickWorker(), reviewerScriptFor: stubReviewer,
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => readEvents(setup.runDir).some((r) => r.kind === "event" &&
+      (r.event as { type?: string }).type === "CHECKS_FAILED"), 30_000, 25, setup.runDir);
+    assert.ok(readEvents(setup.runDir).some((r) => r.kind === "check_failures_pre_existing"), "the first failure was excused against the base");
+    const failed = readEvents(setup.runDir).find((r) => r.kind === "event" &&
+      (r.event as { type?: string }).type === "CHECKS_FAILED")!.event as { failingStep?: string };
+    assert.equal(failed.failingStep, stopping, "the compatibility summary names the command that actually stopped the run");
+    const record = checkRecords(setup.runDir).find((r) => r.tier === "round")!;
+    assert.equal((record.commands as unknown[]).length, 2, "the runner still stops at the first non-excused failure");
+  } finally {
+    await teardown(setup);
+  }
+});
+
 test("plan 07e: a silent check is class silent and a check killed by a stop is interrupted", async () => {
   // 1. A check that exits non-zero with nothing to say is `silent`.
   const silent = await setupConductor({
