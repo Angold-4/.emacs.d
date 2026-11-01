@@ -90,6 +90,8 @@
 (declare-function pilish--find-session "pilish-ui")
 (declare-function pilish--get-chat-buffer "pilish-ui")
 (declare-function pilish--get-input-buffer "pilish-ui")
+(declare-function pilish--display-buffers "pilish-ui")
+(declare-function pilish--rebalance-input-window "pilish-ui")
 (declare-function pilish-open-session-file "pilish")
 (declare-function pilish--display-startup-header "pilish-ui")
 (declare-function pilish--append-to-chat "pilish-ui")
@@ -270,8 +272,34 @@ while the agent works."
   (when +pilish-show-thinking
     (apply orig args)))
 
+(defun +pilish--drop-orphan-input-windows (chat-buf input-buf &rest _)
+  "Delete pi input windows whose chat buffer is not on screen.
+Runs as :after advice on `pilish--display-buffers'.  Showing a session
+takes over the window that showed the previous session's chat, because
+an input window is too short to split, so that session's input window is
+left behind with no chat to talk to.  Deleting it gives its lines back to
+the frame, so the displayed pair is rebalanced to the configured ratio."
+  (let ((shown (mapcar #'window-buffer (window-list nil 'nomini))))
+    (dolist (window (window-list nil 'nomini))
+      (when (window-live-p window)
+        (let ((buffer (window-buffer window)))
+          (when (and (with-current-buffer buffer
+                       (derived-mode-p 'pilish-input-mode))
+                     (not (memq (buffer-local-value 'pilish--chat-buffer buffer)
+                                shown))
+                     (eq t (window-deletable-p window)))
+            (delete-window window))))))
+  (let ((chat-win (get-buffer-window chat-buf))
+        (input-win (get-buffer-window input-buf)))
+    (when (and chat-win input-win)
+      (pilish--rebalance-input-window chat-win input-win))))
+
 (defun +pilish--install-advice ()
   "Install the Pilish advices this module relies on."
+  (unless (advice-member-p #'+pilish--drop-orphan-input-windows
+                           'pilish--display-buffers)
+    (advice-add 'pilish--display-buffers
+                :after #'+pilish--drop-orphan-input-windows))
   (unless (advice-member-p #'+pilish--remember-model
                            'pilish--update-state-from-response)
     (advice-add 'pilish--update-state-from-response
