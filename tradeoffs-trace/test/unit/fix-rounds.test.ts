@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { domainReviewBrief, factKeepsOpen, fixTasks, testRemovalViolations, FIXER_DUTY, type FixFinding, type FixTask } from "../../src/core/fix-rounds.ts";
+import { domainReviewBrief, factKeepsOpen, fixTasks, repairProducedNoChange, testRemovalViolations, FIXER_DUTY, type FixFinding, type FixTask } from "../../src/core/fix-rounds.ts";
 import { ownerRepairPointFor } from "../../src/conductor.ts";
 import { domainFactFailure } from "../../src/fix-loop.ts";
 import { lintPlan, lintTestRemovals } from "../../src/core/plan-lint.ts";
@@ -546,4 +546,15 @@ test("a repair naming a test with no command is an exception", () => {
   const point = ownerRepairPointFor(phase, request, { checks: [] });
   assert.ok(point && "reason" in point);
   assert.match(point.reason, /test with no declared command/);
+});
+
+
+test("a repair with no fixer and the same candidate cannot start acceptance review", () => {
+  const round: import("../../src/core/types.ts").RoundRecord = { round: 2, base: "B", lanes: [], candidates: [], votes: [] };
+  assert.equal(repairProducedNoChange(round), true, "an empty MAP parks");
+  round.fixed = { base: "B", tasks: [{ domain: "booking", findingIds: ["F1"] }], merges: [] };
+  assert.equal(repairProducedNoChange(round), false, "a dispatched fixer still has its ordinary domain loop bound");
+  assert.equal(repairProducedNoChange(round, round.fixed), true, "reusing a previous unchanged MAP is no new repair");
+  round.fixed.candidate = "C";
+  assert.equal(repairProducedNoChange(round, round.fixed), false, "a changed REDUCE checkpoint resumes its checks");
 });

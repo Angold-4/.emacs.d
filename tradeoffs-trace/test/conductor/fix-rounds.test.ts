@@ -1205,3 +1205,44 @@ for (const namesTest of [true, false]) test(namesTest
     cleanupDir(promptDir);
   }
 });
+
+test("a repair that changes nothing calls the lead instead of re-reviewing", async () => {
+  const setup = await setupConductor({
+    phase: fixPhase(),
+    checks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorkerWithDecision(1, "a", "delegated"),
+    laneWorkerScriptFor: (lane, round) => laneWorkerWithDecision(round, lane, "delegated"),
+    laneReviewerScriptFor: reviewerVetoing,
+    reviewerScriptFor: (seat, state) => {
+      const review = laneReview(seat, state.phase.contract.contractVersion);
+      const submit = review.steps[2] as { args: Record<string, unknown> };
+      submit.args.ballots = state.phase.decisions.filter((d) => !d.supersededBy && d.boundCandidateSha === state.phase.candidate?.sha)
+        .map((d) => ({ decisionId: d.id, vote: "reject", rationale: VETO_REASON, evidence: ["booking/cache.ts:12 price"] }));
+      return review;
+    },
+    pickScriptFor: (seat, state) => pickVote(seat, state.phase.rounds?.length ?? 1, "a"),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => {
+      const records = readEvents(setup.runDir);
+      const map = records.findIndex((r) => r.kind === "intent" && (r.event as { domains?: boolean }).domains === true);
+      return map >= 0 && records.slice(map + 1).some((r) => r.kind === "event" &&
+        ["LEAD_CALLED", "FREEZE_COMPLETED", "REVIEW_SUBMITTED"].includes((r.event as { type: string }).type));
+    }, 90_000, 50, setup.runDir);
+    const events = readEvents(setup.runDir);
+    const map = events.findIndex((r) => r.kind === "intent" && (r.event as { domains?: boolean }).domains === true);
+    assert.ok(map >= 0, "a lane-free repair MAP was attempted");
+    assert.equal(fixerIntents(setup.runDir).length, 0, "the repair had no fixer work");
+    const afterMap = events.slice(map + 1);
+    assert.ok(afterMap.some((r) => r.kind === "event" && (r.event as { type?: string; reasons?: string[] }).type === "LEAD_CALLED" &&
+      (r.event as { reasons: string[] }).reasons.some((reason) => reason.includes("repair produced no change"))), "an empty repair calls the lead with its reason");
+    assert.ok(!afterMap.some((r) => r.kind === "event" && ["FREEZE_COMPLETED", "REVIEW_SUBMITTED"].includes((r.event as { type: string }).type)),
+      "the same candidate is never handed off or reviewed again");
+    assert.equal(setup.conductor.state.phase.rounds?.length, 2, "the exception ends the empty repair immediately");
+  } finally {
+    await teardown(setup);
+  }
+});

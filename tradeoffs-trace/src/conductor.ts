@@ -171,6 +171,7 @@ import {
   DEFAULT_INTEGRATE_MAX,
   FIXER_DUTY,
   fixTasks,
+  repairProducedNoChange,
   testRemovalViolations,
   type FixFinding,
   type FixPoint,
@@ -12108,11 +12109,19 @@ export class Conductor {
       }
       if (!resume) this.#applyEvent({ type: "ROUND_STARTED", round, base, lanes: [] });
       this.#log.intent(actionId, { round, base, domains: true });
+      const checkpoint = this.#state.phase.rounds?.find((r) => r.round === round)?.fixed;
       const status = await this.#fixRound(round);
       if (status === "stopped" || this.#stopRequested || this.#recheckCancelledLaneRound) return;
       if (status === "parked") return;
       const record = this.#state.phase.rounds!.find((r) => r.round === round)!;
       const candidate = record.fixed?.candidate ?? record.base;
+      // A repair that ran no fixer and kept its base cannot yield new review
+      // evidence. Park before checks or hand-off, including a reused REDUCE
+      // checkpoint, so an owner's repair allowance cannot spin on one tree.
+      if (repairProducedNoChange(record, checkpoint)) {
+        this.#parkMergedCheck(round, "repair produced no change");
+        return;
+      }
       const kept = resume ? this.#readCheckRecord(candidate)?.record : undefined;
       const expected = kept ? checkCommands(this.#plan.checks, this.#state.phase.contract.checks, this.#state.phase.contract.finalChecks, kept.tier).map((c) => this.#withValues(c)) : [];
       const factIds = new Set(kept?.facts?.map((f) => f.findingId));

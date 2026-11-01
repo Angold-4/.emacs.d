@@ -8,7 +8,7 @@
 import { domainOf, whereKey, type Domain } from "./domains.ts";
 import { testNames } from "./test-names.ts";
 import type { Disposition } from "./triage.ts";
-import type { Finding, FindingFact } from "./types.ts";
+import type { Finding, FindingFact, RoundRecord } from "./types.ts";
 
 /** Plan 07c (D4): the default `#+TT_FIXERS` — the most fixer tasks (one per
  * domain) a fix round may run. */
@@ -90,6 +90,14 @@ export function fixTasks(points: readonly FixPoint[], domains: readonly Domain[]
     if (tasks.length >= limit) break;
   }
   return tasks;
+}
+
+/** No fixer ran in this MAP and REDUCE kept its base. A prior checkpoint
+ * may be reused after a stop, but its old tasks are not a new repair attempt.
+ * The caller parks for the lead before handing the same tree to the seats. */
+export function repairProducedNoChange(round: RoundRecord, checkpoint?: RoundRecord["fixed"]): boolean {
+  const dispatched = checkpoint === undefined && (round.fixed?.tasks.length ?? 0) > 0;
+  return !dispatched && (round.fixed?.candidate ?? round.base) === round.base;
 }
 
 /** 07g1: test removals a mapper may make. An allowance names either a test
