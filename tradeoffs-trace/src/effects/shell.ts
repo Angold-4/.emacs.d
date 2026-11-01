@@ -32,19 +32,17 @@ import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from "node:c
 // it to signal the groups it recorded at spawn; it never calls `process.kill`
 // with a signal itself.
 import { groupAlive, signalGroup } from "./sweep.ts";
-import { CHANGED_TEST_BUDGET_MS, isChangedTestCommand } from "../core/checks.ts";
 
 /** Plan 06l (A2) / 07h2 (C3, R12): the bound ONE worker `sh` command runs
  * under. The policy lives here, with the module that spawns the command, not in
- * the conductor's socket wiring: `tt test --changed` gets its own long budget
- * (its narrow loop is not the phase's check), every other command the plan's
+ * the conductor's socket wiring: every command gets the plan's
  * `TT_SH_MINUTES` cap, and the term grace is the run's. */
 export function shBoundFor(
-  command: string,
+  _command: string,
   deadlines: { readonly shCommandMs: number; readonly termGraceMs: number },
 ): { deadlineMs: number; termGraceMs: number } {
   return {
-    deadlineMs: isChangedTestCommand(command) ? CHANGED_TEST_BUDGET_MS : deadlines.shCommandMs,
+    deadlineMs: deadlines.shCommandMs,
     termGraceMs: deadlines.termGraceMs,
   };
 }

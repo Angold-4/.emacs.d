@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import { childEnv, runCommand } from "../../src/effects/shell.ts";
+import { childEnv, runCommand, shBoundFor } from "../../src/effects/shell.ts";
 // A2/C3 (plan 06e): the sweep owns the signalling decision, so the recovery
 // path's killGroup lives there now.
 import { killGroup } from "../../src/effects/sweep.ts";
@@ -52,6 +52,21 @@ function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
     poll();
   });
 }
+
+test("a worker's tt test --changed command is bounded by TT_SH_MINUTES", async () => {
+  const deadlines = { shCommandMs: 150, termGraceMs: 100 };
+  for (const command of ['tt test --changed --run "$TT_RUN_DIR"', 'node /x/cli.ts test --changed --run /tmp/r', 'sleep 100']) {
+    assert.deepEqual(shBoundFor(command, deadlines), { deadlineMs: 150, termGraceMs: 100 });
+  }
+  // A real executable named tt, not just a string-policy assertion. It must
+  // be killed at the worker cap even though its CLI default would be longer.
+  const tt = path.join(dir, "tt");
+  fs.writeFileSync(tt, "#!/bin/sh\nsleep 100\n", { mode: 0o755 });
+  const command = `${tt} test --changed --run /tmp/r`;
+  const outcome = await runCommand({ command, ...shBoundFor(command, deadlines) }).result;
+  assert.equal(outcome.timedOut, true);
+  assert.ok(outcome.signalsSent.includes("SIGTERM"));
+});
 
 test("onIntent observes the pgid strictly before the command's first side effect", async () => {
   const marker = path.join(dir, "marker");

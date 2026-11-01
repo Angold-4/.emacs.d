@@ -186,7 +186,7 @@ import {
   type Role,
   type ToolSetMismatch,
 } from "./core/roles.ts";
-import { CHANGED_TEST_BUDGET_MS, rerunBudgetMs } from "./core/checks.ts";
+import { rerunBudgetMs } from "./core/checks.ts";
 import {
   decisionSettled,
   decisionStatus,
@@ -11472,12 +11472,9 @@ export class Conductor {
     return Math.max(1, Math.floor(this.#deadlines.reviewMs / 3));
   }
 
-  /** Plan 06l (A2): the extension's own wait for a `sh` result. It must cover
-   * the longest per-command budget (`tt test --changed`), or a worker's narrow
-   * test run would return a client-side timeout while the conductor still has
-   * it running. A normal command still ends at the shell cap, well inside it. */
+  /** The extension waits for the shell cap plus termination and transport grace. */
   #shWaitMs(): number {
-    return Math.max(this.#deadlines.shCommandMs, CHANGED_TEST_BUDGET_MS) + 30_000;
+    return this.#deadlines.shCommandMs + this.#deadlines.termGraceMs + 30_000;
   }
 
   /** Plan 06k3 (A1): one seat's lane review. A review turn that ends without
