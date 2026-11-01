@@ -675,8 +675,8 @@ function shellQuote(value: string): string {
  * reads its JSON from the file in its second positional or, when none is
  * given, from stdin — never inline in argv — so the clearing command pipes
  * the payload. */
-function inputCommand(phase: PhaseState, payload: Record<string, unknown>): string {
-  return `printf %s ${shellQuote(JSON.stringify(payload))} | tt input ${phase.runId}`;
+function inputCommand(phase: PhaseState, payload: Record<string, unknown>, target = phase.runId): string {
+  return `printf %s ${shellQuote(JSON.stringify(payload))} | tt input ${target}`;
 }
 
 function recordBinding(
@@ -689,28 +689,28 @@ function recordBinding(
   return { runId: phase.runId, phaseId: phase.phaseId, recordId, candidateSha, recordVersion, contractVersion };
 }
 
-function resolveCommand(phase: PhaseState, C: string, K: ContractVersion, request: PhaseState["ownerRequests"][number]): string {
+function resolveCommand(phase: PhaseState, C: string, K: ContractVersion, request: PhaseState["ownerRequests"][number], target = phase.runId): string {
   const option =
     request.options.find((o) => o.id === "repair")?.id ?? request.options.find((o) => o.id === "accept_risk")?.id ?? request.options[0]?.id ?? "repair";
   return inputCommand(phase, {
     type: "resolve",
     option,
     binding: recordBinding(phase, C, K, request.id, request.version),
-  });
+  }, target);
 }
 
-function acceptFindingCommand(phase: PhaseState, C: string, K: ContractVersion, finding: { id: string; version: number }): string {
+function acceptFindingCommand(phase: PhaseState, C: string, K: ContractVersion, finding: { id: string; version: number }, target = phase.runId): string {
   return inputCommand(phase, {
     type: "accept-finding",
     scope: "trade-off",
     binding: recordBinding(phase, C, K, finding.id, finding.version),
-  });
+  }, target);
 }
 
 /** Plan 07f (A1/A3): the ONE owner command that settles a trade-off record:
  * a ruling. It is applied at once and never queues a correction. */
-function rulingCommand(phase: PhaseState, detail: string, recordId: string): string {
-  return inputCommand(phase, { type: "ruling", text: detail, recordIds: [recordId] });
+function rulingCommand(phase: PhaseState, detail: string, recordId: string, target = phase.runId): string {
+  return inputCommand(phase, { type: "ruling", text: detail, recordIds: [recordId] }, target);
 }
 
 /** A2/C1: how one seat's evidence is resolved against the candidate. The
@@ -760,18 +760,18 @@ function seatAnchorResolves(evidence: string): boolean {
  * failed, so the blocker points at the run itself: it never names a declared
  * command that may have passed. The owner clears the blocker by inspecting
  * the run and re-running exactly the command that failed. */
-function failingCheckCommands(phase: PhaseState, failedCommands: readonly string[] | undefined): string[] {
+function failingCheckCommands(phase: PhaseState, failedCommands: readonly string[] | undefined, target = phase.runId): string[] {
   if (failedCommands && failedCommands.length > 0) return [...failedCommands];
   // No per-command result: name only the run to inspect, never a declared
   // command that may have passed (A1 asks for the failing command itself).
-  return [`tt status ${phase.runId}`];
+  return [`tt status ${target}`];
 }
 
 /** Plan 07f1b (A1/R1): the ONE command a single-command blocker names, taken
  * from the same list: the failing command when the caller read it, else the
  * declared (or legacy) command. */
-function singleCheckCommand(phase: PhaseState, failedCommands: readonly string[] | undefined): string {
-  return failingCheckCommands(phase, failedCommands)[0];
+function singleCheckCommand(phase: PhaseState, failedCommands: readonly string[] | undefined, target = phase.runId): string {
+  return failingCheckCommands(phase, failedCommands, target)[0];
 }
 
 /** Plan 07f (F1): every condition `accept` requires, in one list. The
@@ -784,7 +784,9 @@ function acceptanceBlockersFor(
   C: string,
   K: ContractVersion,
   failedCommands?: readonly string[],
+  runDir?: string,
 ): AcceptanceBlocker[] {
+  const target = runDir === undefined ? phase.runId : shellQuote(runDir);
   const blockers: AcceptanceBlocker[] = [];
 
   // Mechanical gates are facts (ODP-1, ODP-2): the checks must have passed
@@ -800,7 +802,7 @@ function acceptanceBlockersFor(
     // Plan 07f1b (A1): one blocker per command that FAILED, so every blocker
     // names the failing check command itself — never a command that passed and
     // never a synthesized `a && b` (see `failingCheckCommands`).
-    for (const command of failingCheckCommands(phase, failedCommands)) blockers.push({ kind: "check", detail, command });
+    for (const command of failingCheckCommands(phase, failedCommands, target)) blockers.push({ kind: "check", detail, command });
   }
   // The probe must be onto the CURRENT integration head: a head moved by a
   // stale publish (design §6.4 step 3) must not let a stale probe count.
@@ -816,7 +818,7 @@ function acceptanceBlockersFor(
     blockers.push({
       kind: "probe",
       detail: failed ? "integration probe failed" : "the integration probe has not passed for the candidate onto the current head",
-      command: `tt resume ${phase.runId}`,
+      command: `tt resume ${target}`,
     });
   }
 
@@ -836,7 +838,7 @@ function acceptanceBlockersFor(
       blockers.push({
         kind: "test-verify",
         detail: `named test verify ${problem}`,
-        command: singleCheckCommand(phase, failedCommands),
+        command: singleCheckCommand(phase, failedCommands, target),
       });
     }
     // An architecture deviation is accepted when the owner accepts the item's
@@ -855,8 +857,8 @@ function acceptanceBlockersFor(
         kind: "symbol-deviation",
         detail: `architecture symbol deviation ${id} is not accepted`,
         command: deviationFinding
-          ? acceptFindingCommand(phase, C, K, deviationFinding)
-          : `tt resume ${phase.runId}`,
+          ? acceptFindingCommand(phase, C, K, deviationFinding, target)
+          : `tt resume ${target}`,
       });
     }
     evidenceRecorded = (phase.itemEvidence ?? []).map((e) => e.id);
@@ -866,7 +868,7 @@ function acceptanceBlockersFor(
       blockers.push({
         kind: "evidence",
         detail: `evidence for ${item.id} has not been recorded`,
-        command: `tt evidence ${phase.runId} ${item.id} ${shellQuote(`evidence for ${item.id}`)}`,
+        command: `tt evidence ${target} ${item.id} ${shellQuote(`evidence for ${item.id}`)}`,
       });
     }
   }
@@ -881,7 +883,7 @@ function acceptanceBlockersFor(
       blockers.push({
         kind: "carry",
         detail: `the carried-items acceptance is for ${phase.carriedCandidateSha ?? "another candidate"}, not ${C}`,
-        command: `tt resume ${phase.runId}`,
+        command: `tt resume ${target}`,
       });
     }
     return blockers;
@@ -890,14 +892,14 @@ function acceptanceBlockersFor(
   for (const who of seatsOf(phase.contract)) {
     const review = phase.reviews[who]?.review;
     if (!review) {
-      blockers.push({ kind: "review", detail: `review by ${who} is missing`, command: `tt resume ${phase.runId}` });
+      blockers.push({ kind: "review", detail: `review by ${who} is missing`, command: `tt resume ${target}` });
       continue;
     }
     if (review.candidateSha !== C || !sameVersion(review.contractVersion, K)) {
       blockers.push({
         kind: "review",
         detail: `review by ${who} is not bound to this candidate and contract`,
-        command: `tt resume ${phase.runId}`,
+        command: `tt resume ${target}`,
       });
     }
   }
@@ -925,7 +927,7 @@ function acceptanceBlockersFor(
           `${item.id} is ${outcome?.outcome ?? "incomplete"}` +
           (split ? " (the seats split on it)" : "") +
           (outcome && outcome.seats.some((s) => s.verdict === required) ? " without a majority of resolving anchors" : ""),
-        command: `tt resume ${phase.runId}`,
+        command: `tt resume ${target}`,
       });
     }
   }
@@ -959,7 +961,7 @@ function acceptanceBlockersFor(
       // Plan 07f (A1): a point is a record with a domain and its next fix loop,
       // not an owner decision. `tt why` prints the point with its domain and
       // the command that shows the next step; no owner command can close it.
-      command: `tt why ${phase.runId}`,
+      command: `tt why ${target}`,
     });
   }
 
@@ -977,7 +979,7 @@ function acceptanceBlockersFor(
     blockers.push({
       kind: "finding",
       detail: `blocking finding ${shortId(finding.id)} open`,
-      command: rulingCommand(phase, `accept ${shortId(finding.id)}`, finding.id),
+      command: rulingCommand(phase, `accept ${shortId(finding.id)}`, finding.id, target),
     });
   }
 
@@ -997,7 +999,7 @@ function acceptanceBlockersFor(
     blockers.push({
       kind: "decision",
       detail: `${shortId(decision.id)} ${verb}`,
-      command: rulingCommand(phase, `rule ${shortId(decision.id)} as recorded`, decision.id),
+      command: rulingCommand(phase, `rule ${shortId(decision.id)} as recorded`, decision.id, target),
     });
   }
 
@@ -1010,7 +1012,7 @@ function acceptanceBlockersFor(
     blockers.push({
       kind: "owner-request",
       detail: `owner request ${shortId(request.id)} is open: ${request.reason}`,
-      command: resolveCommand(phase, C, K, request),
+      command: resolveCommand(phase, C, K, request, target),
     });
   }
 
@@ -1029,10 +1031,11 @@ function acceptanceBlockersFor(
 export function acceptanceBlockers(
   phase: PhaseState,
   failedCommands?: readonly string[],
+  runDir?: string,
 ): AcceptanceBlocker[] {
   const C = phase.candidate?.sha;
   if (!C) return [];
-  return acceptanceBlockersFor(phase, C, phase.contract.contractVersion, failedCommands);
+  return acceptanceBlockersFor(phase, C, phase.contract.contractVersion, failedCommands, runDir);
 }
 
 /** accept(C, K): the only way a phase may reach ACCEPTED. Mechanical by

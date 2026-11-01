@@ -2714,9 +2714,11 @@ async function main(): Promise<void> {
   // process or launches a conductor. The read-only path fallback stays as-is.
   const runWriters = ["input", "steer", "note", "correct", "evidence", "verdict", "withdraw", "defer", "recheck", "stop", "resume", "carry", "entry"];
   if (runWriters.includes(cmd) && positional[0]) {
-    const runDir = resolveRunDir(positional[0], runRoot);
+    const runArg = ["steer", "note", "correct"].includes(cmd)
+      ? positional.find((arg) => arg !== "--program-wide") : positional[0];
+    const runDir = resolveRunDir(runArg ?? "", runRoot);
     if (!existsSync(path.join(runDir, "meta.json"))) {
-      throw new Error(`no run ${positional[0]} under ${runRoot}`);
+      throw new Error(`no run ${runArg} under ${runRoot}`);
     }
   }
   if (cmd === "test") {
