@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 /** Pinned Pi version (design "Conventions" table). Asserted at conductor
  * start; an upgrade is a deliberate PR that reruns the phase 0 contract
  * tests. */
-export const PI_VERSION = "0.87.0";
+export const PI_VERSION = "1.4.0";
 
 export type Role = "worker" | "reviewer" | "evaluator" | "panel" | "curator" | "picker";
 

@@ -256,7 +256,7 @@ newer candidate exists, or the worktree reset failed.
 | What | Where / how |
 |---|---|
 | Node 25+ | runs the TypeScript directly, no build step |
-| Pi 0.87.0 | `pi --version`; the conductor asserts this version and each role's tool set |
+| Pi 1.4.0 | `pi --version`; the conductor asserts this version and each role's tool set |
 | Model and credentials | Pi's own configuration, `~/.pi/agent/settings.json` (`defaultProvider`, `defaultModel`) and `auth.json`. Without `#+TT_MODELS` (below), every role uses Pi's `defaultModel`. |
 | Emacs front end | `core/init-tradeoffs-trace.el`, loaded by the Emacs config |
 | An installed runner | see below |

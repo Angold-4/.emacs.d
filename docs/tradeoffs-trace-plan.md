@@ -41,7 +41,7 @@ tradeoffs-trace must not execute the code under review:
 | --- | --- |
 | Code location | `tradeoffs-trace/` in this repository (a Node package) and `core/init-tradeoffs-trace.el`. Moving it to its own repository later is cheap while nothing else depends on it. **Owner decision D0-1.** |
 | Language | TypeScript, run with Node ≥ 22.19 (Pi 0.87.0's floor; locally 25.9) |
-| Pi | pinned to **0.87.0**. The version is asserted at conductor start, and an upgrade is a deliberate PR that reruns the phase 0 contract tests |
+| Pi | pinned to **1.4.0**. The version is asserted at conductor start, and an upgrade is a deliberate PR that reruns the phase 0 contract tests |
 | Tests | `node --test` for TypeScript; ERT in batch mode (`emacs -batch`) for Emacs Lisp; one `make check` target runs both |
 | Structure | **functional core, imperative shell.** All state transitions, predicates, the tally and version binding are pure functions over the event log, tested without Pi, git or a filesystem. Effects (Pi, shell, git, files, socket) are thin adapters around that core |
 | Fake agent | `test/fake-pi/`: an executable speaking Pi's RPC protocol that replays a script (tool calls, submissions, hangs, crashes). Deterministic tests use it. Live tests with real Pi and real models are opt-in for ordinary CI, but **mandatory recorded evidence** at the exit gates that name them (see below) |
