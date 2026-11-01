@@ -116,6 +116,28 @@ export function admitCommands(plan: AdmitPlanShape): string[] {
   return out;
 }
 
+/** A complete version token: `0.87.0`, a `v`-prefixed one, or a
+ * prerelease/build suffix on it. Anchored to whole tokens, so `10.87.0` is one
+ * token, never the pin inside another one. */
+const VERSION_TOKEN = /(?<![\w.-])[vV]?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?(?![\w.-])/g;
+
+/** A version as compared: trimmed, with a leading `v` dropped. */
+function normVersion(text: string): string {
+  return text.trim().replace(/^[vV]/, "");
+}
+
+/** Does what the resolved pi reported (`pi --version`'s own line) assert the
+ * pin? Only a version shown in full counts: `0.87.0` passes the pin `0.87.0`,
+ * while `10.87.0` — which merely CONTAINS the pin's text — must not. A
+ * `--version` that prints words around the number (`pi 0.87.0`, `pi v0.87.0`)
+ * still passes when the only complete version in it is the pin. */
+function reportsPin(reported: string, pinned: string): boolean {
+  const pin = normVersion(pinned);
+  if (normVersion(reported) === pin) return true;
+  const tokens = reported.match(VERSION_TOKEN) ?? [];
+  return tokens.length > 0 && tokens.every((token) => normVersion(token) === pin);
+}
+
 /** The first line of a command's stderr, for a one-line reason. */
 function firstLine(text: string | undefined): string {
   const line = (text ?? "").split("\n").map((l) => l.trim()).find((l) => l.length > 0);
@@ -162,7 +184,7 @@ export function admitVerdict(facts: AdmitFacts): AdmitVerdict {
       facts,
     };
   }
-  if (!facts.pi.version.includes(facts.pi.pinned)) {
+  if (!reportsPin(facts.pi.version, facts.pi.pinned)) {
     return {
       ok: false,
       kind: "X:ENV_FAULT",
