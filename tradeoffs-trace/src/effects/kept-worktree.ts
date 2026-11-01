@@ -63,9 +63,19 @@ export function resumeKeptWorktree(repo: string, worktree: string, base: string,
       git(worktree, ["restore", `--source=${ref}`, "--worktree", "--", "."]);
       return `was recreated on new base ${base}; your full working-file snapshot (including partial conflict resolutions and new files) was restored from ${ref}. The prior unmerged index was not restored; inspect the snapshot's differences against the new base.`;
     }
-    git(worktree, ["stash", "apply", ref]);
-    return `was recreated on new base ${base}; your uncommitted edits were re-applied from a stash. A saved copy remains at ${ref}.`;
+    try {
+      git(worktree, ["stash", "apply", "--index", ref]);
+    } catch {
+      // A failed index restore may have partially applied the stash. Discard
+      // only that restore attempt (all its data is in ref), then retry on the
+      // clean base. No worker has started editing this recreated checkout yet.
+      git(worktree, ["reset", "--hard", base]);
+      git(worktree, ["clean", "-fd"]);
+      git(worktree, ["stash", "apply", ref]);
+      return `was recreated on new base ${base}; your uncommitted edits were re-applied from a stash, but the staged/unstaged split was not restored. The saved ref ${ref} keeps the original index as its second parent.`;
+    }
+    return `was recreated on new base ${base}; your uncommitted edits were re-applied from a stash, including their staged/unstaged split. A saved copy remains at ${ref}.`;
   } catch {
-    return `is on new base ${base}, but your edits did not apply cleanly. The ${saved.kind} is saved to the exact ref ${ref}; inspect the worktree conflicts and recover from that ref before continuing.`;
+    return `is on new base ${base}, but your edits did not apply cleanly. The ${saved.kind} is saved to the exact ref ${ref}; inspect the worktree conflicts and recover from that ref before continuing.${saved.kind === "stash" ? " The staged/unstaged split was not restored; the saved ref keeps the original index as its second parent." : ""}`;
   }
 }

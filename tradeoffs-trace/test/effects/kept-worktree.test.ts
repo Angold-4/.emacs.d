@@ -56,6 +56,40 @@ test("a kept lane with an unmerged index is saved, never pruned unsaved", () => 
   }
 });
 
+test("a resumed kept lane restores index-only edits and reports any lost staged split", async (t) => {
+  for (const indexConflict of [false, true]) await t.test(indexConflict ? "plain-apply fallback names the saved index" : "MM index-only content survives", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tt-kept-index-only-"));
+    const repo = path.join(dir, "repo"), wt = path.join(dir, "lane");
+    const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+    const commit = () => { git(repo, "add", "-A"); git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"); };
+    try {
+      fs.mkdirSync(repo); git(repo, "init", "-q");
+      fs.writeFileSync(path.join(repo, "tracked"), "base\n"); commit();
+      createWorktree(repo, wt, git(repo, "rev-parse", "HEAD"));
+      fs.writeFileSync(path.join(wt, "tracked"), "staged work\n"); git(wt, "add", "tracked");
+      fs.writeFileSync(path.join(wt, "tracked"), "base\n");
+      fs.writeFileSync(path.join(wt, "new"), "new file\n");
+      assert.match(git(wt, "status", "--porcelain"), /MM tracked/);
+      fs.writeFileSync(path.join(repo, indexConflict ? "tracked" : "unrelated"), indexConflict ? "staged work\n" : "new base\n"); commit();
+      const base = git(repo, "rev-parse", "HEAD"), ref = "refs/tt/index/kept/a/saved";
+      const note = resumeKeptWorktree(repo, wt, base, ref);
+      assert.equal(git(repo, "show", `${ref}^2:tracked`), "staged work", "the saved ref keeps the original index");
+      assert.equal(git(wt, "rev-parse", "HEAD"), base);
+      assert.equal(fs.readFileSync(path.join(wt, "new"), "utf8"), "new file\n");
+      if (indexConflict) {
+        assert.match(note, /staged\/unstaged split was not restored/);
+        assert.ok(note.includes(ref));
+        assert.match(note, /original index as its second parent/);
+      } else {
+        assert.match(git(wt, "status", "--porcelain"), /MM tracked/);
+        assert.equal(git(wt, "show", ":tracked"), "staged work");
+        assert.equal(fs.readFileSync(path.join(wt, "tracked"), "utf8"), "base\n");
+        assert.match(note, /including their staged\/unstaged split/);
+      }
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
 test("a kept-lane recreation failure retains its saved ref, and a save failure retains the dirty checkout", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tt-kept-failed-"));
   const repo = path.join(dir, "repo"), wt = path.join(dir, "lane");
