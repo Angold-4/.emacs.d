@@ -163,7 +163,7 @@ test("A4: a marker after output without a newline still starts its own step", as
   assert.equal(outcome.steps?.at(-1)?.command, "test -z x");
   assert.equal(outcome.steps?.at(-1)?.output, "");
   assert.equal(outcome.output, "no-newline");
-  assert.ok(!outcome.output.includes("\u0001tt-step"));
+  assert.ok(!outcome.output.includes("\u001ftt-step"));
 });
 
 // 09-2: the result waits for the pipes to drain, not only for `exit`. A fast

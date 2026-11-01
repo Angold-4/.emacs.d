@@ -134,8 +134,9 @@ const SAMPLE_INTERVAL_MS = 1000;
  * every simple command as the shell reaches it — the last one before a
  * non-zero exit is the failing step. The marker is unusual enough that no
  * ordinary check output contains it; every line that does is stripped from the
- * output the rest of the conductor reads. */
-const STEP_MARKER = "\u0001tt-step ";
+ * output the rest of the conductor reads. It starts with U+001F, not U+0001:
+ * bash (macOS /bin/sh) strips \001 and \002 from PS4 as readline markers. */
+const STEP_MARKER = "\u001ftt-step ";
 
 /** One simple command the shell ran, with the output it produced. */
 export interface CommandStep {
