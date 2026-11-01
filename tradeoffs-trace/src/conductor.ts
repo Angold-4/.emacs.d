@@ -1969,10 +1969,9 @@ export class Conductor {
    * gate) that are still running, each with the time it was recorded. */
   #liveStageGroups = new Map<number, number>();
   #stopRequested = false;
-  /** Plan 07h2 (R10): the ids of this run's program siblings, read once from
-   * the log of each run under the same root (`#programSiblingIds`). */
+  /** Plan 07h2 (R10): known siblings; refreshed when a new window owner is
+   * not yet known. Polling an unchanged owner never scans the root. */
   #programSiblingIdsCache: Set<string> | undefined;
-  #programSiblingsRead = false;
   /** Plan 07e (E4): why the stop was requested, read by the honest check
    * record. Set with `#stopRequested`; never read before it is true. */
   #stopCause: StopCause = "conductor";
@@ -4737,16 +4736,15 @@ export class Conductor {
   #isSiblingProgramRun(runId: string): boolean {
     if (runId.length === 0) return false;
     if (runId === this.#state.phase.runId) return false;
+    if (this.#programSiblingIdsCache?.has(runId)) return true;
     return this.#programSiblingIds()?.has(runId) ?? false;
   }
 
   /** The `init` run ids of the other runs under this root that belong to THIS
-   * run's program (read once). A window marker records the run id from the
+   * run's program (refreshed for an unknown window owner). A marker records the run id from the
    * log's `init` record, which is not the run directory's name, so the ids are
    * collected from each sibling's own log rather than derived from a path. */
   #programSiblingIds(): Set<string> | undefined {
-    if (this.#programSiblingsRead) return this.#programSiblingIdsCache;
-    this.#programSiblingsRead = true;
     let ids: Set<string> | undefined;
     try {
       const own = JSON.parse(fs.readFileSync(path.join(this.#runDir, "program.json"), "utf8")) as { programId?: unknown };
@@ -4815,9 +4813,14 @@ export class Conductor {
         // the log is already closed; the pause simply stays unpaired
       }
     };
+    const classifiedOwners = new Map<string, boolean>();
+    const isSibling = (owner: string): boolean => {
+      if (!classifiedOwners.has(owner)) classifiedOwners.set(owner, this.#isSiblingProgramRun(owner));
+      return classifiedOwners.get(owner)!;
+    };
     const iv = setInterval(() => {
       if (this.#closed) return;
-      const by = otherCheckWindowOwner(this.#checkLockPath, (owner) => this.#isSiblingProgramRun(owner));
+      const by = otherCheckWindowOwner(this.#checkLockPath, isSibling);
       if (by !== undefined && !paused) pause(by);
       else if (by === undefined && paused) resume();
     }, 100);

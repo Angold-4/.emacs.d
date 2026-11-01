@@ -14,9 +14,10 @@ import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import { test } from "node:test";
 
-import { cleanupDir, makeRepo, waitFor } from "./harness.ts";
+import { cleanupDir, makeRepo, waitFor, setupConductor, defaultWorkerHello, readEvents } from "./harness.ts";
+import { openCheckWindow } from "../../src/effects/lock.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
-import { contractVersionFor, runnerRevision, type RunPlanFile } from "../../src/conductor.ts";
+import { Conductor, createRun, contractVersionFor, runnerRevision, type RunPlanFile } from "../../src/conductor.ts";
 import type { ProgramFile } from "../../src/core/program.ts";
 import { appendProgramEvent, createProgram, recordProgramSource, schedulerTick } from "../../src/program.ts";
 
@@ -566,6 +567,51 @@ async function twoRunningNodesCheckWithoutPausingEachOther(): Promise<void> {
 // packet's descriptive one: both drive the same end-to-end body once each.
 test("plan 07h2 (R10, exex 01c3): two running nodes of one program each have their own check slot, and neither run's workers are paused by the other's check", twoRunningNodesCheckWithoutPausingEachOther);
 test("two running nodes of one program check without pausing each other's workers", twoRunningNodesCheckWithoutPausingEachOther);
+
+test("a sibling node started after the first check window never pauses this run's workers", async () => {
+  const setup = await setupConductor({
+    checks: ["true"], checkWindow: "exclusive",
+    deadlines: { workerAttemptMs: 60_000, stallMs: 60_000, helloTimeoutMs: 10_000 },
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [{ kind: "hang-until-abort" }] }),
+  });
+  const checkLockPath = path.join(setup.runRoot, "check.lock");
+  let window: ReturnType<typeof openCheckWindow> | undefined;
+  let sibling: Conductor | undefined;
+  try {
+    fs.writeFileSync(path.join(setup.runDir, "program.json"), JSON.stringify({ programId: "same-program" }));
+    await setup.conductor.start();
+    // Force the first classification/root read BEFORE the sibling exists.
+    // An unrelated window must still pause, so we also know the watch is live.
+    window = openCheckWindow(checkLockPath, "unrelated-run");
+    await waitFor(() => readEvents(setup.runDir).some((r) => r.kind === "worker_paused"), 20_000, 25, setup.runDir);
+    window.release();
+    await waitFor(() => readEvents(setup.runDir).some((r) => r.kind === "worker_resumed"), 10_000, 25, setup.runDir);
+    const pausesBefore = readEvents(setup.runDir).filter((r) => r.kind === "worker_paused").length;
+    const siblingDir = createRun(setup.runRoot, setup.plan);
+    fs.writeFileSync(path.join(siblingDir, "program.json"), JSON.stringify({ programId: "same-program" }));
+    const script = path.join(setup.scriptsDir, "later-sibling.json");
+    fs.writeFileSync(script, JSON.stringify({ hello: defaultWorkerHello(), steps: [{ kind: "hang-until-abort" }] }));
+    sibling = new Conductor({
+      runDir: siblingDir, plan: setup.plan,
+      piCommand: process.execPath, piArgsPrefix: [FAKE_PI_PATH],
+      piEnvFor: () => ({ FAKE_PI_SCRIPT: script }), stubReviews: true,
+      deadlines: { workerAttemptMs: 60_000, stallMs: 60_000, helloTimeoutMs: 10_000 },
+      checkLockPath, gateLockPath: path.join(setup.runRoot, "gate.lock"),
+    });
+    await sibling.start();
+    window = openCheckWindow(checkLockPath, sibling.state.phase.runId);
+    // Several 100ms polls with the new owner: not even a transient pause.
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    assert.equal(readEvents(setup.runDir).filter((r) => r.kind === "worker_paused").length, pausesBefore);
+  } finally {
+    window?.release();
+    await sibling?.stop();
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    cleanupDir(setup.repo.dir);
+  }
+});
 
 test("plan 07h2 (A2): a failed re-export blocks the node with X:PLAN_DEFECT instead of running a stale plan", async () => {
   const repo = makeRepo();
