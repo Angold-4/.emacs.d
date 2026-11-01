@@ -2849,7 +2849,7 @@ async function main(): Promise<void> {
     const full = execFileSync("git", ["-C", repo, "rev-parse", "--verify", `${sha}^{commit}`], { encoding: "utf8" }).trim();
     const dest = path.join(runRoot, "runner", full);
     mkdirSync(dest, { recursive: true });
-    execFileSync("/bin/sh", ["-c", `git -C "$1" archive "$2" tradeoffs-trace | tar -x -C "$3"`, "sh", repo, full, dest]);
+    execFileSync("/bin/sh", ["-c", `git -C "$1" archive "$2" tradeoffs-trace core/init-tradeoffs-trace.el | tar -x -C "$3"`, "sh", repo, full, dest]);
     writeFileSync(path.join(dest, "tradeoffs-trace", "RUNNER_SHA"), `${full}\n`);
     const current = path.join(runRoot, "runner", "current");
     rmSync(current, { force: true });
