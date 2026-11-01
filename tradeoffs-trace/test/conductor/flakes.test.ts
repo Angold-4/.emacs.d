@@ -284,7 +284,10 @@ test("flake: a re-run that exits 0 without running the test does not excuse a re
     reviewerScriptFor: reviewerFor(),
     deadlines: FAST,
   });
-  setup.plan.rerun = "printf 'nothing ran\\n'; exit 0";
+  // 07h1: ADMIT lints the plan, and a `#+TT_RERUN:` template must name the
+  // failing test ({name}) — this one prints the name and still runs nothing,
+  // which is exactly the shape the finding is about.
+  setup.plan.rerun = "printf 'nothing ran {name} ({file})\\n'; exit 0";
   await setup.conductor.start();
   try {
     await waitFor(() => eventTypes(setup.runDir).includes("CHECKS_FAILED"), 90_000, undefined, setup.runDir);

@@ -96,17 +96,29 @@ export function checkWindowDir(checkLockPath: string): string {
  * ignores the windows that owner (a run id) opened itself: since each lane's
  * checks start at its submission (plan 09), a run's own check must not
  * freeze its other lane's worker (exex 01b1 lost ~86 worker-minutes to it). */
-export function anyCheckWindowOpen(checkLockPath: string, exceptOwner?: string): boolean {
+export function anyCheckWindowOpen(checkLockPath: string, exceptOwner?: CheckWindowExcept): boolean {
   return otherCheckWindowOwner(checkLockPath, exceptOwner) !== undefined;
 }
 
 /** Plan 07e (E4): the run id whose check window is open, ignoring
  * `exceptOwner`'s own windows, or undefined when none is. The status names
  * this id (`paused by run <id>'s check`), so a paused worker is never shown
- * as idle. A marker with no owner reads `another`. */
-export function otherCheckWindowOwner(checkLockPath: string, exceptOwner?: string): string | undefined {
+ * as idle. A marker with no owner reads `another`.
+ *
+ * Plan 07h2 (R10): `exceptOwner` may also be a predicate, so a run can ignore
+ * the windows of runs it does not count as "another" — the other nodes of its
+ * own program are one work unit (exex 01c3: node 2's check froze node 1's
+ * workers for the whole check). */
+export type CheckWindowExcept = string | ((owner: string) => boolean);
+
+function excepted(exceptOwner: CheckWindowExcept | undefined, owner: string): boolean {
+  if (exceptOwner === undefined) return false;
+  return typeof exceptOwner === "string" ? owner === exceptOwner : exceptOwner(owner);
+}
+
+export function otherCheckWindowOwner(checkLockPath: string, exceptOwner?: CheckWindowExcept): string | undefined {
   const dir = checkWindowDir(checkLockPath);
-  const active = (activeCheckWindows.get(dir) ?? []).find((owner) => exceptOwner === undefined || owner !== exceptOwner);
+  const active = (activeCheckWindows.get(dir) ?? []).find((owner) => !excepted(exceptOwner, owner));
   if (active !== undefined) return active.length > 0 ? active : "another";
   try {
     if (!fs.existsSync(dir)) return undefined;
@@ -118,7 +130,8 @@ export function otherCheckWindowOwner(checkLockPath: string, exceptOwner?: strin
           fs.rmSync(file, { force: true });
           continue;
         }
-        if (exceptOwner !== undefined && markerOwner(file) === exceptOwner) continue;
+        const owner = markerOwner(file);
+        if (owner !== undefined && excepted(exceptOwner, owner)) continue;
       } catch {
         // a vanished file is not a window
         continue;
@@ -334,20 +347,24 @@ export const DEFAULT_CHECK_SLOTS = 2;
 const CHECK_SLOT_POLL_MS = 250;
 
 /** The lock file of check slot `index`: slot 0 is the check lock itself, so a
- * one-slot host behaves exactly as before; slot i is `<lockPath>.slot<i>`. */
-export function checkSlotPath(lockPath: string, index: number): string {
-  return index === 0 ? lockPath : `${lockPath}.slot${index}`;
+ * one-slot host behaves exactly as before; slot i is `<lockPath>.slot<i>`.
+ * Plan 07h2 (R10): a run may pass its own `slotDir`, so the slots are the
+ * RUN's (two nodes of one program never queue behind each other's checks),
+ * while the check window / pause still keys off the shared `lockPath`. */
+export function checkSlotPath(lockPath: string, index: number, slotDir?: string): string {
+  const base = slotDir === undefined ? lockPath : path.join(slotDir, "check.slot");
+  return index === 0 ? base : `${base}.slot${index}`;
 }
 
-/** Takes the first free of `slots` machine-wide check slots, waiting until one
- * is free. Each slot is its own flock, so a holder that dies frees its slot
- * as the plain lock does. Any failure other than a held slot is thrown. */
-export async function acquireCheckSlot(lockPath: string, slots: number = DEFAULT_CHECK_SLOTS): Promise<Lock> {
+/** Takes the first free of `slots` check slots, waiting until one is free.
+ * Each slot is its own flock, so a holder that dies frees its slot as the
+ * plain lock does. Any failure other than a held slot is thrown. */
+export async function acquireCheckSlot(lockPath: string, slots: number = DEFAULT_CHECK_SLOTS, slotDir?: string): Promise<Lock> {
   const count = Math.max(1, Math.floor(slots));
   for (;;) {
     for (let index = 0; index < count; index++) {
       try {
-        return await acquireLock(checkSlotPath(lockPath, index));
+        return await acquireLock(checkSlotPath(lockPath, index, slotDir));
       } catch (err) {
         if (!(err instanceof LockError) || !err.message.endsWith(": busy")) throw err;
       }

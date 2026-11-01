@@ -580,7 +580,9 @@ function sendRulingFile(setup: TestConductorSetup, recordIds: string[], text: st
 test("a ruling that names an open point closes it and the phase accepts", async () => {
   const evidence = "P-OPEN: the open point the owner rules on";
   const setup = await setupConductor({
-    items: { requirements: [ITEM("R1")] } as never,
+    // 07h1: ADMIT lints the plan, and a plan in domain mode needs a :DOMAIN:
+    // on every item — the ruling here is about domain `booking`.
+    items: { requirements: [{ ...ITEM("R1"), domain: "booking" }] } as never,
     domains: DOMAINS,
     checks: ["true"],
     phaseChecks: ["true"],

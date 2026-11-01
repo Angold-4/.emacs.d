@@ -59,22 +59,9 @@ export function rerunBudgetMs(deadlineAt: number, now: number): number {
 // them import a changed file); the CLI owns the git reads and the run.
 // ---------------------------------------------------------------------------
 
-/** Plan 06l (A2): `tt test --changed`'s own time budget. It is deliberately
- * larger than the conductor's 6-minute shell cap (plan `#+TT_SH_MINUTES`):
- * the narrow loop runs in the worker's own process, not through the `sh`
- * tool, so a legitimately long narrowed run is not killed at that cap. */
+/** The CLI's standalone `tt test --changed` default. A worker invoking it
+ * through `sh` is still bounded by TT_SH_MINUTES like every other command. */
 export const CHANGED_TEST_BUDGET_MS = 20 * 60_000;
-
-/** True when a `sh` command is the narrow `tt test --changed` loop, so the
- * conductor gives it `CHANGED_TEST_BUDGET_MS` instead of the shell cap. The
- * command may be `tt test --changed …` or `node …/cli.ts test --changed …`. */
-export function isChangedTestCommand(command: string): boolean {
-  const trimmed = command.trim();
-  // Only the narrow loop itself: a shell separator would let an arbitrary
-  // long command ride the same 20-minute budget.
-  if (/[;&|\n]/.test(trimmed)) return false;
-  return /^(?:\S*\s+)?(?:\S*\/)?(?:tt|cli\.ts)\s+test\b[^\n]*--changed\b/.test(trimmed);
-}
 
 /** Every test file a plan's check commands name: a token that looks like a
  * test file (`.test.`/`.spec.` with a JS/TS extension) or an entry of a

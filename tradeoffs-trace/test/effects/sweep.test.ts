@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import { groupAlive, groupStartedBefore, isUnder, killGroup, sweep, sweepDecision } from "../../src/effects/sweep.ts";
+import { groupAlive, groupHasRecordedMember, groupMemberIdentities, groupStartedBefore, isUnder, killGroup, sweep, sweepDecision } from "../../src/effects/sweep.ts";
 
 let dir: string;
 
@@ -42,6 +42,17 @@ function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
     poll();
   });
 }
+
+test("escalation ownership requires a recorded birth in the same group", { skip: !["linux", "darwin"].includes(process.platform) }, () => {
+  const pgid = Number(execFileSync("ps", ["-o", "pgid=", "-p", String(process.pid)], { encoding: "utf8" }).trim());
+  const self = groupMemberIdentities(pgid).find(({ pid }) => pid === process.pid);
+  assert.ok(self, "the host exposes process birth facts");
+  assert.equal(groupHasRecordedMember(pgid, [self]), true);
+  assert.equal(groupHasRecordedMember(pgid, [{ ...self, startTime: `${self.startTime}-different-birth` }]), false,
+    "a recycled PID is not the original member");
+  assert.equal(groupHasRecordedMember(0, [self]), false, "a member that left the pgid cannot prove ownership");
+  assert.equal(groupHasRecordedMember(pgid, []), false, "missing TERM-time facts fail closed");
+});
 
 test("a process outside the run's recorded process groups is reported held, never killed (A2)", async () => {
   // `setpgrp(0,0)` puts this process into its own new process group, so its

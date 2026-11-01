@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import { childEnv, runCommand } from "../../src/effects/shell.ts";
+import { childEnv, runCommand, shBoundFor } from "../../src/effects/shell.ts";
 // A2/C3 (plan 06e): the sweep owns the signalling decision, so the recovery
 // path's killGroup lives there now.
 import { killGroup } from "../../src/effects/sweep.ts";
@@ -53,6 +53,21 @@ function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
   });
 }
 
+test("a worker's tt test --changed command is bounded by TT_SH_MINUTES", async () => {
+  const deadlines = { shCommandMs: 150, termGraceMs: 100 };
+  for (const command of ['tt test --changed --run "$TT_RUN_DIR"', 'node /x/cli.ts test --changed --run /tmp/r', 'sleep 100']) {
+    assert.deepEqual(shBoundFor(command, deadlines), { deadlineMs: 150, termGraceMs: 100 });
+  }
+  // A real executable named tt, not just a string-policy assertion. It must
+  // be killed at the worker cap even though its CLI default would be longer.
+  const tt = path.join(dir, "tt");
+  fs.writeFileSync(tt, "#!/bin/sh\nsleep 100\n", { mode: 0o755 });
+  const command = `${tt} test --changed --run /tmp/r`;
+  const outcome = await runCommand({ command, ...shBoundFor(command, deadlines) }).result;
+  assert.equal(outcome.timedOut, true);
+  assert.ok(outcome.signalsSent.includes("SIGTERM"));
+});
+
 test("onIntent observes the pgid strictly before the command's first side effect", async () => {
   const marker = path.join(dir, "marker");
   let markerExistedDuringIntent = true;
@@ -99,6 +114,87 @@ test("deadline escalation: a TERM-ignoring command ends in SIGKILL", async () =>
   assert.equal(outcome.timedOut, true);
   assert.deepEqual(outcome.signalsSent, ["SIGTERM", "SIGKILL"]);
   assert.equal(outcome.signal, "SIGKILL");
+});
+
+test("a worker command's child that ignores SIGTERM is killed after the grace", async () => {
+  const pidFile = path.join(dir, "term-ignoring-child");
+  const script = "import os, signal, time\n" +
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" +
+    `open(${JSON.stringify(pidFile)}, 'w').write(str(os.getpid()))\n` +
+    "while True: time.sleep(0.01)\n";
+  // The shell leader honors TERM; only its child ignores it. The leader's
+  // exit must not cancel escalation or remove the group from bookkeeping.
+  const command = `python3 -c '${script.replaceAll("'", "'\\''")}' & wait`;
+  const running = runCommand({ command, deadlineMs: 1000, termGraceMs: 200 });
+  try {
+    await waitFor(() => fs.existsSync(pidFile), 3000);
+    const pid = Number(fs.readFileSync(pidFile, "utf8"));
+    const outcome = await running.result;
+    assert.equal(outcome.timedOut, true);
+    assert.equal(outcome.signal, "SIGTERM", "the leader exited on TERM");
+    assert.deepEqual(outcome.signalsSent, ["SIGTERM", "SIGKILL"]);
+    await waitFor(() => {
+      try {
+        const state = execFileSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" }).trim();
+        return state.length === 0 || state.startsWith("Z");
+      } catch { return true; }
+    });
+  } finally {
+    // Also clean up when testing the broken revision, whose child survives.
+    await killGroup(await running.pgid, { termGraceMs: 50 });
+  }
+});
+
+test("a grace-expiry kill never signals a recycled process group", { skip: process.platform !== "linux" || !fs.existsSync("/proc/self/stat") }, async () => {
+  const marker = path.join(dir, "recycled-child");
+  const originalKill = process.kill;
+  let group: number | undefined;
+  let childPid: number | undefined;
+  let reused = false;
+  const foreignSignals: unknown[] = [];
+  const script = "import os,signal,time; signal.signal(signal.SIGTERM,lambda *_: None); " +
+    `open(${JSON.stringify(marker)},"w").write(str(os.getpid())); time.sleep(0.8)`;
+  // Delegate real signals until BOTH the real group and child are gone.
+  // Thereafter emulate OS reuse of just the numeric pgid, intercepting any
+  // destructive signal so the probe never harms an unrelated process.
+  process.kill = function (pid, signal) {
+    if (group !== undefined && pid === -group) {
+      if (signal === 0 && !reused) {
+        try { return originalKill.call(process, pid, signal); }
+        catch (err) {
+          if (childPid && !fs.existsSync(`/proc/${childPid}`)) reused = true;
+          else throw err;
+        }
+      }
+      if (reused) {
+        if (signal !== 0) foreignSignals.push(signal);
+        return true;
+      }
+    }
+    return originalKill.call(process, pid, signal);
+  };
+  try {
+    const running = runCommand({
+      command: `python3 -c '${script}' </dev/null >/dev/null 2>&1 & wait`,
+      deadlineMs: 400,
+      termGraceMs: 1200,
+      sampler: () => ({ rssMB: 0, freeMemMB: 0 }),
+    });
+    group = await running.pgid;
+    await waitFor(() => fs.existsSync(marker));
+    childPid = Number(fs.readFileSync(marker, "utf8"));
+    const outcome = await running.result;
+    assert.equal(reused, true, "reuse injected only after the original group died");
+    assert.deepEqual(foreignSignals, [], "no signal may target the replacement group");
+    assert.deepEqual(outcome.signalsSent, ["SIGTERM"]);
+    assert.equal(outcome.escalationSkipped, "group ownership unproven");
+  } finally {
+    process.kill = originalKill;
+    // Never signal the numeric pgid after simulated reuse, even in cleanup.
+    if (group !== undefined && !reused) {
+      try { originalKill.call(process, -group, "SIGKILL"); } catch { /* gone */ }
+    }
+  }
 });
 
 test("a command that honors SIGTERM does not escalate to SIGKILL", async () => {

@@ -237,7 +237,7 @@ export class RunSocketServer {
       this.#write(conn.socket, {
         type: "sh_output",
         commandId: msg.commandId,
-        chunk: shTimeoutNote(deadline.deadlineMs, result.resourceSample),
+        chunk: shTimeoutNote(deadline.deadlineMs, result.resourceSample, msg.command),
         stream: "stderr",
       });
     }
@@ -274,6 +274,16 @@ export class RunSocketServer {
   }
 }
 
+/** Plan 07h2 (R12): how much of a killed command the note quotes — enough to
+ * recognise it, never a whole script. */
+const SH_NOTE_COMMAND_CHARS = 160;
+
+/** One line, at most `limit` characters, with an ellipsis when it was cut. */
+function oneLine(text: string, limit: number): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length <= limit ? flat : `${flat.slice(0, limit - 1)}…`;
+}
+
 /** What an agent reads when its command hits the per-command limit. A bare
  * "timed out" made agents rerun the same command (run b46255dc: a test file
  * that could not finish inside the limit, piped through `tail`, returned no
@@ -281,11 +291,15 @@ export class RunSocketServer {
  * the note also says how much memory the command used and how much the
  * machine had left, from the sampler, so a memory-hungry command is not
  * rerun blindly. */
-export function shTimeoutNote(deadlineMs: number | undefined, sample?: ResourceSample): string {
+export function shTimeoutNote(deadlineMs: number | undefined, sample?: ResourceSample, command?: string): string {
   const limit = deadlineMs === undefined ? "the time limit" : `${Math.round(deadlineMs / 1000)} s`;
   const memory = sample ? ` It used about ${sample.peakRssMB} MB (peak RSS); the machine had about ${sample.freeMemMB} MB free.` : "";
+  // Plan 07h2 (R12): the note names the command it killed, truncated to one
+  // line, so the worker can see WHICH of its commands hit the bound (exex
+  // 01c3a: a worker could not tell its own hung script from the limit).
+  const named = command === undefined || command.trim().length === 0 ? "the command" : oneLine(command.trim(), SH_NOTE_COMMAND_CHARS);
   return (
-    `\n[tt: command killed after ${limit} (the per-command limit). The same command will be killed again. ` +
+    `\n[tt: killed after ${limit} (the per-command limit). The command \`${named}\` was killed with its WHOLE process group, so any child process it started died with it. The same command will be killed again. ` +
     `${memory} ` +
     "Narrow it (one test: --test-name-pattern) or find why it does not finish (a test waiting for an event that never comes). " +
     "Output piped through tail or head is lost when a command is killed.]\n"

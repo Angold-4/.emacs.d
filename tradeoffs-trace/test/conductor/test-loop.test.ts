@@ -10,7 +10,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { CHANGED_TEST_BUDGET_MS, checkTestFiles, isChangedTestCommand, testFilesImporting } from "../../src/core/checks.ts";
+import { CHANGED_TEST_BUDGET_MS, checkTestFiles, testFilesImporting } from "../../src/core/checks.ts";
 import { cleanupDir } from "./harness.ts";
 
 const CLI = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
@@ -97,13 +97,8 @@ test("plan 06l: tt test --changed runs only affected test files and reuses a pas
     const noMatchAgain = tt(["test", "--changed", "--plan", planPath, "--repo", repo], env);
     assert.match(noMatchAgain.stderr, /no test file imports/, "no pass was recorded for a run that ran no tests");
 
-    // Its own budget, not the 6-minute shell cap.
-    assert.ok(CHANGED_TEST_BUDGET_MS > 6 * 60_000, `tt test --changed's budget (${CHANGED_TEST_BUDGET_MS}ms) must exceed the 6-minute shell cap`);
-    assert.equal(isChangedTestCommand('tt test --changed --run "$TT_RUN_DIR"'), true);
-    assert.equal(isChangedTestCommand("node /x/cli.ts test --changed --run /tmp/r"), true);
-    assert.equal(isChangedTestCommand("node --test test/a.test.ts"), false);
-    // A shell separator must not let another long command ride the budget.
-    assert.equal(isChangedTestCommand("tt test --changed --run /tmp/r && make check"), false);
+    // Outside a worker sh, the CLI retains its standalone default.
+    assert.equal(CHANGED_TEST_BUDGET_MS, 20 * 60_000);
   } finally {
     cleanupDir(repo);
     cleanupDir(logDir);

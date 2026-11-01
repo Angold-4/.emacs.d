@@ -661,3 +661,17 @@ export function headOf(worktree: string): string | undefined {
     return undefined;
   }
 }
+
+/** Plan 07h2 (R11): the paths a worktree has changed and NOT committed —
+ * `git status --porcelain`'s one entry per path. Empty for a clean tree, and
+ * empty for a directory that is not a worktree at all (nothing to keep). */
+export function uncommittedFiles(worktree: string): string[] {
+  try {
+    return git(["-C", worktree, "status", "--porcelain"])
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+  } catch {
+    return [];
+  }
+}

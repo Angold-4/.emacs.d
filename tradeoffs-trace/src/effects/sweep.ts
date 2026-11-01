@@ -23,6 +23,7 @@
 // as a one-shot guarantee.
 
 import { execFileSync } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
 import * as path from "node:path";
 
 import { readLog } from "./log.ts";
@@ -76,6 +77,55 @@ export function signalGroup(pgid: number, signal: SignalName): boolean {
 /** True when any process in PGID's group still exists (signal 0). */
 export function groupAlive(pgid: number): boolean {
   return signalGroup(pgid, 0);
+}
+
+/** A process birth identity, not just a recyclable numeric PID. */
+export interface GroupMemberIdentity {
+  pid: number;
+  startTime: string;
+}
+
+/** Live members of PGID, or no proven members when process facts cannot be
+ * read. Linux uses /proc start ticks (field 22), never ps's rounded wall
+ * clock. Both snapshots use this same measure. A vanished/unreadable member
+ * is omitted; it cannot establish ownership. Zombies cannot hold ownership.
+ * On macOS ps provides the birth time for both reads. */
+export function groupMemberIdentities(pgid: number): GroupMemberIdentity[] {
+  const members: GroupMemberIdentity[] = [];
+  if (process.platform === "linux") {
+    let entries: string[];
+    try { entries = readdirSync("/proc"); } catch { return members; }
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      try {
+        const stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+        // comm (field 2) may contain spaces and parentheses.
+        const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+        if (Number(fields[2]) !== pgid || fields[0] === "Z" || fields[0] === "X") continue;
+        const startTime = fields[19];
+        if (startTime && /^\d+$/.test(startTime)) members.push({ pid: Number(entry), startTime });
+      } catch { /* exited or unreadable: not proven */ }
+    }
+    return members;
+  }
+  if (process.platform === "darwin") {
+    try {
+      const out = execFileSync("ps", ["-A", "-o", "pid=,pgid=,stat=,lstart="], { encoding: "utf8" });
+      for (const line of out.split("\n")) {
+        const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);
+        if (match && Number(match[2]) === pgid && !match[3].startsWith("Z") && Number.isFinite(Date.parse(match[4]))) {
+          members.push({ pid: Number(match[1]), startTime: match[4] });
+        }
+      }
+    } catch { /* no process facts: fail closed */ }
+  }
+  return members;
+}
+
+/** An identified descendant counts even after its group leader exited. */
+export function groupHasRecordedMember(pgid: number, recorded: readonly GroupMemberIdentity[]): boolean {
+  const starts = new Map(recorded.map(({ pid, startTime }) => [pid, startTime]));
+  return groupMemberIdentities(pgid).some(({ pid, startTime }) => starts.get(pid) === startTime);
 }
 
 /** SIGTERM to PGID's whole group, then SIGKILL after `termGraceMs` if it is
