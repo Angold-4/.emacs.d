@@ -13,7 +13,7 @@ import { admit, admitPiCommand } from "./effects/admit.ts";
 import { AdmitRefusal, admitRefusalText, type AdmitException } from "./core/admit.ts";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync, existsSync, openSync, mkdirSync, writeFileSync, renameSync, rmSync, symlinkSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { readFileSync, existsSync, openSync, mkdirSync, writeFileSync, renameSync, rmSync, symlinkSync, readdirSync, realpathSync, statSync, appendFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -57,7 +57,8 @@ import { CHANGED_TEST_BUDGET_MS, checkTestFiles, effectiveChecks, testFilesImpor
 // creating runs that are immediately environment-blocked.
 import { envPreflight } from "./core/env-preflight.ts";
 import { buildView, chartModelsFromPlan, prSummary, timingReport, timingText, whyReport, whyText } from "./view.ts";
-import { removedTestsBetween } from "./effects/git.ts";
+import { removedTestsBetween, removeWorktree } from "./effects/git.ts";
+import { pruneRunTargets } from "./effects/prune.ts";
 import { deliver, restack } from "./effects/deliver.ts";
 import {
   loggedSecretStatus,
@@ -852,16 +853,37 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
     if (args.length !== 1) usage();
     const dir = resolveProgramDir(args[0], root);
     appendProgramEvent(dir, { type: "PROGRAM_STOPPED" });
-    try {
+    // Plan 07h2 (A3/R5, program f345a473): a stopped program leaves NO
+    // scheduler process behind. SIGTERM first (a clean exit records the stop),
+    // then SIGKILL after a bounded wait, then a second bounded wait — a
+    // scheduler that ignores SIGTERM must not keep starting nodes.
+    const schedulerPid = (): number | undefined => {
+      try {
+        const pid = Number(readFileSync(programPaths(dir).pid, "utf8"));
+        return pid > 0 ? pid : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    const waitGone = async (ms: number): Promise<void> => {
+      const deadBy = Date.now() + ms;
+      while (programPidAlive(dir) && Date.now() < deadBy) await new Promise((r) => setTimeout(r, 50));
+    };
+    const pid = schedulerPid();
+    if (pid !== undefined) {
       // A2/C3 (plan 06e): the sweep owns the signalling decision.
-      signalProcess(Number(readFileSync(programPaths(dir).pid, "utf8")), "SIGTERM");
-    } catch {
-      // not running
+      signalProcess(pid, "SIGTERM");
+      await waitGone(5_000);
+      if (programPidAlive(dir)) {
+        signalProcess(pid, "SIGKILL");
+        await waitGone(5_000);
+      }
     }
-    // Let the scheduler die before recording statuses, so its last tick cannot
-    // overwrite the chart this command is about to write (M-7).
-    const deadBy = Date.now() + 5_000;
-    while (programPidAlive(dir) && Date.now() < deadBy) await new Promise((r) => setTimeout(r, 50));
+    if (programPidAlive(dir)) {
+      process.stderr.write(`could not stop program ${path.basename(dir)}: scheduler pid ${pid ?? "?"} is still alive\n`);
+      process.exitCode = 1;
+      return;
+    }
     const { state } = foldProgram(dir);
     for (const [node, n] of Object.entries(state.nodes)) {
       if (!n.runId || !["running", "needs-you"].includes(n.status)) continue;
@@ -1245,6 +1267,11 @@ async function runConductorProcess(runDir: string): Promise<void> {
   process.on("SIGINT", cleanStop);
   try {
     await conductor.start();
+    // Plan 07h2 (A3/R4): `start()` returns once the run is under way; the
+    // stop is what ends this process. Waiting on it here is what makes a
+    // finished run's conductor exit instead of living on in a stray handle
+    // (run d170bb37 was still alive 7.5 h after DONE).
+    await conductor.stopped;
   } catch (err) {
     // 07 design §3.4: a refused ADMIT is the run's own named exception, and it
     // is what the operator sees in conductor.log — not a bare stack trace.
@@ -1255,6 +1282,35 @@ async function runConductorProcess(runDir: string): Promise<void> {
     }
     throw err;
   }
+  // Plan 07h2 (A3/R4, run d170bb37: 7.5 h alive after DONE, 134 GB of
+  // targets): a run that reached DONE or BLOCKED has no further use for its
+  // worktrees or its build targets, and its conductor process exits instead of
+  // waiting on a handle nobody closes. A run stopped by the owner keeps both
+  // — that work is unfinished, not finished.
+  const phase = conductor.state.phase.phase;
+  if (phase === "DONE" || phase === "BLOCKED") {
+    let lanes: string[] = [];
+    try {
+      lanes = readdirSync(path.join(runDir, "worktrees")).map((name) => path.join(runDir, "worktrees", name));
+    } catch {
+      lanes = [];
+    }
+    let removed: string[] = [];
+    try {
+      removed = pruneRunTargets(runDir, { run: p.worktree, lanes }, (dir) => removeWorktree(plan.repo, dir)).removed;
+    } catch (err) {
+      process.stderr.write(`could not prune ${runDir}: ${String((err as Error)?.message ?? err)}\n`);
+    }
+    try {
+      appendFileSync(p.log, `${new Date().toISOString()} pruned ${removed.length} director${removed.length === 1 ? "y" : "ies"} after ${phase}\n`);
+    } catch {
+      // the prune itself is the work; the log line is a courtesy
+    }
+  }
+  // The process that owns this run is done. Exiting explicitly is what makes
+  // `conductorAlive` false and stops a stray handle from keeping a finished
+  // run's process (and its memory) around for hours.
+  process.exit(0);
 }
 
 /** design §9.2/round-of-review item 2: `tt status` rebuilds state the same

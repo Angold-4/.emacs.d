@@ -1540,6 +1540,26 @@ whole program; warnings are shown and it starts."
   (json-parse-string (+tt--cli "program" "state" dir) :object-type 'alist :array-type 'list
                      :null-object nil :false-object :false))
 
+(defun +tt-export-program (file)
+  "Print FILE's program (or multi-phase plan) as the JSON `tt program start' reads.
+Plan 07h2 (A2): this is the exporter a program scheduler re-runs at a NODE
+start, so a program fixed between nodes applies without restarting the
+program.  It is the same parser `tt program start' is given.  Errors go to
+stderr and the exit code is 1, which the scheduler reports as
+`X:PLAN_DEFECT' for that node."
+  (let* ((buffer (find-file-noselect file))
+         (parsed (with-current-buffer buffer (+tt-parse-program)))
+         (errors (plist-get parsed :errors)))
+    (with-current-buffer buffer (set-buffer-modified-p nil))
+    (kill-buffer buffer)
+    (if errors
+        (progn
+          (dolist (e errors)
+            (princ (format "line %d: %s\n" (car e) (cdr e)) #'external-debugging-output))
+          (kill-emacs 1))
+      (princ (json-encode (plist-get parsed :program)))
+      (terpri))))
+
 (defun +tt--program-point-anchor ()
   "The run id on the program line at point, for restoring point after a refresh.
 A node line (and its indented detail lines) carries `+tt-run-id'; a line of

@@ -13,19 +13,24 @@
 // the version and the path — even when the recorded PATH is right.
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { AdmitRefusal, Conductor, createRun, runPaths, type RunPlanFile } from "../../src/conductor.ts";
+import { AdmitRefusal, Conductor, contractVersionFor, createRun, runPaths, type RunPlanFile } from "../../src/conductor.ts";
 import { ADMIT_PINNED_PI } from "../../src/core/admit.ts";
+import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import {
   cleanupDir,
+  defaultReviewerHello,
   defaultWorkerHello,
   FAKE_PI_PATH,
   makeRepo,
   makeRunRoot,
   readEvents,
+  setupConductor,
   waitFor,
   writeScript,
 } from "./harness.ts";
@@ -347,5 +352,273 @@ test("a conductor start refuses a check command that does not parse, before any 
     cleanupDir(scripts);
     cleanupDir(runRoot);
     cleanupDir(repo.dir);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Plan 07h2 (A3/R4, R11, R12): what a stopped-or-finished run leaves behind, and
+// what a worker's shell command may never outlive.
+// ---------------------------------------------------------------------------
+
+const CLI_PATH = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
+
+function pidFile(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Pids whose command line contains TOKEN (the whole process table, so a
+ * busy-loop child spawned by a script is found too). */
+function pidsWith(token: string): number[] {
+  const out = execFileSync("ps", ["-eo", "pid=,args="], { encoding: "utf8" });
+  const pids: number[] = [];
+  for (const line of out.split("\n")) {
+    if (!line.includes(token)) continue;
+    const pid = Number(line.trim().split(/\s+/)[0]);
+    if (Number.isFinite(pid) && pid > 0 && pid !== process.pid) pids.push(pid);
+  }
+  return pids;
+}
+
+test("plan 07h2 (R4, run d170bb37): a conductor at DONE exits and removes the run's worktrees and build targets", async () => {
+  const repo = makeRepo();
+  const root = shortTmp("tt-07h2-root");
+  const scriptsDir = shortTmp("tt-07h2-scripts");
+  const plan: RunPlanFile = {
+    title: "lifecycle prune",
+    repo: repo.dir,
+    integrationBranch: "main",
+    checks: ["true"],
+    phases: [{ id: "p1", goal: "do the thing", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [] }],
+  };
+  fs.writeFileSync(path.join(scriptsDir, "plan.json"), JSON.stringify(plan));
+  // The worker builds "134 GB of targets" the way the incident did: inside its
+  // own worktree, before it submits.
+  fs.writeFileSync(
+    path.join(scriptsDir, "worker.json"),
+    JSON.stringify({
+      hello: { role: "worker", tools: ROLE_TOOLS.worker },
+      steps: [
+        { kind: "call-sh", command: "mkdir -p target node_modules/pkg && echo big > target/big.bin && echo dep > node_modules/pkg/index.js" },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+  );
+  fs.writeFileSync(
+    path.join(scriptsDir, "reviewer.json"),
+    JSON.stringify({
+      hello: { role: "reviewer", tools: ROLE_TOOLS.reviewer },
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer: "$TT_REVIEWER",
+            phaseId: "p1",
+            candidateSha: "$TT_CANDIDATE_SHA",
+            contractVersion: contractVersionFor(plan.phases[0]),
+            correctionStatements: [],
+            findingStatements: [],
+          },
+        },
+      ],
+    }),
+  );
+  const env = {
+    ...process.env,
+    TT_TEST_MODE: "1",
+    TT_TEST_PI_COMMAND: process.execPath,
+    TT_TEST_PI_ARGS_PREFIX: JSON.stringify([FAKE_PI_PATH]),
+    TT_TEST_STUB_REVIEWS: "1",
+    TT_TEST_DEADLINES: JSON.stringify({ abortGraceMs: 300, termGraceMs: 300, helloTimeoutMs: 5_000, reviewMs: 20_000, freezeMs: 20_000 }),
+    FAKE_PI_SCRIPT: scriptsDir,
+  };
+  let runId = "";
+  let runDir = "";
+  try {
+    runId = execFileSync(process.execPath, [CLI_PATH, "start", path.join(scriptsDir, "plan.json"), "--root", root], { encoding: "utf8", env }).trim();
+    runDir = path.join(root, runId);
+    const paths = runPaths(runDir);
+    // The worktree existed, with the targets inside it.
+    await waitFor(() => fs.existsSync(path.join(paths.worktree, "target", "big.bin")), 30_000, 50, runDir);
+    // The stage the incident never reached: the conductor process's own exit.
+    const conductorPid = Number(fs.readFileSync(path.join(runDir, "conductor.pid"), "utf8"));
+    await waitFor(() => !pidFile(conductorPid), 180_000, 200, runDir);
+    assert.equal(pidFile(conductorPid), false, "no conductor process remains after DONE");
+    const status = execFileSync(process.execPath, [CLI_PATH, "status", runId, "--root", root], { encoding: "utf8", env });
+    assert.match(status, /phase: p1 — DONE/, `the run ended DONE:\n${status}`);
+
+    // The worktrees and the build targets are gone; the run's evidence is not.
+    assert.equal(fs.existsSync(paths.worktree), false, "the run's worktree is pruned");
+    assert.equal(fs.existsSync(path.join(runDir, "worktrees")), false, "no lane worktrees remain");
+    assert.equal(fs.existsSync(path.join(paths.candidates, "target")), false);
+    assert.equal(fs.existsSync(paths.events), true, "the control log is kept");
+    assert.ok(readEvents(runDir).length > 0);
+    // Nothing named `target` survives anywhere in the run directory.
+    const leftovers = execFileSync("find", [runDir, "-name", "target", "-type", "d"], { encoding: "utf8" }).trim();
+    assert.equal(leftovers, "", `no target directory survives:\n${leftovers}`);
+  } finally {
+    try {
+      if (runId) execFileSync(process.execPath, [CLI_PATH, "stop", runId, "--root", root], { env });
+    } catch {
+      // already gone
+    }
+    cleanupDir(root);
+    cleanupDir(scriptsDir);
+    cleanupDir(repo.dir);
+  }
+});
+
+test("plan 07h2 (R11, exex 01c3b): an owner stop and resume keep a lane's uncommitted work, and the resumed worker is told its worktree is unchanged", async () => {
+  const scripts = shortTmp("tt-07h2-lanes");
+  const promptLog = path.join(scripts, "prompts.log");
+  let conductor: Conductor | undefined;
+  let resumed: Conductor | undefined;
+  const setup = await setupConductor({
+    checks: ["true"],
+    phase: { id: "p1", goal: "two lanes", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [], workers: 2 },
+    deadlines: FAST,
+    laneWorkerScriptFor: (lane) =>
+      lane === "a"
+        ? { hello: defaultWorkerHello(), steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } }] }
+        : {
+            hello: defaultWorkerHello(),
+            // The lane's uncommitted edit, then it waits for the owner's stop.
+            steps: [{ kind: "call-sh", command: "printf 'kept work\\n' > uncommitted.txt" }, { kind: "hang-until-abort" }],
+          },
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [{ kind: "call-sh", command: "printf 'kept work\\n' > uncommitted.txt" }, { kind: "hang-until-abort" }],
+    }),
+    reviewerScriptFor: () => ({ hello: defaultReviewerHello(), steps: [] }),
+  });
+  const laneWorktree = path.join(setup.runDir, "worktrees", "lane-b");
+  try {
+    conductor = setup.conductor;
+    await conductor.start();
+    // Lane b has an UNCOMMITTED file in its own worktree...
+    await waitFor(() => fs.existsSync(path.join(laneWorktree, "uncommitted.txt")), 60_000, 50, setup.runDir);
+    const status = execFileSync("git", ["-C", laneWorktree, "status", "--porcelain"], { encoding: "utf8" });
+    assert.match(status, /uncommitted\.txt/, "the edit is uncommitted before the stop");
+
+    // ...the owner stops, and the edit survives the stop.
+    await conductor.stop();
+    conductor = undefined;
+    assert.ok(fs.existsSync(path.join(laneWorktree, "uncommitted.txt")), "the lane's edits are still on disk after the stop");
+    assert.equal(
+      execFileSync("git", ["-C", laneWorktree, "status", "--porcelain"], { encoding: "utf8" }).includes("uncommitted.txt"),
+      true,
+      "and still uncommitted",
+    );
+    const keptRecord = readEvents(setup.runDir).find((r) => r.kind === "lane_worktree_kept");
+    assert.ok(keptRecord, "the stop recorded the kept lane worktree (so a resume can find it)");
+
+    // The resume: the same run, the same plan, a fresh prompt log.
+    resumed = new Conductor({
+      runDir: setup.runDir,
+      plan: setup.plan,
+      piCommand: process.execPath,
+      piArgsPrefix: [FAKE_PI_PATH],
+      piEnvFor: (role, agentId) => {
+        if (role !== "worker") return undefined;
+        const script = writeScript(scripts, `resume-${agentId}`, {
+          hello: defaultWorkerHello(),
+          steps: [{ kind: "hang-until-abort" }],
+        });
+        return { FAKE_PI_SCRIPT: script, FAKE_PI_PROMPT_LOG: promptLog };
+      },
+      stubReviews: true,
+      deadlines: FAST,
+      checkLockPath: path.join(setup.runRoot, "check.lock"),
+      gateLockPath: path.join(setup.runRoot, "gate.lock"),
+    });
+    await resumed.start();
+    await waitFor(() => fs.existsSync(promptLog), 60_000, 50, setup.runDir);
+    const prompts = fs.readFileSync(promptLog, "utf8");
+    assert.match(prompts, /worktree of lane b is unchanged/, "the resumed worker is told its worktree is unchanged");
+    assert.ok(fs.existsSync(path.join(laneWorktree, "uncommitted.txt")), "the resumed run did not reset the lane's worktree");
+    assert.ok(
+      readEvents(setup.runDir).some(
+        (r) => r.kind === "lane_worktree_reused" && String(JSON.stringify(r.event)).includes("unchanged"),
+      ),
+      "the reuse is recorded, so the work is not silently recreated",
+    );
+  } finally {
+    if (conductor) await conductor.stop().catch(() => undefined);
+    if (resumed) await resumed.stop().catch(() => undefined);
+    await setup.conductor.stop().catch(() => undefined);
+    cleanupDir(scripts);
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    cleanupDir(setup.repo.dir);
+  }
+});
+
+test("plan 07h2 (R12, exex 01c3a): a worker's command and the child process it spawns are killed at the sh bound, and the worker is told the command, the bound and that it was killed", async () => {
+  const scripts = shortTmp("tt-07h2-sh");
+  const marker = "tt-07h2-busyloop";
+  let conductor: Conductor | undefined;
+  let setup: Awaited<ReturnType<typeof setupConductor>> | undefined;
+  try {
+    setup = await setupConductor({
+      checks: ["true"],
+      // The bound the incident's plan set (TT_SH_MINUTES), shortened for the
+      // test: the point is that EVERY command a worker runs is bounded by it.
+      deadlines: { ...FAST, shCommandMs: 3_000 },
+      workerScript: () => ({
+        hello: defaultWorkerHello(),
+        steps: [
+          {
+            kind: "call-sh",
+            // A script the worker wrote itself: it starts a CHILD of its own
+            // that busy-loops, then busy-loops itself. Both must die.
+            command: `python3 -c 'import subprocess, sys
+subprocess.Popen([sys.executable, "-c", "import time\\nwhile True: time.sleep(0.01)  # ${marker}-child"])
+while True: pass  # ${marker}'`,
+          },
+          { kind: "hang-until-abort" },
+        ],
+      }),
+      reviewerScriptFor: () => ({ hello: defaultReviewerHello(), steps: [] }),
+    });
+    conductor = setup.conductor;
+    await conductor.start();
+    // The command really ran (it is the one that is over the bound, not a
+    // command that never started).
+    await waitFor(() => pidsWith(marker).length > 0, 30_000, 50, setup.runDir);
+    // Past the 3 s bound the WHOLE process group is killed — the python script
+    // and the child it spawned.
+    await waitFor(() => pidsWith(marker).length === 0, 30_000, 100, setup.runDir);
+    assert.deepEqual(pidsWith(marker), [], "no process of the killed command survives, child included");
+    // The worker got the note: its command, the bound, and that it was killed.
+    const streamDir = path.join(setup.runDir, "stream");
+    const streams = fs
+      .readdirSync(streamDir)
+      .filter((name) => name.startsWith("worker-"))
+      .map((name) => fs.readFileSync(path.join(streamDir, name), "utf8"))
+      .join("\n");
+    assert.match(streams, /killed after 3 s/, "the note names the bound that killed it");
+    assert.match(streams, /process group/, "the note says the whole process group was killed");
+    assert.ok(streams.includes("python3 -c"), `the note names the command the worker ran:\n${streams.slice(-2000)}`);
+    assert.match(streams, /tt-07h2-busyloop/, "the note quotes the worker's own command text");
+  } finally {
+    if (conductor) await conductor.stop().catch(() => undefined);
+    for (const pid of pidsWith(marker)) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+    if (setup) {
+      cleanupDir(setup.runRoot);
+      cleanupDir(setup.scriptsDir);
+      cleanupDir(setup.repo.dir);
+    }
+    cleanupDir(scripts);
   }
 });

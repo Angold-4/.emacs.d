@@ -12,9 +12,10 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 
-import { createRun, runPaths } from "./conductor.ts";
+import { createRun, runnerRevision, runPaths } from "./conductor.ts";
 // 07 design A1: a node's own start runs the same ADMIT that `tt start` and a
 // resume run — one gate, one verdict, one named exception.
 import { admit, admitPiCommand } from "./effects/admit.ts";
@@ -22,6 +23,7 @@ import { admitRefusalText } from "./core/admit.ts";
 import { triageRecordFor } from "./core/triage.ts";
 import type { RequirementItem } from "./core/items.ts";
 import { readRunState } from "./effects/runner.ts";
+import { hasLintErrors, lintPlan } from "./core/plan-lint.ts";
 import { processAlive } from "./effects/sweep.ts";
 import { envBlockedLine } from "./core/env-preflight.ts";
 import { execFileSync } from "node:child_process";
@@ -512,6 +514,171 @@ export interface SchedulerOptions {
   maxTicks?: number;
   /** Plan 01b: how long a stuck program is watched before its one reminder. */
   notifyReminderMs?: number;
+  /** Plan 07h2 (A2/R3): the exporter a node's own start re-runs over the
+   * program's `--source` file. Injectable, so a test needs no Emacs; the
+   * default is `TT_EXPORT_COMMAND <source>`, else the same Emacs batch
+   * exporter `tt program start` is given. Absent (and unconfigured): a node
+   * starts from the snapshot in `program.json`, exactly as on the base. */
+  exporter?: ProgramExporter;
+  /** Plan 07h2 (A2/R3): the program's current runner, read when a node
+   * starts (never at program start). Defaults to `runnerRevision()`. */
+  runner?: () => string;
+}
+
+/** Plan 07h2 (A2/R3): re-export a program's own source file to the program
+ * JSON the scheduler reads. Throws when the export fails — a node whose plan
+ * cannot be re-exported is blocked with `X:PLAN_DEFECT`. */
+export type ProgramExporter = (source: string) => ProgramFile;
+
+/** Plan 07h2 (A2): the exporter command a host configures (Emacs sets it to
+ * its own batch exporter). `undefined` means no command is configured. */
+export function exporterCommand(): string | undefined {
+  const raw = process.env.TT_EXPORT_COMMAND;
+  return raw !== undefined && raw.trim().length > 0 ? raw.trim() : undefined;
+}
+
+/** The runner's own Emacs exporter file, used when no command is configured. */
+function emacsExporterFile(): string {
+  return fileURLToPath(new URL("../../core/init-tradeoffs-trace.el", import.meta.url));
+}
+
+/** Plan 07h2 (A2/R3): the exporter a node start uses when the caller passes
+ * none. A configured `TT_EXPORT_COMMAND` wins; otherwise this runner's own
+ * Emacs exporter is used, when that Emacs is on this host. `undefined` when
+ * neither is available — a node then keeps the snapshot's plan (base
+ * behaviour, constraint C1). */
+function defaultExporter(): ProgramExporter | undefined {
+  const command = exporterCommand();
+  if (command !== undefined) {
+    return (source) => {
+      const out = execFileSync("/bin/sh", ["-c", `${command} "$1"`, "tt-export", source], {
+        encoding: "utf8",
+        maxBuffer: 64 * 1024 * 1024,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      return parseExportedProgram(out, source);
+    };
+  }
+  const file = emacsExporterFile();
+  if (!fs.existsSync(file) || findOnPath(process.env.TT_EMACS ?? "emacs") === undefined) return undefined;
+  return (source) => {
+    const out = execFileSync(findOnPath(process.env.TT_EMACS ?? "emacs")!, ["--batch", "-Q", "-l", file, "--eval", `(+tt-export-program ${JSON.stringify(source)})`], {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return parseExportedProgram(out, source);
+  };
+}
+
+/** The program JSON an exporter printed, or a named failure. */
+function parseExportedProgram(out: string, source: string): ProgramFile {
+  const text = out.trim();
+  if (text.length === 0) throw new Error(`the exporter printed no program for ${source}`);
+  return JSON.parse(text) as ProgramFile;
+}
+
+/** The absolute path of a binary on PATH, if it is there. */
+function findOnPath(name: string): string | undefined {
+  for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (dir.length === 0) continue;
+    const full = path.join(dir, name);
+    try {
+      if (fs.statSync(full).isFile()) return full;
+    } catch {
+      // not here
+    }
+  }
+  return undefined;
+}
+
+/** Plan 07h2 (A2/R3): what a node's start recorded about the plan it ran —
+ * the source it was re-exported from, the exporter, the program's current
+ * runner and the sha of the plan snapshot the run was created with. Written
+ * into the node's `program.json`, beside the program id. */
+export interface NodeSnapshot {
+  source: string;
+  exporter: "command" | "emacs" | "snapshot";
+  runner: string;
+  planSha256: string;
+  reexported: boolean;
+}
+
+/** Plan 07h2 (A2/R3): the plan a node starts with, and the snapshot recorded
+ * on the node's run. When the program has a `--source` file and an exporter is
+ * available, the source is exported NOW — at the node's start, so a plan fixed
+ * between nodes applies without restarting the program — linted, and used in
+ * place of the snapshot taken when the program started. The program's CURRENT
+ * runner is recorded with it. An export or lint failure is the node's named
+ * `X:PLAN_DEFECT`, never a silent fall back to the older plan. Without a
+ * source or an exporter the snapshot stands (base behaviour, constraint C1). */
+function nodeStartPlan(
+  dir: string,
+  program: ProgramFile,
+  node: ProgramNode,
+  opts: SchedulerOptions,
+): { ok: true; entryId: string; plan: ProgramFile["entries"][number]["plan"]; snapshot: NodeSnapshot } | { ok: false; reason: string } {
+  const entry = program.entries.find((e) => e.id === node.entry)!;
+  const runner = (opts.runner ?? runnerRevision)();
+  const source = readProgramSource(dir);
+  const exporter = opts.exporter ?? defaultExporter();
+  const kept = (why: string): { ok: true; entryId: string; plan: ProgramFile["entries"][number]["plan"]; snapshot: NodeSnapshot } => {
+    try {
+      fs.appendFileSync(programPaths(dir).log, `${new Date().toISOString()} node ${node.id}: starting from the snapshot (${why})\n`);
+    } catch {
+      // a log line that cannot be written must never stop a node
+    }
+    return {
+      ok: true,
+      entryId: entry.id,
+      plan: entry.plan,
+      snapshot: { source: source ?? "", exporter: "snapshot", runner, planSha256: planSha256(entry.plan), reexported: false },
+    };
+  };
+  if (source === undefined) return kept("the program has no source file");
+  if (exporter === undefined) return kept("no exporter is configured");
+  let fresh: ProgramFile;
+  try {
+    fresh = exporter(source);
+  } catch (err) {
+    return { ok: false, reason: `X:PLAN_DEFECT: ${source} could not be re-exported for node ${node.id}: ${String((err as Error)?.message ?? err).split("\n")[0]}` };
+  }
+  const freshEntry = (fresh.entries ?? []).find((e) => e.id === entry.id);
+  if (freshEntry === undefined) {
+    return { ok: false, reason: `X:PLAN_DEFECT: ${source} no longer has an entry ${entry.id} for node ${node.id}` };
+  }
+  if ((freshEntry.plan.phases ?? []).length !== (entry.plan.phases ?? []).length) {
+    return {
+      ok: false,
+      reason: `X:PLAN_DEFECT: ${source}'s entry ${entry.id} has ${(freshEntry.plan.phases ?? []).length} phase(s); node ${node.id} was created for ${(entry.plan.phases ?? []).length}`,
+    };
+  }
+  // The same lint `tt program start` runs, so a re-exported plan that does not
+  // lint blocks the node instead of running.
+  const findings = lintPlan(freshEntry.plan);
+  if (hasLintErrors(findings)) {
+    return {
+      ok: false,
+      reason: `X:PLAN_DEFECT: ${source}'s entry ${entry.id} does not lint: ${findings.find((f) => f.severity === "error")?.message ?? "see tt lint"}`,
+    };
+  }
+  return {
+    ok: true,
+    entryId: entry.id,
+    plan: freshEntry.plan,
+    snapshot: {
+      source,
+      exporter: exporterCommand() !== undefined ? "command" : "emacs",
+      runner,
+      planSha256: planSha256(freshEntry.plan),
+      reexported: true,
+    },
+  };
+}
+
+/** A stable fingerprint of one plan, recorded with the node's snapshot. */
+function planSha256(plan: unknown): string {
+  return createHash("sha256").update(JSON.stringify(plan)).digest("hex");
 }
 
 /** One scheduler step: observe active nodes, start ready ones. Returns the
@@ -551,7 +718,24 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
     }
   }
   for (const id of nextStarts(nodes, state, program.maxParallel)) {
+    // Plan 07h2 (R5, program f345a473): a program the owner stopped while
+    // this tick was observing starts NOTHING new — re-fold the log, so a
+    // `tt program stop` that landed mid-tick wins over the tick's own view.
+    if (foldProgram(dir).state.stopped) break;
     const node = nodes.find((n) => n.id === id)!;
+    // Plan 07h2 (A2/R3): the node's own plan file is re-exported from the
+    // program's `--source` NOW, at the node's start (never at the program's),
+    // and the program's CURRENT runner is recorded with it. An export failure
+    // is the node's `X:PLAN_DEFECT`, before its run exists.
+    const startPlan = nodeStartPlan(dir, program, node, opts);
+    if (!startPlan.ok) {
+      record({ type: "NODE_BLOCKED", node: id, reason: startPlan.reason });
+      continue;
+    }
+    // The re-exported entry carries the node's plan; the graph (ids, deps,
+    // phase order) stays the program-as-started snapshot, like
+    // `program.json` itself, which is never edited.
+    program = { ...program, entries: program.entries.map((e) => (e.id === startPlan.entryId ? { ...e, plan: startPlan.plan } : e)) };
     // Plan 06i: a dependency's carried items become real requirements of this
     // node's contract (an id, the item's text and a VERIFY). A wrong-output
     // item carries a `test` verify; every other carried item is judged by
@@ -596,7 +780,14 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
     const baselineReuse = acceptedCandidateBaseline(program, nodes, node, state, opts.runRoot);
     fs.writeFileSync(
       path.join(runDir, "program.json"),
-      JSON.stringify({ programId: path.basename(dir), node: id, readableId: readableIds[id], ...(baselineReuse ? { baselineReuse } : {}) }),
+      JSON.stringify({
+        programId: path.basename(dir),
+        node: id,
+        readableId: readableIds[id],
+        // Plan 07h2 (A2/R3): the snapshot this node actually started with.
+        snapshot: { ...startPlan.snapshot, planSha256: planSha256(plan) },
+        ...(baselineReuse ? { baselineReuse } : {}),
+      }),
     );
     record({
       type: "NODE_STARTED",

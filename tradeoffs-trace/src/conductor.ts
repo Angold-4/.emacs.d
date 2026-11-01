@@ -282,7 +282,7 @@ import {
   removeWorktree,
   candidateTree,
   saveUnsubmittedWork as gitSaveUnsubmittedWork,
-  verifyIntegrity, removedTestsBetween, testRemovalViolationsBetween, headOf, type DisposableCheckout } from "./effects/git.ts";
+  verifyIntegrity, removedTestsBetween, testRemovalViolationsBetween, headOf, uncommittedFiles, type DisposableCheckout } from "./effects/git.ts";
 import { RunSocketServer, type HelloResult, type SubmitResult } from "./effects/socket.ts";
 import { PiAgent, spawnPiAgent } from "./effects/pi-rpc.ts";
 import { redactBytes, redactRecord, redactText, resolveSecrets, secretNames, secretPromptLines, utf16Kind, type Secret } from "./effects/secrets.ts";
@@ -1547,6 +1547,33 @@ function defaultCheckLockPath(runDir: string): string {
   return path.join(path.dirname(runDir), "check.lock");
 }
 
+/** Plan 07h2 (R10): the `runId` a run's own log starts with — the id a check
+ * window marker carries. Read from the first chunk of `events.jsonl` rather
+ * than the whole file, which grows for the life of a run. */
+function firstLogRunId(runDir: string): string | undefined {
+  let fd: number | undefined;
+  try {
+    const file = runPaths(runDir).events;
+    fd = fs.openSync(file, "r");
+    const buf = Buffer.alloc(8192);
+    const read = fs.readSync(fd, buf, 0, buf.length, 0);
+    const line = buf.subarray(0, read).toString("utf8").split("\n", 1)[0];
+    const record = JSON.parse(line) as { kind?: unknown; event?: { runId?: unknown } };
+    if (record.kind !== "init") return undefined;
+    return typeof record.event?.runId === "string" ? record.event.runId : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // already closed
+      }
+    }
+  }
+}
+
 /** Plan 06g2: a lane round's winner awaiting its reviews' promotion. */
 type PendingLaneWinner = { round: number; lane: string; sha: string; build: LaneBuild; reviews: Array<{ seat: string; review: Review }> };
 
@@ -1836,6 +1863,12 @@ export class Conductor {
    * could not be written. Their dirty worktree is retained (never removed)
    * so the work is not lost, and the next attempt continues in it. */
   #unsavedLaneWorktrees = new Set<string>();
+  /** Plan 07h2 (R11, exex 01c3b): lanes whose worktree held UNCOMMITTED
+   * edits when the owner stopped this run. The worktree is kept as-is across
+   * the stop, the resumed run's worker continues in it, and its prompt says so.
+   * Seeded from the run's own log on every start, so it survives the stop (an
+   * in-memory set would be lost with the process). */
+  #keptLaneWorktrees = new Map<string, { round: number; files: number }>();
   /** Plan 06k3 (A3): the re-run result of each open finding's reproduction
    * command, per candidate, for the reviewer prompt table. Computed once per
    * candidate (after the checks) and reused by every reviewer prompt. */
@@ -1911,6 +1944,10 @@ export class Conductor {
    * survived — before the auto-stop it raced against had actually
    * finished killing the reviewers. */
   #stopping: Promise<void> | undefined;
+  /** Plan 07h2 (A3/R4): resolved by the end of `#doStop`, so the process that
+   * owns the run can await its teardown (`get stopped`) instead of guessing. */
+  #stoppedPromise: Promise<void>;
+  #stoppedResolve!: () => void;
   /** Every agent `sh` process group still running, across all agents —
    * including ones whose handle is already gone (a force-killed worker's
    * orphaned command). Removed when the command exits, so `stop()` only
@@ -1921,6 +1958,10 @@ export class Conductor {
    * gate) that are still running, each with the time it was recorded. */
   #liveStageGroups = new Map<number, number>();
   #stopRequested = false;
+  /** Plan 07h2 (R10): the ids of this run's program siblings, read once from
+   * the log of each run under the same root (`#programSiblingIds`). */
+  #programSiblingIdsCache: Set<string> | undefined;
+  #programSiblingsRead = false;
   /** Plan 07e (E4): why the stop was requested, read by the honest check
    * record. Set with `#stopRequested`; never read before it is true. */
   #stopCause: StopCause = "conductor";
@@ -2007,6 +2048,10 @@ export class Conductor {
     this.#stubReviews = opts.stubReviews ?? false;
     this.#briefsEnabled = opts.briefs ?? false;
     this.#probeReuse = opts.probeReuse ?? true;
+    // Plan 07h2 (A3/R4): the promise the run's own process waits on.
+    this.#stoppedPromise = new Promise<void>((resolve) => {
+      this.#stoppedResolve = resolve;
+    });
     this.#now = opts.now ?? Date.now;
     this.#gateLockPath = opts.gateLockPath ?? path.join(os.homedir(), ".tradeoffs-trace", "gate.lock");
     // Plan 07a (OD-3): the check lock defaults to the run's own root, not the
@@ -2117,6 +2162,18 @@ export class Conductor {
     this.#recordCheckEnv(admitted.path);
 
     const { records } = readLog(this.#paths.events);
+    // Plan 07h2 (R11): a lane worktree the previous process kept because it
+    // held uncommitted edits is STILL that lane's worktree on this start — the
+    // set lives in the log, not in memory, so a stop/resume keeps the work.
+    for (const record of records) {
+      if (record.kind !== "lane_worktree_kept") continue;
+      const kept = record.event as { lane?: unknown; round?: unknown; files?: unknown };
+      if (typeof kept.lane !== "string") continue;
+      this.#keptLaneWorktrees.set(kept.lane, {
+        round: typeof kept.round === "number" ? kept.round : 0,
+        files: typeof kept.files === "number" ? kept.files : 0,
+      });
+    }
     const initRecord = records.find((r) => r.kind === "init");
     if (initRecord) {
       const init = initRecord.event as { runId: string; integrationHead: string; runnerRevision?: string; seats?: Seats; workerPrompts?: unknown };
@@ -2964,6 +3021,16 @@ export class Conductor {
     return this.#stopping;
   }
 
+  /** Plan 07h2 (A3/R4): resolves once this conductor's teardown has finished,
+   * whether it stopped on its own (DONE/BLOCKED) or the owner stopped it.
+   * `start()` returns as soon as the run is under way — it does not wait for
+   * the stop — so the process that owns the run awaits THIS to know the run is
+   * over, prune it, and exit (run d170bb37 kept a finished run's process alive
+   * for 7.5 hours because nothing did). */
+  get stopped(): Promise<void> {
+    return this.#stoppedPromise;
+  }
+
   async #doStop(): Promise<void> {
     this.#stopRequested = true;
     if (this.#budgetTimer) clearTimeout(this.#budgetTimer);
@@ -2977,6 +3044,12 @@ export class Conductor {
     // Plan 06f (A2): a stopped conductor is neither alive nor waiting, so its
     // row leaves `live.json` here.
     this.#writeLive();
+    // Plan 07h2 (R11, exex 01c3b): an owner stop must never throw away a lane's
+    // uncommitted work. A lane worktree that still holds edits is marked kept
+    // before the log closes, so the resumed run continues in it instead of
+    // recreating it at the base (~35 minutes of lane b's work were lost that
+    // way).
+    this.#recordKeptLaneWorktrees();
     // design §9.3: `tt stop` ends a run's conductor cleanly — the stop event
     // is logged (with why) before anything is torn down, so the record is
     // durable even if a later step is slow or fails.
@@ -3019,6 +3092,9 @@ export class Conductor {
     await this.#socket?.close();
     await this.#lock?.release();
     this.#log?.close();
+    // Plan 07h2 (A3/R4): the run is over — its own process can now prune it
+    // and exit.
+    this.#stoppedResolve();
   }
 
   // -- event application ----------------------------------------------
@@ -4642,6 +4718,51 @@ export class Conductor {
    * worker's process group (SIGSTOP) and its attempt clock, so a check that
    * holds the machine for minutes does not time the worker out. Resumes
    * (SIGCONT) the moment the window closes. Returns a stop function. */
+  /** Plan 07h2 (R10/A2): is `runId` another node of THIS run's program? Two
+   * nodes of one program are one work unit, so node 2's exclusive check window
+   * must not freeze node 1's workers (exex 01c3: `#+TT_PROGRAM: 2` froze the
+   * sibling for the whole check, and the sibling's `sh` bound then read as
+   * "the check took 40 minutes"). A run that is not a program node (no
+   * `program.json`) and a run of a different program are still "another run". */
+  #isSiblingProgramRun(runId: string): boolean {
+    if (runId.length === 0) return false;
+    if (runId === this.#state.phase.runId) return false;
+    return this.#programSiblingIds()?.has(runId) ?? false;
+  }
+
+  /** The `init` run ids of the other runs under this root that belong to THIS
+   * run's program (read once). A window marker records the run id from the
+   * log's `init` record, which is not the run directory's name, so the ids are
+   * collected from each sibling's own log rather than derived from a path. */
+  #programSiblingIds(): Set<string> | undefined {
+    if (this.#programSiblingsRead) return this.#programSiblingIdsCache;
+    this.#programSiblingsRead = true;
+    let ids: Set<string> | undefined;
+    try {
+      const own = JSON.parse(fs.readFileSync(path.join(this.#runDir, "program.json"), "utf8")) as { programId?: unknown };
+      if (typeof own.programId === "string" && own.programId.length > 0) {
+        const root = path.dirname(this.#runDir);
+        const set = new Set<string>();
+        for (const name of fs.readdirSync(root)) {
+          const dir = path.join(root, name);
+          try {
+            const info = JSON.parse(fs.readFileSync(path.join(dir, "program.json"), "utf8")) as { programId?: unknown };
+            if (info.programId !== own.programId) continue;
+            const id = firstLogRunId(dir);
+            if (id !== undefined) set.add(id);
+          } catch {
+            // not one of this program's node runs
+          }
+        }
+        ids = set;
+      }
+    } catch {
+      ids = undefined;
+    }
+    this.#programSiblingIdsCache = ids;
+    return ids;
+  }
+
   #watchCheckWindow(agentId: string, agent: PiAgent, ...timers: Array<PausableTimer<"timeout" | "steer">>): () => void {
     // Plan 07e (E4/A5): opt-in only. A plan without `#+TT_CHECK_WINDOW:
     // exclusive` keeps its workers running through another run's check.
@@ -4686,7 +4807,7 @@ export class Conductor {
     };
     const iv = setInterval(() => {
       if (this.#closed) return;
-      const by = otherCheckWindowOwner(this.#checkLockPath, this.#state.phase.runId);
+      const by = otherCheckWindowOwner(this.#checkLockPath, (owner) => this.#isSiblingProgramRun(owner));
       if (by !== undefined && !paused) pause(by);
       else if (by === undefined && paused) resume();
     }, 100);
@@ -8879,6 +9000,29 @@ export class Conductor {
     return path.join(this.#runDir, "worktrees", `lane-${lane}`);
   }
 
+  /** Plan 07h2 (R11, exex 01c3b): record every lane worktree that still holds
+   * uncommitted edits when this run stops, so the resumed run reuses it. A
+   * finished run keeps nothing (its worktrees are pruned, A3/R4) and a single-
+   * worker phase has no lane worktrees at all. */
+  #recordKeptLaneWorktrees(): void {
+    if (!this.#laneRoundEnabled()) return;
+    const phase = this.#state?.phase.phase;
+    if (phase === "DONE" || phase === "BLOCKED") return;
+    for (const lane of this.#lanes()) {
+      const worktree = this.#laneWorktree(lane);
+      if (!fs.existsSync(worktree)) continue;
+      const files = uncommittedFiles(worktree);
+      if (files.length === 0) continue;
+      const round = (this.#state.phase.rounds ?? []).length;
+      this.#keptLaneWorktrees.set(lane, { round, files: files.length });
+      try {
+        this.#log?.append("lane_worktree_kept", { lane, round, files: files.length });
+      } catch {
+        // A closed log must never stop the stop itself.
+      }
+    }
+  }
+
   /** A repeat of a round that failed only for a missing review or vote: each
    * lane that passed its checks restarts from its own candidate, and a lane
    * whose candidate was still red continues from that red candidate. Derived
@@ -9161,6 +9305,15 @@ export class Conductor {
         `A lane whose unsubmitted work could not be saved to a ref keeps its worktree, so its earlier work is still in it: ${retained.join(", ")}.`,
       );
     }
+    // Plan 07h2 (R11, exex 01c3b): a lane worktree kept across an owner stop is
+    // UNCHANGED — the resumed worker is told so, instead of assuming its earlier
+    // edits were reset to the base and redoing them.
+    const kept = this.#lanes().filter((l) => this.#keptLaneWorktrees.has(l));
+    if (kept.length > 0) {
+      lines.push(
+        `This run was stopped and resumed: the worktree of lane ${kept.join(", ")} is unchanged, so the edits you had not submitted are still in it (uncommitted). Continue from them; do not start over.`,
+      );
+    }
     // Plan 06k1 (A1): when a majority of the previous round's seats said the
     // losing lane had something the winner lacked, the losing lane's anchors
     // are carried into this round's prompt, so both lanes can take them on.
@@ -9245,6 +9398,12 @@ export class Conductor {
         // could not be written to a ref, so its dirty worktree is kept as-is
         // and the worker continues in it.
         this.#log.append("lane_worktree_reused", { lane, round, reason: "unsubmitted work was not saved to a ref" });
+      } else if (this.#keptLaneWorktrees.has(lane) && fs.existsSync(worktree) && headOf(worktree) === base) {
+        // Plan 07h2 (R11): the run was stopped with this lane's edits still
+        // uncommitted. Its worktree is unchanged, so the resumed worker
+        // continues in it — it is never reset to the base.
+        this.#keptLaneWorktrees.delete(lane);
+        this.#log.append("lane_worktree_reused", { lane, round, reason: "the run stopped with uncommitted work; the worktree is unchanged" });
       } else {
         if (fs.existsSync(worktree)) removeWorktree(this.#plan.repo, worktree);
         crashAt("before_create_worktree");
@@ -10630,7 +10789,7 @@ export class Conductor {
    * disposable checkout of its commit, under the machine-wide lock. No
    * command means nothing to gate on, so the fixer is green. */
   async #checkFixer(task: FixTask, round: number, sha: string): Promise<LaneCheck> {
-    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
+    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots, this.#runDir);
     const window = this.#openCheckWindow();
     try {
       const command = this.#state.phase.contract.fixChecks;
@@ -10800,7 +10959,7 @@ export class Conductor {
 
   /** One candidate's checks, run under the machine-wide lock (C2). */
   async #checkLaneCandidate(round: number, lane: string, sha: string): Promise<LaneCheck> {
-    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
+    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots, this.#runDir);
     // Plan 06k1 (A4): the check holds the host-wide window for its duration,
     // so every other run's workers are paused while it runs.
     const window = this.#openCheckWindow();
@@ -11866,7 +12025,7 @@ export class Conductor {
         check = { ok: true };
         this.#log.append("integrated_check_reused", { round, candidateSha: candidate, base: record.base });
       } else {
-        const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
+        const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots, this.#runDir);
         const window = this.#openCheckWindow();
         try {
           this.#log.append("integrated_check_started", { round, candidateSha: candidate, base: record.base });
@@ -14213,7 +14372,7 @@ export class Conductor {
     // holds one of the machine-wide check slots (at most `#checkSlots` checks
     // at once) and the host-wide check window, so every other run's workers
     // pause while this one runs.
-    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
+    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots, this.#runDir);
     const window = this.#openCheckWindow();
     this.#log.intent(actionId, { candidateSha });
     crashAt("before_run_checks");
