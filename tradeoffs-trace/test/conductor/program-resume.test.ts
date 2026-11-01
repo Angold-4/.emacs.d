@@ -264,7 +264,12 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-test("plan 07h2 (R5, program f345a473): tt program stop leaves no scheduler process, and no node starts afterwards", async () => {
+/** Plan 07h2 (R5, program f345a473): a stopped program's scheduler is GONE —
+ * `tt program stop` returns only after the scheduler process has exited, and
+ * nothing starts a node afterwards. Registered under the phase contract's own
+ * test name ("tt program stop leaves no scheduler process") and under this
+ * packet's longer, descriptive one. */
+async function stopLeavesNoSchedulerProcess(): Promise<void> {
   const s = setup();
   let id = "";
   try {
@@ -305,4 +310,7 @@ test("plan 07h2 (R5, program f345a473): tt program stop leaves no scheduler proc
     }
     s.cleanup();
   }
-});
+}
+
+test("plan 07h2 (R5, program f345a473): tt program stop leaves no scheduler process, and no node starts afterwards", stopLeavesNoSchedulerProcess);
+test("tt program stop leaves no scheduler process", stopLeavesNoSchedulerProcess);

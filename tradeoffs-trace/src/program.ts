@@ -598,7 +598,7 @@ function findOnPath(name: string): string | undefined {
  * into the node's `program.json`, beside the program id. */
 export interface NodeSnapshot {
   source: string;
-  exporter: "command" | "emacs" | "snapshot";
+  exporter: "command" | "emacs" | "injected" | "snapshot";
   runner: string;
   planSha256: string;
   reexported: boolean;
@@ -619,9 +619,15 @@ function nodeStartPlan(
   opts: SchedulerOptions,
 ): { ok: true; entryId: string; plan: ProgramFile["entries"][number]["plan"]; snapshot: NodeSnapshot } | { ok: false; reason: string } {
   const entry = program.entries.find((e) => e.id === node.entry)!;
+  // Plan 07h2 (A2): the program's current runner, read NOW — at this node's
+  // start, never cached at the program's — and recorded beside the plan. The
+  // node's run is created under this same value (`createRun`'s `runner`), so
+  // the run's own `meta.json` and this snapshot can never name two runners.
   const runner = (opts.runner ?? runnerRevision)();
   const source = readProgramSource(dir);
   const exporter = opts.exporter ?? defaultExporter();
+  const exporterLabel: NodeSnapshot["exporter"] =
+    opts.exporter !== undefined ? "injected" : exporterCommand() !== undefined ? "command" : "emacs";
   const kept = (why: string): { ok: true; entryId: string; plan: ProgramFile["entries"][number]["plan"]; snapshot: NodeSnapshot } => {
     try {
       fs.appendFileSync(programPaths(dir).log, `${new Date().toISOString()} node ${node.id}: starting from the snapshot (${why})\n`);
@@ -668,7 +674,7 @@ function nodeStartPlan(
     plan: freshEntry.plan,
     snapshot: {
       source,
-      exporter: exporterCommand() !== undefined ? "command" : "emacs",
+      exporter: exporterLabel,
       runner,
       planSha256: planSha256(freshEntry.plan),
       reexported: true,
@@ -767,7 +773,7 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
     }
     let runDir: string;
     try {
-      runDir = createRun(opts.runRoot, plan);
+      runDir = createRun(opts.runRoot, plan, undefined, { runner: startPlan.snapshot.runner });
     } catch (err) {
       // e.g. a shallow clone: the node cannot start, and says why.
       record({ type: "NODE_BLOCKED", node: id, reason: String((err as Error).message ?? err) });

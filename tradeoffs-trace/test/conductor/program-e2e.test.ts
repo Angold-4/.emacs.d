@@ -18,6 +18,7 @@ import { cleanupDir, makeRepo, waitFor } from "./harness.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import { contractVersionFor, runnerRevision, type RunPlanFile } from "../../src/conductor.ts";
 import type { ProgramFile } from "../../src/core/program.ts";
+import { appendProgramEvent, createProgram, recordProgramSource, schedulerTick } from "../../src/program.ts";
 
 const FAKE_PI_PATH = fileURLToPath(new URL("../fake-pi/fake-pi.ts", import.meta.url));
 const CLI_PATH = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
@@ -400,7 +401,12 @@ test("plan 07h2 (R3, A2, exex 01: five restarts): a node started after its plan 
   }
 });
 
-test("plan 07h2 (R10, exex 01c3): two running nodes of one program each have their own check slot, and neither run's workers are paused by the other's check", async () => {
+/** Plan 07h2 (R10): the behaviour the phase contract names as "two running
+ * nodes of one program check without pausing each other's workers" — two
+ * nodes of one program each take their own check slot, and neither plan's
+ * exclusive check window freezes the other node's workers. Registered under
+ * both the plan-named test name and this packet's own descriptive one. */
+async function twoRunningNodesCheckWithoutPausingEachOther(): Promise<void> {
   const repo = makeRepo();
   const root = shortTmp("tt-07h2-r10-root");
   const scriptsDir = shortTmp("tt-07h2-r10-scripts");
@@ -551,7 +557,13 @@ test("plan 07h2 (R10, exex 01c3): two running nodes of one program each have the
     cleanupDir(scriptsDir);
     cleanupDir(repo.dir);
   }
-});
+}
+
+test(
+  "plan 07h2 (R10, exex 01c3): two running nodes of one program each have their own check slot, and neither run's workers are paused by the other's check",
+  twoRunningNodesCheckWithoutPausingEachOther,
+);
+test("two running nodes of one program check without pausing each other's workers", twoRunningNodesCheckWithoutPausingEachOther);
 
 test("plan 07h2 (A2): a failed re-export blocks the node with X:PLAN_DEFECT instead of running a stale plan", async () => {
   const repo = makeRepo();
@@ -627,4 +639,90 @@ test("plan 07h2 (A2): a failed re-export blocks the node with X:PLAN_DEFECT inst
     cleanupDir(scriptsDir);
     cleanupDir(repo.dir);
   }
+});
+
+/** Plan 07h2 (R3/A2): the phase contract's own name for "a plan fixed between
+ * nodes applies without a restart". The end-to-end proof is the plan-named
+ * test above (two real nodes, a real conductor each); this one drives the
+ * step that decides it — `schedulerTick` — so the *node start* itself is
+ * pinned: node a already ran and finished from the program-as-started
+ * snapshot, the owner then fixed node b's plan file, and the next node start
+ * is the one that reads it. No conductor is spawned (`launch` is recorded),
+ * so this is deterministic and fast. */
+test("a node started after its plan file changed runs the changed plan", () => {
+  const repo = makeRepo();
+  const root = shortTmp("tt-07h2-r3-plan-root");
+  const scriptsDir = shortTmp("tt-07h2-r3-plan-scripts");
+  const STALE = "echo the-plan-as-the-program-started";
+  const CHANGED = "echo the-plan-fixed-between-nodes";
+  const phase = (checks: string[]) => ({ id: "p1", goal: "g", acceptance: ["it works"], checks, boundaries: [], reserved: [] });
+  const plan = (title: string, checks: string[]): RunPlanFile => ({
+    title,
+    repo: repo.dir,
+    integrationBranch: "main",
+    checks,
+    phases: [phase(checks)],
+  });
+  const program = (bChecks: string[]): ProgramFile => ({
+    title: "plan-fixed-between-nodes",
+    maxParallel: 1,
+    entries: [
+      { id: "a", after: [], plan: plan("a", ["true"]) },
+      { id: "b", after: ["a"], plan: plan("b", bChecks) },
+    ],
+  });
+  const source = path.join(scriptsDir, "source.json");
+  fs.writeFileSync(source, JSON.stringify(program([STALE])));
+  // The program was STARTED from this snapshot, which still says STALE; the
+  // `--source` file is what a node's own start re-exports.
+  const dir = createProgram(root, program([STALE]), "r3plan");
+  recordProgramSource(dir, source);
+  // Node a already ran and finished — from the program-as-started snapshot.
+  appendProgramEvent(dir, { type: "NODE_STARTED", node: "a", runId: "aaaaaaaa", branch: "tt/a", base: repo.head });
+  appendProgramEvent(dir, { type: "NODE_STATUS", node: "a", status: "done" });
+  // ...and published its work on its own branch, which node b is cut from.
+  execFileSync("git", ["-C", repo.dir, "branch", "main--a", repo.head]);
+  // The owner fixes node b's plan file AFTER node a started.
+  fs.writeFileSync(source, JSON.stringify(program([CHANGED])));
+
+  const launched: string[] = [];
+  let asked = 0;
+  schedulerTick(dir, {
+    runRoot: root,
+    launch: (runDir) => launched.push(runDir),
+    // The exporter is injectable, exactly as `TT_EXPORT_COMMAND` is: `cat`
+    // would print the source file, and so does this.
+    exporter: (file) => {
+      asked += 1;
+      return JSON.parse(fs.readFileSync(file, "utf8")) as ProgramFile;
+    },
+    // Plan 07h2 (A2): the program's current runner, read at THIS node's
+    // start — a distinct value from the program's own start, so the record
+    // cannot be a leftover.
+    runner: () => "runner-at-node-start",
+  });
+
+  assert.equal(asked, 1, "the node's start re-exported the source file");
+  assert.equal(launched.length, 1, "exactly the ready node started");
+  const runDir = launched[0];
+  // The node's run carries the CHANGED plan, not the snapshot.
+  const runPlan = JSON.parse(fs.readFileSync(path.join(runDir, "plan", "v1.json"), "utf8")) as RunPlanFile;
+  assert.deepEqual(runPlan.checks, [CHANGED], "the node's own run runs the plan file as it is NOW");
+  // ...and it records where that plan came from and which runner started it.
+  const nodeRecord = JSON.parse(fs.readFileSync(path.join(runDir, "program.json"), "utf8")) as {
+    node: string;
+    snapshot: { source: string; exporter: string; runner: string; reexported: boolean; planSha256: string };
+  };
+  assert.equal(nodeRecord.node, "b");
+  assert.equal(nodeRecord.snapshot.reexported, true);
+  assert.equal(nodeRecord.snapshot.source, source);
+  assert.equal(nodeRecord.snapshot.runner, "runner-at-node-start");
+  const meta = JSON.parse(fs.readFileSync(path.join(runDir, "meta.json"), "utf8")) as { runnerRevision: string };
+  assert.equal(meta.runnerRevision, "runner-at-node-start", "the run itself is recorded under the runner its start snapshotted");
+  // The program-as-started snapshot is never edited: it still holds STALE.
+  const asStarted = JSON.parse(fs.readFileSync(path.join(root, "programs", "r3plan", "program.json"), "utf8")) as ProgramFile;
+  assert.deepEqual(asStarted.entries[1].plan!.checks, [STALE]);
+  cleanupDir(root);
+  cleanupDir(scriptsDir);
+  cleanupDir(repo.dir);
 });

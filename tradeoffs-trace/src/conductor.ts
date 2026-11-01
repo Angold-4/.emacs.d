@@ -1111,7 +1111,18 @@ function seededDirective(seed: RunPlanDirectiveSeed, index: number): OwnerDirect
 /** Creates a fresh run directory (fails if it already exists) with the
  * layout design §9.1 describes, writes `meta.json` and the plan snapshot,
  * and returns the run id (the directory's basename). */
-export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().slice(0, 8)): string {
+export function createRun(
+  root: string,
+  plan: RunPlanFile,
+  runId = randomUUID().slice(0, 8),
+  // Plan 07h2 (A2): a program node's run is recorded under the runner the
+  // node's START snapshotted, not under a second, independent reading of this
+  // conductor's own installed `RUNNER_SHA`. The two readings are the same in
+  // an ordinary `tt start`; keeping ONE value is what makes "the node
+  // snapshots its runner at its start" true of the record rather than of the
+  // snapshot file alone.
+  opts: { runner?: string } = {},
+): string {
   if (plan.repo && isShallowRepository(plan.repo)) {
     throw new Error(`${plan.repo} is a shallow clone; candidate checkouts cannot be made from it. Run \`git -C ${plan.repo} fetch --unshallow\` first.`);
   }
@@ -1196,7 +1207,7 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
           repo: plan.repo,
           createdAt: new Date().toISOString(),
           status: "created",
-          runnerRevision: runnerRevision(),
+          runnerRevision: opts.runner ?? runnerRevision(),
         },
         maskable,
       ),
