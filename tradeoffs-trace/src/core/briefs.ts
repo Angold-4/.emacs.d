@@ -808,7 +808,7 @@ export function fallbackBrief(
     today,
     // The backstop never asserts what it did not check.
     impact: opts.catalogs === null
-      ? "The effect of this choice has not been checked by this backstop; decide from the request's own evidence."
+      ? "The effect of this choice is not established by this backstop; decide from the request's own evidence."
       : "Whether any market stops publishing is not established by this backstop; the request's own evidence is below.",
     noRecommendationReason: opts.noRecommendationReason ?? "the brief writer did not run",
     // No recommendation: the backstop never recommends an option by position
@@ -851,7 +851,7 @@ export function fallbackDecisionBrief(
     question,
     today: opts.catalogs === null ? "The flagged choice and its recorded reasoning are below." : "No concrete example was recorded for this flagged choice. (example unverified)",
     impact: opts.catalogs === null
-      ? "The effect of this choice has not been checked by this backstop; decide from its recorded reasoning."
+      ? "The effect of this choice is not established by this backstop; decide from its recorded reasoning."
       : "Whether any market stops publishing is not established by this backstop; the decision's own reasoning is what the reviewers voted on.",
     noRecommendationReason: opts.noRecommendationReason ?? "the brief writer did not run",
     options: [
@@ -883,7 +883,7 @@ export function fallbackEntryBrief(
     question,
     today: opts.catalogs === null ? "The entry and its linked messages describe the current behavior." : "No concrete example was recorded for this entry. (example unverified)",
     impact: opts.catalogs === null
-      ? "The effect of this choice has not been checked by this backstop; decide from the linked messages."
+      ? "The effect of this choice is not established by this backstop; decide from the linked messages."
       : "Whether any market stops publishing is not established by this backstop; the entry's own linked messages are below.",
     noRecommendationReason: opts.noRecommendationReason ?? "the brief writer did not run",
     options: [

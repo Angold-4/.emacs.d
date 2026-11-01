@@ -486,8 +486,8 @@ const submitBriefFields: Record<string, TSchema> = {
     }),
   ),
   question: Type.String({ description: "One plain line, no code identifiers" }),
-  today: Type.String({ description: "What the system does now, with one concrete example naming a real market and time from the plan's calendars" }),
-  impact: Type.String({ description: "What the owner would notice; always say whether any market stops publishing" }),
+  today: Type.String({ description: "What the system does now, with one concrete example; when the plan supplies catalogs, name a real market and time from its calendars" }),
+  impact: Type.String({ description: "What the owner would notice; when the plan supplies catalogs, say whether any market stops publishing" }),
   options: Type.Array(BriefOptionParam, { minItems: 1, description: "The request's own options, one-to-one by id, relabelled in plain words" }),
   recommendation: Type.Optional(Type.Object({ option: Type.String(), why: Type.String({ description: "Cite the plan or IC section" }) })),
   related: Type.Array(BriefRelatedParam, { description: "Other open items on the same file or plan clause" }),
@@ -1001,14 +1001,14 @@ export default function (pi: ExtensionAPI) {
     name: "submit_brief",
     label: "Submit Decision Brief",
     description:
-      "Write one owner-facing brief for one open owner item: a plain question with no code identifiers, what the system does today (one concrete example with a real market and time from the plan's calendars), what the owner would notice (always say whether any market stops publishing), the request's own options relabelled with their effects and costs, one recommendation citing the plan, related open items, and the original evidence. A time, count or duration must cite config: or code:",
+      "Write one owner-facing brief for one open owner item: a plain question with no code identifiers, what the system does today (one concrete example), what the owner would notice (when the plan supplies catalogs, name a real market and time from its calendars and say whether any market stops publishing), the request's own options relabelled with their effects and costs, one recommendation citing the plan, related open items, and the original evidence. A time, count or duration must cite config: or code:",
     promptSnippet: "Write the owner-facing brief for each open owner item",
     parameters: SubmitBriefParams,
     async execute(_toolCallId, params) {
       params = dropEmptyStrings(params) as typeof params;
       const error = validateOrError(BRIEF_SCHEMA, params);
       if (error) return { isError: true, content: [{ type: "text" as const, text: error }] };
-      const issue = briefIssue(params as never);
+      const issue = briefIssue(params as never, { catalogs: null });
       if (issue) return { isError: true, content: [{ type: "text" as const, text: `invalid brief: ${issue}` }] };
       return submitTool("submit_brief", params, false);
     },
