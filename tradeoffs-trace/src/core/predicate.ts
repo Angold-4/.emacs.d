@@ -173,9 +173,8 @@ export function typesNeedingEvaluation(phase: PhaseState): MessageType[] {
   const types = (EVALUATOR_TYPES as readonly MessageType[]).filter((t) =>
     (phase.messages ?? []).some((m) => m.type === t && (m.state === "raw" || m.state === "refused")),
   );
-  // Plan 06b (OD-1 R3b): a majority `unmet`/`deviates` needs the evaluator's
-  // substantive re-check against the candidate before it blocks. Force one
-  // `finding` evaluator pass for it when no finding message already asks.
+  // Only a split item needs the evaluator. A unanimous unmet item is
+  // mechanically decided and becomes a point, without waiting for a model.
   if (itemsNeedingEvaluatorReverify(phase) && !types.includes("finding")) types.push("finding");
   // Plan 06i (A3): a finding or discovered decision that still owes its impact
   // classification needs its evaluator pass even with no raw message of that
@@ -195,21 +194,11 @@ export function typesNeedingEvaluation(phase: PhaseState): MessageType[] {
   return types;
 }
 
-/** Plan 06b (OD-1 R3b): true when a structured phase has an item whose
- * majority verdict is `unmet` or `deviates`, so the evaluator must re-check
- * it against the candidate before it can block. */
+/** §7a: only a split item needs evaluation. Keep the completion gate in
+ * agreement with evaluationExceptions, so a unanimous unmet item cannot
+ * leave EVALUATING waiting forever for a session that must never start. */
 export function itemsNeedingEvaluatorReverify(phase: PhaseState): boolean {
-  if (!isStructured(phase.contract)) return false;
-  // ODP-2: an item blocker is never raised without an evaluator item check,
-  // so every outcome that is not met/fits owes one.
-  const outcomes = phaseItemOutcomes(phase);
-  if (outcomes.some((o) => o.outcome !== "met" && o.outcome !== "fits")) return true;
-  // Plan 07f (F0): the seats split on an item — at least one says met/fits
-  // and at least one does not. The mechanical majority still decides the
-  // verdict, but the split is exactly what the evaluator exists to resolve.
-  // A unanimous met/fits item with resolving anchors is mechanically decided:
-  // thin evidence alone never starts an evaluator session (plan 07f A-2).
-  return outcomes.some(itemIsSplit);
+  return isStructured(phase.contract) && phaseItemOutcomes(phase).some(itemIsSplit);
 }
 
 /** True when the seats do not give an item the verdict the plan requires by

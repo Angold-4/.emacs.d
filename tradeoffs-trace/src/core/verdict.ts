@@ -77,7 +77,7 @@ export function notAcceptedReasons(phase: PhaseState): string[] {
  * and therefore the only records an evaluator session is started for:
  *
  *   - a raw/owner-refused message awaiting evaluation;
- *   - a plan item the seats split on, or one a majority judged unmet/fits;
+ *   - a plan item the seats split on;
  *   - an open point with no proving doneWhen fact (a failing fact keeps it
  *     open, whatever an evaluator drop says);
  *   - an open finding or discovered decision whose impact is not classified.
@@ -108,15 +108,12 @@ export function evaluationExceptions(phase: PhaseState): EvaluationException[] {
   }
   if (isStructured(phase.contract)) {
     for (const outcome of phaseItemOutcomes(phase)) {
-      const owed = outcome.outcome !== "met" && outcome.outcome !== "fits";
-      const split = itemIsSplit(outcome);
-      if (!owed && !split) continue;
+      if (!itemIsSplit(outcome)) continue;
       out.push({
         kind: "item",
         id: outcome.item.id,
         detail:
-          `${outcome.item.id} ${outcome.item.title}: ${outcome.outcome}` +
-          (split ? " (the seats split on it)" : " (a majority judged it unmet or deviating)"),
+          `${outcome.item.id} ${outcome.item.title}: ${outcome.outcome} (the seats split on it)`,
       });
     }
   }

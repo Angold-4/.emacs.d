@@ -214,7 +214,7 @@ import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { FAILED_VOTE_OPTIONS, isRepairForcingOption, openFindingOptions } from "./core/owner-requests.ts";
 import { BRIEF_GLOSSARY, briefIssue, enrichBriefRelated, evidenceFile, fallbackBrief, fallbackDecisionBrief, fallbackEntryBrief, parseCatalogs, renderGlossaryOrg, stripCodeTokens, stripCounts, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
 import { evaluationExceptions, notAcceptedReasons } from "./core/verdict.ts";
-import { itemsNeedingEvaluatorReverify, pendingEvidenceItems, setSeatAnchorResolver } from "./core/predicate.ts";
+import { evaluationSettled, itemsNeedingEvaluatorReverify, pendingEvidenceItems, setSeatAnchorResolver } from "./core/predicate.ts";
 // Plan 06b: the pure item machinery (coverage, test-verify resolution,
 // verdict validation, per-item majority, the matrix and the status counts).
 import {
@@ -4879,6 +4879,10 @@ export class Conductor {
           this.#applyEvent({ type: "TRIAGE_FAILED", reason });
           return;
         }
+        // Mechanical unmet votes may just have created a point. If that
+        // point has no proving fact, its exception must settle before the
+        // completion event; never emit an event the reducer must reject.
+        if (!evaluationSettled(this.#state.phase)) return;
         try {
           this.#recordCandidateApproval();
         } catch (err) {

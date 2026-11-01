@@ -797,7 +797,9 @@ test("plan 06b: a review-only majority unmet item with no evaluator item check i
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
       ],
     }),
-    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: "unmet" })),
+    // Two unmet votes and one met: a genuine split exception, not the
+    // retired unanimous-item evaluator re-check (§7a).
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: reviewer === "A" ? "met" : "unmet" })),
     evaluatorScriptFor: () => ({
       hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
       steps: [
@@ -833,7 +835,7 @@ test("plan 06b: an evaluator item check with an invalid anchor never overturns a
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
       ],
     }),
-    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: "unmet" })),
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: reviewer === "A" ? "met" : "unmet" })),
     evaluatorScriptFor: () => ({
       hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
       steps: [
@@ -877,7 +879,7 @@ test("plan 06c: a confirmed evaluator item check with invalid anchors is recorde
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
       ],
     }),
-    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: "unmet" })),
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: reviewer === "A" ? "met" : "unmet" })),
     // Plan 06k2 (A2): a `confirmed` check whose anchor does not resolve is
     // re-asked ONCE for a repo-relative path; only after that is it recorded
     // `unchecked by evaluator`, never as a confirmation. The script supplies
@@ -989,7 +991,7 @@ test("plan 06b: an evaluator that times out still records the item blocker as un
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
       ],
     }),
-    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: "unmet" })),
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: reviewer === "A" ? "met" : "unmet" })),
     // The evaluator settles without ever submitting: its dispatch times out.
     evaluatorScriptFor: () => ({ hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator }, steps: [] }),
   });
@@ -2208,7 +2210,7 @@ function anchorCoverage() {
 }
 
 /** One conductor run: the candidate writes the given tracked files, the
- * reviewers mark R1 unmet (so the evaluator owes an item check), and the
+ * reviewers split on R1 (two unmet, one met, so an exception is owed), and the
  * evaluator's check cites `tests/config_files.rs:312`. */
 async function runAnchorScenario(fileCount: 1 | 2): Promise<{ check: { verdict?: string; evidence?: string } | undefined; events: ReturnType<typeof readEvents> }> {
   const write =
@@ -2232,6 +2234,7 @@ async function runAnchorScenario(fileCount: 1 | 2): Promise<{ check: { verdict?:
     reviewerScriptFor: (reviewer, state) => ({
       hello: defaultReviewerHello(),
       steps: [
+        { kind: "call-tool", tool: "read", args: { path: "crates/foo/tests/config_files.rs" } },
         { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
         { kind: "wait-for-prompt" },
         {
@@ -2244,7 +2247,7 @@ async function runAnchorScenario(fileCount: 1 | 2): Promise<{ check: { verdict?:
             contractVersion: state.phase.contract.contractVersion,
             correctionStatements: [],
             findingStatements: [],
-            items: [{ id: "R1", verdict: "unmet", evidence: "crates/foo/tests/config_files.rs:1 the review item is unmet" }],
+            items: [{ id: "R1", verdict: reviewer === "A" ? "met" : "unmet", evidence: "crates/foo/tests/config_files.rs:1 the split item needs an anchor ruling" }],
             arch: [],
           },
         },

@@ -9,7 +9,7 @@ import { test } from "node:test";
 
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import type { Reviewer } from "../../src/core/types.ts";
-import { accept, acceptanceBlockers, itemIsSplit, itemMinorityNotes, shortId } from "../../src/core/predicate.ts";
+import { accept, acceptanceBlockers, evaluationSettled, itemIsSplit, itemMinorityNotes, shortId, typesNeedingEvaluation } from "../../src/core/predicate.ts";
 import { phaseItemOutcomes } from "../../src/core/items.ts";
 import { openFindings } from "../../src/core/triage.ts";
 import { evaluationExceptions } from "../../src/core/verdict.ts";
@@ -775,6 +775,18 @@ function noExceptionPhase() {
     doneWhenFacts: [{ findingId: "F-1", candidateSha: EX_C, exitCode: 0, timedOut: false, outputTail: "", passesOnBase: false }],
   } as never);
 }
+
+test("a unanimous unmet item is not an evaluator exception", () => {
+  const phase = noExceptionPhase();
+  for (const seat of ["M", "A", "B"] as const) {
+    phase.reviews[seat] = { review: exReview(seat, { R1: "unmet", R2: "met" }) } as never;
+  }
+  assert.deepEqual(evaluationExceptions(phase), [], "unanimous unmet is mechanically decided, not an exception");
+  assert.deepEqual(typesNeedingEvaluation(phase), [], "the completion gate owes no forbidden evaluator session");
+  assert.equal(evaluationSettled(phase), true, "the mechanically decided unmet item cannot strand EVALUATING");
+  assert.equal(accept(phase, EX_C, EX_K), false, "unmet still blocks acceptance");
+  assert.ok(acceptanceBlockers(phase, []).some((b) => b.detail.includes("R1")), "the unmet item remains work to fix");
+});
 
 function factClosedNoEvaluator(): void {
   const phase = noExceptionPhase();
