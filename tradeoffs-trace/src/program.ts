@@ -15,6 +15,10 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { createRun, runPaths } from "./conductor.ts";
+// 07 design A1: a node's own start runs the same ADMIT that `tt start` and a
+// resume run — one gate, one verdict, one named exception.
+import { admit, admitPiCommand } from "./effects/admit.ts";
+import { admitRefusalText } from "./core/admit.ts";
 import { triageRecordFor } from "./core/triage.ts";
 import type { RequirementItem } from "./core/items.ts";
 import { readRunState } from "./effects/runner.ts";
@@ -560,6 +564,21 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
     const prepared = prepareBranch(plan.repo, plan.integrationBranch, nodeBases(program, nodes, node), id);
     if (!prepared.ok) {
       record({ type: "NODE_BLOCKED", node: id, reason: prepared.reason });
+      continue;
+    }
+    // 07 design A1: a node's own start runs ADMIT — the plan it is about to
+    // run lints, its TT_REPO is a git work tree, every check command parses,
+    // and the pinned pi is the one on this scheduler's PATH, resolved now (a
+    // plan fixed between nodes applies without a restart, and no recorded
+    // environment is consulted). A refusal blocks the node with its named
+    // exception, before its run exists and before any event of that run.
+    const admitted = admit(plan, {
+      path: process.env.PATH ?? "",
+      cwd: plan.repo,
+      ...(admitPiCommand() !== undefined ? { pi: "pi" } : {}),
+    });
+    if (!admitted.ok) {
+      record({ type: "NODE_BLOCKED", node: id, reason: admitRefusalText(admitted.kind, admitted.reason) });
       continue;
     }
     let runDir: string;

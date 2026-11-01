@@ -180,7 +180,6 @@ import { failingDomainOf, integrateBrief, resolutionOutsideConflicted, runDomain
 import {
   assertToolSet,
   launchArgs,
-  PI_VERSION,
   ROLE_TOOLS,
   type PlanModels,
   type ModelRole,
@@ -262,6 +261,10 @@ import { validate } from "./core/schema.ts";
 import { EventLog, readLog, type LogRecord } from "./effects/log.ts";
 import { acquireCheckSlot, acquireLock, acquireWaitingLock, DEFAULT_CHECK_SLOTS, openCheckWindow, otherCheckWindowOwner, PausableTimer, type Lock } from "./effects/lock.ts";
 import { childEnv, runCommand, type CommandStep, type RunCommandResult } from "./effects/shell.ts";
+// 07 design A1: ADMIT — the one gate start, resume and a program node's own
+// start run before any event.
+import { admitOrRefuse } from "./effects/admit.ts";
+import { AdmitRefusal, type AdmitFacts } from "./core/admit.ts";
 import { groupStartedBefore, killGroup, loggedHeld, processAlive, signalProcess, sweep, type SweepResult } from "./effects/sweep.ts";
 import {
   createWorktree,
@@ -310,6 +313,10 @@ const OWNER_COMMAND_SCHEMA: Record<string, unknown> = JSON.parse(
  * `incomplete_review`). Two: a model that fixes its own omission gets a
  * second and third chance within the same turn, and one that never does
  * cannot wedge the turn. */
+/** 07 design A1: a refused ADMIT, re-exported so a caller — and a test —
+ * reads the one gate's exception from the conductor it refuses. */
+export { AdmitRefusal };
+
 export const MAX_INCOMPLETE_REVIEW_REJECTIONS = 2;
 
 /** Plan 06k3 (A1): how many times a two-lane round that fails only because a
@@ -677,6 +684,12 @@ export interface ConductorOptions {
    * point it at a scratch PATH to prove a missing tool blocks a run and a
    * fixed one lets `tt resume` proceed. */
   preflightEnv?: NodeJS.ProcessEnv;
+  /** 07 design A1: the PATH ADMIT resolves the pinned pi against — the one the
+   * SHELL that launched this conductor has, captured before any recorded path
+   * is adopted (`adoptRecordedPath`), so a resume never resolves the pi a run
+   * recorded at its first start (exex 07f1, 2026-10-28). Defaults to this
+   * process's own PATH, read at `start()`. */
+  admitPath?: string;
   /** Per-agent environment override — tests use this to give each fake-pi
    * agent (worker, reviewer M/A/B) its own `FAKE_PI_SCRIPT`. */
   piEnvFor?: (role: Role, agentId: string) => NodeJS.ProcessEnv | undefined;
@@ -1702,6 +1715,9 @@ export class Conductor {
   #extraEnv: NodeJS.ProcessEnv;
   /** Plan 05i: the environment `#runEnvPreflight` resolves tools in. */
   #preflightEnv: NodeJS.ProcessEnv;
+  /** 07 design A1: the PATH ADMIT resolves the pinned pi against — the shell's
+   * own, captured before a recorded path is adopted. */
+  #admitPath: string | undefined;
   #piEnvFor: ((role: Role, agentId: string) => NodeJS.ProcessEnv | undefined) | undefined;
   #stubReviews: boolean;
   #briefsEnabled: boolean;
@@ -1978,6 +1994,7 @@ export class Conductor {
     this.#piArgsPrefix = opts.piArgsPrefix ?? [];
     this.#extraEnv = opts.extraEnv ?? {};
     this.#preflightEnv = opts.preflightEnv ?? process.env;
+    this.#admitPath = opts.admitPath;
     this.#piEnvFor = opts.piEnvFor;
     this.#providerModelFor = opts.providerModelFor;
     this.#stubReviews = opts.stubReviews ?? false;
@@ -2061,19 +2078,25 @@ export class Conductor {
     this.#secretMaskable = resolved.maskable;
     this.#missingSecrets = resolved.missing;
     this.#tooShortSecrets = resolved.tooShort;
+    // 07 design §3.1/A1: ADMIT runs BEFORE any event of this start — before
+    // the log is even opened. The plan lints, TT_REPO is a git work tree,
+    // every check command parses and the pinned pi is the one on the PATH
+    // this shell has — resolved again on every start, never read back from
+    // the run's `check-env.json` (exex 07f1). A refusal releases the lock and
+    // throws before the init record, so a refused start appends no event and
+    // a resume's existing events are untouched.
+    let admitted: AdmitFacts;
+    try {
+      admitted = this.#admitRun();
+    } catch (err) {
+      await this.#lock?.release();
+      this.#lock = undefined;
+      throw err;
+    }
     this.#log = new EventLog(this.#paths.events, this.#secretMaskable, (err) => this.#noteDiskFull(err));
     // Plan 06k1 (A6): record the check environment once, before any check or
-    // resume can need it.
-    this.#recordCheckEnv();
-
-    // design §2.1: assert the Pi version before ever launching it — but
-    // only when the real `pi` binary is actually going to be used for at
-    // least one role; tests inject fake-pi via `piCommand`/`piArgsPrefix`
-    // (or, for live-single-phase's mixed run, `piCommandFor`) and never
-    // touch this.
-    if (this.#resolvePiCommand("worker") === undefined || this.#resolvePiCommand("reviewer") === undefined) {
-      assertPiVersion();
-    }
+    // resume can need it — the PATH it records is the one ADMIT just saw.
+    this.#recordCheckEnv(admitted.path);
 
     const { records } = readLog(this.#paths.events);
     const initRecord = records.find((r) => r.kind === "init");
@@ -13432,6 +13455,37 @@ export class Conductor {
     }
   }
 
+  /** 07 design A1 (§3.1): the conductor's own ADMIT, run before any event of
+   * this start — the plan lints, TT_REPO is a git work tree, every check
+   * command parses, and the pinned pi is the one on the PATH this SHELL has,
+   * resolved again on every start (`admitPath`, captured before a recorded
+   * path was adopted) and never from the run's `check-env.json` (exex 07f1:
+   * a resume adopted a recorded brew pi 1.4.0 and the conductor crashed at its
+   * next agent launch instead of naming the environment fault). A refusal
+   * throws `AdmitRefusal` — X:PLAN_DEFECT or X:ENV_FAULT with its reason —
+   * before the init record exists, so a refused start appends no event. The
+   * facts are written to `<run>/admit.json` so the owner can read what was
+   * checked and against what.
+   *
+   * The pi version is checked only when a real binary will be launched: a test
+   * injects fake-pi through `piCommand`/`piCommandFor` and never touches the
+   * machine's pi (the rule `assertPiVersion` always had). */
+  #admitRun(): AdmitFacts {
+    const resolvedPath = this.#admitPath ?? process.env.PATH ?? "";
+    const realPi = this.#resolvePiCommand("worker") === undefined || this.#resolvePiCommand("reviewer") === undefined;
+    const facts = admitOrRefuse(this.#plan, {
+      path: resolvedPath,
+      cwd: this.#plan.repo,
+      ...(realPi ? { pi: "pi" } : {}),
+    });
+    try {
+      fs.writeFileSync(path.join(this.#runDir, "admit.json"), `${JSON.stringify(facts, null, 2)}\n`);
+    } catch {
+      // A read-only run dir must not stop the run; the record is for the owner.
+    }
+    return facts;
+  }
+
   /** Plan 05i: the one gate that runs at `start()`, before the baseline and
    * before any agent. It resolves every declared executable, records the
    * resolved paths (`ENV_CHECKED`), and either applies `ENV_PREFLIGHT_FAILED`
@@ -14772,8 +14826,12 @@ export class Conductor {
    * `PATH` plus every variable the plan declares (`envVars`) or a check
    * command references (`$NAME`/`${NAME}`). On a resume the recorded file is
    * read back, so the resuming shell's own environment never changes a check.
-   * Written at start, before any check runs. */
-  #recordCheckEnv(): void {
+   * Written at start, before any check runs.
+   *
+   * 07 design A1: this record is what ADMIT SAW — `admitPath` is the PATH
+   * ADMIT resolved on this start, so a resume's record never claims a path
+   * ADMIT did not use. ADMIT never reads it back (only checks do). */
+  #recordCheckEnv(admitPath?: string): void {
     const file = path.join(this.#runDir, "check-env.json");
     if (fs.existsSync(file)) {
       try {
@@ -14815,7 +14873,7 @@ export class Conductor {
     for (const name of this.#secretNames) names.delete(name);
     const env: Record<string, string | null> = {};
     for (const name of names) {
-      env[name] = process.env[name] ?? null;
+      env[name] = name === "PATH" && admitPath !== undefined ? admitPath : (process.env[name] ?? null);
     }
     this.#recordedEnv = env;
     try {
@@ -17989,24 +18047,4 @@ export function helloRetryTimeoutMs(baseMs: number, sessionBytes: number): numbe
 
 function currentHead(repo: string, branch: string): string {
   return execFileSync("git", ["-C", repo, "rev-parse", branch], { encoding: "utf8" }).trim();
-}
-
-/** design §2.1: assert the pinned Pi version before ever launching the real
- * `pi` binary — an upgrade is a deliberate PR that reruns the phase 0
- * contract tests, not something that should silently drift. Only called
- * when no `piCommand` override was given (never for fake-pi in tests). */
-function assertPiVersion(): void {
-  let output: string;
-  try {
-    output = execFileSync("pi", ["--version"], { encoding: "utf8" }).trim();
-  } catch (err) {
-    throw new Error(
-      `could not run 'pi --version' to assert the pinned Pi version (${PI_VERSION}): ${String((err as Error)?.message ?? err)}`,
-    );
-  }
-  if (!output.includes(PI_VERSION)) {
-    throw new Error(
-      `pi reports version '${output}', expected the pinned ${PI_VERSION} (design §2.1) — upgrading is a deliberate PR that reruns the phase 0 contract tests`,
-    );
-  }
 }

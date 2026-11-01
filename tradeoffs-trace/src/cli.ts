@@ -8,6 +8,10 @@
 // run id immediately rather than blocking for the whole run.
 
 import { adoptRecordedPath } from "./effects/run-env.ts";
+// 07 design A1: ADMIT — the one gate `tt start`, `tt resume` and a program's
+// node start all run before anything is created or any event exists.
+import { admit, admitPiCommand } from "./effects/admit.ts";
+import { AdmitRefusal, admitRefusalText, type AdmitException } from "./core/admit.ts";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, existsSync, openSync, mkdirSync, writeFileSync, renameSync, rmSync, symlinkSync, readdirSync, realpathSync, statSync } from "node:fs";
@@ -794,8 +798,17 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
     const findings = allFindings(program);
     reportFindings(findings, args[0], process.stderr);
     if (hasLintErrors(findings)) {
-      process.exitCode = 1;
+      // 07 design §3.4: the refusal is a named exception (see cmdStart).
+      refuseAdmit("X:PLAN_DEFECT", `${args[0]} does not lint (the findings above are the reason)`, "start the program");
       return;
+    }
+    // 07 design A1: ADMIT every entry's plan before the program directory
+    // exists — the plan lints, TT_REPO is a git work tree, every check command
+    // parses, and the pinned pi is the one on this shell's PATH. A node's own
+    // start runs the same gate again (src/program.ts), so a plan fixed between
+    // nodes is admitted on its own.
+    for (const entry of program.entries) {
+      if (admitPlanOrRefuse(entry.plan, `start the program (node ${entry.id})`)) return;
     }
     if (refuseMissingSecretsForPlans(program.entries.map((e) => e.plan), "start the program", resolvedEnvFile)) return;
     // Plan 05i: every node's declared commands must resolve in THIS caller's
@@ -1019,6 +1032,31 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
   }
 }
 
+/** 07 design A1: print a refused ADMIT — its named exception and reason — and
+ * stop. X:PLAN_DEFECT is fixed by amending the plan, X:ENV_FAULT by fixing the
+ * machine and running the command again. Nothing is created before this: a
+ * refused start leaves no run, no program and no event behind. */
+function refuseAdmit(kind: AdmitException, reason: string, what: string): void {
+  process.stderr.write(`refusing to ${what}: ${admitRefusalText(kind, reason)}\n`);
+  process.exitCode = 1;
+}
+
+/** 07 design A1: a plan file's ADMIT, run by the command that admits it —
+ * `tt start` and `tt program start`. The PATH is this shell's own and the
+ * pinned pi is re-resolved on every call. A resume runs the same gate inside
+ * the conductor it launches (`__run-conductor`), against the snapshot's plan. */
+function admitPlanOrRefuse(plan: RunPlanFile, what: string): boolean {
+  const pi = admitPiCommand();
+  const verdict = admit(plan, {
+    path: process.env.PATH ?? "",
+    cwd: plan.repo,
+    ...(pi !== undefined ? { pi } : {}),
+  });
+  if (verdict.ok) return false;
+  refuseAdmit(verdict.kind, verdict.reason, what);
+  return true;
+}
+
 async function cmdStart(planPath: string, root: string, skipModelsCheck = false, envFile?: string): Promise<void> {
   const plan = JSON.parse(readFileSync(planPath, "utf8")) as RunPlanFile;
   if (!plan.repo) usage();
@@ -1032,9 +1070,15 @@ async function cmdStart(planPath: string, root: string, skipModelsCheck = false,
   const findings = allFindings(plan);
   reportFindings(findings, planPath, process.stderr);
   if (hasLintErrors(findings)) {
-    process.exitCode = 1;
+    // 07 design §3.4: the refusal is a named exception, so the operator (and
+    // a script) sees X:PLAN_DEFECT rather than only the findings above.
+    refuseAdmit("X:PLAN_DEFECT", `${planPath} does not lint (the findings above are the reason)`, "start the run");
     return;
   }
+  // 07 design A1: ADMIT before anything is created — the plan lints, TT_REPO
+  // is a git work tree, every check command parses, and the pinned pi is the
+  // one on this shell's PATH.
+  if (admitPlanOrRefuse(plan, "start the run")) return;
   if (refuseMissingSecrets(plan.secrets, "start the run", plan.envFile)) return;
   // 06a finding #24: create the run, probe its distinct configured models,
   // record the result in the run directory, and refuse to launch when one is
@@ -1165,6 +1209,11 @@ function testStubReviews(): boolean {
  * script) to stay inside this packet's file scope. */
 async function runConductorProcess(runDir: string): Promise<void> {
   const p = runPaths(runDir);
+  // 07 design A1: the shell's own PATH, captured BEFORE `adoptRecordedPath`
+  // prepends the PATH this run recorded at its first start. ADMIT resolves the
+  // pinned pi against this one — a recorded path is never the source on resume
+  // (exex 07f1: a resume adopted a recorded brew `pi` 1.4.0).
+  const shellPath = process.env.PATH ?? "";
   adoptRecordedPath(runDir);
   const plan = JSON.parse(readFileSync(path.join(p.plan, "v1.json"), "utf8")) as RunPlanFile;
   const { piCommand, piArgsPrefix } = testPiInjection();
@@ -1182,7 +1231,7 @@ async function runConductorProcess(runDir: string): Promise<void> {
   // the one place a run's Conductor is built. `testPiInjection` above still
   // supplies the fake-pi command for a test-launched run; the two do not
   // interact (one picks the binary, the other the model flags).
-  const conductor = new Conductor({ runDir, plan, piCommand, piArgsPrefix, providerModelFor: planModelSelector(plan, plan.seats), deadlines, stubReviews, briefs: true });
+  const conductor = new Conductor({ runDir, plan, piCommand, piArgsPrefix, providerModelFor: planModelSelector(plan, plan.seats), deadlines, stubReviews, briefs: true, admitPath: shellPath });
   const cleanStop = () =>
     void conductor.stop().then(() => {
       writeFileSync(stoppedMarker, new Date().toISOString());
@@ -1190,7 +1239,18 @@ async function runConductorProcess(runDir: string): Promise<void> {
     });
   process.on("SIGTERM", cleanStop);
   process.on("SIGINT", cleanStop);
-  await conductor.start();
+  try {
+    await conductor.start();
+  } catch (err) {
+    // 07 design §3.4: a refused ADMIT is the run's own named exception, and it
+    // is what the operator sees in conductor.log — not a bare stack trace.
+    if (err instanceof AdmitRefusal) {
+      process.stderr.write(`refusing to resume the run: ${err.message}\n`);
+      await conductor.stop().catch(() => undefined);
+      process.exit(1);
+    }
+    throw err;
+  }
 }
 
 /** design §9.2/round-of-review item 2: `tt status` rebuilds state the same
@@ -2607,6 +2667,12 @@ async function main(): Promise<void> {
     const runDir = resolveRunDir(positional[0], runRoot);
     const runPlan = readPlan(runDir);
     if (refuseMissingSecrets(runPlan.secrets, "resume the run", runPlan.envFile)) return;
+    // 07 design A1: the resume's own ADMIT runs inside the conductor this
+    // launches (`__run-conductor` -> `Conductor.start()`), which re-resolves
+    // this shell's PATH and the pinned pi — never the PATH the run recorded —
+    // and writes its refusal to conductor.log. Keeping the check there lets a
+    // run recorded under another runner still reach that runner check and say
+    // so here.
     launchDetached(runDir, { root: runRoot });
   } else if (cmd === "program") {
     await cmdProgram(positional[0], positional.slice(1), runRoot, json, source, skipModelsCheck, envFile);
