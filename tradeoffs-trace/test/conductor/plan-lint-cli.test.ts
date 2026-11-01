@@ -280,6 +280,43 @@ test("plan-lint CLI: `tt lint` on a program lints every entry", async () => {
   }
 });
 
+test("lint warns on a plan-only keyword in a program file", async () => {
+  const dir = tmpDir("tt-lint-program-keyword");
+  try {
+    const sourceFile = path.join(dir, "program.org");
+    const programPath = path.join(dir, "program.json");
+    const header = [
+      "#+TITLE: delivery",
+      "#+TT_PROGRAM: 1",
+      "#+TT_DELIVER_BRANCH: integration",
+      "#+tt_deliver_audit: true",
+      "#+TT_BASE: main",
+      "#+TT_PROGRAM_FINAL_CHECKS: true",
+    ].join("\n");
+    fs.writeFileSync(sourceFile, `${header}\n* node\n#+TT_DELIVER_BRANCH: body-example\n`);
+    const program = { ...programWith(planWith([], [], "/nonexistent/repo")), sourceFile };
+    fs.writeFileSync(programPath, JSON.stringify(program));
+    const result = await runCli(["lint", programPath], {});
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal((result.stdout.match(/warning:/g) ?? []).length, 2, result.stdout);
+    assert.ok(result.stdout.includes(`${sourceFile}:3: warning: [program] #+TT_DELIVER_BRANCH belongs in each node's plan`), result.stdout);
+    assert.ok(result.stdout.includes(`${sourceFile}:4: warning: [program] #+TT_DELIVER_AUDIT belongs in each node's plan`), result.stdout);
+    assert.doesNotMatch(result.stdout, /error:|body-example|TT_BASE|TT_PROGRAM_FINAL_CHECKS/);
+
+    // A plan exported as a one-entry program may use its delivery settings.
+    fs.writeFileSync(sourceFile, header.replace("#+TT_PROGRAM: 1\n", ""));
+    const plan = await runCli(["lint", programPath], {});
+    assert.equal(plan.code, 0, plan.stderr);
+    assert.equal(plan.stdout, "");
+    fs.unlinkSync(sourceFile);
+    const unavailable = await runCli(["lint", programPath], {});
+    assert.equal(unavailable.code, 0, unavailable.stderr);
+    assert.equal(unavailable.stdout, "");
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
 test("plan-lint CLI: `tt start` refuses an error before any run exists", async () => {
   const dir = tmpDir("tt-start-lint");
   try {

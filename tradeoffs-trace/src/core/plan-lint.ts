@@ -38,6 +38,7 @@ export type LintRule =
   | "future-dependency"
   | "no-tolerance"
   | "model-declaration"
+  | "program-keyword"
   | "rerun-template"
   // Plan 06j (A1): a phase's checks cannot see what its :BOUNDARIES: let it
   // change, or the repository's CI runs something the plan never does.

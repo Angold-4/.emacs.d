@@ -130,7 +130,37 @@ function coverageFindings(json: unknown): LintFinding[] {
  * repository coverage. `tt lint` and both start commands use this one
  * function, so the warnings they show are the same. */
 function allFindings(json: unknown): LintFinding[] {
-  return [...lintJson(json), ...coverageFindings(json), ...verifyReachFindings(json), ...testRemovalFindings(json)];
+  return [...lintJson(json), ...programHeaderFindings(json), ...coverageFindings(json), ...verifyReachFindings(json), ...testRemovalFindings(json)];
+}
+
+/** Delivery settings belong to each node's plan. The exported program keeps
+ * sourceFile, so lint can name ignored header keywords without another Org
+ * parser. A plan exported as a one-entry program still owns its settings. */
+function programHeaderFindings(json: unknown): LintFinding[] {
+  if (!isProgramInput(json)) return [];
+  const sourceFile = (json as LintProgramInput).sourceFile;
+  if (!sourceFile) return [];
+  let source: string;
+  try {
+    source = readFileSync(sourceFile, "utf8");
+  } catch {
+    return [];
+  }
+  const header = source.split(/^\*+\s/m, 1)[0];
+  if (!/^\s*#\+TT_PROGRAM:/im.test(header)) return [];
+  const out: LintFinding[] = [];
+  for (const [i, line] of header.split("\n").entries()) {
+    const match = /^\s*#\+(TT_DELIVER_BRANCH|TT_DELIVER_AUDIT):/i.exec(line);
+    if (!match) continue;
+    const keyword = `#+${match[1].toUpperCase()}`;
+    out.push({
+      severity: "warning", rule: "program-keyword", phaseId: "program",
+      sourceFile, line: i + 1, item: line.trim(),
+      problem: `${keyword} belongs in each node's plan`,
+      fix: "Move this keyword from the program header to each node's plan.",
+    });
+  }
+  return out;
 }
 
 /** 07g1: every `#+TT_TEST_REMOVALS` entry must name a test the base declares,
