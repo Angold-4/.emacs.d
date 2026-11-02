@@ -213,8 +213,11 @@ export interface LaunchOptions {
  * launching one role's agent, per design §2.1: `--mode rpc`, the role's
  * explicit `--tools` allowlist, the skeleton extension, `--no-extensions`
  * and `--no-skills` so the owner's own user extensions/skills under
- * `~/.pi/agent` never leak into a role's tool set, and no prompt is ever
- * included — dispatching a prompt is a later phase's job. */
+ * `~/.pi/agent` never leak into a role's tool set, `--no-context-files` so
+ * no `AGENTS.md`/`CLAUDE.md` (the owner's global one, or the worktree's and
+ * its parents') reaches a role's prompt, and no prompt is ever included —
+ * dispatching a prompt is a later phase's job. The one way instructions
+ * reach an agent is explicit: `#+TT_WORKER_PROMPT` files, appended below. */
 export function launchArgs(role: Role, opts: LaunchOptions = {}): string[] {
   const extensionPath = opts.extensionPath ?? defaultExtensionPath();
   const args: string[] = [
@@ -226,6 +229,7 @@ export function launchArgs(role: Role, opts: LaunchOptions = {}): string[] {
     extensionPath,
     "--no-extensions",
     "--no-skills",
+    "--no-context-files",
   ];
   if (opts.provider) args.push("--provider", opts.provider);
   if (opts.model) args.push("--model", opts.model);
