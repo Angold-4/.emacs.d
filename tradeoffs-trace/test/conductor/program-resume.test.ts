@@ -246,3 +246,71 @@ test("plan 06d: a scheduler lock left by a dead pid is taken over", async () => 
     cleanupDir(repo.dir);
   }
 });
+
+/** Is this pid alive? (`process.kill(pid, 0)` on a zombie that its parent has
+ * not reaped says yes, so a stopped process is also checked for having LEFT
+ * the process table via `ps`.) */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ESRCH") return false;
+  }
+  try {
+    const out = execFileSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" }).trim();
+    return out.length > 0 && !out.startsWith("Z");
+  } catch {
+    return false;
+  }
+}
+
+/** Plan 07h2 (R5, program f345a473): a stopped program's scheduler is GONE —
+ * `tt program stop` returns only after the scheduler process has exited, and
+ * nothing starts a node afterwards. Registered under the phase contract's own
+ * test name ("tt program stop leaves no scheduler process") and under this
+ * packet's longer, descriptive one. */
+async function stopLeavesNoSchedulerProcess(): Promise<void> {
+  const s = setup();
+  let id = "";
+  try {
+    id = s.cli(["program", "start", path.join(s.scripts, "program.json")]).trim();
+    await waitFor(() => s.nodes(id).a.status === "running", 20_000, 200);
+    const schedulerPid = Number(fs.readFileSync(path.join(s.root, "programs", id, "scheduler.pid"), "utf8").trim());
+    assert.ok(Number.isInteger(schedulerPid) && schedulerPid > 0, "the scheduler recorded its pid");
+    assert.ok(pidAlive(schedulerPid), "the scheduler is running");
+    const startedBefore = nodeStartedCount(s.root, id, "a") + nodeStartedCount(s.root, id, "b");
+
+    s.cli(["program", "stop", id]);
+
+    // The stop RETURNS only once the scheduler is gone (SIGTERM, then SIGKILL
+    // after the grace), so the very next check must already be clean.
+    assert.equal(pidAlive(schedulerPid), false, "tt program stop leaves no scheduler process");
+    const state = JSON.parse(s.cli(["program", "state", id])) as { schedulerAlive: boolean; state: { stopped: boolean } };
+    assert.equal(state.schedulerAlive, false, "the program reports no live scheduler");
+    assert.equal(state.state.stopped, true, "the program is stopped");
+
+    // And nothing starts a node afterwards: the scheduler that would have was
+    // the process that is gone.
+    await new Promise((resolve) => setTimeout(resolve, 3_000));
+    assert.equal(pidAlive(schedulerPid), false, "no scheduler came back on its own");
+    assert.equal(
+      nodeStartedCount(s.root, id, "a") + nodeStartedCount(s.root, id, "b"),
+      startedBefore,
+      "no node started after the stop",
+    );
+    assert.equal(nodeStartedCount(s.root, id, "b"), 0, "the waiting node never started");
+    assert.equal(s.nodes(id).b.status, "waiting");
+  } finally {
+    if (id) {
+      try {
+        s.cli(["program", "stop", id]);
+      } catch {
+        // finished
+      }
+    }
+    s.cleanup();
+  }
+}
+
+test("plan 07h2 (R5, program f345a473): tt program stop leaves no scheduler process, and no node starts afterwards", stopLeavesNoSchedulerProcess);
+test("tt program stop leaves no scheduler process", stopLeavesNoSchedulerProcess);

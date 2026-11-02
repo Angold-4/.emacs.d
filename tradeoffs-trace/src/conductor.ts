@@ -180,14 +180,13 @@ import { failingDomainOf, integrateBrief, resolutionOutsideConflicted, runDomain
 import {
   assertToolSet,
   launchArgs,
-  PI_VERSION,
   ROLE_TOOLS,
   type PlanModels,
   type ModelRole,
   type Role,
   type ToolSetMismatch,
 } from "./core/roles.ts";
-import { CHANGED_TEST_BUDGET_MS, isChangedTestCommand, rerunBudgetMs } from "./core/checks.ts";
+import { rerunBudgetMs } from "./core/checks.ts";
 import {
   decisionSettled,
   decisionStatus,
@@ -261,7 +260,12 @@ import { validate } from "./core/schema.ts";
 
 import { EventLog, readLog, type LogRecord } from "./effects/log.ts";
 import { acquireCheckSlot, acquireLock, acquireWaitingLock, DEFAULT_CHECK_SLOTS, openCheckWindow, otherCheckWindowOwner, PausableTimer, type Lock } from "./effects/lock.ts";
-import { childEnv, runCommand, type CommandStep, type RunCommandResult } from "./effects/shell.ts";
+import { resumeKeptWorktree } from "./effects/kept-worktree.ts";
+import { childEnv, runCommand, shBoundFor, type CommandStep, type RunCommandResult } from "./effects/shell.ts";
+// 07 design A1: ADMIT — the one gate start, resume and a program node's own
+// start run before any event.
+import { admitOrRefuse } from "./effects/admit.ts";
+import { AdmitRefusal, type AdmitFacts } from "./core/admit.ts";
 import { groupStartedBefore, killGroup, loggedHeld, processAlive, signalProcess, sweep, type SweepResult } from "./effects/sweep.ts";
 import {
   createWorktree,
@@ -279,7 +283,7 @@ import {
   removeWorktree,
   candidateTree,
   saveUnsubmittedWork as gitSaveUnsubmittedWork,
-  verifyIntegrity, removedTestsBetween, testRemovalViolationsBetween, headOf, type DisposableCheckout } from "./effects/git.ts";
+  verifyIntegrity, removedTestsBetween, testRemovalViolationsBetween, headOf, uncommittedFiles, type DisposableCheckout } from "./effects/git.ts";
 import { RunSocketServer, type HelloResult, type SubmitResult } from "./effects/socket.ts";
 import { PiAgent, spawnPiAgent } from "./effects/pi-rpc.ts";
 import { redactBytes, redactRecord, redactText, resolveSecrets, secretNames, secretPromptLines, utf16Kind, type Secret } from "./effects/secrets.ts";
@@ -310,6 +314,10 @@ const OWNER_COMMAND_SCHEMA: Record<string, unknown> = JSON.parse(
  * `incomplete_review`). Two: a model that fixes its own omission gets a
  * second and third chance within the same turn, and one that never does
  * cannot wedge the turn. */
+/** 07 design A1: a refused ADMIT, re-exported so a caller — and a test —
+ * reads the one gate's exception from the conductor it refuses. */
+export { AdmitRefusal };
+
 export const MAX_INCOMPLETE_REVIEW_REJECTIONS = 2;
 
 /** Plan 06k3 (A1): how many times a two-lane round that fails only because a
@@ -581,6 +589,17 @@ export interface RunPlanFile {
   /** Plan 07e (E4/A5): `#+TT_CHECK_WINDOW: exclusive`. Off by default: a run
    * pauses its own workers for another run's check only when it opts in. */
   checkWindow?: "exclusive" | "off";
+  /** 07h3 (R8): `#+TT_DELIVER_AUDIT` — the principle audit `tt deliver` runs
+   * on the accepted node before it delivers it (a removed or changed test, a
+   * spec line, a protocol-crate function). The plan names the command;
+   * `tt deliver` runs it on the node's own tree and records what it printed.
+   * A non-zero exit is the delivery's `audit` exception — nothing is pushed. */
+  deliverAudit?: string;
+  /** 07h3 (R8): `#+TT_DELIVER_BRANCH` — the branch a node is delivered into:
+   * `tt deliver` audits the accepted node, test-merges it into this branch,
+   * runs the merge check on the merged tree and pushes the branch fast
+   * forward. Absent: today's stacked per-node delivery, unchanged. */
+  deliverBranch?: string;
   /** Documents the plan cites that live outside the repository (absolute
    * paths; Emacs collects them from #+TT_REFS and from the plan text). They
    * are copied into <run>/refs at creation, so a run keeps the version it
@@ -677,6 +696,12 @@ export interface ConductorOptions {
    * point it at a scratch PATH to prove a missing tool blocks a run and a
    * fixed one lets `tt resume` proceed. */
   preflightEnv?: NodeJS.ProcessEnv;
+  /** 07 design A1: the PATH ADMIT resolves the pinned pi against — the one the
+   * SHELL that launched this conductor has, captured before any recorded path
+   * is adopted (`adoptRecordedPath`), so a resume never resolves the pi a run
+   * recorded at its first start (exex 07f1, 2026-10-28). Defaults to this
+   * process's own PATH, read at `start()`. */
+  admitPath?: string;
   /** Per-agent environment override — tests use this to give each fake-pi
    * agent (worker, reviewer M/A/B) its own `FAKE_PI_SCRIPT`. */
   piEnvFor?: (role: Role, agentId: string) => NodeJS.ProcessEnv | undefined;
@@ -1098,7 +1123,18 @@ function seededDirective(seed: RunPlanDirectiveSeed, index: number): OwnerDirect
 /** Creates a fresh run directory (fails if it already exists) with the
  * layout design §9.1 describes, writes `meta.json` and the plan snapshot,
  * and returns the run id (the directory's basename). */
-export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().slice(0, 8)): string {
+export function createRun(
+  root: string,
+  plan: RunPlanFile,
+  runId = randomUUID().slice(0, 8),
+  // Plan 07h2 (A2): a program node's run is recorded under the runner the
+  // node's START snapshotted, not under a second, independent reading of this
+  // conductor's own installed `RUNNER_SHA`. The two readings are the same in
+  // an ordinary `tt start`; keeping ONE value is what makes "the node
+  // snapshots its runner at its start" true of the record rather than of the
+  // snapshot file alone.
+  opts: { runner?: string } = {},
+): string {
   if (plan.repo && isShallowRepository(plan.repo)) {
     throw new Error(`${plan.repo} is a shallow clone; candidate checkouts cannot be made from it. Run \`git -C ${plan.repo} fetch --unshallow\` first.`);
   }
@@ -1183,7 +1219,7 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
           repo: plan.repo,
           createdAt: new Date().toISOString(),
           status: "created",
-          runnerRevision: runnerRevision(),
+          runnerRevision: opts.runner ?? runnerRevision(),
         },
         maskable,
       ),
@@ -1534,6 +1570,33 @@ function defaultCheckLockPath(runDir: string): string {
   return path.join(path.dirname(runDir), "check.lock");
 }
 
+/** Plan 07h2 (R10): the `runId` a run's own log starts with — the id a check
+ * window marker carries. Read from the first chunk of `events.jsonl` rather
+ * than the whole file, which grows for the life of a run. */
+function firstLogRunId(runDir: string): string | undefined {
+  let fd: number | undefined;
+  try {
+    const file = runPaths(runDir).events;
+    fd = fs.openSync(file, "r");
+    const buf = Buffer.alloc(8192);
+    const read = fs.readSync(fd, buf, 0, buf.length, 0);
+    const line = buf.subarray(0, read).toString("utf8").split("\n", 1)[0];
+    const record = JSON.parse(line) as { kind?: unknown; event?: { runId?: unknown } };
+    if (record.kind !== "init") return undefined;
+    return typeof record.event?.runId === "string" ? record.event.runId : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // already closed
+      }
+    }
+  }
+}
+
 /** Plan 06g2: a lane round's winner awaiting its reviews' promotion. */
 type PendingLaneWinner = { round: number; lane: string; sha: string; build: LaneBuild; reviews: Array<{ seat: string; review: Review }> };
 
@@ -1702,6 +1765,16 @@ export class Conductor {
   #extraEnv: NodeJS.ProcessEnv;
   /** Plan 05i: the environment `#runEnvPreflight` resolves tools in. */
   #preflightEnv: NodeJS.ProcessEnv;
+  /** 07 design A1: the PATH ADMIT resolves the pinned pi against — the shell's
+   * own, captured before a recorded path is adopted. */
+  #admitPath: string | undefined;
+  /** 07 design A1 (07f1): the pi binary ADMIT resolved on `#admitPath`, set by
+   * `#admitRun` before any agent can launch. Every agent runs THIS binary, so a
+   * resume whose process PATH still carries the run's recorded (stale) entries
+   * — `adoptRecordedPath` prepends them — cannot launch a different pi than the
+   * one ADMIT checked (exex 07f1: a bare `pi` picked up the recorded brew 1.4.0
+   * and crashed the first agent). */
+  #admitPiPath: string | undefined;
   #piEnvFor: ((role: Role, agentId: string) => NodeJS.ProcessEnv | undefined) | undefined;
   #stubReviews: boolean;
   #briefsEnabled: boolean;
@@ -1813,6 +1886,12 @@ export class Conductor {
    * could not be written. Their dirty worktree is retained (never removed)
    * so the work is not lost, and the next attempt continues in it. */
   #unsavedLaneWorktrees = new Set<string>();
+  /** Plan 07h2 (R11, exex 01c3b): lanes whose worktree held UNCOMMITTED
+   * edits when the owner stopped this run. The worktree is kept as-is across
+   * the stop, the resumed run's worker continues in it, and its prompt says so.
+   * Seeded from the run's own log on every start, so it survives the stop (an
+   * in-memory set would be lost with the process). */
+  #keptLaneWorktrees = new Map<string, { round: number; files: number }>();
   /** Plan 06k3 (A3): the re-run result of each open finding's reproduction
    * command, per candidate, for the reviewer prompt table. Computed once per
    * candidate (after the checks) and reused by every reviewer prompt. */
@@ -1888,6 +1967,10 @@ export class Conductor {
    * survived — before the auto-stop it raced against had actually
    * finished killing the reviewers. */
   #stopping: Promise<void> | undefined;
+  /** Plan 07h2 (A3/R4): resolved by the end of `#doStop`, so the process that
+   * owns the run can await its teardown (`get stopped`) instead of guessing. */
+  #stoppedPromise: Promise<void>;
+  #stoppedResolve!: () => void;
   /** Every agent `sh` process group still running, across all agents —
    * including ones whose handle is already gone (a force-killed worker's
    * orphaned command). Removed when the command exits, so `stop()` only
@@ -1898,6 +1981,9 @@ export class Conductor {
    * gate) that are still running, each with the time it was recorded. */
   #liveStageGroups = new Map<number, number>();
   #stopRequested = false;
+  /** Plan 07h2 (R10): known siblings; refreshed when a new window owner is
+   * not yet known. Polling an unchanged owner never scans the root. */
+  #programSiblingIdsCache: Set<string> | undefined;
   /** Plan 07e (E4): why the stop was requested, read by the honest check
    * record. Set with `#stopRequested`; never read before it is true. */
   #stopCause: StopCause = "conductor";
@@ -1978,11 +2064,16 @@ export class Conductor {
     this.#piArgsPrefix = opts.piArgsPrefix ?? [];
     this.#extraEnv = opts.extraEnv ?? {};
     this.#preflightEnv = opts.preflightEnv ?? process.env;
+    this.#admitPath = opts.admitPath;
     this.#piEnvFor = opts.piEnvFor;
     this.#providerModelFor = opts.providerModelFor;
     this.#stubReviews = opts.stubReviews ?? false;
     this.#briefsEnabled = opts.briefs ?? false;
     this.#probeReuse = opts.probeReuse ?? true;
+    // Plan 07h2 (A3/R4): the promise the run's own process waits on.
+    this.#stoppedPromise = new Promise<void>((resolve) => {
+      this.#stoppedResolve = resolve;
+    });
     this.#now = opts.now ?? Date.now;
     this.#gateLockPath = opts.gateLockPath ?? path.join(os.homedir(), ".tradeoffs-trace", "gate.lock");
     // Plan 07a (OD-3): the check lock defaults to the run's own root, not the
@@ -2038,7 +2129,18 @@ export class Conductor {
     return Object.fromEntries(this.#agentTokenTotals);
   }
 
+  /** The binary an agent of this role is spawned as: a test's injected fake-pi
+   * first, else the pi ADMIT resolved on the shell's PATH (07 design A1), else
+   * `undefined` — the production shape before ADMIT has run, where the spawn
+   * falls back to a bare `pi`. */
   #resolvePiCommand(role: Role): string | undefined {
+    return this.#piInjectedCommand(role) ?? this.#admitPiPath;
+  }
+
+  /** Only a test's own injected binary; `undefined` for a real pi (ADMIT's
+   * resolved path is NOT an injection — `launchArgs`' `noSession`, a flag for
+   * fake-pi, must not follow from it). */
+  #piInjectedCommand(role: Role): string | undefined {
     return this.#piCommandFor?.(role) ?? this.#piCommand;
   }
 
@@ -2061,21 +2163,39 @@ export class Conductor {
     this.#secretMaskable = resolved.maskable;
     this.#missingSecrets = resolved.missing;
     this.#tooShortSecrets = resolved.tooShort;
+    // 07 design §3.1/A1: ADMIT runs BEFORE any event of this start — before
+    // the log is even opened. The plan lints, TT_REPO is a git work tree,
+    // every check command parses and the pinned pi is the one on the PATH
+    // this shell has — resolved again on every start, never read back from
+    // the run's `check-env.json` (exex 07f1). A refusal releases the lock and
+    // throws before the init record, so a refused start appends no event and
+    // a resume's existing events are untouched.
+    let admitted: AdmitFacts;
+    try {
+      admitted = this.#admitRun();
+    } catch (err) {
+      await this.#lock?.release();
+      this.#lock = undefined;
+      throw err;
+    }
     this.#log = new EventLog(this.#paths.events, this.#secretMaskable, (err) => this.#noteDiskFull(err));
     // Plan 06k1 (A6): record the check environment once, before any check or
-    // resume can need it.
-    this.#recordCheckEnv();
-
-    // design §2.1: assert the Pi version before ever launching it — but
-    // only when the real `pi` binary is actually going to be used for at
-    // least one role; tests inject fake-pi via `piCommand`/`piArgsPrefix`
-    // (or, for live-single-phase's mixed run, `piCommandFor`) and never
-    // touch this.
-    if (this.#resolvePiCommand("worker") === undefined || this.#resolvePiCommand("reviewer") === undefined) {
-      assertPiVersion();
-    }
+    // resume can need it — the PATH it records is the one ADMIT just saw.
+    this.#recordCheckEnv(admitted.path);
 
     const { records } = readLog(this.#paths.events);
+    // Plan 07h2 (R11): a lane worktree the previous process kept because it
+    // held uncommitted edits is STILL that lane's worktree on this start — the
+    // set lives in the log, not in memory, so a stop/resume keeps the work.
+    for (const record of records) {
+      if (record.kind !== "lane_worktree_kept") continue;
+      const kept = record.event as { lane?: unknown; round?: unknown; files?: unknown };
+      if (typeof kept.lane !== "string") continue;
+      this.#keptLaneWorktrees.set(kept.lane, {
+        round: typeof kept.round === "number" ? kept.round : 0,
+        files: typeof kept.files === "number" ? kept.files : 0,
+      });
+    }
     const initRecord = records.find((r) => r.kind === "init");
     if (initRecord) {
       const init = initRecord.event as { runId: string; integrationHead: string; runnerRevision?: string; seats?: Seats; workerPrompts?: unknown };
@@ -2217,12 +2337,11 @@ export class Conductor {
         this.#log.append("forbidden_refused", { agentId, pattern, command: redactText(command, this.#secretMaskable) });
         return `refused: the command matches the phase's forbidden pattern ${JSON.stringify(pattern)} (#+TT_FORBIDDEN)`;
       },
-      // Plan 06l (A2): `tt test --changed` gets its own budget (20 min),
-      // never the conductor's shell cap; every other command keeps the cap.
-      shDeadline: (command: string) => ({
-        deadlineMs: isChangedTestCommand(command) ? CHANGED_TEST_BUDGET_MS : this.#deadlines.shCommandMs,
-        termGraceMs: this.#deadlines.termGraceMs,
-      }),
+      // Plan 06l (A2) / 07h2 (C3): the bound ONE worker `sh` command runs
+      // under is an effect's policy (`shBoundFor`), not the socket wiring's:
+      // `tt test --changed` gets its own budget, every other command the
+      // plan's `TT_SH_MINUTES` cap (R12).
+      shDeadline: (command: string) => shBoundFor(command, this.#deadlines),
       // Plan 06e (A1): a `sh` command's environment carries childEnv() plus
       // every resolved secret value, so `$NAME` works whether the environment
       // or the env file supplied the value.
@@ -2923,6 +3042,16 @@ export class Conductor {
     return this.#stopping;
   }
 
+  /** Plan 07h2 (A3/R4): resolves once this conductor's teardown has finished,
+   * whether it stopped on its own (DONE/BLOCKED) or the owner stopped it.
+   * `start()` returns as soon as the run is under way — it does not wait for
+   * the stop — so the process that owns the run awaits THIS to know the run is
+   * over, prune it, and exit (run d170bb37 kept a finished run's process alive
+   * for 7.5 hours because nothing did). */
+  get stopped(): Promise<void> {
+    return this.#stoppedPromise;
+  }
+
   async #doStop(): Promise<void> {
     this.#stopRequested = true;
     if (this.#budgetTimer) clearTimeout(this.#budgetTimer);
@@ -2936,6 +3065,12 @@ export class Conductor {
     // Plan 06f (A2): a stopped conductor is neither alive nor waiting, so its
     // row leaves `live.json` here.
     this.#writeLive();
+    // Plan 07h2 (R11, exex 01c3b): an owner stop must never throw away a lane's
+    // uncommitted work. A lane worktree that still holds edits is marked kept
+    // before the log closes, so the resumed run continues in it instead of
+    // recreating it at the base (~35 minutes of lane b's work were lost that
+    // way).
+    this.#recordKeptLaneWorktrees();
     // design §9.3: `tt stop` ends a run's conductor cleanly — the stop event
     // is logged (with why) before anything is torn down, so the record is
     // durable even if a later step is slow or fails.
@@ -2978,6 +3113,9 @@ export class Conductor {
     await this.#socket?.close();
     await this.#lock?.release();
     this.#log?.close();
+    // Plan 07h2 (A3/R4): the run is over — its own process can now prune it
+    // and exit.
+    this.#stoppedResolve();
   }
 
   // -- event application ----------------------------------------------
@@ -4601,6 +4739,50 @@ export class Conductor {
    * worker's process group (SIGSTOP) and its attempt clock, so a check that
    * holds the machine for minutes does not time the worker out. Resumes
    * (SIGCONT) the moment the window closes. Returns a stop function. */
+  /** Plan 07h2 (R10/A2): is `runId` another node of THIS run's program? Two
+   * nodes of one program are one work unit, so node 2's exclusive check window
+   * must not freeze node 1's workers (exex 01c3: `#+TT_PROGRAM: 2` froze the
+   * sibling for the whole check, and the sibling's `sh` bound then read as
+   * "the check took 40 minutes"). A run that is not a program node (no
+   * `program.json`) and a run of a different program are still "another run". */
+  #isSiblingProgramRun(runId: string): boolean {
+    if (runId.length === 0) return false;
+    if (runId === this.#state.phase.runId) return false;
+    if (this.#programSiblingIdsCache?.has(runId)) return true;
+    return this.#programSiblingIds()?.has(runId) ?? false;
+  }
+
+  /** The `init` run ids of the other runs under this root that belong to THIS
+   * run's program (refreshed for an unknown window owner). A marker records the run id from the
+   * log's `init` record, which is not the run directory's name, so the ids are
+   * collected from each sibling's own log rather than derived from a path. */
+  #programSiblingIds(): Set<string> | undefined {
+    let ids: Set<string> | undefined;
+    try {
+      const own = JSON.parse(fs.readFileSync(path.join(this.#runDir, "program.json"), "utf8")) as { programId?: unknown };
+      if (typeof own.programId === "string" && own.programId.length > 0) {
+        const root = path.dirname(this.#runDir);
+        const set = new Set<string>();
+        for (const name of fs.readdirSync(root)) {
+          const dir = path.join(root, name);
+          try {
+            const info = JSON.parse(fs.readFileSync(path.join(dir, "program.json"), "utf8")) as { programId?: unknown };
+            if (info.programId !== own.programId) continue;
+            const id = firstLogRunId(dir);
+            if (id !== undefined) set.add(id);
+          } catch {
+            // not one of this program's node runs
+          }
+        }
+        ids = set;
+      }
+    } catch {
+      ids = undefined;
+    }
+    this.#programSiblingIdsCache = ids;
+    return ids;
+  }
+
   #watchCheckWindow(agentId: string, agent: PiAgent, ...timers: Array<PausableTimer<"timeout" | "steer">>): () => void {
     // Plan 07e (E4/A5): opt-in only. A plan without `#+TT_CHECK_WINDOW:
     // exclusive` keeps its workers running through another run's check.
@@ -4643,9 +4825,14 @@ export class Conductor {
         // the log is already closed; the pause simply stays unpaired
       }
     };
+    const classifiedOwners = new Map<string, boolean>();
+    const isSibling = (owner: string): boolean => {
+      if (!classifiedOwners.has(owner)) classifiedOwners.set(owner, this.#isSiblingProgramRun(owner));
+      return classifiedOwners.get(owner)!;
+    };
     const iv = setInterval(() => {
       if (this.#closed) return;
-      const by = otherCheckWindowOwner(this.#checkLockPath, this.#state.phase.runId);
+      const by = otherCheckWindowOwner(this.#checkLockPath, isSibling);
       if (by !== undefined && !paused) pause(by);
       else if (by === undefined && paused) resume();
     }, 100);
@@ -7731,6 +7918,7 @@ export class Conductor {
       });
 
       const workerPiCommand = this.#resolvePiCommand("worker");
+      const workerPiInjected = this.#piInjectedCommand("worker") !== undefined;
       const workerProviderModel = this.#providerModelFor?.("worker");
       const agent = spawnPiAgent({
         command: workerPiCommand,
@@ -7739,7 +7927,7 @@ export class Conductor {
           ...launchArgs("worker", {
             sessionDir,
             continueSession,
-            noSession: workerPiCommand !== undefined,
+            noSession: workerPiInjected,
             provider: workerProviderModel?.provider,
             model: workerProviderModel?.model,
             // `#+TT_WORKER_PROMPT`: a single worker takes lane a's files.
@@ -8837,6 +9025,29 @@ export class Conductor {
     return path.join(this.#runDir, "worktrees", `lane-${lane}`);
   }
 
+  /** Plan 07h2 (R11, exex 01c3b): record every lane worktree that still holds
+   * uncommitted edits when this run stops, so the resumed run reuses it. A
+   * finished run keeps nothing (its worktrees are pruned, A3/R4) and a single-
+   * worker phase has no lane worktrees at all. */
+  #recordKeptLaneWorktrees(): void {
+    if (!this.#laneRoundEnabled()) return;
+    const phase = this.#state?.phase.phase;
+    if (phase === "DONE" || phase === "BLOCKED") return;
+    for (const lane of this.#lanes()) {
+      const worktree = this.#laneWorktree(lane);
+      if (!fs.existsSync(worktree)) continue;
+      const files = uncommittedFiles(worktree);
+      if (files.length === 0) continue;
+      const round = (this.#state.phase.rounds ?? []).length;
+      this.#keptLaneWorktrees.set(lane, { round, files: files.length });
+      try {
+        this.#log?.append("lane_worktree_kept", { lane, round, files: files.length });
+      } catch {
+        // A closed log must never stop the stop itself.
+      }
+    }
+  }
+
   /** A repeat of a round that failed only for a missing review or vote: each
    * lane that passed its checks restarts from its own candidate, and a lane
    * whose candidate was still red continues from that red candidate. Derived
@@ -8998,6 +9209,7 @@ export class Conductor {
         : // A pick seat runs on its own reviewer seat's model.
           this.#providerModelFor?.(opts.role === "picker" ? "reviewer" : opts.role, opts.seat);
     const command = this.#resolvePiCommand(opts.role);
+    const piInjected = this.#piInjectedCommand(opts.role) !== undefined;
     const streamFile = path.join(this.#paths.stream, `${opts.agentId}.jsonl`);
     // Declared before the spawn so the event callback below can never see it
     // in its temporal dead zone.
@@ -9009,7 +9221,7 @@ export class Conductor {
         ...launchArgs(opts.role, {
           sessionDir: opts.sessionDir,
           continueSession: opts.freshSession === true ? false : hasSessionFile(opts.sessionDir),
-          noSession: command !== undefined,
+          noSession: piInjected,
           provider: providerModel?.provider,
           model: providerModel?.model,
           // `#+TT_WORKER_PROMPT`: only a lane WORKER gets its lane's files;
@@ -9188,12 +9400,18 @@ export class Conductor {
     // `--continue`.
     this.#log.append("lane_session", { lane, round, continueSession: !freshSession });
     const worktree = this.#laneWorktree(lane);
+    let keptWorktreeNote: string | undefined;
     // Plan 06k2 (A4, finding M-1): a lane worktree create/remove that throws
     // is recorded as THIS lane attempt's failure, exactly like the
     // single-worker reset — never a bare throw the round swallows without a
     // lane-specific reason.
     try {
-      if (fix && fs.existsSync(worktree) && headOf(worktree) === fix.of) {
+      if (this.#keptLaneWorktrees.has(lane) && fs.existsSync(worktree)) {
+        const ref = `refs/tt/${this.#state.phase.runId}/kept/${lane}/${randomUUID()}`;
+        keptWorktreeNote = `This run was stopped and resumed: the worktree of lane ${lane} ${resumeKeptWorktree(this.#plan.repo, worktree, fix?.of ?? base, ref)}`;
+        this.#keptLaneWorktrees.delete(lane);
+        this.#log.append("lane_worktree_reused", { lane, round, reason: keptWorktreeNote });
+      } else if (fix && fs.existsSync(worktree) && headOf(worktree) === fix.of) {
         // exex 01a2: the worktree already holds the red candidate (its
         // freeze commit); the worker fixes it in place.
         this.#log.append("lane_worktree_reused", { lane, round, reason: `fixing its red candidate ${fix.of}` });
@@ -9262,7 +9480,7 @@ export class Conductor {
         this.#log.completion(actionId, { lane, round, outcome: "no-candidate", reason: note });
         return { lane, note };
       }
-      await handle.agent.prompt(prompt);
+      await handle.agent.prompt(keptWorktreeNote === undefined ? prompt : `${prompt}\n\n${keptWorktreeNote}`);
       // Plan 06k1 (A5, finding D-M-63): a queued correction counts as
       // delivered only now that a lane worker that STARTED received the
       // prompt carrying it. Both lanes send the same prompt; the first to get
@@ -10587,7 +10805,7 @@ export class Conductor {
    * disposable checkout of its commit, under the machine-wide lock. No
    * command means nothing to gate on, so the fixer is green. */
   async #checkFixer(task: FixTask, round: number, sha: string): Promise<LaneCheck> {
-    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
+    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots, this.#runDir);
     const window = this.#openCheckWindow();
     try {
       const command = this.#state.phase.contract.fixChecks;
@@ -10757,7 +10975,7 @@ export class Conductor {
 
   /** One candidate's checks, run under the machine-wide lock (C2). */
   async #checkLaneCandidate(round: number, lane: string, sha: string): Promise<LaneCheck> {
-    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
+    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots, this.#runDir);
     // Plan 06k1 (A4): the check holds the host-wide window for its duration,
     // so every other run's workers are paused while it runs.
     const window = this.#openCheckWindow();
@@ -11260,12 +11478,9 @@ export class Conductor {
     return Math.max(1, Math.floor(this.#deadlines.reviewMs / 3));
   }
 
-  /** Plan 06l (A2): the extension's own wait for a `sh` result. It must cover
-   * the longest per-command budget (`tt test --changed`), or a worker's narrow
-   * test run would return a client-side timeout while the conductor still has
-   * it running. A normal command still ends at the shell cap, well inside it. */
+  /** The extension waits for the shell cap plus termination and transport grace. */
   #shWaitMs(): number {
-    return Math.max(this.#deadlines.shCommandMs, CHANGED_TEST_BUDGET_MS) + 30_000;
+    return this.#deadlines.shCommandMs + this.#deadlines.termGraceMs + 30_000;
   }
 
   /** Plan 06k3 (A1): one seat's lane review. A review turn that ends without
@@ -11823,7 +12038,7 @@ export class Conductor {
         check = { ok: true };
         this.#log.append("integrated_check_reused", { round, candidateSha: candidate, base: record.base });
       } else {
-        const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
+        const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots, this.#runDir);
         const window = this.#openCheckWindow();
         try {
           this.#log.append("integrated_check_started", { round, candidateSha: candidate, base: record.base });
@@ -13432,6 +13647,41 @@ export class Conductor {
     }
   }
 
+  /** 07 design A1 (§3.1): the conductor's own ADMIT, run before any event of
+   * this start — the plan lints, TT_REPO is a git work tree, every check
+   * command parses, and the pinned pi is the one on the PATH this SHELL has,
+   * resolved again on every start (`admitPath`, captured before a recorded
+   * path was adopted) and never from the run's `check-env.json` (exex 07f1:
+   * a resume adopted a recorded brew pi 1.4.0 and the conductor crashed at its
+   * next agent launch instead of naming the environment fault). A refusal
+   * throws `AdmitRefusal` — X:PLAN_DEFECT or X:ENV_FAULT with its reason —
+   * before the init record exists, so a refused start appends no event. The
+   * facts are written to `<run>/admit.json` so the owner can read what was
+   * checked and against what.
+   *
+   * The pi version is checked only when a real binary will be launched: a test
+   * injects fake-pi through `piCommand`/`piCommandFor` and never touches the
+   * machine's pi (the rule `assertPiVersion` always had). */
+  #admitRun(): AdmitFacts {
+    const resolvedPath = this.#admitPath ?? process.env.PATH ?? "";
+    const realPi = this.#piInjectedCommand("worker") === undefined || this.#piInjectedCommand("reviewer") === undefined;
+    const facts = admitOrRefuse(this.#plan, {
+      path: resolvedPath,
+      cwd: this.#plan.repo,
+      ...(realPi ? { pi: "pi" } : {}),
+    });
+    // 07 design A1 (07f1): the pi every agent of this start launches is the one
+    // ADMIT just resolved on the shell's PATH — never whatever a bare `pi`
+    // would find on a PATH a recorded run's environment was prepended to.
+    this.#admitPiPath = facts.pi.path;
+    try {
+      fs.writeFileSync(path.join(this.#runDir, "admit.json"), `${JSON.stringify(facts, null, 2)}\n`);
+    } catch {
+      // A read-only run dir must not stop the run; the record is for the owner.
+    }
+    return facts;
+  }
+
   /** Plan 05i: the one gate that runs at `start()`, before the baseline and
    * before any agent. It resolves every declared executable, records the
    * resolved paths (`ENV_CHECKED`), and either applies `ENV_PREFLIGHT_FAILED`
@@ -14135,7 +14385,7 @@ export class Conductor {
     // holds one of the machine-wide check slots (at most `#checkSlots` checks
     // at once) and the host-wide check window, so every other run's workers
     // pause while this one runs.
-    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
+    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots, this.#runDir);
     const window = this.#openCheckWindow();
     this.#log.intent(actionId, { candidateSha });
     crashAt("before_run_checks");
@@ -14772,8 +15022,12 @@ export class Conductor {
    * `PATH` plus every variable the plan declares (`envVars`) or a check
    * command references (`$NAME`/`${NAME}`). On a resume the recorded file is
    * read back, so the resuming shell's own environment never changes a check.
-   * Written at start, before any check runs. */
-  #recordCheckEnv(): void {
+   * Written at start, before any check runs.
+   *
+   * 07 design A1: this record is what ADMIT SAW — `admitPath` is the PATH
+   * ADMIT resolved on this start, so a resume's record never claims a path
+   * ADMIT did not use. ADMIT never reads it back (only checks do). */
+  #recordCheckEnv(admitPath?: string): void {
     const file = path.join(this.#runDir, "check-env.json");
     if (fs.existsSync(file)) {
       try {
@@ -14815,7 +15069,7 @@ export class Conductor {
     for (const name of this.#secretNames) names.delete(name);
     const env: Record<string, string | null> = {};
     for (const name of names) {
-      env[name] = process.env[name] ?? null;
+      env[name] = name === "PATH" && admitPath !== undefined ? admitPath : (process.env[name] ?? null);
     }
     this.#recordedEnv = env;
     try {
@@ -15227,6 +15481,7 @@ export class Conductor {
     // crash-recovered attempt. `noSession` (no persistence at all) only for
     // fake-pi, which does not understand sessions.
     const reviewerPiCommand = this.#resolvePiCommand("reviewer");
+    const reviewerPiInjected = this.#piInjectedCommand("reviewer") !== undefined;
     const sessionDir = path.join(this.#paths.sessions, `reviewer-${reviewer}`);
     fs.mkdirSync(sessionDir, { recursive: true });
     // design §2: M keeps one session for the run; A and B are kept across
@@ -15243,7 +15498,7 @@ export class Conductor {
         ...launchArgs("reviewer", {
           sessionDir,
           continueSession,
-          noSession: reviewerPiCommand !== undefined,
+          noSession: reviewerPiInjected,
           provider: reviewerProviderModel?.provider,
           model: reviewerProviderModel?.model,
         }),
@@ -15857,12 +16112,13 @@ export class Conductor {
     const nextSettle = () => new Promise<"settled">((resolve) => settleWaiters.push(() => resolve("settled")));
     let fallbackReason = "the brief writer did not run";
     const evaluatorPiCommand = this.#resolvePiCommand("evaluator");
+    const evaluatorPiInjected = this.#piInjectedCommand("evaluator") !== undefined;
     const providerModel = this.#providerModelFor?.("evaluator");
     const agent = spawnPiAgent({
       command: evaluatorPiCommand,
       args: [
         ...this.#resolvePiArgsPrefix("evaluator"),
-        ...launchArgs("evaluator", { noSession: evaluatorPiCommand !== undefined, provider: providerModel?.provider, model: providerModel?.model }),
+        ...launchArgs("evaluator", { noSession: evaluatorPiInjected, provider: providerModel?.provider, model: providerModel?.model }),
       ],
       cwd: candidateDir,
       env,
@@ -16041,6 +16297,7 @@ export class Conductor {
     });
 
     const evaluatorPiCommand = this.#resolvePiCommand("evaluator");
+    const evaluatorPiInjected = this.#piInjectedCommand("evaluator") !== undefined;
     const providerModel = this.#providerModelFor?.("evaluator");
     // An evaluator that settles without an ACCEPTED submission fails fast
     // (that type times out and publishes unevaluated); waiting out the whole
@@ -16052,7 +16309,7 @@ export class Conductor {
       args: [
         ...this.#resolvePiArgsPrefix("evaluator"),
         ...launchArgs("evaluator", {
-          noSession: evaluatorPiCommand !== undefined,
+          noSession: evaluatorPiInjected,
           provider: providerModel?.provider,
           model: providerModel?.model,
         }),
@@ -16342,6 +16599,7 @@ export class Conductor {
     });
 
     const panelPiCommand = this.#resolvePiCommand("panel");
+    const panelPiInjected = this.#piInjectedCommand("panel") !== undefined;
     // #+TT_MODELS per-seat: `panel.N` first, else the reviewer of this
     // position when panel=reviewers, else the shared `panel` model.
     const providerModel = this.#providerModelFor?.("panel", seat);
@@ -16352,7 +16610,7 @@ export class Conductor {
       args: [
         ...this.#resolvePiArgsPrefix("panel"),
         ...launchArgs("panel", {
-          noSession: panelPiCommand !== undefined,
+          noSession: panelPiInjected,
           provider: providerModel?.provider,
           model: providerModel?.model,
         }),
@@ -16541,6 +16799,7 @@ export class Conductor {
     });
 
     const panelPiCommand = this.#resolvePiCommand("panel");
+    const panelPiInjected = this.#piInjectedCommand("panel") !== undefined;
     const providerModel = this.#providerModelFor?.("panel", seat);
     const settleWaiters: Array<() => void> = [];
     const nextSettle = () => new Promise<"settled">((resolve) => settleWaiters.push(() => resolve("settled")));
@@ -16549,7 +16808,7 @@ export class Conductor {
       args: [
         ...this.#resolvePiArgsPrefix("panel"),
         ...launchArgs("panel", {
-          noSession: panelPiCommand !== undefined,
+          noSession: panelPiInjected,
           provider: providerModel?.provider,
           model: providerModel?.model,
         }),
@@ -17989,24 +18248,4 @@ export function helloRetryTimeoutMs(baseMs: number, sessionBytes: number): numbe
 
 function currentHead(repo: string, branch: string): string {
   return execFileSync("git", ["-C", repo, "rev-parse", branch], { encoding: "utf8" }).trim();
-}
-
-/** design §2.1: assert the pinned Pi version before ever launching the real
- * `pi` binary — an upgrade is a deliberate PR that reruns the phase 0
- * contract tests, not something that should silently drift. Only called
- * when no `piCommand` override was given (never for fake-pi in tests). */
-function assertPiVersion(): void {
-  let output: string;
-  try {
-    output = execFileSync("pi", ["--version"], { encoding: "utf8" }).trim();
-  } catch (err) {
-    throw new Error(
-      `could not run 'pi --version' to assert the pinned Pi version (${PI_VERSION}): ${String((err as Error)?.message ?? err)}`,
-    );
-  }
-  if (!output.includes(PI_VERSION)) {
-    throw new Error(
-      `pi reports version '${output}', expected the pinned ${PI_VERSION} (design §2.1) — upgrading is a deliberate PR that reruns the phase 0 contract tests`,
-    );
-  }
 }

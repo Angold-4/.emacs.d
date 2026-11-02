@@ -120,12 +120,50 @@ export interface DeliveryLayer {
   deliveredSha?: string;
   tree: string;
   labels: string[];
+  /** 07h3 (R8): the checks the merged delivery branch must pass — the plan's
+   * `#+TT_CHECKS` and the phase's own `:CHECKS:`, run on the merge result. */
+  checks: string[];
   /** The PR body: the phase summary, the whole-stack graph and the
    * trade-offs table, and no generated-by footer. */
   body: string;
+  /** 07h3 (R8): the plan's `#+TT_DELIVER_AUDIT`, run on the accepted node
+   * before it is delivered. Absent: no audit. */
+  audit?: string;
+  /** 07h3 (R8): the plan's `#+TT_DELIVER_BRANCH`. When set, this layer is
+   * delivered into that branch (audit → test merge → merge check → fast-forward
+   * push) instead of being pushed as its own stacked layer. */
+  deliverBranch?: string;
   /** The previously pushed SHA (the `--force-with-lease` value); `""` when
    * nothing has been pushed for this layer yet. */
   lease: string;
+}
+
+/** 07h3 (R8): an exception, not a silent failure. A conflict, an audit flag or
+ * a red merge check stops the delivery with everything the lead needs: the
+ * node, the branch, the files or command that stopped it and its own output.
+ * Nothing is pushed when one is raised. */
+export interface DeliveryException {
+  kind: "audit" | "conflict" | "check" | "push" | "branch";
+  node: string;
+  branch: string;
+  /** One line naming what stopped the delivery. */
+  detail: string;
+  /** The conflicting paths (a merge conflict). */
+  files?: string[];
+  /** The command's own output (an audit flag, a red merge check, a refused
+   * push). */
+  output?: string;
+}
+
+/** The one printed line of an exception (the details follow it). */
+export function exceptionText(exception: DeliveryException): string {
+  const what =
+    exception.kind === "conflict"
+      ? `conflict merging ${exception.node} into ${exception.branch}${
+          exception.files && exception.files.length > 0 ? `: ${exception.files.join(", ")}` : ""
+        }`
+      : `${exception.kind} stopped ${exception.node} (${exception.branch}): ${exception.detail}`;
+  return `exception: ${what}; nothing was pushed`;
 }
 
 export interface DeliveryPlan {
@@ -229,9 +267,10 @@ export function planDelivery(opts: { programDir: string; runRoot: string; cmd?: 
   const repo = program.entries[0]?.plan.repo;
   if (!repo) return { ok: false, reason: "the program names no repository" };
   const remote = opts.remote ?? ledger.remote ?? "origin";
-  // The root base: the branch a restack moved the stack onto, else the plan's
-  // integration branch.
-  const base = ledger.base ?? program.entries[0]!.plan.integrationBranch;
+  // The root base: the branch a restack moved the stack onto, else the
+  // program's own `#+TT_BASE` (07h3 H2 — the branch its root nodes are cut
+  // from), else the plan's integration branch.
+  const base = ledger.base ?? program.base ?? program.entries[0]!.plan.integrationBranch;
   const gh = opts.gh ?? "gh";
   const orderedIds = new Set(ordered.map((n) => n.id));
   const layers: DeliveryLayer[] = [];
@@ -282,7 +321,10 @@ export function planDelivery(opts: { programDir: string; runRoot: string; cmd?: 
       candidateSha,
       tree,
       labels: entry.plan.labels ?? [],
+      checks: [...new Set([...(entry.plan.checks ?? []), ...(phase.checks ?? [])])],
       body,
+      ...(entry.plan.deliverAudit?.trim() ? { audit: entry.plan.deliverAudit.trim() } : {}),
+      ...(entry.plan.deliverBranch?.trim() ? { deliverBranch: entry.plan.deliverBranch.trim() } : {}),
       lease: recorded?.sha ?? "",
       ...(recorded?.sha ? { deliveredSha: recorded.sha } : {}),
     });
@@ -314,6 +356,14 @@ function deliveryOrder(nodes: readonly ProgramNode[], state: ProgramState): Prog
 export function renderDeliveryPlan(plan: DeliveryPlan): string {
   const lines = [`deliver ${plan.layers.length} layer(s) to ${plan.remote}, base ${plan.base}`];
   for (const l of plan.layers) {
+    if (l.deliverBranch) {
+      lines.push(`  ${l.node} → ${l.deliverBranch}`);
+      if (l.audit) lines.push(`    audit: ${l.audit}`);
+      lines.push(`    test merge ${l.candidateSha.slice(0, 12)} into ${l.deliverBranch}`);
+      for (const check of l.checks) lines.push(`    merge check: ${check}`);
+      lines.push(`    push ${plan.remote} ${l.deliverBranch} (fast forward)`);
+      continue;
+    }
     lines.push(`  ${l.branch} (${l.node})`);
     const on = l.parentCommit ? l.parentCommit.slice(0, 12) : `${l.parentNode}'s new commit`;
     lines.push(`    commit tree ${l.tree.slice(0, 12)} on ${on} (base ${l.parentBranch})`);
@@ -329,6 +379,8 @@ export interface DeliveryResult {
   applied: boolean;
   messages: string[];
   ledger: DeliveryLedger;
+  /** 07h3 (R8): the exception that stopped the delivery, when one did. */
+  exception?: DeliveryException;
 }
 
 /** Apply (or print) the delivery. Without `apply` nothing mutates. */
@@ -349,6 +401,48 @@ export function deliver(opts: DeliveryOptions): DeliveryResult {
   const delivered: Record<string, string> = {};
   for (const layer of plan.layers) {
     const previous = ledger.layers[layer.node];
+    // 07h3 (R8): a node whose plan names `#+TT_DELIVER_BRANCH` is delivered
+    // into that branch — audit, test merge, merge check, fast-forward push —
+    // and is not pushed as its own stacked layer (there is no per-node PR to
+    // open for it). A conflict or an audit flag stops the delivery here.
+    if (layer.deliverBranch) {
+      const result = deliverLayerToBranch(cmd, plan.repo, plan.remote, layer, previous);
+      if (!result.ok) {
+        return {
+          ok: false,
+          applied: Object.keys(delivered).length > 0,
+          messages: [
+            ...messages,
+            exceptionText(result.exception),
+            ...(result.exception.files && result.exception.files.length > 0 ? [`conflicting files: ${result.exception.files.join(", ")}`] : []),
+            ...(result.exception.output && result.exception.output.length > 0 ? [`${result.exception.kind} output: ${result.exception.output}`] : []),
+          ],
+          ledger,
+          exception: result.exception,
+        };
+      }
+      delivered[layer.node] = result.sha;
+      ledger.layers[layer.node] = result.entry;
+      ledger.remote = plan.remote;
+      writeDeliveryLedger(opts.programDir, ledger);
+      messages.push(result.message);
+      continue;
+    }
+    // 07h3 (R8): an audit declared without a delivery branch still gates the
+    // node's own delivery: it runs on the accepted node first.
+    if (layer.audit) {
+      const audit = runInWorktree(cmd, plan.repo, layer.candidateSha, layer.audit);
+      if (audit.status !== 0) {
+        const exception: DeliveryException = {
+          kind: "audit",
+          node: layer.node,
+          branch: layer.branch,
+          detail: `the audit command exited ${audit.status}: ${layer.audit}`,
+          output: audit.output,
+        };
+        return { ok: false, applied: Object.keys(delivered).length > 0, messages: [...messages, exceptionText(exception), `audit output: ${audit.output}`], ledger, exception };
+      }
+    }
     // Plan 06m (OD-3(1), contract-92): the parent commit is resolved from the
     // ledger — the parent layer's delivered commit (this run's, else the
     // recorded one), or for the root the parent it was recorded on (a
@@ -440,6 +534,9 @@ export function deliver(opts: DeliveryOptions): DeliveryResult {
     writeDeliveryLedger(opts.programDir, ledger);
     messages.push(`${layer.branch}: ${pushed ? `${sha.slice(0, 12)} pushed` : `${sha.slice(0, 12)} kept`}, PR ${exists ? "updated" : "opened"}`);
   }
+  // 07h3 (R8): a delivery into a branch has no stack of PRs to link — the
+  // push that landed each node IS the delivery, so no gh step runs.
+  if (plan.layers.some((l) => l.deliverBranch)) return { ok: true, applied: true, messages, ledger };
   const link = cmd(gh, ["stack", "link", "--base", plan.base], { cwd: plan.repo });
   if (link.status !== 0) {
     // Plan 06m (A-33/disc-M-43): an unlinked stack is an incomplete delivery,
@@ -448,6 +545,142 @@ export function deliver(opts: DeliveryOptions): DeliveryResult {
   }
   messages.push(`gh stack link --base ${plan.base}`);
   return { ok: true, applied: true, messages, ledger };
+}
+
+/** 07h3 (R8): one layer delivered into the plan's `#+TT_DELIVER_BRANCH` — the
+ * program's delivery step, in the design's order:
+ *   1. the plan's `#+TT_DELIVER_AUDIT` on the accepted node;
+ *   2. a test merge of that node into the delivery branch;
+ *   3. the merge check (`#+TT_CHECKS` and the phase's `:CHECKS:`) on the merge;
+ *   4. a fast-forward push of the delivery branch.
+ * A conflict, an audit flag or a red merge check raises an exception with its
+ * output and pushes nothing. */
+function deliverLayerToBranch(
+  cmd: Cmd,
+  repo: string,
+  remote: string,
+  layer: DeliveryLayer,
+  recorded: DeliveryLedgerEntry | undefined,
+): { ok: true; sha: string; message: string; entry: DeliveryLedgerEntry } | { ok: false; exception: DeliveryException } {
+  const branch = layer.deliverBranch!;
+  const exception = (e: Omit<DeliveryException, "node" | "branch">): { ok: false; exception: DeliveryException } => ({
+    ok: false,
+    exception: { ...e, node: layer.node, branch },
+  });
+  // The branch the node is delivered INTO: a local branch, else the
+  // remote-tracking copy of it. A branch that exists nowhere is an exception
+  // naming it (the lead creates the delivery branch once, by hand).
+  const head = gitSha(cmd, repo, `refs/heads/${branch}`) ?? gitSha(cmd, repo, `refs/remotes/${remote}/${branch}`);
+  if (!head) {
+    return exception({ kind: "branch", detail: `delivery branch ${branch} does not exist (create it, then rerun)` });
+  }
+  // Idempotent: a node whose accepted tree is already on the delivery branch
+  // (the ledger names the deliver of it, and that commit is in the branch) is
+  // not merged twice.
+  if (recorded?.candidateTree === layer.tree && isAncestor(cmd, repo, recorded.sha, head)) {
+    return { ok: true, sha: recorded.sha, message: `${branch}: ${layer.node} already delivered ${recorded.sha.slice(0, 12)}`, entry: recorded };
+  }
+  // 1. The principle audit, on the accepted node's own tree.
+  if (layer.audit) {
+    const audit = runInWorktree(cmd, repo, layer.candidateSha, layer.audit);
+    if (audit.status !== 0) {
+      return exception({
+        kind: "audit",
+        detail: `the audit command exited ${audit.status}: ${layer.audit}`,
+        output: audit.output,
+      });
+    }
+  }
+  // 2. The test merge: a real merge of the accepted node into the delivery
+  // branch, tested before anything moves. `merge-tree --write-tree` reports
+  // the conflicting paths without touching a worktree or a branch.
+  const dry = cmd("git", ["-C", repo, "merge-tree", "--write-tree", "--name-only", head, layer.candidateSha]);
+  const dryOutput = `${dry.stdout}${dry.stderr}`.trim();
+  if (dry.status !== 0) {
+    // `--name-only` prints the tree oid, then one path per line, then a blank
+    // line and the human messages; take only the path lines.
+    const files: string[] = [];
+    for (const line of dry.stdout.split("\n").slice(1)) {
+      const trimmed = line.trim();
+      if (trimmed === "") break;
+      files.push(trimmed);
+    }
+    return exception({ kind: "conflict", detail: "the test merge conflicts", files, output: dryOutput });
+  }
+  const tree = dry.stdout.split("\n")[0]?.trim() ?? "";
+  if (tree.length === 0) return exception({ kind: "conflict", detail: "the test merge produced no tree", output: dryOutput });
+  // The merge commit itself (two parents: the branch head and the accepted
+  // node) — a child of the branch head, so pushing it is a fast forward.
+  const mergeCommit = cmd("git", [
+    "-C",
+    repo,
+    "-c",
+    "user.name=tradeoffs-trace",
+    "-c",
+    "user.email=tradeoffs-trace@localhost",
+    "commit-tree",
+    tree,
+    "-p",
+    head,
+    "-p",
+    layer.candidateSha,
+    "-m",
+    `${layer.title}\n\nTT-Deliver-merge: ${layer.node} into ${branch}`,
+  ]);
+  if (mergeCommit.status !== 0) {
+    return exception({ kind: "check", detail: "could not create the merge commit", output: `${mergeCommit.stdout}${mergeCommit.stderr}`.trim() });
+  }
+  const merged = mergeCommit.stdout.trim();
+  // 3. The merge check, on the merged tree.
+  for (const check of layer.checks) {
+    const run = runInWorktree(cmd, repo, merged, check);
+    if (run.status !== 0) {
+      return exception({ kind: "check", detail: `the merge check failed: ${check}`, output: run.output });
+    }
+  }
+  // 4. A fast-forward push. A plain (unforced) push is refused by the remote
+  // unless the merge descends from the branch it replaces, so a delivery that
+  // is not a fast forward is an exception, never a rewrite.
+  const pushed = cmd("git", ["-C", repo, "push", remote, `${merged}:refs/heads/${branch}`]);
+  if (pushed.status !== 0) {
+    return exception({ kind: "push", detail: `the fast-forward push to ${branch} was refused`, output: `${pushed.stdout}${pushed.stderr}`.trim() });
+  }
+  // The local branch follows the push (a no-op when it already is the head).
+  cmd("git", ["-C", repo, "update-ref", `refs/heads/${branch}`, merged, head]);
+  return {
+    ok: true,
+    sha: merged,
+    message: `${branch}: ${layer.node} merged and pushed fast forward ${head.slice(0, 12)} → ${merged.slice(0, 12)}`,
+    entry: {
+      node: layer.node,
+      branch,
+      sha: merged,
+      tree: gitTree(cmd, repo, merged) ?? layer.tree,
+      candidateTree: layer.tree,
+      parent: head,
+    },
+  };
+}
+
+/** True when A is an ancestor of B in REPO (both resolve to commits). */
+function isAncestor(cmd: Cmd, repo: string, a: string, b: string): boolean {
+  return cmd("git", ["-C", repo, "merge-base", "--is-ancestor", a, b]).status === 0;
+}
+
+/** Run COMMAND in a detached worktree of REPO at SHA (so it sees that tree's
+ * files), and return what it printed. A worktree that cannot be created is a
+ * failed run with the git error as its output, never a silent pass. */
+function runInWorktree(cmd: Cmd, repo: string, sha: string, command: string): { status: number; output: string } {
+  const worktree = fs.mkdtempSync(path.join("/tmp", "tt-deliver-check-"));
+  try {
+    const added = cmd("git", ["-C", repo, "worktree", "add", "-q", "--detach", worktree, sha]);
+    if (added.status !== 0) return { status: 1, output: `git worktree add failed: ${`${added.stdout}${added.stderr}`.trim()}` };
+    const run = cmd("/bin/sh", ["-c", command], { cwd: worktree });
+    return { status: run.status, output: `${run.stdout}${run.stderr}`.trim() };
+  } finally {
+    cmd("git", ["-C", repo, "worktree", "remove", "--force", worktree]);
+    fs.rmSync(worktree, { recursive: true, force: true });
+  }
 }
 
 function sha256(text: string): string {

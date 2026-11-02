@@ -7,10 +7,13 @@
 // `<run>/conductor.log`, so the parent (this CLI invocation) returns the
 // run id immediately rather than blocking for the whole run.
 
-import { adoptRecordedPath } from "./effects/run-env.ts";
+// 07 design A1: ADMIT — the one gate `tt start`, `tt resume` and a program's
+// node start all run before anything is created or any event exists.
+import { admit, admitPiCommand } from "./effects/admit.ts";
+import { AdmitRefusal, admitRefusalText, type AdmitException } from "./core/admit.ts";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync, existsSync, openSync, mkdirSync, writeFileSync, renameSync, rmSync, symlinkSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { readFileSync, existsSync, openSync, mkdirSync, writeFileSync, renameSync, rmSync, symlinkSync, readdirSync, realpathSync, statSync, appendFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -54,7 +57,8 @@ import { CHANGED_TEST_BUDGET_MS, checkTestFiles, effectiveChecks, testFilesImpor
 // creating runs that are immediately environment-blocked.
 import { envPreflight } from "./core/env-preflight.ts";
 import { buildView, chartModelsFromPlan, prSummary, timingReport, timingText, whyReport, whyText } from "./view.ts";
-import { removedTestsBetween } from "./effects/git.ts";
+import { removedTestsBetween, removeWorktree } from "./effects/git.ts";
+import { pruneRunTargets } from "./effects/prune.ts";
 import { deliver, restack } from "./effects/deliver.ts";
 import {
   loggedSecretStatus,
@@ -794,8 +798,17 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
     const findings = allFindings(program);
     reportFindings(findings, args[0], process.stderr);
     if (hasLintErrors(findings)) {
-      process.exitCode = 1;
+      // 07 design §3.4: the refusal is a named exception (see cmdStart).
+      refuseAdmit("X:PLAN_DEFECT", `${args[0]} does not lint (the findings above are the reason)`, "start the program");
       return;
+    }
+    // 07 design A1: ADMIT every entry's plan before the program directory
+    // exists — the plan lints, TT_REPO is a git work tree, every check command
+    // parses, and the pinned pi is the one on this shell's PATH. A node's own
+    // start runs the same gate again (src/program.ts), so a plan fixed between
+    // nodes is admitted on its own.
+    for (const entry of program.entries) {
+      if (admitPlanOrRefuse(entry.plan, `start the program (node ${entry.id})`)) return;
     }
     if (refuseMissingSecretsForPlans(program.entries.map((e) => e.plan), "start the program", resolvedEnvFile)) return;
     // Plan 05i: every node's declared commands must resolve in THIS caller's
@@ -840,16 +853,37 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
     if (args.length !== 1) usage();
     const dir = resolveProgramDir(args[0], root);
     appendProgramEvent(dir, { type: "PROGRAM_STOPPED" });
-    try {
+    // Plan 07h2 (A3/R5, program f345a473): a stopped program leaves NO
+    // scheduler process behind. SIGTERM first (a clean exit records the stop),
+    // then SIGKILL after a bounded wait, then a second bounded wait — a
+    // scheduler that ignores SIGTERM must not keep starting nodes.
+    const schedulerPid = (): number | undefined => {
+      try {
+        const pid = Number(readFileSync(programPaths(dir).pid, "utf8"));
+        return pid > 0 ? pid : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    const waitGone = async (ms: number): Promise<void> => {
+      const deadBy = Date.now() + ms;
+      while (programPidAlive(dir) && Date.now() < deadBy) await new Promise((r) => setTimeout(r, 50));
+    };
+    const pid = schedulerPid();
+    if (pid !== undefined) {
       // A2/C3 (plan 06e): the sweep owns the signalling decision.
-      signalProcess(Number(readFileSync(programPaths(dir).pid, "utf8")), "SIGTERM");
-    } catch {
-      // not running
+      signalProcess(pid, "SIGTERM");
+      await waitGone(5_000);
+      if (programPidAlive(dir)) {
+        signalProcess(pid, "SIGKILL");
+        await waitGone(5_000);
+      }
     }
-    // Let the scheduler die before recording statuses, so its last tick cannot
-    // overwrite the chart this command is about to write (M-7).
-    const deadBy = Date.now() + 5_000;
-    while (programPidAlive(dir) && Date.now() < deadBy) await new Promise((r) => setTimeout(r, 50));
+    if (programPidAlive(dir)) {
+      process.stderr.write(`could not stop program ${path.basename(dir)}: scheduler pid ${pid ?? "?"} is still alive\n`);
+      process.exitCode = 1;
+      return;
+    }
     const { state } = foldProgram(dir);
     for (const [node, n] of Object.entries(state.nodes)) {
       if (!n.runId || !["running", "needs-you"].includes(n.status)) continue;
@@ -1019,6 +1053,31 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
   }
 }
 
+/** 07 design A1: print a refused ADMIT — its named exception and reason — and
+ * stop. X:PLAN_DEFECT is fixed by amending the plan, X:ENV_FAULT by fixing the
+ * machine and running the command again. Nothing is created before this: a
+ * refused start leaves no run, no program and no event behind. */
+function refuseAdmit(kind: AdmitException, reason: string, what: string): void {
+  process.stderr.write(`refusing to ${what}: ${admitRefusalText(kind, reason)}\n`);
+  process.exitCode = 1;
+}
+
+/** 07 design A1: a plan file's ADMIT, run by the command that admits it —
+ * `tt start` and `tt program start`. The PATH is this shell's own and the
+ * pinned pi is re-resolved on every call. A resume runs the same gate inside
+ * the conductor it launches (`__run-conductor`), against the snapshot's plan. */
+function admitPlanOrRefuse(plan: RunPlanFile, what: string): boolean {
+  const pi = admitPiCommand();
+  const verdict = admit(plan, {
+    path: process.env.PATH ?? "",
+    cwd: plan.repo,
+    ...(pi !== undefined ? { pi } : {}),
+  });
+  if (verdict.ok) return false;
+  refuseAdmit(verdict.kind, verdict.reason, what);
+  return true;
+}
+
 async function cmdStart(planPath: string, root: string, skipModelsCheck = false, envFile?: string): Promise<void> {
   const plan = JSON.parse(readFileSync(planPath, "utf8")) as RunPlanFile;
   if (!plan.repo) usage();
@@ -1032,9 +1091,15 @@ async function cmdStart(planPath: string, root: string, skipModelsCheck = false,
   const findings = allFindings(plan);
   reportFindings(findings, planPath, process.stderr);
   if (hasLintErrors(findings)) {
-    process.exitCode = 1;
+    // 07 design §3.4: the refusal is a named exception, so the operator (and
+    // a script) sees X:PLAN_DEFECT rather than only the findings above.
+    refuseAdmit("X:PLAN_DEFECT", `${planPath} does not lint (the findings above are the reason)`, "start the run");
     return;
   }
+  // 07 design A1: ADMIT before anything is created — the plan lints, TT_REPO
+  // is a git work tree, every check command parses, and the pinned pi is the
+  // one on this shell's PATH.
+  if (admitPlanOrRefuse(plan, "start the run")) return;
   if (refuseMissingSecrets(plan.secrets, "start the run", plan.envFile)) return;
   // 06a finding #24: create the run, probe its distinct configured models,
   // record the result in the run directory, and refuse to launch when one is
@@ -1165,7 +1230,17 @@ function testStubReviews(): boolean {
  * script) to stay inside this packet's file scope. */
 async function runConductorProcess(runDir: string): Promise<void> {
   const p = runPaths(runDir);
-  adoptRecordedPath(runDir);
+  // 07 design A1: a resume resolves the environment from the shell that runs
+  // it — the PATH the run recorded at its first start is never adopted. It
+  // used to be (`adoptRecordedPath`), and on 07f1 that record led a resume to
+  // a brew `pi` 1.4.0: ADMIT would have passed on the shell's pinned pi, and
+  // every agent this conductor spawns resolves `pi` on `process.env.PATH`
+  // (`spawnPiAgent`), so the recorded PATH would still have picked the wrong
+  // binary. A check that needs the recorded variables keeps getting them from
+  // the recorded check environment (`Conductor#checkEnv`), which is a
+  // different question. A shell without the pinned pi is `X:ENV_FAULT` from
+  // ADMIT, naming it.
+  const shellPath = process.env.PATH ?? "";
   const plan = JSON.parse(readFileSync(path.join(p.plan, "v1.json"), "utf8")) as RunPlanFile;
   const { piCommand, piArgsPrefix } = testPiInjection();
   // A plan's own limits (TT_*_MINUTES), then the test-only override.
@@ -1182,7 +1257,7 @@ async function runConductorProcess(runDir: string): Promise<void> {
   // the one place a run's Conductor is built. `testPiInjection` above still
   // supplies the fake-pi command for a test-launched run; the two do not
   // interact (one picks the binary, the other the model flags).
-  const conductor = new Conductor({ runDir, plan, piCommand, piArgsPrefix, providerModelFor: planModelSelector(plan, plan.seats), deadlines, stubReviews, briefs: true });
+  const conductor = new Conductor({ runDir, plan, piCommand, piArgsPrefix, providerModelFor: planModelSelector(plan, plan.seats), deadlines, stubReviews, briefs: true, admitPath: shellPath });
   const cleanStop = () =>
     void conductor.stop().then(() => {
       writeFileSync(stoppedMarker, new Date().toISOString());
@@ -1190,7 +1265,54 @@ async function runConductorProcess(runDir: string): Promise<void> {
     });
   process.on("SIGTERM", cleanStop);
   process.on("SIGINT", cleanStop);
-  await conductor.start();
+  try {
+    await conductor.start();
+    // Plan 07h2 (A3/R4): `start()` returns once the run is under way; the
+    // stop is what ends this process. Waiting on it here is what makes a
+    // finished run's conductor exit instead of living on in a stray handle
+    // (run d170bb37 was still alive 7.5 h after DONE).
+    await conductor.stopped;
+  } catch (err) {
+    // 07 design §3.4: a refused ADMIT is the run's own named exception, and it
+    // is what the operator sees in conductor.log — not a bare stack trace.
+    if (err instanceof AdmitRefusal) {
+      process.stderr.write(`refusing to resume the run: ${err.message}\n`);
+      await conductor.stop().catch(() => undefined);
+      process.exit(1);
+    }
+    throw err;
+  }
+  // Plan 07h2 (A3/R4, run d170bb37: 7.5 h alive after DONE, 134 GB of
+  // targets): a run that reached DONE or BLOCKED has no further use for its
+  // worktrees or its build targets, and its conductor process exits instead of
+  // waiting on a handle nobody closes. A run stopped by the owner keeps both
+  // — that work is unfinished, not finished.
+  const phase = conductor.state.phase.phase;
+  if (phase === "DONE" || phase === "BLOCKED") {
+    let lanes: string[] = [];
+    try {
+      lanes = readdirSync(path.join(runDir, "worktrees")).map((name) => path.join(runDir, "worktrees", name));
+    } catch {
+      lanes = [];
+    }
+    let removed: string[] = [];
+    try {
+      removed = pruneRunTargets(runDir, { run: p.worktree, lanes }, (dir) => removeWorktree(plan.repo, dir), {
+        repo: plan.repo, runId: conductor.state.phase.runId,
+      }).removed;
+    } catch (err) {
+      process.stderr.write(`could not prune ${runDir}: ${String((err as Error)?.message ?? err)}\n`);
+    }
+    try {
+      appendFileSync(p.log, `${new Date().toISOString()} pruned ${removed.length} director${removed.length === 1 ? "y" : "ies"} after ${phase}\n`);
+    } catch {
+      // the prune itself is the work; the log line is a courtesy
+    }
+  }
+  // The process that owns this run is done. Exiting explicitly is what makes
+  // `conductorAlive` false and stops a stray handle from keeping a finished
+  // run's process (and its memory) around for hours.
+  process.exit(0);
 }
 
 /** design §9.2/round-of-review item 2: `tt status` rebuilds state the same
@@ -2130,6 +2252,8 @@ async function cmdDeliver(rest: string[], root: string): Promise<void> {
   }
   const result = deliver({ programDir, runRoot: root, apply });
   for (const m of result.messages) process.stdout.write(`${m}\n`);
+  // 07h3 (R8): a conflict or an audit flag stopped the delivery; the message
+  // already names it and its output, and the command exits non-zero.
   if (!result.ok) process.exitCode = 1;
 }
 
@@ -2607,6 +2731,12 @@ async function main(): Promise<void> {
     const runDir = resolveRunDir(positional[0], runRoot);
     const runPlan = readPlan(runDir);
     if (refuseMissingSecrets(runPlan.secrets, "resume the run", runPlan.envFile)) return;
+    // 07 design A1: the resume's own ADMIT runs inside the conductor this
+    // launches (`__run-conductor` -> `Conductor.start()`), which re-resolves
+    // this shell's PATH and the pinned pi — never the PATH the run recorded —
+    // and writes its refusal to conductor.log. Keeping the check there lets a
+    // run recorded under another runner still reach that runner check and say
+    // so here.
     launchDetached(runDir, { root: runRoot });
   } else if (cmd === "program") {
     await cmdProgram(positional[0], positional.slice(1), runRoot, json, source, skipModelsCheck, envFile);

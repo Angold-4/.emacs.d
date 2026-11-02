@@ -13,13 +13,22 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 
-import { createRun, runPaths } from "./conductor.ts";
+import { createRun, runnerRevision, runPaths } from "./conductor.ts";
+// 07 design A1: a node's own start runs the same ADMIT that `tt start` and a
+// resume run — one gate, one verdict, one named exception.
+import { admit, admitPiCommand } from "./effects/admit.ts";
+import { admitRefusalText } from "./core/admit.ts";
 import { triageRecordFor } from "./core/triage.ts";
 import type { RequirementItem } from "./core/items.ts";
-import { readRunState } from "./effects/runner.ts";
+import { readRunState, installedRunnerRoot } from "./effects/runner.ts";
+// Plan 07h2 (A2/R3, C3): re-export validation lives in its own effect.
+import { planForNodeStart, planSha256 } from "./effects/node-plan.ts";
 import { processAlive } from "./effects/sweep.ts";
 import { envBlockedLine } from "./core/env-preflight.ts";
+// 07h3 (H3): the program final gate is bounded by the final-check bound.
+import { boundDefaultMs } from "./core/bounds.ts";
 import { execFileSync } from "node:child_process";
 import { acquireLock, type Lock } from "./effects/lock.ts";
 
@@ -508,6 +517,238 @@ export interface SchedulerOptions {
   maxTicks?: number;
   /** Plan 01b: how long a stuck program is watched before its one reminder. */
   notifyReminderMs?: number;
+  /** Plan 07h2 (A2/R3): the exporter a node's own start re-runs over the
+   * program's `--source` file. Injectable, so a test needs no Emacs; the
+   * default is `TT_EXPORT_COMMAND <source>`, else the same Emacs batch
+   * exporter `tt program start` is given. With a source file and no exporter
+   * at all a node cannot read the plan file as it is NOW, so it is blocked
+   * with `X:PLAN_DEFECT` instead of running the program-start snapshot (A2). */
+  exporter?: ProgramExporter;
+  /** Plan 07h2 (A2/R3): the program's current runner, read when a node
+   * starts (never at program start). Defaults to `currentProgramRunner` — the
+   * copy `tt runner install` last selected (`<root>/runner/current`), else
+   * this process's own revision. */
+  runner?: () => string;
+}
+
+/** Plan 07h2 (A2/R3): re-export a program's own source file to the program
+ * JSON the scheduler reads. Throws when the export fails — a node whose plan
+ * cannot be re-exported is blocked with `X:PLAN_DEFECT`. */
+export type ProgramExporter = (source: string) => ProgramFile;
+
+/** Plan 07h2 (A2): the exporter command a host configures (Emacs sets it to
+ * its own batch exporter). `undefined` means no command is configured. */
+export function exporterCommand(): string | undefined {
+  const raw = process.env.TT_EXPORT_COMMAND;
+  return raw !== undefined && raw.trim().length > 0 ? raw.trim() : undefined;
+}
+
+/** The runner's own Emacs exporter file, used when no command is configured. */
+function emacsExporterFile(): string {
+  return fileURLToPath(new URL("../../core/init-tradeoffs-trace.el", import.meta.url));
+}
+
+/** Plan 07h2 (A2/R3): the exporter a node start uses when the caller passes
+ * none. A configured `TT_EXPORT_COMMAND` wins; otherwise this runner's own
+ * Emacs exporter is used, when that Emacs is on this host. `undefined` when
+ * neither is available — with a source file that is a node's named
+ * `X:PLAN_DEFECT`, because the plan file as it is NOW cannot be read. */
+function defaultExporter(): ProgramExporter | undefined {
+  const command = exporterCommand();
+  if (command !== undefined) {
+    return (source) => {
+      const out = execFileSync("/bin/sh", ["-c", `${command} "$1"`, "tt-export", source], {
+        encoding: "utf8",
+        maxBuffer: 64 * 1024 * 1024,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      return parseExportedProgram(out, source);
+    };
+  }
+  const file = emacsExporterFile();
+  if (!fs.existsSync(file) || findOnPath(process.env.TT_EMACS ?? "emacs") === undefined) return undefined;
+  return (source) => {
+    const out = execFileSync(findOnPath(process.env.TT_EMACS ?? "emacs")!, ["--batch", "-Q", "-l", file, "--eval", `(+tt-export-program ${JSON.stringify(source)})`], {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return parseExportedProgram(out, source);
+  };
+}
+
+/** The program JSON an exporter printed, or a named failure. */
+function parseExportedProgram(out: string, source: string): ProgramFile {
+  const text = out.trim();
+  if (text.length === 0) throw new Error(`the exporter printed no program for ${source}`);
+  return JSON.parse(text) as ProgramFile;
+}
+
+/** The absolute path of a binary on PATH, if it is there. */
+function findOnPath(name: string): string | undefined {
+  for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (dir.length === 0) continue;
+    const full = path.join(dir, name);
+    try {
+      if (fs.statSync(full).isFile()) return full;
+    } catch {
+      // not here
+    }
+  }
+  return undefined;
+}
+
+/** Plan 07h2 (A2/R3): the runner THIS PROGRAM is on now, as a node's own
+ * start reads it. `tt runner install <sha>` freezes a revision under
+ * `<root>/runner/<sha>/tradeoffs-trace` and points `<root>/runner/current` at
+ * it; that selection — not the revision of the copy the scheduler process
+ * happens to be running — is what a node started after the install must run
+ * under. A root with no selection (or one whose copy is gone) falls back to
+ * this process's own `runnerRevision()`, which is also what a plain checkout
+ * gives. */
+export function currentProgramRunner(root: string, fallback: () => string): string {
+  try {
+    const link = path.join(root, "runner", "current");
+    const target = path.basename(fs.readlinkSync(link).trim());
+    // `runner/current` is a symlink to the revision's directory name, and only
+    // an actual installed copy can serve a run: a dangling selection is not a
+    // runner.
+    if (target.length > 0 && installedRunnerRoot(root, target) !== undefined) return target;
+  } catch {
+    // no runner install here (the usual checkout), or it is not a symlink
+  }
+  return fallback();
+}
+
+/** Plan 07h2 (A2/R3): what a node's start recorded about the plan it ran —
+ * the source it was re-exported from, the exporter, the program's current
+ * runner and the sha of the plan snapshot the run was created with. Written
+ * into the node's `program.json`, beside the program id. */
+export interface NodeSnapshot {
+  source: string;
+  exporter: "command" | "emacs" | "injected" | "snapshot";
+  runner: string;
+  planSha256: string;
+  reexported: boolean;
+}
+
+/** Observe the source, exporter and current runner at the node's own start.
+ * Re-exporting and validating the plan is delegated to `planForNodeStart`.
+ * A source with no available exporter is a defect, not a stale-plan fallback. */
+function nodeStartPlan(
+  dir: string,
+  program: ProgramFile,
+  node: ProgramNode,
+  opts: SchedulerOptions,
+): { ok: true; entryId: string; plan: ProgramFile["entries"][number]["plan"]; snapshot: NodeSnapshot } | { ok: false; reason: string } {
+  const entry = program.entries.find((e) => e.id === node.entry)!;
+  // Plan 07h2 (A2): the program's current runner, resolved NOW — at this
+  // node's start, never cached at the program's — and recorded beside the
+  // plan. The node's run is created under this same value (`createRun`'s
+  // `runner`), so the run's own `meta.json` and this snapshot can never name
+  // two runners.
+  const runner = opts.runner !== undefined ? opts.runner() : currentProgramRunner(path.dirname(path.dirname(dir)), runnerRevision);
+  const source = readProgramSource(dir);
+  const exporter = opts.exporter ?? defaultExporter();
+  const result = planForNodeStart({
+    nodeId: node.id,
+    entryId: entry.id,
+    recorded: entry.plan,
+    ...(source !== undefined ? { source } : {}),
+    exporter: exporter === undefined ? "snapshot" : exporterCommand() !== undefined ? "command" : "emacs",
+    runner,
+    ...(exporter !== undefined ? { reexport: exporter } : {}),
+    logPath: programPaths(dir).log,
+  });
+  // The effect's exporter labels describe host exporters; retain the scheduler's
+  // explicit injected-exporter provenance only when it actually re-exported.
+  if (result.ok && result.snapshot.reexported && opts.exporter !== undefined) {
+    return { ...result, snapshot: { ...result.snapshot, exporter: "injected" } };
+  }
+  return result;
+}
+
+/** 07h3 (H3): the one program final gate. `#+TT_PROGRAM_FINAL_CHECKS` runs
+ * once, after every node is DONE, on the last node's branch, bounded by the
+ * final-check bound. Its result is recorded as `PROGRAM_FINAL`; a failure
+ * also records `LEAD_CALLED` with the gate's own output, and the program is
+ * `stuck` (never refused, never retried behind the owner's back). A program
+ * that declares no gate, or that has not finished every node, does nothing. */
+function runProgramFinalGate(
+  program: ProgramFile,
+  nodes: ProgramNode[],
+  state: ProgramState,
+  record: (event: ProgramEvent) => void,
+): void {
+  const command = program.programFinalChecks?.trim();
+  if (!command || command.length === 0) return;
+  if (state.final !== undefined || state.stopped) return;
+  if (nodes.length === 0 || !nodes.every((n) => state.nodes[n.id]?.status === "done")) return;
+  const last = nodes[nodes.length - 1];
+  const entry = program.entries.find((e) => e.id === last.entry);
+  const repo = entry?.plan.repo ?? "";
+  // The last node's own published branch: the gate runs on the program's
+  // final result, not on some earlier head.
+  const branch = state.nodes[last.id]?.branch ?? nodeBranch(program, last);
+  const limitMs = entry?.plan.deadlines?.finalCheckMs ?? boundDefaultMs("final-check");
+  const startedAt = Date.now();
+  const result = runFinalGateCommand(repo, branch, command, limitMs);
+  const durationMs = Date.now() - startedAt;
+  record({ type: "PROGRAM_FINAL", passed: result.passed, durationMs });
+  if (!result.passed) {
+    record({
+      type: "LEAD_CALLED",
+      reasons: [
+        `program final gate failed on ${branch}: ${command}`,
+        ...(result.timedOut ? [`it reached the final-check bound (${Math.round(limitMs / 60_000)}m)`] : []),
+        `output: ${oneLine(result.output.length > 0 ? result.output : "(no output)")}`,
+      ],
+    });
+  }
+}
+
+/** 07h3 (H3): run the program final gate on BRANCH in a detached worktree of
+ * REPO, so the command sees the tree that branch publishes. A worktree that
+ * cannot be created is a failed gate with that reason, never a silent pass. */
+function runFinalGateCommand(
+  repo: string,
+  branch: string,
+  command: string,
+  limitMs: number,
+): { passed: boolean; output: string; timedOut: boolean } {
+  const worktree = fs.mkdtempSync(path.join("/tmp", "tt-program-final-"));
+  try {
+    try {
+      git(repo, ["worktree", "add", "-q", "--detach", worktree, branch]);
+    } catch (err) {
+      const e = err as { stdout?: string; stderr?: string };
+      return { passed: false, output: String(e.stderr ?? e.stdout ?? (err as Error)?.message ?? err).trim(), timedOut: false };
+    }
+    try {
+      const stdout = execFileSync("/bin/sh", ["-c", command], {
+        cwd: worktree,
+        encoding: "utf8",
+        maxBuffer: 64 * 1024 * 1024,
+        timeout: limitMs,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      return { passed: true, output: stdout, timedOut: false };
+    } catch (err) {
+      const e = err as { status?: number; stdout?: string; stderr?: string; signal?: string; killed?: boolean };
+      const output = `${e.stdout ?? ""}${e.stderr ?? ""}`.trim() || `${(err as Error)?.message ?? err}`;
+      // `execFileSync` kills the command at its timeout (SIGTERM); a command
+      // killed at the bound is reported as timed out, not as a silent failure.
+      const timedOut = e.signal === "SIGTERM" || e.killed === true;
+      return { passed: false, output, timedOut };
+    }
+  } finally {
+    try {
+      git(repo, ["worktree", "remove", "--force", worktree]);
+    } catch {
+      // the worktree may never have been created
+    }
+    fs.rmSync(worktree, { recursive: true, force: true });
+  }
 }
 
 /** One scheduler step: observe active nodes, start ready ones. Returns the
@@ -547,7 +788,24 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
     }
   }
   for (const id of nextStarts(nodes, state, program.maxParallel)) {
+    // Plan 07h2 (R5, program f345a473): a program the owner stopped while
+    // this tick was observing starts NOTHING new — re-fold the log, so a
+    // `tt program stop` that landed mid-tick wins over the tick's own view.
+    if (foldProgram(dir).state.stopped) break;
     const node = nodes.find((n) => n.id === id)!;
+    // Plan 07h2 (A2/R3): the node's own plan file is re-exported from the
+    // program's `--source` NOW, at the node's start (never at the program's),
+    // and the program's CURRENT runner is recorded with it. An export failure
+    // is the node's `X:PLAN_DEFECT`, before its run exists.
+    const startPlan = nodeStartPlan(dir, program, node, opts);
+    if (!startPlan.ok) {
+      record({ type: "NODE_BLOCKED", node: id, reason: startPlan.reason });
+      continue;
+    }
+    // The re-exported entry carries the node's plan; the graph (ids, deps,
+    // phase order) stays the program-as-started snapshot, like
+    // `program.json` itself, which is never edited.
+    program = { ...program, entries: program.entries.map((e) => (e.id === startPlan.entryId ? { ...e, plan: startPlan.plan } : e)) };
     // Plan 06i: a dependency's carried items become real requirements of this
     // node's contract (an id, the item's text and a VERIFY). A wrong-output
     // item carries a `test` verify; every other carried item is judged by
@@ -562,9 +820,24 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
       record({ type: "NODE_BLOCKED", node: id, reason: prepared.reason });
       continue;
     }
+    // 07 design A1: a node's own start runs ADMIT — the plan it is about to
+    // run lints, its TT_REPO is a git work tree, every check command parses,
+    // and the pinned pi is the one on this scheduler's PATH, resolved now (a
+    // plan fixed between nodes applies without a restart, and no recorded
+    // environment is consulted). A refusal blocks the node with its named
+    // exception, before its run exists and before any event of that run.
+    const admitted = admit(plan, {
+      path: process.env.PATH ?? "",
+      cwd: plan.repo,
+      ...(admitPiCommand() !== undefined ? { pi: "pi" } : {}),
+    });
+    if (!admitted.ok) {
+      record({ type: "NODE_BLOCKED", node: id, reason: admitRefusalText(admitted.kind, admitted.reason) });
+      continue;
+    }
     let runDir: string;
     try {
-      runDir = createRun(opts.runRoot, plan);
+      runDir = createRun(opts.runRoot, plan, undefined, { runner: startPlan.snapshot.runner });
     } catch (err) {
       // e.g. a shallow clone: the node cannot start, and says why.
       record({ type: "NODE_BLOCKED", node: id, reason: String((err as Error).message ?? err) });
@@ -577,7 +850,14 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
     const baselineReuse = acceptedCandidateBaseline(program, nodes, node, state, opts.runRoot);
     fs.writeFileSync(
       path.join(runDir, "program.json"),
-      JSON.stringify({ programId: path.basename(dir), node: id, readableId: readableIds[id], ...(baselineReuse ? { baselineReuse } : {}) }),
+      JSON.stringify({
+        programId: path.basename(dir),
+        node: id,
+        readableId: readableIds[id],
+        // Plan 07h2 (A2/R3): the snapshot this node actually started with.
+        snapshot: { ...startPlan.snapshot, planSha256: planSha256(plan) },
+        ...(baselineReuse ? { baselineReuse } : {}),
+      }),
     );
     record({
       type: "NODE_STARTED",
@@ -588,6 +868,10 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
     });
     opts.launch(runDir);
   }
+  // 07h3 (H3): once every node is DONE, the program's ONE final gate runs
+  // (on the last node's branch, recorded once). Its failure makes the program
+  // `stuck` with LEAD_CALLED, which the outcome below reports.
+  runProgramFinalGate(program, nodes, state, record);
   // Plan 03c: keep `views/program.txt` current after every status change.
   writeProgramChart(dir);
   // Plan 06f (A2): the scheduler is `live.json`'s node writer, on the same
@@ -775,10 +1059,13 @@ export function notifyProgramOutcome(dir: string, outcome: "done" | "stuck", opt
     // so the notification must name its `env blocked · …` reason, not omit
     // the tool.
     const stuck = nodes.find((n) => state.nodes[n.id].status === "blocked" || state.nodes[n.id].status === "env-blocked");
+    const finalFailed = state.final && !state.final.passed ? state.leadCalled?.reasons?.[0] : undefined;
     const reason =
       outcome === "done"
         ? "program done"
-        : `program stuck${stuck ? `: ${oneLine(state.nodes[stuck.id].reason ?? `${stuck.id} ${state.nodes[stuck.id].status}`)}` : ""}`;
+        : `program stuck${
+            stuck ? `: ${oneLine(state.nodes[stuck.id].reason ?? `${stuck.id} ${state.nodes[stuck.id].status}`)}` : finalFailed ? `: ${oneLine(finalFailed)}` : ""
+          }`;
     notify(
       { id, kind: "program", title: program.title, reason, waitKey: `program:${id}:${outcome}` },
       { root: path.dirname(path.dirname(dir)), ...(opts.reminderMs !== undefined ? { reminderMs: opts.reminderMs } : {}), onError: (message) => log(`notify: ${message}`) },
@@ -954,7 +1241,13 @@ export function programStatusLines(dir: string, now: Date = new Date(), opts: { 
   const lines = [
     `${program.title}`,
     `program ${path.basename(dir)} · scheduler ${alive ? "running" : "stopped"} · ${outcome} · max ${program.maxParallel} in parallel`,
+    ...(program.base ? [`base      ${program.base}`] : []),
     ...(modelsCheck ? [`models    ${modelsCheck}`] : []),
+    // 07h3 (H3): the program's one final gate, when it has run — once.
+    ...(state.final
+      ? [`final     ${state.final.passed ? "passed" : "failed"} (${Math.round(state.final.durationMs / 1000)}s)`]
+      : []),
+    ...(state.leadCalled ? state.leadCalled.reasons.map((r) => `lead      ${oneLine(r)}`) : []),
     "",
   ];
   const mark: Record<NodeStatus, string> = {

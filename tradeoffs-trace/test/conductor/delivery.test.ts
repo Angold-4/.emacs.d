@@ -627,3 +627,111 @@ test("plan 06m: tt restack stops on a conflict in an undeclared file naming the 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+/** 07h3 (R8, the lead's deliver-phase.sh of 2026-10-27/28): a node whose plan
+ * names `#+TT_DELIVER_BRANCH` is delivered in four steps — the plan's
+ * `#+TT_DELIVER_AUDIT` on the accepted node, a test merge into the delivery
+ * branch, the merge check on the merged tree, and a fast-forward push. A
+ * conflict or an audit flag is an exception carrying its output, and nothing is
+ * pushed. */
+test("tt deliver merges an accepted node after its audit and raises a conflict as an exception", () => {
+  const root = fs.mkdtempSync(path.join("/tmp", "tt-deliver-branch-"));
+  const repo = path.join(root, "repo");
+  const remote = path.join(root, "remote.git");
+  const runRoot = path.join(root, "runs");
+  const marker = path.join(root, "steps.log");
+  const git = (args: string[]) => execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  const remoteTip = () => git(["--git-dir", remote, "rev-parse", "refs/heads/release"]);
+  /** A one-node program whose plan names the delivery branch and its audit. */
+  const writeProgramFor = (id: string, node: string, audit: string, checks: string[]): string => {
+    const programDir = path.join(root, "programs", id);
+    writeProgram(programDir, {
+      title: id,
+      maxParallel: 1,
+      entries: [
+        {
+          id: node,
+          after: [],
+          plan: plan(repo, `layer ${node}`, { deliverBranch: "release", deliverAudit: audit, checks }),
+        },
+      ],
+    });
+    markDone(programDir, [node]);
+    fs.mkdirSync(path.join(runRoot, `run-${node}`), { recursive: true });
+    return programDir;
+  };
+  try {
+    fs.mkdirSync(repo, { recursive: true });
+    fs.mkdirSync(runRoot, { recursive: true });
+    git(["init", "-q", "-b", "main", repo]);
+    fs.writeFileSync(path.join(repo, "base.txt"), "base\n");
+    git(["-C", repo, "add", "-A"]);
+    git(["-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "base"]);
+    const base = git(["-C", repo, "rev-parse", "HEAD"]);
+    execFileSync("git", ["init", "-q", "--bare", remote]);
+    git(["-C", repo, "remote", "add", "origin", remote]);
+    git(["-C", repo, "push", "-q", "origin", "main"]);
+    // The delivery branch the lead keeps: it starts at main and is pushed.
+    git(["-C", repo, "push", "-q", "origin", "main:refs/heads/release"]);
+    git(["-C", repo, "branch", "release", "main"]);
+    const releaseStart = remoteTip();
+
+    // 1. An accepted node whose audit passes: audited, test-merged into the
+    // delivery branch, the merge check run, then pushed fast forward.
+    const a = commitFile(repo, base, "a.txt", "a\n", "a");
+    const programDir = writeProgramFor(
+      "p1",
+      "a",
+      `test -f a.txt && echo audit-ran >> ${marker}`,
+      [`test -f a.txt && echo check-ran >> ${marker}`],
+    );
+    const readRunA = () => ({ state: doneState(a) });
+    // Without --apply nothing mutates, in this mode too.
+    const dry = deliver({ programDir, runRoot, apply: false, readRun: readRunA });
+    assert.equal(dry.ok, true);
+    assert.equal(dry.applied, false);
+    assert.equal(remoteTip(), releaseStart, "a dry run pushes nothing");
+    assert.ok(dry.messages.join("\n").includes("→ release"), `the printed plan names the delivery branch:\n${dry.messages.join("\n")}`);
+    const delivered = deliver({ programDir, runRoot, apply: true, readRun: readRunA });
+    assert.equal(delivered.ok, true, delivered.messages.join("\n"));
+    assert.equal(delivered.exception, undefined, "no exception on a clean delivery");
+    const merged = delivered.ledger.layers.a.sha;
+    assert.equal(remoteTip(), merged, "the delivery branch was pushed");
+    assert.equal(git(["-C", repo, "rev-parse", "release"]), merged, "the local delivery branch follows the push");
+    assert.equal(git(["--git-dir", remote, "rev-parse", `${merged}^1`]), releaseStart, "the push is a fast forward of the old tip");
+    assert.equal(git(["--git-dir", remote, "rev-parse", `${merged}^2`]), a, "the accepted node is the merge's second parent");
+    assert.equal(git(["--git-dir", remote, "show", "release:a.txt"]), "a", "the delivery branch now holds the accepted node's work");
+    assert.deepEqual(fs.readFileSync(marker, "utf8").trim().split("\n"), ["audit-ran", "check-ran"], "the audit runs before the merge check");
+
+    // 2. A conflicting node: the exception names the conflicting files and
+    // nothing is pushed.
+    const b = commitFile(repo, merged, "a.txt", "from-the-node\n", "b");
+    const releaseEdit = commitFile(repo, merged, "a.txt", "from-the-branch\n", "a release edit");
+    git(["-C", repo, "update-ref", "refs/heads/release", releaseEdit]);
+    git(["-C", repo, "push", "-q", "origin", "release"]);
+    const conflictingDir = writeProgramFor("p2", "b", "test -f a.txt", ["true"]);
+    const conflicted = deliver({ programDir: conflictingDir, runRoot, apply: true, readRun: () => ({ state: doneState(b) }) });
+    assert.equal(conflicted.ok, false, "a conflicting node is not delivered");
+    assert.equal(conflicted.exception?.kind, "conflict", `the exception is a conflict:\n${conflicted.messages.join("\n")}`);
+    assert.deepEqual(conflicted.exception?.files, ["a.txt"], "the exception names the conflicting files");
+    assert.match(conflicted.messages.join("\n"), /conflict/i);
+    assert.match(conflicted.messages.join("\n"), /a\.txt/);
+    assert.equal(remoteTip(), releaseEdit, "a conflict pushes nothing");
+
+    // 3. An audit that exits non-zero: the exception carries its output, and
+    // nothing is pushed.
+    const c = commitFile(repo, releaseEdit, "c.txt", "c\n", "c");
+    const flaggedDir = writeProgramFor("p3", "c", 'echo "audit: a removed test"; exit 7', ["true"]);
+    const flagged = deliver({ programDir: flaggedDir, runRoot, apply: true, readRun: () => ({ state: doneState(c) }) });
+    assert.equal(flagged.ok, false, "an audit flag stops the delivery");
+    assert.equal(flagged.exception?.kind, "audit", `the exception is the audit:\n${flagged.messages.join("\n")}`);
+    const flagText = flagged.messages.join("\n");
+    assert.match(flagText, /exited 7/, `the exception names the audit's exit code:\n${flagText}`);
+    assert.match(flagText, /audit: a removed test/, `the exception carries the audit's output:\n${flagText}`);
+    assert.match(flagText, /nothing was pushed/, "the exception says nothing was pushed");
+    assert.equal(remoteTip(), releaseEdit, "a flagged audit pushes nothing");
+    assert.equal(git(["-C", repo, "rev-parse", "release"]), releaseEdit, "and moves no local branch");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
