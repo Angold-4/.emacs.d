@@ -284,7 +284,9 @@ test("a conductor launches the pi ADMIT resolved, not the one the recorded PATH 
     assert.equal(admit.pi.path, shellPi, "ADMIT resolved the pinned pi the shell's PATH leads to");
     assert.equal(admit.pi.version, ADMIT_PINNED_PI);
     // ...and the agent process that just launched IS that binary: its own
-    // shim recorded the launch, the recorded PATH's pi recorded nothing.
+    // shim recorded the launch, the recorded PATH's pi recorded nothing. The
+    // agent's pgid exists from spawn, before its shim has written the marker.
+    await waitFor(() => fs.existsSync(shellMarker) || fs.existsSync(recordedMarker), 20_000, 25, runDir);
     assert.ok(fs.existsSync(shellMarker), "the launched agent ran the pi ADMIT resolved");
     assert.deepEqual(
       fs.readFileSync(shellMarker, "utf8").trim().split("\n"),
