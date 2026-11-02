@@ -410,7 +410,11 @@ export function revotePair(round: RoundRecord, seats: number | readonly string[]
   const needed = Math.floor(seatCount / 2) + 1;
   const counts = countVotes(round.votes, passing);
   if (passing.some((c) => (counts.get(c.lane) ?? 0) >= needed)) return undefined;
-  const ranked = [...passing].sort((a, b) => (counts.get(b.lane) ?? 0) - (counts.get(a.lane) ?? 0));
+  // Ties are ordered by lane, so the pair never depends on which candidate
+  // finished first.
+  const ranked = [...passing].sort(
+    (a, b) => (counts.get(b.lane) ?? 0) - (counts.get(a.lane) ?? 0) || a.lane.localeCompare(b.lane),
+  );
   if (ranked.length < 2) return undefined;
   return [ranked[0].lane, ranked[1].lane];
 }
