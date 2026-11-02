@@ -1120,3 +1120,170 @@ test("a failing final check becomes a point in the failing file's domain", async
     await teardown(setup);
   }
 });
+
+
+/** Resolve through the same bound inbox command the owner UI writes. */
+function resolveRepair(setup: TestConductorSetup, request: import("../../src/core/types.ts").OwnerRequest, note?: string): void {
+  fs.writeFileSync(path.join(runPaths(setup.runDir).inbox, `resolve-${request.id}.json`), JSON.stringify({
+    commandId: `resolve-${request.id}`,
+    type: "resolve",
+    recordKind: "request",
+    option: "reject_and_repair",
+    ...(note ? { note } : {}),
+    binding: {
+      runId: setup.conductor.state.phase.runId,
+      phaseId: "p1",
+      candidateSha: setup.conductor.state.phase.candidate!.sha,
+      contractVersion: setup.conductor.state.phase.contract.contractVersion,
+      recordId: request.id,
+      recordVersion: request.version,
+    },
+  }));
+}
+
+for (const mode of ["named", "missing", "green"]) test(mode === "named"
+  ? "an owner reject_and_repair on a failed vote dispatches that domain's fixer"
+  : `an owner repair ${mode === "missing" ? "without a named test" : "with a green base"} calls the lead as UNPROVABLE and accepts a rewrite`, async () => {
+  const namesTest = mode === "named";
+  const promptDir = fs.mkdtempSync("/tmp/tt-owner-repair-prompts-");
+  const promptLog = path.join(promptDir, "prompts.txt");
+  const setup = await setupConductor({
+    phase: fixPhase(),
+    checks: ["true"],
+    stubReviews: true,
+    deadlines: { ...FAST, inboxPollMs: 40 },
+    rerun: `${BOOKING_DONE} # {name}`,
+    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
+    workerScript: () => laneWorkerWithDecision(1, "a", "delegated"),
+    laneWorkerScriptFor: (lane, round) => laneWorkerWithDecision(round, lane, "delegated"),
+    laneReviewerScriptFor: (seat, candidate, state) => {
+      const review = reviewerVetoing(seat, candidate, state);
+      if (seat === "M" && namesTest) {
+        const submit = review.steps[2] as { args: { ballots: Array<{ rationale: string }> } };
+        submit.args.ballots[0].rationale += '; test "booking/cache.test.ts::rejects unsafe prices"';
+      }
+      return review;
+    },
+    pickScriptFor: (seat, state) => pickVote(seat, state.phase.rounds?.length ?? 1, "a"),
+    fixerScriptFor: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: "printf 'fixed\\n' > booking-fixed.txt" },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (seat, state) => {
+      // Stub candidate seats have no discovery/prompt turn. Keep the veto
+      // live if an older runner re-reviews the unrepaired candidate, so the
+      // base fails on missing repair work, not a fixture waiting for a prompt.
+      const review = laneReview(seat, state.phase.contract.contractVersion);
+      review.steps = review.steps.slice(2);
+      (review.steps[0] as { args: Record<string, unknown> }).args.ballots = state.phase.decisions
+        .filter((d) => !d.supersededBy && d.boundCandidateSha === state.phase.candidate?.sha)
+        .map((d) => ({ decisionId: d.id, vote: "reject", rationale: VETO_REASON, evidence: ["booking/cache.ts:12 price"] }));
+      return review;
+    },
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 90_000, 50, setup.runDir);
+    assert.equal(setup.conductor.state.phase.inFlight.dispatch_worker, undefined,
+      "parking finishes the domain driver so an owner resolution can dispatch MAP again");
+    let request = setup.conductor.state.phase.ownerRequests.find((r) => r.status === "open" && r.origin === "failed_vote");
+    assert.ok(request, "a failed vote asks the owner to rule");
+    const before = readEvents(setup.runDir).length;
+    const original = setup.conductor.state.phase.candidate!.sha;
+    resolveRepair(setup, request, mode === "green" ? "doneWhen: true" : undefined);
+    await waitFor(() => readEvents(setup.runDir).slice(before).some((r) =>
+      r.kind === "event" && (r.event as { type?: string }).type === "OWNER_REQUEST_RESOLVED"), 20_000, 50, setup.runDir);
+    await waitFor(() => fixerIntents(setup.runDir).length > 0 || setup.conductor.state.phase.phase === "AWAITING_OWNER" ||
+      readEvents(setup.runDir).slice(before).some((r) => r.kind === "event" && (r.event as { type?: string }).type === "FREEZE_COMPLETED"),
+      90_000, 50, setup.runDir);
+    if (!namesTest) {
+      await waitFor(() => readEvents(setup.runDir).slice(before).some((r) => r.kind === "lead_called" &&
+        /X:UNPROVABLE.*doneWhen/.test((r.event as { reason: string }).reason)), 20_000, 50, setup.runDir);
+      assert.equal(fixerIntents(setup.runDir).length, 0);
+      assert.equal(setup.conductor.state.phase.findings.some((f) => f.id.includes("owner-repair")), false);
+      const failed = request;
+      request = setup.conductor.state.phase.ownerRequests.find((r) => r.status === "open" && r.linkedDecisionId === failed.linkedDecisionId);
+      assert.ok(request, "UNPROVABLE offers a rewrite of the same linked work");
+      const replayed = rebuildState(setup.runDir, setup.plan);
+      assert.deepEqual(JSON.parse(JSON.stringify(replayed.phase.ownerRequests)), JSON.parse(JSON.stringify(setup.conductor.state.phase.ownerRequests)));
+      resolveRepair(setup, request, `doneWhen: ${BOOKING_DONE}`);
+      await waitFor(() => fixerIntents(setup.runDir).length > 0, 20_000, 50, setup.runDir);
+    }
+    assert.equal(fixerIntents(setup.runDir).length, 1, "the owner's ruling dispatches a fixer before another review");
+    const point = setup.conductor.state.phase.findings.find((f) => f.linkedDecisionId === request.linkedDecisionId && f.domain === "booking");
+    assert.ok(point, "the rejected decision became a booking point");
+    assert.equal(point.doneWhen, namesTest ? `test -f booking-fixed.txt # 'rejects unsafe prices'` : BOOKING_DONE,
+      "admission uses the effective resolution's proving command");
+    assert.deepEqual(rebuildState(setup.runDir, setup.plan).phase.findings.find((f) => f.id === point.id), point,
+      "strict recovery preserves the admitted replacement point");
+    const records = readEvents(setup.runDir);
+    const baseFactIndex = records.findIndex((r) => r.kind === "done_when_base" && (r.event as { findingId?: string }).findingId === point.id);
+    const raisedIndex = records.findIndex((r) => r.kind === "event" && (r.event as { type?: string; finding?: { id: string } }).type === "FINDING_RAISED" &&
+      (r.event as { finding: { id: string } }).finding.id === point.id);
+    assert.ok(baseFactIndex >= before && baseFactIndex < raisedIndex, "a recorded failing base fact precedes point admission");
+    const baseFact = records[baseFactIndex].event as { baseSha: string; command: string; exitCode: number; timedOut: boolean; output: string };
+    assert.equal(baseFact.baseSha, original);
+    assert.equal(baseFact.command, point.doneWhen);
+    assert.equal(baseFact.exitCode, 1);
+    assert.equal(baseFact.timedOut, false);
+    assert.equal(typeof baseFact.output, "string", "the admission fact records the command output");
+    assert.match(point.expected ?? "", /reject_and_repair/);
+    assert.match(point.expected ?? "", /VETO_REASON/);
+    await waitFor(() => fs.existsSync(promptLog) && fs.readFileSync(promptLog, "utf8").includes(point.id), 20_000, 50, setup.runDir);
+    const prompt = fs.readFileSync(promptLog, "utf8").split("\n=====\n").find((p) => p.includes(point.id));
+    assert.match(prompt ?? "", /domain booking/);
+    assert.match(prompt ?? "", /VETO_REASON/);
+    assert.match(prompt ?? "", /reject_and_repair/);
+    await waitFor(() => setup.conductor.state.phase.candidate!.sha !== original, 90_000, 50, setup.runDir);
+    const fixed = setup.conductor.state.phase.rounds!.find((r) => r.fixed?.tasks.some((t) => t.findingIds.includes(point.id)));
+    assert.deepEqual(fixed?.fixed?.tasks.map((t) => t.domain), ["booking"]);
+    assert.notEqual(fixed?.fixed?.candidate, original, "the repair reached the candidate");
+  } finally {
+    await teardown(setup);
+    cleanupDir(promptDir);
+  }
+});
+
+test("a repair that changes nothing calls the lead instead of re-reviewing", async () => {
+  const setup = await setupConductor({
+    phase: fixPhase(),
+    checks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorkerWithDecision(1, "a", "delegated"),
+    laneWorkerScriptFor: (lane, round) => laneWorkerWithDecision(round, lane, "delegated"),
+    laneReviewerScriptFor: reviewerVetoing,
+    reviewerScriptFor: (seat, state) => {
+      const review = laneReview(seat, state.phase.contract.contractVersion);
+      const submit = review.steps[2] as { args: Record<string, unknown> };
+      submit.args.ballots = state.phase.decisions.filter((d) => !d.supersededBy && d.boundCandidateSha === state.phase.candidate?.sha)
+        .map((d) => ({ decisionId: d.id, vote: "reject", rationale: VETO_REASON, evidence: ["booking/cache.ts:12 price"] }));
+      return review;
+    },
+    pickScriptFor: (seat, state) => pickVote(seat, state.phase.rounds?.length ?? 1, "a"),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => {
+      const records = readEvents(setup.runDir);
+      const map = records.findIndex((r) => r.kind === "intent" && (r.event as { domains?: boolean }).domains === true);
+      return map >= 0 && records.slice(map + 1).some((r) => r.kind === "event" &&
+        ["LEAD_CALLED", "FREEZE_COMPLETED", "REVIEW_SUBMITTED"].includes((r.event as { type: string }).type));
+    }, 90_000, 50, setup.runDir);
+    const events = readEvents(setup.runDir);
+    const map = events.findIndex((r) => r.kind === "intent" && (r.event as { domains?: boolean }).domains === true);
+    assert.ok(map >= 0, "a lane-free repair MAP was attempted");
+    assert.equal(fixerIntents(setup.runDir).length, 0, "the repair had no fixer work");
+    const afterMap = events.slice(map + 1);
+    assert.ok(afterMap.some((r) => r.kind === "event" && (r.event as { type?: string; reasons?: string[] }).type === "LEAD_CALLED" &&
+      (r.event as { reasons: string[] }).reasons.some((reason) => reason.includes("repair produced no change"))), "an empty repair calls the lead with its reason");
+    assert.ok(!afterMap.some((r) => r.kind === "event" && ["FREEZE_COMPLETED", "REVIEW_SUBMITTED"].includes((r.event as { type: string }).type)),
+      "the same candidate is never handed off or reviewed again");
+    assert.equal(setup.conductor.state.phase.rounds?.length, 2, "the exception ends the empty repair immediately");
+  } finally {
+    await teardown(setup);
+  }
+});

@@ -130,7 +130,37 @@ function coverageFindings(json: unknown): LintFinding[] {
  * repository coverage. `tt lint` and both start commands use this one
  * function, so the warnings they show are the same. */
 function allFindings(json: unknown): LintFinding[] {
-  return [...lintJson(json), ...coverageFindings(json), ...verifyReachFindings(json), ...testRemovalFindings(json)];
+  return [...lintJson(json), ...programHeaderFindings(json), ...coverageFindings(json), ...verifyReachFindings(json), ...testRemovalFindings(json)];
+}
+
+/** Delivery settings belong to each node's plan. The exported program keeps
+ * sourceFile, so lint can name ignored header keywords without another Org
+ * parser. A plan exported as a one-entry program still owns its settings. */
+function programHeaderFindings(json: unknown): LintFinding[] {
+  if (!isProgramInput(json)) return [];
+  const sourceFile = (json as LintProgramInput).sourceFile;
+  if (!sourceFile) return [];
+  let source: string;
+  try {
+    source = readFileSync(sourceFile, "utf8");
+  } catch {
+    return [];
+  }
+  const header = source.split(/^\*+\s/m, 1)[0];
+  if (!/^\s*#\+TT_PROGRAM:/im.test(header)) return [];
+  const out: LintFinding[] = [];
+  for (const [i, line] of header.split("\n").entries()) {
+    const match = /^\s*#\+(TT_DELIVER_BRANCH|TT_DELIVER_AUDIT):/i.exec(line);
+    if (!match) continue;
+    const keyword = `#+${match[1].toUpperCase()}`;
+    out.push({
+      severity: "warning", rule: "program-keyword", phaseId: "program",
+      sourceFile, line: i + 1, item: line.trim(),
+      problem: `${keyword} belongs in each node's plan`,
+      fix: "Move this keyword from the program header to each node's plan.",
+    });
+  }
+  return out;
 }
 
 /** 07g1: every `#+TT_TEST_REMOVALS` entry must name a test the base declares,
@@ -361,6 +391,19 @@ function resolveRunDir(rootOrId: string, root: string): string {
   if (existsSync(path.join(candidate, "meta.json"))) return candidate;
   const readable = resolveReadableRunDir(rootOrId, root);
   if (readable) return readable;
+  // Views and owner bindings name the init record's runId. The directory
+  // name can differ (including runs created before this resolver existed).
+  const entries = existsSync(root) ? readdirSync(root, { withFileTypes: true }) : [];
+  for (const entry of entries) {
+    const dir = path.join(root, entry.name);
+    if (!entry.isDirectory() || !existsSync(path.join(dir, "meta.json"))) continue;
+    try {
+      const init = readLog(path.join(dir, "events.jsonl")).records.find((r) => r.kind === "init");
+      if ((init?.event as { runId?: string } | undefined)?.runId === rootOrId) return dir;
+    } catch {
+      // An unrelated unreadable/corrupt run cannot resolve this id.
+    }
+  }
   return path.resolve(rootOrId);
 }
 
@@ -2667,6 +2710,17 @@ async function main(): Promise<void> {
   }
   const { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source, skipModelsCheck, envFile, toPhase, deferTest, deferOwnerRuling } = parseArgs(rest);
   const runRoot = root ?? DEFAULT_ROOT;
+  // Resolve before any writer reads input, creates an inbox, signals a
+  // process or launches a conductor. The read-only path fallback stays as-is.
+  const runWriters = ["input", "steer", "note", "correct", "evidence", "verdict", "withdraw", "defer", "recheck", "stop", "resume", "carry", "entry"];
+  if (runWriters.includes(cmd) && positional[0]) {
+    const runArg = ["steer", "note", "correct"].includes(cmd)
+      ? positional.find((arg) => arg !== "--program-wide") : positional[0];
+    const runDir = resolveRunDir(runArg ?? "", runRoot);
+    if (!existsSync(path.join(runDir, "meta.json"))) {
+      throw new Error(`no run ${runArg} under ${runRoot}`);
+    }
+  }
   if (cmd === "test") {
     // Plan 06l (A2): the narrow worker test loop. Its own flags (`--changed`,
     // `--run`, `--plan`, `--base`, `--budget`) are parsed by the handler, not
@@ -2849,7 +2903,7 @@ async function main(): Promise<void> {
     const full = execFileSync("git", ["-C", repo, "rev-parse", "--verify", `${sha}^{commit}`], { encoding: "utf8" }).trim();
     const dest = path.join(runRoot, "runner", full);
     mkdirSync(dest, { recursive: true });
-    execFileSync("/bin/sh", ["-c", `git -C "$1" archive "$2" tradeoffs-trace | tar -x -C "$3"`, "sh", repo, full, dest]);
+    execFileSync("/bin/sh", ["-c", `git -C "$1" archive "$2" tradeoffs-trace core/init-tradeoffs-trace.el | tar -x -C "$3"`, "sh", repo, full, dest]);
     writeFileSync(path.join(dest, "tradeoffs-trace", "RUNNER_SHA"), `${full}\n`);
     const current = path.join(runRoot, "runner", "current");
     rmSync(current, { force: true });

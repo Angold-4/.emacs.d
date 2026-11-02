@@ -19,7 +19,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { Conductor, contractVersionFor, createRun, runPaths, type RunPlanFile } from "../../src/conductor.ts";
+import { Conductor, contractVersionFor, createRun, runPaths, runnerRevision, type RunPlanFile } from "../../src/conductor.ts";
 import { EventLog } from "../../src/effects/log.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import { baselineHasEnvironmentFailure, baselineKey, parseBaseline } from "../../src/core/test-failures.ts";
@@ -164,7 +164,9 @@ test("env-preflight: a missing check tool blocks before the baseline and any age
       await resumed.start();
       await waitFor(() => resumed.state.phase.phase === "DONE", 90_000, undefined, setup.runDir);
       assert.deepEqual(eventTypes(setup.runDir).filter((t) => t === "ENV_PREFLIGHT_FAILED").length, 1);
-      assert.ok(eventTypes(setup.runDir).includes("RUN_RESUMED"));
+      const resume = readEvents(setup.runDir).find((r) => r.kind === "event" && (r.event as { type?: string }).type === "RUN_RESUMED");
+      assert.ok(resume);
+      assert.equal((resume.event as { runnerRevision?: string }).runnerRevision, runnerRevision(), "environment recovery stamps its actual writer");
       // The resolved path is recorded in the status at start.
       const doneText = renderStatusText(setup.runDir, resumed.state, buildView(setup.runDir, setup.plan, false), { missing: [], tooShort: [] });
       assert.ok(doneText.includes(`env  ${missing} ${tool}`));

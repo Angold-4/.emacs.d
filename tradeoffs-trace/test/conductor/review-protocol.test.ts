@@ -386,7 +386,11 @@ test("plan 06c: a reviewer whose turn settles without submit_review is re-prompt
     });
     await setup.conductor.start();
     try {
-      await waitFor(() => eventTypes(readEvents(setup.runDir)).includes("REVIEW_TIMED_OUT"), 120_000, 50, setup.runDir);
+      // Another seat can time out/retry before B finishes its silent turn.
+      // This scenario is about B's re-prompt, not the first timeout anywhere.
+      await waitFor(() => readEvents(setup.runDir).some((r) => r.kind === "event" &&
+        (r.event as { type?: string; reviewer?: string }).type === "REVIEW_TIMED_OUT" &&
+        (r.event as { reviewer?: string }).reviewer === "B"), 120_000, 50, setup.runDir);
       const records = readEvents(setup.runDir);
       assert.ok(records.some((r) => r.kind === "review_reprompt" && (r.event as { reviewer?: string }).reviewer === "B"), "B was re-prompted once before timing out");
       const completion = records.find(

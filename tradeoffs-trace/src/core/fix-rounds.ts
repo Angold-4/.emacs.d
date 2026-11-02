@@ -1,14 +1,14 @@
 // 07g1 (design A3): the fix-round task rule. A fix round takes POINTS only —
 // an open finding triaged `fix`, with the domain of the files it cites — and
 // groups them by domain, one fixer per domain. A decision the seats vetoed or
-// the evaluator triaged is never fixer work: it goes to the seats' vote or to
-// the owner. This module is the ONE place that decides those tasks; the
+// the evaluator triaged is never fixer work by itself: it goes to the seats'
+// vote or the owner. An owner repair ruling creates a finding before MAP. This module is the ONE place that decides those tasks; the
 // conductor only runs what it returns. It is pure: no clock, no I/O, no model.
 
 import { domainOf, whereKey, type Domain } from "./domains.ts";
 import { testNames } from "./test-names.ts";
 import type { Disposition } from "./triage.ts";
-import type { Finding, FindingFact } from "./types.ts";
+import type { Finding, FindingFact, RoundRecord } from "./types.ts";
 
 /** Plan 07c (D4): the default `#+TT_FIXERS` — the most fixer tasks (one per
  * domain) a fix round may run. */
@@ -44,7 +44,8 @@ export interface FixTask {
  * Exported so the conductor's prompt and its tests name exactly one text. */
 export const FIXER_DUTY =
   "You are a fixer. You fix exactly the points below and nothing else: change only what they need. " +
-  "A voted-down or vetoed decision is never your task — it goes to the seats or the owner; you still decide no trade-off yourself. " +
+  "An owner repair ruling reaches you as a point; carry out its expected outcome. " +
+  "A voted-down or vetoed decision alone goes to the seats or the owner; you still decide no trade-off yourself. " +
   "If you meet a decision that changes scope, behaviour or cost, report it as a disclosure in submit_phase instead of deciding it. " +
   "When you are done, call submit_phase with your decisions, assumptions and deviations; you owe no item coverage and no answers to other findings.";
 
@@ -89,6 +90,14 @@ export function fixTasks(points: readonly FixPoint[], domains: readonly Domain[]
     if (tasks.length >= limit) break;
   }
   return tasks;
+}
+
+/** No fixer ran in this MAP and REDUCE kept its base. A prior checkpoint
+ * may be reused after a stop, but its old tasks are not a new repair attempt.
+ * The caller parks for the lead before handing the same tree to the seats. */
+export function repairProducedNoChange(round: RoundRecord, checkpoint?: RoundRecord["fixed"]): boolean {
+  const dispatched = checkpoint === undefined && (round.fixed?.tasks.length ?? 0) > 0;
+  return !dispatched && (round.fixed?.candidate ?? round.base) === round.base;
 }
 
 /** 07g1: test removals a mapper may make. An allowance names either a test

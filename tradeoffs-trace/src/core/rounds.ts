@@ -33,6 +33,7 @@ import type {
   FindingSeverity,
   LaneCandidateRecord,
   PhaseContract,
+  PhaseState,
   PickVote,
   PriorDecisionStatement,
   RoundRecord,
@@ -169,6 +170,24 @@ export function roundBudget(contract: Pick<PhaseContract, "roundsAllowed"> | und
   const n = contract?.roundsAllowed;
   if (typeof n !== "number" || !Number.isFinite(n) || n < 1) return DEFAULT_ROUND_BUDGET;
   return Math.floor(n);
+}
+
+/** All repair entry points spend the same log-derived allowance. The first
+ * round is free. Historical round checkpoints also count, including logs
+ * written before lane-free ROUND_STARTED charged repairRoundsUsed. */
+export function repairRoundsSpent(phase: PhaseState): number {
+  return Math.max(phase.repairRoundsUsed, ...(phase.rounds ?? []).map((r) => r.round - 1));
+}
+
+export function repairBudgetRemains(phase: PhaseState, nextRound = repairRoundsSpent(phase) + 2): boolean {
+  // The absolute ceiling is one initial round plus all recorded grants.
+  return Math.max(repairRoundsSpent(phase) + 1, nextRound - 1) <= phase.repairRoundsGranted;
+}
+
+/** After the first pick, ROUND_STARTED owns the charge. The phase entry
+ * event only changes phase; resuming a checkpoint spends nothing. */
+export function hasDomainRounds(phase: PhaseState): boolean {
+  return (phase.rounds ?? []).some((r) => r.picked !== undefined || r.lanes.length === 0);
 }
 
 /** The candidates of a round that passed their checks: the only ones that are
@@ -391,7 +410,11 @@ export function revotePair(round: RoundRecord, seats: number | readonly string[]
   const needed = Math.floor(seatCount / 2) + 1;
   const counts = countVotes(round.votes, passing);
   if (passing.some((c) => (counts.get(c.lane) ?? 0) >= needed)) return undefined;
-  const ranked = [...passing].sort((a, b) => (counts.get(b.lane) ?? 0) - (counts.get(a.lane) ?? 0));
+  // Ties are ordered by lane, so the pair never depends on which candidate
+  // finished first.
+  const ranked = [...passing].sort(
+    (a, b) => (counts.get(b.lane) ?? 0) - (counts.get(a.lane) ?? 0) || a.lane.localeCompare(b.lane),
+  );
   if (ranked.length < 2) return undefined;
   return [ranked[0].lane, ranked[1].lane];
 }

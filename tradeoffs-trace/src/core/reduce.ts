@@ -32,6 +32,7 @@ import {
   recordRulings,
 } from "./owner-commands.ts";
 import { isLiveDecision, panelOutcome, panelSeatNumbers, panelSeatSettled, panelSeatsSettled, reviewIngestionIssue, sameVersion } from "./predicate.ts";
+import { repairBudgetRemains, repairRoundsSpent } from "./rounds.ts";
 import { factKeepsOpen } from "./fix-rounds.ts";
 import { seatsOf } from "./seats.ts";
 import { namedCandidate } from "./ruling-picks.ts";
@@ -544,11 +545,18 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       if (event.round < 1) {
         return rejected(state, "ROUND_STARTED needs a positive round number");
       }
+      const prior = (p.rounds ?? []).find((r) => r.round === event.round);
+      if (event.lanes.length === 0 && prior) {
+        if (prior.lanes.length !== 0 || prior.base !== event.base) return rejected(state, "ROUND_STARTED cannot replace a different checkpoint");
+        return ok(state);
+      }
+      if (event.lanes.length === 0 && !repairBudgetRemains(p, event.round)) return rejected(state, "ROUND_STARTED exceeds the recorded repair allowance");
       const others = (p.rounds ?? []).filter((r) => r.round !== event.round);
       return ok({
         ...state,
         phase: {
           ...p,
+          ...(event.lanes.length === 0 ? { repairRoundsUsed: repairRoundsSpent(p) + 1 } : {}),
           rounds: [
             ...others,
             { round: event.round, base: event.base, lanes: [...event.lanes], candidates: [], votes: [] },

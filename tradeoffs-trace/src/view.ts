@@ -828,7 +828,7 @@ export function whyReport(runDir: string, plan: RunPlanFile): WhyReport {
   installSeatAnchorRule();
   const { timeline, events } = rebuildTimelineWithEvents(runDir, plan);
   const phase = timeline.state.phase;
-  const blockers = acceptanceBlockers(phase, failedCheckCommands(runDir, phase));
+  const blockers = acceptanceBlockers(phase, failedCheckCommands(runDir, phase), path.resolve(runDir));
   const revision = recordedRunnerRevision(runDir);
   const bounds = events
     .filter((e): e is Extract<typeof e, { type: "BOUND_REACHED" }> => e.type === "BOUND_REACHED")
@@ -907,7 +907,7 @@ export function buildView(
   // simple command the shell ran last before the non-zero exit) and marks a
   // step that printed nothing as silent. The step comes from the check record
   // the conductor wrote, never from re-running the check here.
-  const reasons = acceptanceBlockers(phase, failedCheckCommands(runDir, phase)).map(
+  const reasons = acceptanceBlockers(phase, failedCheckCommands(runDir, phase), path.resolve(runDir)).map(
     (b) => `${b.detail}${b.kind === "check" ? failingStepNote(runDir, phase, b.command) : ""} — ${b.command}`,
   );
   // Plan 06n (A6): the header's round is the round of the last ROUND_STARTED,

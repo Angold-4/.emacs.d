@@ -20,6 +20,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { reduce } from "./core/reduce.ts";
+import { acceptedReplayRecords } from "./log-replay.ts";
 import { parseWorkerPromptRecord, SINGLE_WORKER_LANE, workerPromptPaths, type WorkerPromptMap, type WorkerPromptRecord } from "./core/worker-prompt.ts";
 import { resolveWorkerPrompts } from "./effects/worker-prompt.ts";
 import { curatorEvent, entryVerdictEvents, formatAnchor, planEntryEvents, validateLink, type CuratorProposal, type Entry } from "./core/entries.ts";
@@ -34,7 +35,7 @@ import { namedCandidate } from "./core/ruling-picks.ts";
 // Plan 06g: the round's only decision points — `pickWinner`, `blocksAcceptance`
 // and `roundBudget` (architecture A3 and A6). Nothing in this file decides a
 // winner or whether a finding blocks by itself.
-import { advisoryReason, bestCandidate, blocksAcceptance, candidateLabel, carryBallotsForward, carryDecisionsForward, laneMetItems, losingLanes, loserAnchors, roundBudget, type AcceptanceGate, type FindingGround, type PickGuard } from "./core/rounds.ts";
+import { advisoryReason, bestCandidate, blocksAcceptance, candidateLabel, carryBallotsForward, carryDecisionsForward, laneMetItems, losingLanes, loserAnchors, roundBudget, repairBudgetRemains, type AcceptanceGate, type FindingGround, type PickGuard } from "./core/rounds.ts";
 // Plan 06g2 (A1): `runRound` is the round's only orchestrator. The conductor
 // implements its `LaneHost` with the worktree, agent, check, review and vote
 // machinery below and calls it; it decides nothing about lanes itself.
@@ -171,6 +172,7 @@ import {
   DEFAULT_INTEGRATE_MAX,
   FIXER_DUTY,
   fixTasks,
+  repairProducedNoChange,
   testRemovalViolations,
   type FixFinding,
   type FixPoint,
@@ -209,7 +211,7 @@ import {
 } from "./core/predicate.ts";
 import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { FAILED_VOTE_OPTIONS, isRepairForcingOption, openFindingOptions } from "./core/owner-requests.ts";
-import { BRIEF_GLOSSARY, briefIssue, enrichBriefRelated, evidenceFile, fallbackBrief, fallbackDecisionBrief, fallbackEntryBrief, parseCatalogs, renderGlossaryOrg, stripCodeTokens, stripCounts, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
+import { briefInstructions, briefIssue, enrichBriefRelated, evidenceFile, fallbackBrief, fallbackDecisionBrief, fallbackEntryBrief, parseCatalogs, renderGlossaryOrg, stripCodeTokens, stripCounts, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
 import { evaluationExceptions, notAcceptedReasons } from "./core/verdict.ts";
 import { evaluationSettled, itemsNeedingEvaluatorReverify, pendingEvidenceItems, setSeatAnchorResolver } from "./core/predicate.ts";
 // Plan 06b: the pure item machinery (coverage, test-verify resolution,
@@ -230,6 +232,7 @@ import {
   evidenceHasAnchor,
   itemsFromPhase,
   itemTestVerifies,
+  parseVerify,
   requirementAndConstraintItems,
   phaseItemOutcomes,
   repairItemLines,
@@ -1317,14 +1320,24 @@ export function restartInstants(records: readonly LogRecord[]): string[] {
   return out;
 }
 
+/** Stored reviews already passed candidate-anchor validation at ingestion.
+ * Live execution and replay must use the same rule: checking a recorded
+ * file:line against the reader's cwd can reject FINAL_CHECK_REQUIRED and
+ * strand a successfully published run in RESOLVING during lenient replay. */
+function installRecordedSeatAnchorRule(): void {
+  setSeatAnchorResolver((evidence) => evidenceHasAnchor(evidence));
+}
+
 function timelineFromRecords(records: readonly LogRecord[], plan: RunPlanFile): Timeline {
+  installRecordedSeatAnchorRule();
   const init = records.find((r) => r.kind === "init")?.event as { runId: string; integrationHead: string; seats?: Seats } | undefined;
   let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "", plan.ownerDirectives ?? [], init?.seats, plan);
   const phases: Timeline["phases"] = [];
   const rounds: Timeline["rounds"] = [];
-  const restarts = restartInstants(records);
-  const stops = records.filter((r) => r.kind === "stop").map((r) => r.ts);
-  for (const record of records) {
+  const accepted = [...acceptedReplayRecords(records)];
+  const restarts = restartInstants(accepted);
+  const stops = accepted.filter((r) => r.kind === "stop").map((r) => r.ts);
+  for (const record of accepted) {
     if (record.kind !== "event") continue;
     const before = state;
     const result = reduce(state, record.event);
@@ -1366,7 +1379,7 @@ export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
  * re-parsing the whole log once per status beat. */
 export function rebuildTimelineWithEvents(runDir: string, plan: RunPlanFile): { timeline: Timeline; events: MetricEvent[]; records: LogRecord[] } {
   const { records } = readLog(runPaths(runDir).events);
-  return { timeline: timelineFromRecords(records, plan), events: metricEvents(records), records };
+  return { timeline: timelineFromRecords(records, plan), events: metricEvents([...acceptedReplayRecords(records)]), records };
 }
 
 /** Folds every `"event"`-kind record in `records` (in order) through
@@ -1374,14 +1387,10 @@ export function rebuildTimelineWithEvents(runDir: string, plan: RunPlanFile): { 
  * `rebuildState`'s doc comment for why that is always a bug, not something
  * to paper over. */
 function foldEvents(base: State, records: readonly LogRecord[], lenient = false): State {
+  installRecordedSeatAnchorRule();
   let state = base;
-  for (let i = 0; i < records.length; i++) {
-    const record = records[i];
+  for (const record of acceptedReplayRecords(records)) {
     if (record.kind !== "event") continue;
-    // A runner before the stale-review fix logged an event and THEN its
-    // rejection; the live conductor never applied it, so neither does
-    // recovery (otherwise such a run could never be resumed).
-    if (records[i + 1]?.kind === "rejected") continue;
     const result = reduce(state, record.event);
     if (!result.ok && lenient) {
       // Read-only views of a run written by an older runner revision: skip
@@ -1645,6 +1654,121 @@ export function parseOwnerPointFields(text: string): { fields: Partial<OwnerPoin
   }
   const missing = (["domain", "where", "expected", "doneWhen"] as const).filter((k) => !fields[k]);
   return { fields, missing };
+}
+
+/** Requests opened by a later exception rewrite the same work at the same
+ * binding. Derive its identity through corrections and materialized repair
+ * points, rather than treating every request as a new piece of work. */
+function ownerRepairWorkKey(phase: PhaseState, request: PhaseState["ownerRequests"][number]): string {
+  const correction = phase.corrections.find((c) => c.id === request.linkedCorrectionId);
+  const target = request.linkedFindingId ?? correction?.targetRecordId;
+  const source = target && phase.ownerRequests.find((r) => `F-${phase.phaseId}-owner-repair-${r.id}` === target);
+  if (source && source !== request) return ownerRepairWorkKey(phase, source);
+  if (target) return `${phase.decisions.some((d) => d.id === target) ? "decision" : "finding"}:${target}`;
+  if (request.linkedDecisionId) return `decision:${request.linkedDecisionId}`;
+  if (request.linkedCorrectionId) return `correction:${request.linkedCorrectionId}`;
+  if (request.linkedMessageId) return `message:${request.linkedMessageId}`;
+  return `request:${request.id}`;
+}
+
+/** A repair ruling becomes ordinary finding work before MAP. The same path
+ * mapping as a red REDUCE check owns it; the owner's choice and the rejecting
+ * seats supply its expected outcome. No evaluator triage or new phase state
+ * is needed. A missing domain is an exception, never an empty repair. */
+export function ownerRepairPointFor(
+  phase: PhaseState,
+  request: PhaseState["ownerRequests"][number],
+  declared: DeclaredTestCommands,
+): { finding: Finding; replaces?: string } | { reason: string } | undefined {
+  if (request.status !== "resolved" || !request.resolution) return undefined;
+  const key = ownerRepairWorkKey(phase, request);
+  const sameWork = phase.ownerRequests.filter((r) => r.status === "resolved" && r.resolution &&
+    r.resolvedBinding?.candidateSha === request.resolvedBinding?.candidateSha &&
+    sameVersion(r.resolvedBinding?.contractVersion, request.resolvedBinding?.contractVersion) &&
+    ownerRepairWorkKey(phase, r) === key);
+  // Resolution writers move newly resolved requests to the end, so this is
+  // accepted resolution order, even when requests were created in the opposite
+  // order. A later repair/drop/ruling supersedes unmaterialized work before admission.
+  if (sameWork.at(-1)?.id !== request.id || !isRepairForcingOption(request.origin, request.resolution.option)) return undefined;
+  // Already admitted work is reused, never duplicated by a fresh request.
+  const materialized = sameWork.map((r) => phase.findings.find((f) => f.id === `F-${phase.phaseId}-owner-repair-${r.id}`)).find(Boolean);
+  const id = materialized?.id ?? `F-${phase.phaseId}-owner-repair-${request.id}`;
+  const correction = phase.corrections.find((c) => c.id === request.linkedCorrectionId);
+  const target = correction?.targetRecordId;
+  const finding = phase.findings.find((f) => f.id === (request.linkedFindingId ?? target));
+  const decision = phase.decisions.find((d) => d.id === (request.linkedDecisionId ?? finding?.linkedDecisionId ?? target));
+  // Direct record-level withdrawals and final owner rulings also settle the
+  // work; an old repair request cannot recreate a point after that exit.
+  if (correction?.status === "withdrawn" || finding?.status === "accepted" ||
+    (decision && phase.ruledDecisions?.some((r) => r.id === decision.id && r.choice === decision.choice))) return undefined;
+  const existing = phase.findings.find((f) => f.id === id);
+  if (existing) return { finding: existing, ...(finding?.status === "open" && finding.id !== existing.id ? { replaces: finding.id } : {}) };
+  const message = phase.messages?.find((m) => m.id === request.linkedMessageId);
+  const ballots = (request.relatedBallots ?? phase.ballots.filter((b) => b.decisionId === decision?.id))
+    .filter((b) => b.vote === "reject");
+  const evidence = [
+    finding?.where, finding?.evidence, finding?.expected,
+    decision?.choice, decision?.whyItMatters, decision?.recommendation.choice, decision?.recommendation.reason,
+    ...(decision?.alternatives.map((a) => `${a.option}: ${a.consequence}`) ?? []),
+    ...ballots.flatMap((b) => [...b.evidence, b.rationale]),
+    correction?.correctionText, message?.context, ...(message?.evidence ?? []),
+    request.reason, request.resolution.note,
+  ].filter((s): s is string => typeof s === "string" && s.length > 0).join("\n");
+  const owner = failingDomainOf(evidence, phase.contract.domains ?? []);
+  if (!owner) return { reason: `owner repair ${request.id} names no file owned by a declared domain; the lead must rewrite the point` };
+  const fields = parseOwnerPointFields(evidence).fields;
+  const anchor = evidenceFileAnchors(evidence).find((a) => a.path === owner.path);
+  const where = finding?.where && domainOf(whereKey(finding.where).split(" ")[0], phase.contract.domains) === owner.domain
+    ? finding.where : `${owner.path}:${anchor?.start ?? 1}`;
+  const itemId = finding?.itemId ?? finding?.item ?? decision?.itemId ?? fields.item;
+  const item = flatItems(itemsFromPhase(phase.contract)).find((i) => i.id === itemId);
+  const tests: TestVerify[] = [];
+  for (const citation of evidence.matchAll(/\btest\s+(?:final\s+)?(?:"[^"]+"|[\w./:-]+::[\w.:-]+)/g)) {
+    for (const verify of parseVerify(citation[0])) if (verify.kind === "test") tests.push(verify);
+  }
+  if (item) tests.push(...itemTestVerifies(item));
+  const doneWhen = fields.doneWhen ?? finding?.doneWhen ??
+    (finding?.reproduction?.result === "reproduced" ? finding.reproduction.command : undefined) ??
+    lostTestsDoneWhen(tests, declared);
+  if (!doneWhen?.trim()) return { reason: `X:UNPROVABLE: owner repair ${request.id} ${tests.length ? "names a test with no declared command" : "has no proving command"}; the lead must rewrite the point with doneWhen` };
+  const option = request.resolution.option;
+  const label = request.options.find((o) => o.id === option)?.label ?? option;
+  return {
+    finding: {
+      id, version: 1, phaseId: phase.phaseId, kind: "defect", severity: "blocking",
+      raisedBy: "conductor", status: "open", boundCandidateSha: phase.candidate?.sha ?? request.boundCandidateSha ?? "",
+      domain: owner.domain, where, evidence,
+      expected: [
+        `Owner ${request.id}: ${option} (${label}). ${request.resolution.note ?? ""}`.trim(),
+        finding?.expected,
+        ...ballots.map((b) => `${b.reviewer} rejected: ${b.rationale}`),
+      ].filter(Boolean).join("\n"),
+      ...(decision ? { linkedDecisionId: decision.id } : {}),
+      ...(itemId ? { itemId, item: itemId } : {}),
+      ...(doneWhen ? { doneWhen } : {}),
+    },
+    ...(finding?.status === "open" ? { replaces: finding.id } : {}),
+  };
+}
+
+/** Admission precedes FINDING_RAISED and MAP. The caller establishes and
+ * records the command's base result; a green or inconclusive base cannot
+ * prove a repair. Replays reuse that recorded fact. */
+export async function admitOwnerRepairPoint(
+  phase: PhaseState,
+  request: PhaseState["ownerRequests"][number],
+  declared: DeclaredTestCommands,
+  baseFact: (finding: Finding) => Promise<{ exitCode: number | null; timedOut: boolean }>,
+): Promise<ReturnType<typeof ownerRepairPointFor>> {
+  const point = ownerRepairPointFor(phase, request, declared);
+  if (!point || "reason" in point) return point;
+  if (!point.finding.doneWhen?.trim()) return { reason: `X:UNPROVABLE: owner repair ${request.id} has no doneWhen; the lead must rewrite the point` };
+  const fact = await baseFact(point.finding);
+  if (fact.exitCode === 0 && !fact.timedOut) return { reason: `X:UNPROVABLE: owner repair ${request.id} doneWhen already passes on the base; the lead must rewrite the point` };
+  if (fact.timedOut || fact.exitCode === null || fact.exitCode === 126 || fact.exitCode === 127) {
+    return { reason: `X:UNPROVABLE: owner repair ${request.id} has no conclusive failing base result; the lead must rewrite the point` };
+  }
+  return point;
 }
 
 /** Plan 07f (A3/§3.2/§3.3): what an owner correction does, whichever state it
@@ -2092,7 +2216,7 @@ export class Conductor {
     // test name, or a command the reviewer ran) as the resolver acceptance
     // reads. It is stateless, so it stays installed after the conductor stops:
     // a logged ACCEPTED event must still reduce when replayed (rebuildState).
-    setSeatAnchorResolver((evidence) => evidenceHasAnchor(evidence));
+    installRecordedSeatAnchorRule();
   }
 
   get state(): State {
@@ -2257,7 +2381,7 @@ export class Conductor {
     ) {
       this.#driveSuspended = true;
       try {
-        this.#applyEvent({ type: "RUN_RESUMED" });
+        this.#applyEvent({ type: "RUN_RESUMED", runnerRevision: runnerRevision() });
       } finally {
         this.#driveSuspended = false;
       }
@@ -9030,8 +9154,8 @@ export class Conductor {
    * finished run keeps nothing (its worktrees are pruned, A3/R4) and a single-
    * worker phase has no lane worktrees at all. */
   #recordKeptLaneWorktrees(): void {
-    if (!this.#laneRoundEnabled()) return;
-    const phase = this.#state?.phase.phase;
+    if (!this.#state || !this.#laneRoundEnabled()) return;
+    const phase = this.#state.phase.phase;
     if (phase === "DONE" || phase === "BLOCKED") return;
     for (const lane of this.#lanes()) {
       const worktree = this.#laneWorktree(lane);
@@ -9787,11 +9911,11 @@ export class Conductor {
         ...f,
         ...(inferred ? { domain: inferred } : {}),
         disposition: triageRecordFor(this.#state.phase.triage, f.id)?.disposition ??
-          (f.raisedBy === "conductor" ? { kind: "fix" as const, reason: "a final check failure is fixed in its file's domain" } : undefined),
+          (f.raisedBy === "conductor" ? { kind: "fix" as const, reason: "a conductor point is fixed in its file's domain" } : undefined),
       };
     });
-    // 07g1: only points are fixer work. A voted-down or vetoed decision goes
-    // to the seats (or the owner), never to a fixer.
+    // Only points are fixer work. An owner repair resolution has already
+    // materialized its decision or finding as a point before this MAP.
     const open = new Set(this.#openPointsOn(record.base));
     const points: FixTask["findings"] = findings.filter((f) => open.has(f.id));
     const cap = this.#state.phase.contract.fixers ?? DEFAULT_FIXERS;
@@ -9978,11 +10102,11 @@ export class Conductor {
       .map((f) => f.id);
   }
 
-  /** §7a.3: a mechanical item point without a command closes by an approved
+  /** §7a.3: a conductor point without a command closes by an approved
    * domain review with green fix checks. Read only replayed checkpoints and
    * require that the reviewed head actually merged into this candidate. */
   #approvedItemPointReview(finding: Finding, candidateSha: string): string | undefined {
-    if (finding.raisedBy !== "conductor" || !finding.itemId || finding.doneWhen || candidateSha === finding.boundCandidateSha) return undefined;
+    if (finding.raisedBy !== "conductor" || finding.doneWhen || candidateSha === finding.boundCandidateSha) return undefined;
     for (const round of this.#state.phase.rounds ?? []) {
       for (const pass of round.fixed?.domains ?? []) {
         if (!pass.sha || !pass.facts?.checkPassed || !pass.review?.quality.ok ||
@@ -12002,6 +12126,33 @@ export class Conductor {
       });
   }
 
+  /** Establish admission from the candidate the owner rejected, before any
+   * point or fixer is admitted. Keep the full command output in the log. */
+  async #ownerRepairBaseFact(finding: Finding, baseSha: string): Promise<{ exitCode: number | null; timedOut: boolean }> {
+    const command = this.#withValues(finding.doneWhen!);
+    const { records } = readLog(this.#paths.events);
+    const recorded = records.find((r) => r.kind === "done_when_base" &&
+      (r.event as any).findingId === finding.id && (r.event as any).baseSha === baseSha &&
+      (r.event as any).command === command)?.event as { exitCode: number | null; timedOut: boolean } | undefined;
+    if (recorded) return recorded;
+    const checkout = disposableCheckout(this.#plan.repo, baseSha);
+    const startedAt = Date.now();
+    try {
+      const result = await runCommand({
+        command, cwd: checkout.dir, env: this.#checkEnv(),
+        deadlineMs: this.#deadlines.reproductionMs, termGraceMs: this.#deadlines.termGraceMs,
+        onIntent: ({ pgid }) => {
+          this.#onStageShIntent(pgid);
+          this.#log.intent(`owner-repair-base-${finding.id}-${pgid}`, { pgid, findingId: finding.id, baseSha });
+        },
+      }).result;
+      if (result.timedOut) this.#recordBound("fact", `owner-repair:${finding.id}:base`, this.#deadlines.reproductionMs, Date.now() - startedAt);
+      const fact = { findingId: finding.id, baseSha, command, exitCode: result.exitCode, timedOut: result.timedOut, output: result.output };
+      this.#log.append("done_when_base", fact);
+      return fact;
+    } finally { checkout.dispose(); }
+  }
+
   /** After the pick there are no lanes: domain MAP, git/facts REDUCE, then
    * ordinary candidate seats only when every point is closed. Empty-lane
    * RoundRecords are durable loop checkpoints, never candidates to pick. */
@@ -12010,25 +12161,50 @@ export class Conductor {
     let last = this.#state.phase.rounds?.at(-1);
     if (!last) return;
     if (last.lanes.length > 0) this.#recordRegression(last);
-    const limit = this.#state.phase.contract.roundsAllowed ?? this.#plan.rounds ?? boundDefinition("rounds").defaultValue;
+    // Materialize resolved owner work before reading the MAP checkpoint. A
+    // stable finding id makes a crash between this event and MAP replay-safe.
+    for (const request of this.#state.phase.ownerRequests) {
+      if (request.resolvedBinding?.candidateSha !== this.#state.phase.candidate?.sha) continue;
+      const point = await admitOwnerRepairPoint(this.#state.phase, request, this.#declaredTestCommands(),
+        (finding) => this.#ownerRepairBaseFact(finding, this.#state.phase.candidate!.sha));
+      if (!point) continue;
+      if ("reason" in point) {
+        this.#parkMergedCheck(last.round, point.reason);
+        return;
+      }
+      if (!this.#state.phase.findings.some((f) => f.id === point.finding.id)) this.#applyEvent({ type: "FINDING_RAISED", finding: point.finding });
+      if (point.replaces) this.#applyEvent({ type: "FINDING_MERGED", findingId: point.replaces, into: point.finding.id, byReviewer: "owner" });
+    }
     // A completed acceptance hand-off that was rejected starts another loop.
     // A stopped REDUCE reuses the existing fixed checkpoint and its base.
     let resume = last.lanes.length === 0 &&
       !(last.fixed?.candidate && last.fixed.candidate === this.#state.phase.candidate?.sha);
+    // A REDUCE checkpoint cannot consume a point the owner added after MAP.
+    // Keep the integrated work as the next base and give that point a new MAP.
+    if (last.fixed && this.#openPointsOn(last.fixed.candidate ?? last.base)
+      .some((id) => !last.fixed!.tasks.some((t) => t.findingIds.includes(id)))) resume = false;
     let base = last.picked?.sha ?? last.fixed?.candidate ?? last.base;
     for (;;) {
       const round = resume ? last.round : last.round + 1;
-      if (round > limit) {
+      if (!resume && !repairBudgetRemains(this.#state.phase, round)) {
         this.#parkOpenPoints(last.round, "the fix loop's round bound was reached", this.#openPointsOn(base));
         return;
       }
       if (!resume) this.#applyEvent({ type: "ROUND_STARTED", round, base, lanes: [] });
       this.#log.intent(actionId, { round, base, domains: true });
+      const checkpoint = this.#state.phase.rounds?.find((r) => r.round === round)?.fixed;
       const status = await this.#fixRound(round);
       if (status === "stopped" || this.#stopRequested || this.#recheckCancelledLaneRound) return;
       if (status === "parked") return;
       const record = this.#state.phase.rounds!.find((r) => r.round === round)!;
       const candidate = record.fixed?.candidate ?? record.base;
+      // A repair that ran no fixer and kept its base cannot yield new review
+      // evidence. Park before checks or hand-off, including a reused REDUCE
+      // checkpoint, so an owner's repair allowance cannot spin on one tree.
+      if (repairProducedNoChange(record, checkpoint)) {
+        this.#parkMergedCheck(round, "repair produced no change");
+        return;
+      }
       const kept = resume ? this.#readCheckRecord(candidate)?.record : undefined;
       const expected = kept ? checkCommands(this.#plan.checks, this.#state.phase.contract.checks, this.#state.phase.contract.finalChecks, kept.tier).map((c) => this.#withValues(c)) : [];
       const factIds = new Set(kept?.facts?.map((f) => f.findingId));
@@ -12093,7 +12269,7 @@ export class Conductor {
         return;
       }
       this.#log.append("fix_loop_chained", { round, candidate, openPoints });
-      if (round >= limit) {
+      if (!repairBudgetRemains(this.#state.phase)) {
         this.#parkOpenPoints(round, `the fix loop's bound was reached with points still open: ${openPoints.join(", ")}`, openPoints);
         return;
       }
@@ -13706,7 +13882,7 @@ export class Conductor {
       // run is still ENV_BLOCKED would otherwise be the state the auto-stop
       // sees, freezing the log before `RUN_RESUMED` could be applied.
       if (result.missing.length === 0 && this.#state.run === "ENV_BLOCKED") {
-        this.#applyEvent({ type: "RUN_RESUMED" });
+        this.#applyEvent({ type: "RUN_RESUMED", runnerRevision: runnerRevision() });
       }
       // No declared command means no tool to record; skip the (otherwise
       // empty) record so an unchanged run's log stays quiet.
@@ -15861,19 +16037,15 @@ export class Conductor {
     return lines.join("\n");
   }
 
-  /** The plan's calendars.yaml / products.yaml, or null when neither is
-   * readable. Never throws: a missing catalog makes a brief say its example
-   * is unverified, it never invents one. */
+  /** The plan repository's calendars.yaml / products.yaml, or null when
+   * neither is readable. No catalogs means briefs use the plan's domain. */
   #briefCatalogs(): Catalogs | null {
     const tryRead = (rel: string): string | undefined => {
-      for (const candidate of [path.join(this.#plan.repo, rel), rel]) {
-        try {
-          return fs.readFileSync(candidate, "utf8");
-        } catch {
-          // keep looking
-        }
+      try {
+        return fs.readFileSync(path.join(this.#plan.repo, rel), "utf8");
+      } catch {
+        return undefined;
       }
-      return undefined;
     };
     const calendars = tryRead("config/index/calendars.yaml");
     const products = tryRead("config/index/products.yaml");
@@ -16056,10 +16228,10 @@ export class Conductor {
         continue;
       }
       const concern = concerns.find((c) => c.id === id);
-      const opts = { allItems: concerns, files: concern?.files, planRefs: concern?.planRefs, noRecommendationReason: reason };
+      const opts = { catalogs, allItems: concerns, files: concern?.files, planRefs: concern?.planRefs, noRecommendationReason: reason };
       const request = findOwnerRequest(phase, id);
       if (request) {
-        briefs.push({ ...fallbackBrief(request, { catalogs, ...opts }), candidateSha: C });
+        briefs.push({ ...fallbackBrief(request, opts), candidateSha: C });
         this.#briefBackstopEpisode.set(`${C}::${id}`, this.#awaitingEpisode);
         continue;
       }
@@ -16209,8 +16381,7 @@ export class Conductor {
 
   /** The brief-writing evaluator prompt: each item that still needs a brief,
    * its own option ids, the underlying evidence, the other open items on the
-   * same concern, and the plan's calendars/products so `today` can name a real
-   * market and session time. */
+   * same concern, and the plan's catalogs when provided. */
   #buildBriefPrompt(ids: readonly string[]): string {
     const phase = this.#state.phase;
     const catalogs = this.#briefCatalogs();
@@ -16218,28 +16389,7 @@ export class Conductor {
       `You write the owner-facing decision briefs for phase ${phase.phaseId}, candidate ${(phase.candidate?.sha ?? "").slice(0, 9)}.`,
       "The owner must be able to decide from each brief alone, in under a minute.",
       "",
-      "For EACH item below call submit_brief exactly once, with:",
-      "- question: one plain line, NO code identifiers (no snake_case, no path/file.rs), e.g. \"Should a vendor excluded before a weekend stay excluded when its market reopens?\"",
-      "- today: what the system does now, with ONE concrete example naming a real product and session time from the calendars below; a weekday reopen must match the calendar's weekly reopen. If you cannot check it, write \"(example unverified)\".",
-      "- ALL owner-facing text (the question, today, impact, the options, the recommendation and the related questions) must stay PLAIN: no file paths and no code identifiers. Cite a claim by its evidence number in square brackets, e.g. '10 s after a reopen[2]'.",
-      "- evidence: the numbered list of what you read, e.g. 'message: ...' then 'config: ...' or 'code: path:line'. Every time, count or duration in today, impact or an option must carry its OWN [n] reference into this list; one reference does not cover another claim.",
-      "- impact: what the owner would notice (price flow, number of vendors, quality, duration) and ALWAYS whether any market stops publishing. The publishing answer itself must cite the config or code it was checked against, or say it is unverified.",
-      "- options: exactly the item's own option ids, each relabelled in plain words with what happens and its cost.",
-      "- recommendation: one option id and why, citing the plan or an IC section.",
-      "- related: the other item ids below that touch the same file or plan clause.",
-      "",
-      "Calendars (calendars.yaml):",
-      ...(catalogs
-        ? Object.entries(catalogs.calendars).map(
-            ([name, c]) => `- ${name}: weekly reopen ${c.opens ?? "(none declared)"}; sessions ${Object.entries(c.sessions).map(([s, t]) => `${s} ${t}`).join(", ")}`,
-          )
-        : ["(none readable)"]),
-      "Products (products.yaml):",
-      ...(catalogs ? Object.entries(catalogs.products).map(([sym, p]) => `- ${sym}: vendor ${p.vendor ?? "?"}, calendar ${p.calendar ?? "?"}`) : ["(none readable)"]),
-      "",
-      "Glossary — use these terms as-is and never explain them inline; the brief links each one:",
-      ...BRIEF_GLOSSARY.map((g) => `- ${g.term}: ${g.meaning}`),
-      "",
+      ...briefInstructions(catalogs),
       `Items needing a brief (${ids.length}):`,
     ];
     const concerns = this.#briefConcerns();

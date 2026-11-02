@@ -283,6 +283,9 @@ test("plan 06h: three lanes with five seats splitting 2-2-1 go to one revote bet
   // 2-2-1: no lane has a strict majority (3 of 5), so the top two revote.
   assert.equal(pickWinner(split, seats, "M"), undefined, "no first-round winner");
   assert.deepEqual(revotePair(split, seats), ["a", "b"]);
+  // Tied lanes are ordered by lane, never by which candidate was recorded first.
+  const reversed = round({ ...split, candidates: [...split.candidates].reverse() });
+  assert.deepEqual(revotePair(reversed, seats), ["a", "b"], "the tied pair does not depend on candidate order");
 
   // The revote: the four non-leader seats split 2-2; the leader's vote breaks
   // the tie for lane b.

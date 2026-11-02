@@ -194,6 +194,24 @@ function resolveOwnerBlockerMessage(messages: readonly Message[], messageId: str
   return result.ok ? result.messages : [...messages];
 }
 
+/** Keep newly resolved requests after earlier resolutions. Array order is the
+ * durable accepted-resolution order used by the same-work projection, not
+ * request creation order. A single automatic act can resolve several requests;
+ * ties within that act retain their existing order. Open requests keep theirs.
+ * All resolution writers, including automatic ones, use this mapping. */
+export function mapOwnerRequestsInResolutionOrder(
+  requests: PhaseState["ownerRequests"],
+  update: (request: PhaseState["ownerRequests"][number]) => PhaseState["ownerRequests"][number],
+): PhaseState["ownerRequests"] {
+  const unchanged: PhaseState["ownerRequests"] = [];
+  const resolved: PhaseState["ownerRequests"] = [];
+  for (const request of requests) {
+    const next = update(request);
+    (request.status !== "resolved" && next.status === "resolved" ? resolved : unchanged).push(next);
+  }
+  return [...unchanged, ...resolved];
+}
+
 /** Resolve any OPEN owner request linked to `recordId` (a decision,
  * finding or correction) as a side effect of the owner acting on that
  * record directly (override, accept-finding, or revise) — the record-level
@@ -205,7 +223,7 @@ export function autoResolveLinkedRequest(
   candidateSha: string,
   contractVersion: ContractVersion,
 ): PhaseState {
-  const ownerRequests = phase.ownerRequests.map((r) =>
+  const ownerRequests = mapOwnerRequestsInResolutionOrder(phase.ownerRequests, (r) =>
     r.status === "open" &&
     (r.linkedDecisionId === recordId || r.linkedFindingId === recordId || r.linkedCorrectionId === recordId)
       ? { ...r, status: "resolved" as const, resolution: { option }, resolvedBinding: { candidateSha, contractVersion } }
@@ -245,7 +263,7 @@ export function checkOwnerRequestResolved(phase: PhaseState, event: EvOwnerReque
 
 export function applyOwnerRequestResolved(phase: PhaseState, event: EvOwnerRequestResolved): PhaseState {
   const request = findOwnerRequest(phase, event.requestId)!;
-  const ownerRequests = phase.ownerRequests.map((r) =>
+  const ownerRequests = mapOwnerRequestsInResolutionOrder(phase.ownerRequests, (r) =>
     r === request
       ? {
           ...r,
@@ -476,7 +494,7 @@ export function applyItemCarried(phase: PhaseState, event: EvItemCarried): Phase
   let next = autoResolveLinkedRequest({ ...phase, carriedItems, carriedTo }, event.recordId, "carried", event.boundCandidateSha, event.boundContractVersion);
   next = {
     ...next,
-    ownerRequests: next.ownerRequests.map((r) =>
+    ownerRequests: mapOwnerRequestsInResolutionOrder(next.ownerRequests, (r) =>
       r.status === "open" && r.linkedMessageId === event.recordId
         ? {
             ...r,
@@ -498,7 +516,7 @@ export function applyItemCarried(phase: PhaseState, event: EvItemCarried): Phase
       ...next,
       carriedItems,
       carriedTo,
-      ownerRequests: next.ownerRequests.map((r) =>
+      ownerRequests: mapOwnerRequestsInResolutionOrder(next.ownerRequests, (r) =>
         r.id === gate.id
           ? {
               ...r,

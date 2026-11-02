@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "decision-brief.schema.json",
   "title": "Decision brief",
-  "description": "One owner-facing brief for one open item that needs the owner's decision. The question is plain language (no code identifiers); today carries one concrete example checked against calendars.yaml/products.yaml; impact always answers whether any market stops publishing; options map one-to-one to the underlying request's option ids; every time, count or duration cites the config or code it read; the original message/finding/file:line stays in evidence.",
+  "description": "One owner-facing brief for one open item that needs the owner's decision. The question is plain language (no code identifiers); with plan catalogs, today carries one concrete example checked against calendars.yaml/products.yaml and impact answers whether any market stops publishing; without catalogs, today and impact use the plan's own domain; options map one-to-one to the underlying request's option ids; every time, count or duration cites the config or code it read; the original message/finding/file:line stays in evidence.",
   "type": "object",
   "additionalProperties": false,
   "required": ["requestId", "question", "today", "impact", "options", "related", "evidence"],
