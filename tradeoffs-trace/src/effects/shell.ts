@@ -27,6 +27,7 @@
 // workers").
 
 import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 
 // A2/C3 (plan 06e): the sweep owns the signalling decision. This module asks
 // it to signal the groups it recorded at spawn; it never calls `process.kill`
@@ -34,6 +35,12 @@ import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from "node:c
 import { groupAlive, signalGroup } from "./sweep.ts";
 
 const DEFAULT_TERM_GRACE_MS = 10_000;
+
+/** The shell a step-traced command runs under: dash where it exists (Linux's
+ * /bin/sh, and /bin/dash on macOS), so its xtrace steps read the same on every
+ * machine. macOS's /bin/sh is bash, whose xtrace quotes arguments. Untraced
+ * commands keep /bin/sh. */
+const TRACE_SHELL = existsSync("/bin/dash") ? "/bin/dash" : "/bin/sh";
 const STOP_POLL_INTERVAL_MS = 5;
 const STOP_POLL_TIMEOUT_MS = 5_000;
 /** 09-2: how long a command's result waits, after its process exited, for
@@ -128,8 +135,29 @@ export function realSampler(pgid: number): { rssMB: number; freeMemMB: number } 
  * sample is taken at spawn, so a short deadline always has a reading. */
 const SAMPLE_INTERVAL_MS = 1000;
 
+/** 07g2 (A4/R9): the marker a step-traced command prints before each simple
+ * command it runs. A check records which step failed: the whole chain runs in
+ * ONE shell process (so `cd` and env persist between steps), and xtrace names
+ * every simple command as the shell reaches it — the last one before a
+ * non-zero exit is the failing step. The marker is unusual enough that no
+ * ordinary check output contains it; every line that does is stripped from the
+ * output the rest of the conductor reads. It starts with U+001F, not U+0001:
+ * bash (macOS /bin/sh) strips \001 and \002 from PS4 as readline markers. */
+const STEP_MARKER = "\u001ftt-step ";
+
+/** One simple command the shell ran, with the output it produced. */
+export interface CommandStep {
+  command: string;
+  output: string;
+}
+
 export interface RunCommandOptions {
   command: string;
+  /** 07g2 (A4/R9): run the command under `set -x` with a step marker, so the
+   * result names the simple command the shell ran last and its own output.
+   * Used for checks only: the trace lines are stripped from `output`, so
+   * nothing else observes them. */
+  traceSteps?: boolean;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   /** Kill the group if the command has not finished after this many ms. */
@@ -155,6 +183,9 @@ export interface RunCommandResult {
   cancelled: boolean;
   output: string;
   signalsSent: string[];
+  /** 07g2 (A4/R9): every simple command the shell ran, in order, when the
+   * command was step-traced. The trace lines themselves are not in `output`. */
+  steps?: CommandStep[];
   /** A3: the command's peak resident set and the machine's free memory, from
    * the sampler, when at least one sample was taken. Present on every
    * outcome; a kill note uses it when the command was killed at its limit. */
@@ -231,6 +262,36 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
   let freeMemMB = 0;
   let sampled = false;
   let sampleTimer: NodeJS.Timeout | undefined;
+  // 07g2 (A4/R9): the step tracer. The command runs in the SAME shell (one
+  // process, so `cd` and exported env persist); every trace line starts a new
+  // step and is stripped from the output everyone else reads.
+  const traceSteps = options.traceSteps === true;
+  const innerCommand = traceSteps
+    ? `PS4='${STEP_MARKER}'; exec 2>&1; set -x; ${options.command}`
+    : options.command;
+  let stepsForResult: CommandStep[] | undefined;
+  const visibleOutput = (raw: string): string => {
+    if (!traceSteps) return raw;
+    const steps: CommandStep[] = [];
+    // A marker starts a step wherever it appears, not only at a line start:
+    // a step that prints without a trailing newline runs straight into the
+    // next trace line, so that next step's marker is mid-line. Splitting on
+    // the marker keeps each step's output with its own step and strips the
+    // trace (command plus its terminating newline) from the visible output,
+    // which is therefore the same stream an untraced shell would have printed.
+    const chunks = raw.split(STEP_MARKER);
+    let visible = chunks[0] ?? "";
+    for (let i = 1; i < chunks.length; i += 1) {
+      const chunk = chunks[i];
+      const newline = chunk.indexOf("\n");
+      const command = newline < 0 ? chunk : chunk.slice(0, newline);
+      const stepOutput = newline < 0 ? "" : chunk.slice(newline + 1);
+      steps.push({ command, output: stepOutput.replace(/\n$/, "") });
+      visible += stepOutput;
+    }
+    stepsForResult = steps;
+    return visible;
+  };
 
   function takeSample(): void {
     if (resolvedPgid === undefined) return;
@@ -261,10 +322,11 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
     }, termGraceMs);
   }
 
+  const shell = traceSteps ? TRACE_SHELL : "/bin/sh";
   const result = new Promise<RunCommandResult>((resolveResult, rejectResult) => {
     child = spawn(
-      "/bin/sh",
-      ["-c", 'kill -STOP $$; exec /bin/sh -c "$1"', "tt-sh", options.command],
+      shell,
+      ["-c", `kill -STOP $$; exec ${shell} -c "$1"`, "tt-sh", innerCommand],
       {
         cwd: options.cwd,
         env: options.env,
@@ -349,8 +411,9 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
         signal: exited.signal,
         timedOut,
         cancelled: cancelRequested,
-        output,
+        output: visibleOutput(output),
         signalsSent,
+        ...(stepsForResult ? { steps: stepsForResult } : {}),
         ...(sampled ? { resourceSample: { peakRssMB, freeMemMB } } : {}),
       });
     };

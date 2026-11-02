@@ -36,6 +36,7 @@ import {
   sameVersion,
   typesNeedingEvaluation,
 } from "./predicate.ts";
+import { evaluationExceptions } from "./verdict.ts";
 import type { Action, InFlightKey, PhaseState, Reviewer, State } from "./types.ts";
 
 function hasValidReview(phase: PhaseState, who: Reviewer): boolean {
@@ -104,7 +105,12 @@ export function next(state: State): Action[] {
     // dispatched type has finished or timed out. Acceptance can never outrun
     // evaluation.
     case "EVALUATING": {
-      const pending = typesNeedingEvaluation(p).filter((t) => p.evaluation?.types?.[t]?.settled !== true);
+      // Plan 07f (F0): no exception ⇒ no evaluator. The mechanical verdict
+      // stands; the conductor records EVALUATION_SKIPPED on completion.
+      const pending =
+        evaluationExceptions(p).length === 0
+          ? []
+          : typesNeedingEvaluation(p).filter((t) => p.evaluation?.types?.[t]?.settled !== true);
       const actions: Action[] = [];
       const seatCount = seatsOf(p.contract).length;
       for (const t of pending) {

@@ -48,6 +48,9 @@ export interface MetricEvent {
   command?: string;
   candidateSha?: string;
   savedRound?: boolean;
+  /** Plan 07e (E5): the worker a check window paused (and its run). */
+  agentId?: string;
+  by?: string;
 }
 
 /** Plan 05d: one test's flakes: how often it was observed and when last. */
@@ -107,6 +110,11 @@ export interface PhaseMetrics {
   reviewShare: number;
   /** Time in AWAITING_OWNER: how long the owner's desk held the run. */
   ownerWaitMs: number;
+  /** Plan 07e (E5): worker time spent SIGSTOPped by another run's check
+   * window, summed per agent from the worker_paused/worker_resumed records. */
+  checkWindowPauseMs: number;
+  /** The same number under its short status spelling. */
+  pausedMs: number;
   /** Raw vs published and every terminal state, per message type. */
   messages: Record<MessageType, MessageCounts>;
   /** `merged / raised` across all types. */
@@ -205,6 +213,27 @@ export function computeMetrics(phase: PhaseState, timeline: MetricsTimeline, eve
   const timeMs = timeByState(timeline, endMs);
   const reviewMs = (timeMs.REVIEWING ?? 0) + (timeMs.EVALUATING ?? 0);
   const ownerWaitMs = timeMs.AWAITING_OWNER ?? 0;
+  // Plan 07e (E5): pair each worker_paused with its own worker_resumed. A
+  // pause still open at the last logged event is counted to that event, so
+  // the projection stays deterministic (no wall clock).
+  const paused = new Map<string, number>();
+  let checkWindowPauseMs = 0;
+  for (const e of events) {
+    if (e.type !== "worker_paused" && e.type !== "worker_resumed") continue;
+    const agent = e.agentId ?? "";
+    const at = Date.parse(e.ts ?? "");
+    if (!Number.isFinite(at)) continue;
+    if (e.type === "worker_paused") {
+      if (!paused.has(agent)) paused.set(agent, at);
+    } else {
+      const start = paused.get(agent);
+      if (start !== undefined) {
+        checkWindowPauseMs += Math.max(0, at - start);
+        paused.delete(agent);
+      }
+    }
+  }
+  for (const start of paused.values()) checkWindowPauseMs += Math.max(0, endMs - start);
 
   const messages: Record<MessageType, MessageCounts> = {
     tradeoff: EMPTY_COUNTS(),
@@ -325,6 +354,8 @@ export function computeMetrics(phase: PhaseState, timeline: MetricsTimeline, eve
     reviewMs,
     reviewShare: ratio(reviewMs, wallMs),
     ownerWaitMs,
+    checkWindowPauseMs,
+    pausedMs: checkWindowPauseMs,
     messages,
     mergeRate: ratio(merged, raised),
     dropRate: ratio(dropped, raised),
@@ -377,6 +408,8 @@ export function metricsLine(m: PhaseMetrics): string {
     `unexposed ${m.unexposedTradeoffs}`,
     `entries ${m.cleanness.liveEntries}${m.cleanness.entryBudgetWarning ? ` (over budget ${m.cleanness.entryBudget})` : ""} · hints ${m.cleanness.openHints} · m/s ${m.cleanness.ownerMerges}/${m.cleanness.ownerSplits} · lint ${m.cleanness.lintViolations}`,
   ];
+  // Plan 07e (E5): worker time frozen by another run's check window.
+  if (m.checkWindowPauseMs > 0) parts.push(`paused ${duration(m.checkWindowPauseMs)}`);
   const flakes = flakesLine(m);
   if (flakes) parts.push(flakes);
   if (m.picks.rounds > 0) parts.push(picksLine(m.picks));
@@ -445,7 +478,16 @@ export interface LogLike {
  * carrying its log timestamp. Exported so a caller that already read the log
  * (the conductor's timeline rebuild) can reuse the same snapshot. */
 export function metricEvents(records: readonly LogLike[]): MetricEvent[] {
-  return records.filter((r) => r.kind === "event").map((r) => ({ ...(r.event as MetricEvent), ts: r.ts }));
+  const events: MetricEvent[] = [];
+  for (const r of records) {
+    // Plan 07e (E5): check-window pauses are low-level records (their own
+    // kind, not "event") because no phase transition is involved; fold them
+    // into the same ordered stream so the pause duration is counted.
+    if (r.kind === "event" || r.kind === "worker_paused" || r.kind === "worker_resumed") {
+      events.push({ ...(r.event as MetricEvent), ...(r.kind === "event" ? {} : { type: r.kind }), ts: r.ts });
+    }
+  }
+  return events;
 }
 
 /** Read a run's control log and compute its metrics from the given state and

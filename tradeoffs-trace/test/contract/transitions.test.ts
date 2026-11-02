@@ -292,20 +292,37 @@ const BUILD: Record<string, Fixture> = {
     }),
     event: { type: "FINAL_CHECKS_PASSED", candidateSha: "C1" },
   },
-  // Plan 06k1 (A5, finding A-8): a correction queued during FINAL_CHECKING is
-  // an acceptance obligation; a passing final check repairs, not accepts.
-  "final-checks-passed-correction-queued": {
+  // Plan 07f (C2): a real blocker (the failed probe), not a queued
+  // correction, requires repair even after the final check passes.
+  "final-checks-passed-not-accepted": {
     state: baseState({
       phase: "FINAL_CHECKING",
       candidate: C1,
       integrationHead: "H0",
       checks: { candidateSha: "C1", passed: true },
-      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: false },
       reviews: acceptableReviews,
       inFlight: { run_final_checks: { actionId: "a1" } },
       queuedCorrections: [{ id: "C-1", text: "use UTC everywhere" }],
       repairRoundsUsed: 0,
       repairRoundsGranted: 1,
+      contract: finalContract(),
+    }),
+    event: { type: "FINAL_CHECKS_PASSED", candidateSha: "C1" },
+  },
+  // Plan 07f (C2, §3.1): a spent repair budget parks the phase for the owner
+  // instead of starting a repair loop with no bound.
+  "final-checks-passed-budget-exhausted": {
+    state: baseState({
+      phase: "FINAL_CHECKING",
+      candidate: C1,
+      integrationHead: "H0",
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: false },
+      reviews: acceptableReviews,
+      inFlight: { run_final_checks: { actionId: "a1" } },
+      repairRoundsUsed: 3,
+      repairRoundsGranted: 3,
       contract: finalContract(),
     }),
     event: { type: "FINAL_CHECKS_PASSED", candidateSha: "C1" },
@@ -450,9 +467,9 @@ const BUILD: Record<string, Fixture> = {
       checks: { candidateSha: "C1", passed: true },
       probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
       reviews: {
-        M: { review: { ...approvingReview("M", "C1", K), items: [{ id: "R1", verdict: "met", evidence: "src/x.ts:1" }] } },
-        A: { review: { ...approvingReview("A", "C1", K), items: [{ id: "R1", verdict: "met", evidence: "src/x.ts:1" }] } },
-        B: { review: { ...approvingReview("B", "C1", K), items: [{ id: "R1", verdict: "met", evidence: "src/x.ts:1" }] } },
+        M: { review: { ...approvingReview("M", "C1", K), items: [{ id: "R1", verdict: "met", evidence: "README.md:1" }] } },
+        A: { review: { ...approvingReview("A", "C1", K), items: [{ id: "R1", verdict: "met", evidence: "README.md:1" }] } },
+        B: { review: { ...approvingReview("B", "C1", K), items: [{ id: "R1", verdict: "met", evidence: "README.md:1" }] } },
       },
       itemEvidence: [{ id: "R1", text: "recorded" }],
       ownerRequests: [
@@ -499,6 +516,11 @@ const BUILD: Record<string, Fixture> = {
   "repairing-budget-exhausted": {
     state: baseState({ phase: "REPAIRING", repairRoundsUsed: 3, repairRoundsGranted: 3 }),
     event: { type: "REPAIR_BUDGET_EXHAUSTED" },
+  },
+  // 07g2 (A2/R4): the fix loop spent the round budget with points still open.
+  "implementing-loop-bound-reached": {
+    state: baseState({ phase: "IMPLEMENTING" }),
+    event: { type: "LOOP_BOUND_REACHED", round: 3, loops: 3, reason: "the fix loop bound was reached" },
   },
   "run-budget-exceeded": {
     state: baseState({}, "RUN_ACTIVE"),

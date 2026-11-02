@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
 
-import { computeMetrics, flakesLine, metricsForRunDir, metricsLine, metricsSummary, projectMetrics, type MetricsTimeline } from "../../src/metrics.ts";
+import { computeMetrics, flakesLine, metricEvents, metricsForRunDir, metricsLine, metricsSummary, projectMetrics, type MetricsTimeline } from "../../src/metrics.ts";
 import { applyEntryEvent, planEntryEvents, type Entry } from "../../src/core/entries.ts";
 import { basePhase, makeMessage } from "./helpers.ts";
 
@@ -113,6 +113,24 @@ test("every balance metric has its expected value from the fixture run", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("plan 07e (E5): check-window pauses are summed in the metrics", () => {
+  const phase = basePhase({ runId: "r-metrics", phaseId: "p1" });
+  const m = computeMetrics(phase, TIMELINE, [
+    { type: "worker_paused", agentId: "w-a", ts: "2026-09-27T09:00:10.000Z" },
+    { type: "worker_resumed", agentId: "w-a", ts: "2026-09-27T09:00:20.000Z" },
+    { type: "worker_paused", agentId: "w-b", ts: "2026-09-27T09:00:50.000Z" },
+  ]);
+  assert.equal(m.checkWindowPauseMs, 20_000, "10s for w-a + 10s still open for w-b at the last event");
+  assert.equal(m.pausedMs, 20_000);
+  assert.match(metricsLine(m), /paused 20s/);
+  // The low-level pause records are folded into the metrics' event stream.
+  const folded = metricEvents([
+    { seq: 1, ts: "2026-09-27T09:00:10.000Z", kind: "worker_paused", event: { agentId: "w-a", by: "run-1" } },
+    { seq: 2, ts: "2026-09-27T09:00:20.000Z", kind: "worker_resumed", event: { agentId: "w-a" } },
+  ]);
+  assert.deepEqual(folded.map((e) => e.type), ["worker_paused", "worker_resumed"]);
 });
 
 test("the cleanness metrics join views/metrics.json, the status line and tt summary", () => {

@@ -73,6 +73,9 @@ export interface RunSocketHandlers {
   /** Called once the command's process group has finished (exit, timeout or
    * cancel), so the caller stops tracking the pgid. */
   onShExit?: (agentId: string, commandId: string, pgid: number) => void;
+  /** Plan 07e (E2): a `sh` command reached its own bound. The caller records
+   * BOUND_REACHED; the agent still receives the ordinary timeout note. */
+  onShTimeout?: (agentId: string, command: string, deadlineMs: number) => void;
   /** Per-command deadline (design §8.1's "each `sh` command the worker
    * runs"). Defaults live here so tests can override with ms-scale values.
    * Plan 06l (A2): a function form lets the conductor give the narrow
@@ -230,6 +233,7 @@ export class RunSocketServer {
     const result = await running.result;
     if (groupId !== undefined) this.#handlers.onShExit?.(agentId, msg.commandId, groupId);
     if (result.timedOut) {
+      this.#handlers.onShTimeout?.(agentId, msg.command, deadline.deadlineMs);
       this.#write(conn.socket, {
         type: "sh_output",
         commandId: msg.commandId,

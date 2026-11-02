@@ -162,6 +162,21 @@
       "description": "Lint-only: the 1-based line of #+TT_FIX_CHECKS in the source Org file.",
       "type": "integer"
     },
+    "domainLoopMax": {
+      "description": "07g1: #+TT_DOMAIN_LOOP_MAX — how many domain reviews one domain may spend before it is dropped.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "forbidden": {
+      "description": "07g1: #+TT_FORBIDDEN — shell patterns a mapper must never run.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "testRemovals": {
+      "description": "07g1: #+TT_TEST_REMOVALS — test files/functions the owner allowed a mapper to remove.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
     "workerPrompt": {
       "description": "#+TT_WORKER_PROMPT: per lane (a, b, ...), the absolute paths appended to that lane's worker system prompt (--append-system-prompt), in order. An empty list is `none`. A single worker uses lane a's.",
       "type": "object",
@@ -236,6 +251,9 @@
           "type": "string",
           "minLength": 1
         },
+        "domainLoopMax": { "type": "integer", "minimum": 1 },
+        "forbidden": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "testRemovals": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "architecture": { "type": "array", "items": { "$ref": "#/$defs/ArchitectureItem" } },
         "requirements": { "type": "array", "items": { "$ref": "#/$defs/RequirementItem" } },
         "constraints": { "type": "array", "items": { "$ref": "#/$defs/ConstraintItem" } }

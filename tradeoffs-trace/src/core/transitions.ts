@@ -564,9 +564,18 @@ failureRows("checks-failed", "CHECKING", "CHECKS_FAILED", REPAIR_ATTEMPT_ACTIONS
   // classification into state, so the repair prompt and the reviewers' prompts
   // label a real regression and a flake apart (finding #35).
   const failures = (ev as Extract<Event, { type: "CHECKS_FAILED" }>).failures;
+  const failingStep = (ev as Extract<Event, { type: "CHECKS_FAILED" }>).failingStep;
+  const failingStepSilent = (ev as Extract<Event, { type: "CHECKS_FAILED" }>).failingStepSilent;
   const candidateSha = s.phase.candidate!.sha;
   return withPhase(s, {
-    checks: { candidateSha, passed: false, tier: "round", ...(failures && failures.length > 0 ? { failures } : {}) },
+    checks: {
+      candidateSha,
+      passed: false,
+      tier: "round",
+      ...(failures && failures.length > 0 ? { failures } : {}),
+      ...(failingStep ? { failingStep } : {}),
+      ...(failingStepSilent ? { failingStepSilent } : {}),
+    },
     // Plan 05d: keep the split across the repair freeze too, so the reviewers
     // of the repaired candidate see which tests failed and how each was
     // classified (finding A-5).
@@ -1338,20 +1347,38 @@ addRow({
     }),
 });
 
-// Plan 06k1 (A5, finding A-8): a correction arrived while the final check ran.
-// It is queued for the next attempt and granted its own round, so a passing
-// final check sends the phase to REPAIRING instead of accepting the candidate
-// without it.
+// Plan 07f (C2): a passing final check does not clear other acceptance
+// blockers. Repair only when the common predicate still reports a blocker;
+// the presence or delivery of a legacy queued correction is irrelevant.
+// Plan 07f (C2, §3.1): the repair it starts is bounded like every other one —
+// a blocker that survives a spent budget parks on the owner (X:BOUND) instead
+// of starting an unbounded repair loop.
 addRow({
-  id: "final-checks-passed-correction-queued",
+  id: "final-checks-passed-not-accepted",
   axis: "phase",
   from: "FINAL_CHECKING",
   trigger: "FINAL_CHECKS_PASSED",
-  guardName: "queuedCorrectionBlocksAcceptance",
-  guard: (s) => !acceptHoldsOnFinalPass(s) && (s.phase.queuedCorrections ?? []).length > 0,
+  guardName: "acceptDoesNotHoldOnFinalPassAndBudgetRemains",
+  guard: (s) => !acceptHoldsOnFinalPass(s) && budgetRemains(s),
   to: "REPAIRING",
   actions: REPAIR_ATTEMPT_ACTIONS,
   apply: (s) => withPhase(s, { phase: "REPAIRING", inFlight: clearInFlight(s.phase, "run_final_checks") }),
+});
+
+addRow({
+  id: "final-checks-passed-budget-exhausted",
+  axis: "phase",
+  from: "FINAL_CHECKING",
+  trigger: "FINAL_CHECKS_PASSED",
+  guardName: "acceptDoesNotHoldOnFinalPassAndBudgetExhausted",
+  guard: (s) => !acceptHoldsOnFinalPass(s) && budgetExhausted(s),
+  to: "AWAITING_OWNER",
+  actions: [],
+  apply: (s) =>
+    enterAwaitingOwner(
+      withPhase(s, { inFlight: clearInFlight(s.phase, "run_final_checks") }),
+      "the repair budget ran out",
+    ),
 });
 
 failureRows(
@@ -2089,6 +2116,25 @@ addRow({
       blockedReason: launchFailedReason(e),
       inFlight: clearInFlight(s.phase, "dispatch_worker"),
     });
+  },
+});
+
+// Plan 07e (E2/A3) / 07g2 (A2): the rounds bound ran out while points were
+// still open in the fix loop. Parking is the whole meaning: no further loop
+// and no seat acceptance review starts. The conductor records BOUND_REACHED
+// (rounds) and LEAD_CALLED beside this event.
+addRow({
+  id: "implementing-loop-bound-reached",
+  axis: "phase",
+  from: "IMPLEMENTING",
+  trigger: "LOOP_BOUND_REACHED",
+  guardName: "always",
+  guard: () => true,
+  to: "AWAITING_OWNER",
+  actions: [],
+  apply: (s, ev) => {
+    const e = ev as Extract<Event, { type: "LOOP_BOUND_REACHED" }>;
+    return enterAwaitingOwner(s, e.reason);
   },
 });
 

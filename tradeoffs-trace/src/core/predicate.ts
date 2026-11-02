@@ -29,14 +29,23 @@
 // itself, or directly) rather than re-deriving the same facts — round-1
 // review item 5's last bullet: openItemsRemain must not reimplement this.
 
+import { readFileSync } from "node:fs";
+
 import { leaderOf, seatsOf } from "./seats.ts";
 import { currentBallot, isValidBallot, tally } from "./tally.ts";
 import type { Domain } from "./domains.ts";
 // Plan 06b: the per-item acceptance half — every R and C met by majority with
 // its test verifies passed, every A fitting by majority or its deviation
 // accepted by the owner, and every evidence item recorded.
-import { flatItems, isStructured, itemNeedsEvidence, itemsAccept, itemsFromPhase, phaseItemOutcomes, tallyItems, testVerifyProblems, thinMetItems, workerAnchorsOf } from "./items.ts";
-import { discoveredDecisions, hasBlockingFix, openFindings, ownerRequestIsStale, recordClassified, undispositionedBlockingFinding } from "./triage.ts";
+import { evidenceFileAnchors, evidenceHasAnchor, flatItems, isStructured, itemNeedsEvidence, itemsFromPhase, phaseItemOutcomes, testVerifyProblems } from "./items.ts";
+import { factKeepsOpen } from "./fix-rounds.ts";
+import {
+  discoveredDecisions,
+  findingDispositionIsTradeoff,
+  openFindings,
+  ownerRequestIsStale,
+  recordClassified,
+} from "./triage.ts";
 import type { RoundPanelOutcome, RoundPanelState } from "./types.ts";
 import type {
   ContractVersion,
@@ -130,13 +139,49 @@ export const EVALUATOR_TYPES = ["tradeoff", "finding", "blocker"] as const;
 /** Plan 04a: the types this round's EVALUATING stage must evaluate: a type
  * with a raw message to check, or one with an owner-refused message awaiting
  * its "was it addressed" report (owner correction, item 3). */
+/** Plan 07f (F0): true when a point's doneWhen fact on this candidate made
+ * it pass, and the same command did NOT pass on the round's base — i.e. the
+ * fact actually proves the point. A passing-but-also-on-base fact, a failing
+ * one, a timeout, or no fact at all proves nothing. */
+export function pointHasProvingFact(
+  phase: PhaseState,
+  finding: { id: string; doneWhen?: string; domain?: string },
+): boolean {
+  const C = phase.candidate?.sha;
+  if (!C || (!finding.domain && !finding.doneWhen)) return false;
+  return (phase.doneWhenFacts ?? []).some(
+    (f) =>
+      f.findingId === finding.id &&
+      f.candidateSha === C &&
+      !f.timedOut &&
+      f.exitCode === 0 &&
+      f.passesOnBase !== true,
+  );
+}
+
+/** Plan 07f (F0): true when an open point/finding still needs the
+ * evaluator: an unclassified record, or a point with no proving doneWhen fact
+ * that no approved trade-off closes. This is the ONE rule both the evaluator
+ * dispatch list and `evaluationExceptions` read. */
+export function pointNeedsEvaluation(phase: PhaseState, finding: import("./types.ts").Finding): boolean {
+  // §7a: the seats already decided a non-split item. Its conductor point
+  // is a mechanical fix, closed by a proving fact or approved domain review,
+  // not a new unprovable-point exception asking a model to judge that vote.
+  if (finding.raisedBy === "conductor" && finding.itemId) {
+    const outcome = phaseItemOutcomes(phase).find((o) => o.item.id === finding.itemId);
+    if (outcome && !itemIsSplit(outcome)) return false;
+  }
+  const classified = recordClassified(phase, "finding", finding.id);
+  if (!finding.domain && !finding.doneWhen) return !classified;
+  return !(classified && (pointHasProvingFact(phase, finding) || findingDispositionIsTradeoff(phase.triage, finding.id)));
+}
+
 export function typesNeedingEvaluation(phase: PhaseState): MessageType[] {
   const types = (EVALUATOR_TYPES as readonly MessageType[]).filter((t) =>
     (phase.messages ?? []).some((m) => m.type === t && (m.state === "raw" || m.state === "refused")),
   );
-  // Plan 06b (OD-1 R3b): a majority `unmet`/`deviates` needs the evaluator's
-  // substantive re-check against the candidate before it blocks. Force one
-  // `finding` evaluator pass for it when no finding message already asks.
+  // Only a split item needs the evaluator. A unanimous unmet item is
+  // mechanically decided and becomes a point, without waiting for a model.
   if (itemsNeedingEvaluatorReverify(phase) && !types.includes("finding")) types.push("finding");
   // Plan 06i (A3): a finding or discovered decision that still owes its impact
   // classification needs its evaluator pass even with no raw message of that
@@ -145,23 +190,47 @@ export function typesNeedingEvaluation(phase: PhaseState): MessageType[] {
   if (openFindings(phase).some((f) => !recordClassified(phase, "finding", f.id)) && !types.includes("finding")) {
     types.push("finding");
   }
+  // Plan 07f (F0): an open point with no proving fact is an acceptance
+  // exception even when its message was published in an earlier round.
+  if (openFindings(phase).some((f) => pointNeedsEvaluation(phase, f)) && !types.includes("finding")) {
+    types.push("finding");
+  }
   if (discoveredDecisions(phase).some((d) => !recordClassified(phase, "decision", d.id)) && !types.includes("tradeoff")) {
     types.push("tradeoff");
   }
   return types;
 }
 
-/** Plan 06b (OD-1 R3b): true when a structured phase has an item whose
- * majority verdict is `unmet` or `deviates`, so the evaluator must re-check
- * it against the candidate before it can block. */
+/** §7a: only a split item needs evaluation. Keep the completion gate in
+ * agreement with evaluationExceptions, so a unanimous unmet item cannot
+ * leave EVALUATING waiting forever for a session that must never start. */
 export function itemsNeedingEvaluatorReverify(phase: PhaseState): boolean {
-  if (!isStructured(phase.contract)) return false;
-  // ODP-2: an item blocker is never raised without an evaluator item check,
-  // so every outcome that is not met/fits owes one.
-  const outcomes = phaseItemOutcomes(phase);
-  if (outcomes.some((o) => o.outcome !== "met" && o.outcome !== "fits")) return true;
-  // Plan 06c (R5): a unanimous thin met/fits is audited by the evaluator.
-  return thinMetItems(outcomes, workerAnchorsOf(phase.coverage)).length > 0;
+  return isStructured(phase.contract) && phaseItemOutcomes(phase).some(itemIsSplit);
+}
+
+/** True when the seats do not give an item the verdict the plan requires by
+ * a STRICT MAJORITY of the seats that voted for it — at least one says the
+ * required verdict and less than a majority does. 07g2 (R6, design §7a.4):
+ * two of three met/fits is a majority and is mechanically decided; the
+ * dissenting seat's reason is a follow-up note, never an evaluator exception. */
+export function itemIsSplit(outcome: { item: { kind: string }; seats: ReadonlyArray<{ verdict: string }> }): boolean {
+  const required = outcome.item.kind === "architecture" ? "fits" : "met";
+  const votes = outcome.seats.length;
+  const yes = outcome.seats.filter((s) => s.verdict === required).length;
+  const no = outcome.seats.filter((s) => s.verdict !== required).length;
+  return yes > 0 && no > 0 && yes * 2 <= votes;
+}
+
+/** 07g2 (R6): the seats' dissenting reasons on an item the majority decided —
+ * one line each, for the report's follow-up notes. Empty when the seats gave
+ * the required verdict or when there is no majority either way (that item is
+ * an evaluator exception instead). */
+export function itemMinorityNotes(outcome: { item: { id: string; kind: string }; seats: ReadonlyArray<{ seat: string; verdict: string; evidence?: string }> }): string[] {
+  if (itemIsSplit(outcome)) return [];
+  const required = outcome.item.kind === "architecture" ? "fits" : "met";
+  return outcome.seats
+    .filter((s) => s.verdict !== required)
+    .map((s) => `${s.seat} did not mark ${outcome.item.id} ${required}: ${s.verdict}${s.evidence ? ` — ${s.evidence}` : ""}`);
 }
 
 /** Plan 04a: whether everything EVALUATING waits for has settled. In 04a
@@ -562,16 +631,177 @@ export function budgetGateIsMoot(phase: PhaseState, r: PhaseState["ownerRequests
   return accept(without, phase.candidate.sha, phase.contract.contractVersion);
 }
 
-/** accept(C, K): the only way a phase may reach ACCEPTED. */
-export function accept(phase: PhaseState, C: string, K: ContractVersion): boolean {
+/** Plan 07f (F1): one unmet acceptance condition, with the command that
+ * clears it. This is the single mechanical description of WHY a candidate is
+ * not accepted; `accept()` is exactly "this list is empty", `notAcceptedReasons`
+ * and the status view render it, and no other function keeps a second list. */
+export type AcceptanceBlockerKind =
+  | "candidate"
+  | "check"
+  | "probe"
+  | "test-verify"
+  | "symbol-deviation"
+  | "evidence"
+  | "review"
+  | "item"
+  | "point"
+  | "finding"
+  | "decision"
+  | "owner-request"
+  | "carry";
+
+export interface AcceptanceBlocker {
+  kind: AcceptanceBlockerKind;
+  /** One plain line the owner reads (it becomes `notAcceptedReasons`). */
+  detail: string;
+  /** The CLI command that clears this blocker. */
+  command: string;
+}
+
+/** A record id without its phase and candidate prefix: "D-p2d-x-dbe24445-4"
+ * → "D-4", "F-p2d-x-M-3" → "F-M-3". */
+export function shortId(id: string): string {
+  const m = id.match(/^([A-Z]+)-.*?-((?:[MAB]-)?(?:[a-z]+-)?\d+)$/);
+  if (!m) return id;
+  const tail = m[2].replace(/^(?:disc|trigger)-/, "");
+  return `${m[1]}-${tail}`;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/** A decision-view owner command through `tt input`'s ONE writer. `tt input`
+ * reads its JSON from the file in its second positional or, when none is
+ * given, from stdin — never inline in argv — so the clearing command pipes
+ * the payload. */
+function inputCommand(phase: PhaseState, payload: Record<string, unknown>): string {
+  return `printf %s ${shellQuote(JSON.stringify(payload))} | tt input ${phase.runId}`;
+}
+
+function recordBinding(
+  phase: PhaseState,
+  candidateSha: string,
+  contractVersion: ContractVersion,
+  recordId: string,
+  recordVersion: number,
+) {
+  return { runId: phase.runId, phaseId: phase.phaseId, recordId, candidateSha, recordVersion, contractVersion };
+}
+
+function resolveCommand(phase: PhaseState, C: string, K: ContractVersion, request: PhaseState["ownerRequests"][number]): string {
+  const option =
+    request.options.find((o) => o.id === "repair")?.id ?? request.options.find((o) => o.id === "accept_risk")?.id ?? request.options[0]?.id ?? "repair";
+  return inputCommand(phase, {
+    type: "resolve",
+    option,
+    binding: recordBinding(phase, C, K, request.id, request.version),
+  });
+}
+
+function acceptFindingCommand(phase: PhaseState, C: string, K: ContractVersion, finding: { id: string; version: number }): string {
+  return inputCommand(phase, {
+    type: "accept-finding",
+    scope: "trade-off",
+    binding: recordBinding(phase, C, K, finding.id, finding.version),
+  });
+}
+
+/** Plan 07f (A1/A3): the ONE owner command that settles a trade-off record:
+ * a ruling. It is applied at once and never queues a correction. */
+function rulingCommand(phase: PhaseState, detail: string, recordId: string): string {
+  return inputCommand(phase, { type: "ruling", text: detail, recordIds: [recordId] });
+}
+
+/** A2/C1: how one seat's evidence is resolved against the candidate. The
+ * conductor, which owns the candidate's tree, installs its own resolver here
+ * (see `setSeatAnchorResolver`); the default is the best-effort check of the
+ * process's own tree that a pure fixture or unit test has. */
+export type SeatAnchorResolver = (evidence: string) => boolean;
+
+let seatAnchorResolver: SeatAnchorResolver | undefined;
+
+/** Plan 07f (A2): install the resolver `acceptanceBlockers` uses to decide
+ * whether a seat's item evidence resolves in the candidate. Only the
+ * conductor can see the candidate's own tree (a lane's candidate lives in
+ * its worktree, not in the conductor's cwd), so it passes its resolution in
+ * here; `undefined` restores the default. */
+export function setSeatAnchorResolver(resolver: SeatAnchorResolver | undefined): void {
+  seatAnchorResolver = resolver;
+}
+
+/** A2/C1: the review-lint anchor check applied to one seat's item evidence:
+ * a file:line-range must resolve in the candidate (in range), while a test
+ * name or a command the reviewer ran is an anchor by itself. A bare
+ * file:line token that names no candidate file is not an anchor. */
+function seatAnchorResolves(evidence: string): boolean {
+  if (seatAnchorResolver) return seatAnchorResolver(evidence);
+  if (!evidenceHasAnchor(evidence)) return false;
+  const anchors = evidenceFileAnchors(evidence);
+  if (anchors.length === 0) return true;
+  return anchors.every((a) => {
+    try {
+      const lines = readFileSync(a.path, "utf8").split("\n").length;
+      return a.start >= 1 && a.end <= lines;
+    } catch {
+      return false;
+    }
+  });
+}
+
+/** Plan 07f1a (A1/R1), finished by 07f1b (A1): the commands a red check's
+ * blockers name — the commands that ACTUALLY FAILED when the caller read the
+ * candidate's check record, never a synthesized `a && b` the owner never ran.
+ * The failing set is passed in by the caller that reads the record (the
+ * conductor's accept() only needs the count; `tt why` and `tt status` pass the
+ * commands they read for the run they print), so the predicate stays pure and
+ * two runs in one process never share a source. Without a per-command result
+ * (an old log, a fixture, an interrupted run) nothing knows which command
+ * failed, so the blocker points at the run itself: it never names a declared
+ * command that may have passed. The owner clears the blocker by inspecting
+ * the run and re-running exactly the command that failed. */
+function failingCheckCommands(phase: PhaseState, failedCommands: readonly string[] | undefined): string[] {
+  if (failedCommands && failedCommands.length > 0) return [...failedCommands];
+  // No per-command result: name only the run to inspect, never a declared
+  // command that may have passed (A1 asks for the failing command itself).
+  return [`tt status ${phase.runId}`];
+}
+
+/** Plan 07f1b (A1/R1): the ONE command a single-command blocker names, taken
+ * from the same list: the failing command when the caller read it, else the
+ * declared (or legacy) command. */
+function singleCheckCommand(phase: PhaseState, failedCommands: readonly string[] | undefined): string {
+  return failingCheckCommands(phase, failedCommands)[0];
+}
+
+/** Plan 07f (F1): every condition `accept` requires, in one list. The
+ * mechanical gates come first (they are facts, and an owner carry never
+ * waives them); then, when there is no carry, the review items, the points
+ * whose doneWhen fact does not prove them, the ledger's blocking records, the
+ * decisions, the owner requests and the corrections. */
+function acceptanceBlockersFor(
+  phase: PhaseState,
+  C: string,
+  K: ContractVersion,
+  failedCommands?: readonly string[],
+): AcceptanceBlocker[] {
+  const blockers: AcceptanceBlocker[] = [];
+
   // Mechanical gates are facts (ODP-1, ODP-2): the checks must have passed
   // for C, and the probe must be for C onto the CURRENT integration head. They
   // are evaluated BEFORE the owner's accept-with-carried shortcut, so a carry
   // can never accept a failing or stale candidate.
   if (!(phase.checks && phase.checks.candidateSha === C && phase.checks.passed === true)) {
-    return false;
+    const failed = phase.checks?.candidateSha === C && phase.checks.passed === false;
+    // 07g2 (A4/R9): the failing step is recorded in the check record and named
+    // on the status line (`view.ts` reads `phase.checks.failingStep` there);
+    // the blocker detail stays the stable `checks failed` every reader matches.
+    const detail = failed ? "checks failed" : "checks have not passed for the candidate";
+    // Plan 07f1b (A1): one blocker per command that FAILED, so every blocker
+    // names the failing check command itself — never a command that passed and
+    // never a synthesized `a && b` (see `failingCheckCommands`).
+    for (const command of failingCheckCommands(phase, failedCommands)) blockers.push({ kind: "check", detail, command });
   }
-
   // The probe must be onto the CURRENT integration head: a head moved by a
   // stale publish (design §6.4 step 3) must not let a stale probe count.
   if (
@@ -582,7 +812,12 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
       phase.probe.head === phase.integrationHead
     )
   ) {
-    return false;
+    const failed = phase.probe?.candidateSha === C && phase.probe.passed === false;
+    blockers.push({
+      kind: "probe",
+      detail: failed ? "integration probe failed" : "the integration probe has not passed for the candidate onto the current head",
+      command: `tt resume ${phase.runId}`,
+    });
   }
 
   // Plan 06b (OD-1): a STRUCTURED phase additionally requires its `test`
@@ -590,14 +825,20 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
   // `evidence` item recorded. These are MECHANICAL item gates (ODP-3): they are
   // evaluated BEFORE the owner's carry shortcut, so a carry can never waive a
   // missing named test verify, a symbol deviation or unrecorded evidence. The
-  // item REVIEW VERDICTS (the tally below) are review items the carry does
-  // waive. An old-format phase declares no items and keeps today's rule.
+  // item REVIEW VERDICTS are review items the carry does waive. An old-format
+  // phase declares no items and keeps today's rule.
   const itemsEnforced = isStructured(phase.contract);
   const items = itemsEnforced ? itemsFromPhase(phase.contract) : undefined;
   let acceptedDeviations: Set<string> | undefined;
   let evidenceRecorded: string[] | undefined;
   if (itemsEnforced) {
-    if (testVerifyProblems(phase.checkResolution ?? []).length > 0) return false;
+    for (const problem of testVerifyProblems(phase.checkResolution ?? [])) {
+      blockers.push({
+        kind: "test-verify",
+        detail: `named test verify ${problem}`,
+        command: singleCheckCommand(phase, failedCommands),
+      });
+    }
     // An architecture deviation is accepted when the owner accepts the item's
     // own blocking finding as a trade-off (`accept_risk`), or when it is
     // recorded in `acceptedDeviations`.
@@ -607,96 +848,198 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
     ]);
     // A `:WHERE:` symbol the conductor could not find is a deviation the
     // owner must accept before acceptance, whatever the seats said.
-    if ((phase.archSymbolDeviations ?? []).some((id) => !acceptedDeviations!.has(id))) return false;
+    for (const id of phase.archSymbolDeviations ?? []) {
+      if (acceptedDeviations.has(id)) continue;
+      const deviationFinding = phase.findings.find((f) => f.itemId === id);
+      blockers.push({
+        kind: "symbol-deviation",
+        detail: `architecture symbol deviation ${id} is not accepted`,
+        command: deviationFinding
+          ? acceptFindingCommand(phase, C, K, deviationFinding)
+          : `tt resume ${phase.runId}`,
+      });
+    }
     evidenceRecorded = (phase.itemEvidence ?? []).map((e) => e.id);
     // Every `evidence` item is owner-recorded, never waived by a carry.
-    if (flatItems(items!).some((i) => itemNeedsEvidence(i) && !evidenceRecorded!.includes(i.id))) return false;
+    for (const item of flatItems(items!)) {
+      if (!itemNeedsEvidence(item) || evidenceRecorded.includes(item.id)) continue;
+      blockers.push({
+        kind: "evidence",
+        detail: `evidence for ${item.id} has not been recorded`,
+        command: `tt evidence ${phase.runId} ${item.id} ${shellQuote(`evidence for ${item.id}`)}`,
+      });
+    }
   }
 
   // Plan 06g (A6/ODP-2/ODP-3): the owner's "accept with carried items" decision
   // at the end of the round budget accepts the candidate the carry was given
   // for (`carriedCandidateSha`), waiving only the OPEN REVIEW ITEMS — the
   // review verdicts, open findings, decisions and corrections that are carried.
-  // It never waives the mechanical gates above (checks, probe, test verifies,
-  // symbol deviations, evidence), the candidate binding, or another
-  // candidate's gate/probe.
-  if (phase.acceptedWithCarried) return phase.carriedCandidateSha === C;
-
-  // Plan 06i: a record the triage dispositioned `fix` blocks acceptance,
-  // whatever the reviewer's severity label and whatever round it was raised
-  // in (06g's round-2 downgrade never applies to a wrong-output record). A
-  // wrong-output finding is item-linked by definition, so it is never
-  // downgraded. An explicit owner carry above is the one owner decision that
-  // accepts with the item, exactly as it does for any open review item.
-  // Plan 06i (A2): acceptance follows the item's disposition, never the
-  // reviewer's label. A fix disposition blocks; a trade-off does not; an
-  // in-window escalation blocks through its open owner request below. A
-  // blocking finding that has not been triaged yet still blocks (fail safe).
-  if (hasBlockingFix(phase) || undispositionedBlockingFinding(phase)) return false;
+  // It never waives the mechanical gates above.
+  if (phase.acceptedWithCarried) {
+    if (phase.carriedCandidateSha !== C) {
+      blockers.push({
+        kind: "carry",
+        detail: `the carried-items acceptance is for ${phase.carriedCandidateSha ?? "another candidate"}, not ${C}`,
+        command: `tt resume ${phase.runId}`,
+      });
+    }
+    return blockers;
+  }
 
   for (const who of seatsOf(phase.contract)) {
     const review = phase.reviews[who]?.review;
-    if (!review) return false;
-    if (review.candidateSha !== C || !sameVersion(review.contractVersion, K)) return false;
-  }
-
-  if (itemsEnforced) {
-    const reviews = seatsOf(phase.contract).map((seat) => {
-      const r = phase.reviews[seat]?.review;
-      return { seat, items: r ? { items: r.items ?? [], arch: r.arch ?? [] } : undefined };
-    });
-    const outcomes = tallyItems(items!, reviews, phase.overturns ?? []);
-    if (
-      !itemsAccept(items!, outcomes, {
-        acceptedDeviations: [...acceptedDeviations!],
-        evidenceRecorded: evidenceRecorded!,
-      })
-    ) {
-      return false;
+    if (!review) {
+      blockers.push({ kind: "review", detail: `review by ${who} is missing`, command: `tt resume ${phase.runId}` });
+      continue;
+    }
+    if (review.candidateSha !== C || !sameVersion(review.contractVersion, K)) {
+      blockers.push({
+        kind: "review",
+        detail: `review by ${who} is not bound to this candidate and contract`,
+        command: `tt resume ${phase.runId}`,
+      });
     }
   }
 
+  if (itemsEnforced) {
+    // Plan 07f (F0/F1): an item is met only by a strict seat majority whose
+    // own anchors pass the review-lint anchor check. An evaluator's `unchecked`
+    // entry is not a seat verdict, so it can never make or unmake this
+    // majority; a `contradicted` entry is applied earlier, as an overturn.
+    const needed = Math.floor(seatsOf(phase.contract).length / 2) + 1;
+    const outcomes = phaseItemOutcomes(phase);
+    for (const item of flatItems(items!)) {
+      if (item.kind === "architecture" && acceptedDeviations!.has(item.id)) continue;
+      if (itemNeedsEvidence(item) && !evidenceRecorded!.includes(item.id)) continue;
+      const outcome = outcomes.find((o) => o.item.id === item.id);
+      const required = item.kind === "architecture" ? "fits" : "met";
+      const resolving = outcome
+        ? outcome.seats.filter((s) => s.verdict === required && seatAnchorResolves(s.evidence)).length
+        : 0;
+      if (resolving >= needed) continue;
+      const split = outcome ? itemIsSplit(outcome) : false;
+      blockers.push({
+        kind: "item",
+        detail:
+          `${item.id} is ${outcome?.outcome ?? "incomplete"}` +
+          (split ? " (the seats split on it)" : "") +
+          (outcome && outcome.seats.some((s) => s.verdict === required) ? " without a majority of resolving anchors" : ""),
+        command: `tt resume ${phase.runId}`,
+      });
+    }
+  }
 
+  // Plan 07c/07f: every OPEN domain point must be closed by a doneWhen fact
+  // that passes on this candidate and not on its base, or by the evaluator's
+  // approved trade-off. A failing fact keeps it open whatever an evaluator
+  // drop says. Points are grouped by domain so the owner reads one blocker per
+  // domain, naming the point ids.
+  const facts = phase.doneWhenFacts ?? [];
+  const open = openFindings(phase);
+  const pointIds = new Set<string>();
+  const pointsByDomain = new Map<string, string[]>();
+  for (const finding of open) {
+    if (!finding.domain && !finding.doneWhen) continue;
+    const proves = pointHasProvingFact(phase, finding);
+    // Plan 07f (F0/A1): a point is closed by a proving fact (or a domain
+    // review that the conductor records as a closed finding). An evaluator's
+    // trade-off triage record alone is not a closure — the owner accepts the
+    // finding, or the fact/domain review proves it.
+    if (!factKeepsOpen(finding, facts, C) && proves) continue;
+    pointIds.add(finding.id);
+    const key = finding.domain ?? "ungrouped";
+    pointsByDomain.set(key, [...(pointsByDomain.get(key) ?? []), finding.id]);
+  }
+  for (const [domain, ids] of pointsByDomain) {
+    const names = ids.map(shortId).join(", ");
+    blockers.push({
+      kind: "point",
+      detail: `open point${ids.length === 1 ? "" : "s"} in ${domain}: ${names} — no proving fact closes ${ids.length === 1 ? "it" : "them"}`,
+      // Plan 07f (A1): a point is a record with a domain and its next fix loop,
+      // not an owner decision. `tt why` prints the point with its domain and
+      // the command that shows the next step; no owner command can close it.
+      command: `tt why ${phase.runId}`,
+    });
+  }
 
+  // Plan 07f (A2): triage dispositions are no longer acceptance gates of
+  // their own (a `fix` on a finding, a decision or an amendment no longer
+  // blocks acceptance by itself). What remains is a blocking finding that is
+  // still OPEN — a point or a trade-off the owner closes with a ruling.
+  const covered = new Set(pointIds);
+  for (const finding of open) {
+    if (finding.severity !== "blocking" || covered.has(finding.id)) continue;
+    // Plan 07f (A2): a disposition `tradeoff` settles the finding; its old
+    // blocking label no longer blocks acceptance. An untriaged finding still
+    // blocks (fail safe).
+    if (findingDispositionIsTradeoff(phase.triage, finding.id)) continue;
+    blockers.push({
+      kind: "finding",
+      detail: `blocking finding ${shortId(finding.id)} open`,
+      command: rulingCommand(phase, `accept ${shortId(finding.id)}`, finding.id),
+    });
+  }
+
+  // Plan 07f (F1/A2): one blocker (and one ruling) per unsettled decision, so
+  // every outstanding decision has its own visible clearing action. A record
+  // bound to an older candidate or contract version was closed when the phase
+  // moved (conductor records DECISION_CLOSED); it never blocks acceptance.
   for (const decision of phase.decisions) {
-    // A decision superseded by a correction (design §7.5 step 1) is
-    // historical: the correction, not the original decision's vote or
-    // owner resolution, is what acceptance now depends on (via the
-    // corrections/addressed check below).
     if (!isLiveDecision(decision)) continue;
-    // Plan 01g: an amendment record is never an acceptance blocker by
-    // itself. A passing one is applied (next.ts's `apply_amendment`); a
-    // failed one leaves the criterion unchanged, and the round is handled
-    // exactly as today — a dispute must not, by itself, consume a repair
-    // round or park the run on the owner.
+    // Plan 01g: an amendment record is never an acceptance blocker by itself.
     if (decision.amendment) continue;
-    if (!decisionSettled(decision, phase, C, K)) return false;
+    if (decisionSettled(decision, phase, C, K)) continue;
+    if (decision.boundCandidateSha !== C || !sameVersion(decision.boundContractVersion, K)) continue;
+    const why = decisionStatus(decision, phase).reason ?? "failed";
+    const veto = /([A-Za-z0-9_]+) veto/.exec(why);
+    const verb = veto ? `vetoed by ${veto[1]}` : `failed (${why})`;
+    blockers.push({
+      kind: "decision",
+      detail: `${shortId(decision.id)} ${verb}`,
+      command: rulingCommand(phase, `rule ${shortId(decision.id)} as recorded`, decision.id),
+    });
   }
 
   // Plan 06i: a non-blocking owner request (a late discovery's escalation)
   // is visible but does not gate acceptance; an open request whose linked
   // item is already closed is moot and does not gate it either.
-  if (
-    phase.ownerRequests.some(
-      (r) => r.status === "open" && r.blocking !== false && !ownerRequestIsStale(phase, r) && !budgetGateIsMoot(phase, r),
-    )
-  ) {
-    return false;
+  for (const request of phase.ownerRequests) {
+    if (request.status !== "open" || request.blocking === false) continue;
+    if (ownerRequestIsStale(phase, request) || budgetGateIsMoot(phase, request)) continue;
+    blockers.push({
+      kind: "owner-request",
+      detail: `owner request ${shortId(request.id)} is open: ${request.reason}`,
+      command: resolveCommand(phase, C, K, request),
+    });
   }
 
-  for (const correction of phase.corrections) {
-    if (correction.status !== "open") continue; // resolved/superseded already settled
-    if (!addressed(correction, phase, C, K)) return false;
-  }
+  // Plan 07f (A3/C2, design §3.3): a correction is a point for its domain's
+  // next fix loop, never an acceptance obligation; a ruling applies at once.
+  // Acceptance therefore never waits for a correction to reach a worker and
+  // keeps no separate corrections/queued-corrections gates.
 
-  // Plan 06k1 (A5, finding A-8): a correction queued while the phase was
-  // reviewing, evaluating or final-checking has not reached a worker prompt
-  // yet. It is an acceptance obligation: the phase repairs (granting the
-  // correction's own round) until NOTES_DELIVERED clears it, so a correction
-  // is never lost to timing and never accepted around.
-  if ((phase.queuedCorrections ?? []).length > 0) return false;
+  return blockers;
+}
 
-  return true;
+/** Plan 07f (F1): every unmet acceptance condition for the phase's current
+ * candidate, each with the command that clears it. Empty ⇒ accepted. The
+ * caller that prints a blocker passes the failing check commands it read for
+ * THIS phase (07f1b A1); a caller that only counts them omits it. */
+export function acceptanceBlockers(
+  phase: PhaseState,
+  failedCommands?: readonly string[],
+): AcceptanceBlocker[] {
+  const C = phase.candidate?.sha;
+  if (!C) return [];
+  return acceptanceBlockersFor(phase, C, phase.contract.contractVersion, failedCommands);
+}
+
+/** accept(C, K): the only way a phase may reach ACCEPTED. Mechanical by
+ * default (plan 07f F0): acceptance IS "no blockers". */
+export function accept(phase: PhaseState, C: string, K: ContractVersion): boolean {
+  if (phase.candidate?.sha !== C) return false;
+  return acceptanceBlockersFor(phase, C, K).length === 0;
 }
 
 /** Plan 06b: true when the ONLY thing keeping the phase from acceptance is an
@@ -774,7 +1117,7 @@ export function decisionStatus(decision: Decision, phase: PhaseState): DecisionS
   }
   const C = phase.candidate?.sha;
   const K = phase.contract.contractVersion;
-  if (!C || decision.boundCandidateSha !== C) return { status: "pending", reason: "not bound to the current candidate", ...(amendment ? { amendment } : {}) };
+  if (!C || C !== decision.boundCandidateSha) return { status: "pending", reason: "not bound to the current candidate", ...(amendment ? { amendment } : {}) };
   const flag = decision.class === "reserved" ? { flagged: true } : {};
   return { ...votedStatus(decision, phase, C, K), ...flag, ...(amendment ? { amendment } : {}) };
 }

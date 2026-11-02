@@ -22,6 +22,7 @@ import {
   readEvents,
   setupConductor,
   waitFor,
+  type FakePiStep,
   type TestConductorSetup,
 } from "./harness.ts";
 import { contractVersionFor, runPaths, type Deadlines, type RunPlanFile } from "../../src/conductor.ts";
@@ -104,6 +105,105 @@ function stateJson(runDir: string, root: string): State {
       state: State;
     }
   ).state;
+}
+
+/** A two-lane, domain-mode phase with fix rounds on (the same shape the fix
+ * round tests use). */
+function fixPhase() {
+  return {
+    id: "p1",
+    goal: "fix the points",
+    acceptance: ["it works"],
+    checks: ["true"],
+    boundaries: [],
+    reserved: [],
+    workers: 2,
+    domains: [
+      { name: "booking", globs: ["booking/**"] },
+      { name: "gates", globs: ["gates/**"] },
+    ],
+    fixRounds: "domains",
+    fixers: 4,
+    fixChecks: "true",
+  };
+}
+
+function laneWorker(round: number, lane: string): { hello: unknown; steps: FakePiStep[] } {
+  return {
+    hello: defaultWorkerHello(),
+    steps: [
+      { kind: "call-sh", command: `printf 'lane ${lane} r${round}\\n' > lane-${lane}-r${round}.txt` },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+    ],
+  };
+}
+
+function laneReview(seat: Reviewer, contractVersion: unknown, findings: unknown[] = []): { hello: unknown; steps: FakePiStep[] } {
+  return {
+    hello: defaultReviewerHello(),
+    steps: [
+      { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+      { kind: "wait-for-prompt" },
+      // Keep the review open long enough for the owner's correction to land
+      // before the pick and the fix round that follows it.
+      { kind: "sleep", ms: 2_000 },
+      {
+        kind: "call-submit",
+        tool: "submit_review",
+        args: {
+          reviewer: seat,
+          phaseId: "p1",
+          candidateSha: "$TT_CANDIDATE_SHA",
+          contractVersion,
+          correctionStatements: [],
+          findingStatements: [],
+          ballots: [],
+          findings,
+        },
+      },
+    ],
+  };
+}
+
+function reviewerWithBookingPoint() {
+  return (seat: Reviewer, _candidate: string, state: State): { hello: unknown; steps: FakePiStep[] } => {
+    const K = state.phase.contract.contractVersion;
+    const round = state.phase.rounds?.length ?? 1;
+    if (round === 1 && seat === "M") {
+      return laneReview("M", K, [
+        {
+          kind: "defect",
+          severity: "blocking",
+          evidence: "the booking path is wrong",
+          domain: "booking",
+          item: "R1",
+          where: "booking/a.ts:1 fn",
+          expected: "BOOKING_EXPECTED",
+          doneWhen: "test -f booking-fixed.txt",
+        },
+      ]);
+    }
+    return laneReview(seat as Reviewer, K);
+  };
+}
+
+function pickVote(seat: Reviewer, round: number, lane: string): { hello: unknown; steps: FakePiStep[] } {
+  return {
+    hello: { role: "picker" as const, tools: ROLE_TOOLS.picker },
+    steps: [
+      {
+        kind: "call-submit",
+        tool: "submit_pick_vote",
+        args: { inspected: ["a", "b", "c", "d"], round, seat, lane, why: `${seat} picks ${lane}`, loserHad: { yes: false, anchors: [] } },
+      },
+    ],
+  };
+}
+
+async function teardownOwnerDirectives(setup: TestConductorSetup): Promise<void> {
+  await setup.conductor.stop();
+  cleanupDir(setup.runRoot);
+  cleanupDir(setup.scriptsDir);
 }
 
 test("owner-directives: an input while the worker runs is steered to the worker, recorded as OD-1, and quoted in every later prompt", async () => {
@@ -291,13 +391,16 @@ test("owner-directives: an input while the reviewers are mid-turn is steered to 
   }
 });
 
-test("owner-directives: a directive survives a restart, and a correction at AWAITING_OWNER is a directive too", async () => {
+test("owner-directives: a directive survives a restart, and a note at AWAITING_OWNER is a directive too", async () => {
   const dir = shortTmp("tt-dir-restart");
   const promptLog = path.join(dir, "worker-prompts.log");
+  const marker = path.join(dir, "owner-fixed");
   const text = "hold the lock under 50us";
-  const correction = "CORRECTION: a lone cancellation must not wait for the next tick";
+  const note = "NOTE: a lone cancellation must not wait for the next tick";
   const setup = await setupConductor({
-    checks: ["false"],
+    // The check fails until the owner's repair lands; the owner's grant after
+    // the note is what lets that repair run and the phase accept.
+    checks: [`test -f ${marker}`],
     workerScriptForAttempt: (attempt) => ({
       hello: defaultWorkerHello(),
       steps: attempt === 1 ? [{ kind: "sleep", ms: 3_000 }, submitPhaseStep()] : [submitPhaseStep()],
@@ -317,12 +420,38 @@ test("owner-directives: a directive survives a restart, and a correction at AWAI
     await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 90_000);
 
     // `tt stop`, then `tt resume`: the detached conductor folds the log
-    // back. The repair attempt the correction starts is launched by that
+    // back. The repair attempt the owner's grant starts is launched by that
     // detached process, which has no per-attempt script map — one script
     // for every role, and the prompt log it writes is this run's.
     await setup.conductor.stop();
+    // One script serves every role of the detached conductor: a reviewer's
+    // submit_review lands first, a worker's submit_phase does. The other call
+    // is refused and the agent settles, which is harmless.
+    const contractVersion = setup.conductor.state.phase.contract.contractVersion;
     const repairScript = path.join(setup.scriptsDir, "repair.json");
-    fs.writeFileSync(repairScript, JSON.stringify({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }));
+    fs.writeFileSync(
+      repairScript,
+      JSON.stringify({
+        hello: defaultWorkerHello(),
+        steps: [
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: {
+              reviewer: "$TT_REVIEWER",
+              phaseId: "p1",
+              candidateSha: "$TT_CANDIDATE_SHA",
+              contractVersion,
+              correctionStatements: [],
+              findingStatements: [],
+              ballots: [],
+              findings: [],
+            },
+          },
+          submitPhaseStep(),
+        ],
+      }),
+    );
     const cliEnv: NodeJS.ProcessEnv = {
       ...process.env,
       TT_TEST_MODE: "1",
@@ -347,27 +476,43 @@ test("owner-directives: a directive survives a restart, and a correction at AWAI
     assert.equal(before.phase, "AWAITING_OWNER", "the resumed run is parked on the owner");
     assert.ok(before.ownerRequests.some((r) => r.status === "open"), "AWAITING_OWNER has open owner requests");
     const grantedBefore = before.repairRoundsGranted;
-    writeCommand(setup.runDir, "cmd-corr", {
-      type: "correction",
-      text: correction,
+    // Plan 07f (A3/§3.3): a correction at AWAITING_OWNER is a point in the
+    // domain it names — in every phase, with or without a declared domain — so
+    // the note channel is where queued owner text goes now. The note below
+    // proves a note never becomes a correction and grants no round.
+    writeCommand(setup.runDir, "cmd-note", {
+      type: "note",
+      text: note,
       binding: { runId: before.runId, phaseId: before.phaseId },
     });
 
-    await waitFor(() => stateJson(setup.runDir, setup.runRoot).phase.phase !== "AWAITING_OWNER", 60_000);
+    await waitFor(
+      () => stateJson(setup.runDir, setup.runRoot).phase.ownerDirectives?.some((d) => d.commandId === "cmd-note"),
+      60_000,
+    );
     const after = stateJson(setup.runDir, setup.runRoot).phase;
-    assert.equal(after.ownerRequests.filter((r) => r.status === "open").length, 0, "the correction resolves every request");
-    assert.equal(after.repairRoundsGranted, grantedBefore + 3, "a correction grants 3 fresh rounds");
-    const corrDirective = (after.ownerDirectives ?? []).find((d) => d.commandId === "cmd-corr");
-    assert.ok(corrDirective, "the correction is also an owner directive");
-    assert.equal(corrDirective!.id, "OD-2", "directives are numbered OD-1, OD-2, …");
+    assert.equal(after.phase, "AWAITING_OWNER", "a note moves no phase");
+    assert.equal(
+      after.ownerRequests.filter((r) => r.status === "open").length,
+      before.ownerRequests.filter((r) => r.status === "open").length,
+      "a note resolves no owner request",
+    );
+    assert.equal(after.repairRoundsGranted, grantedBefore, "a note grants no round");
+    const noteDirective = (after.ownerDirectives ?? []).find((d) => d.commandId === "cmd-note");
+    assert.ok(noteDirective, "the note is also an owner directive");
+    assert.equal(noteDirective!.id, "OD-2", "directives are numbered OD-1, OD-2, …");
+    assert.ok((after.ownerNotes ?? []).some((n) => n === note), "the note is queued for the next attempt's prompt");
+    assert.ok(
+      fs.existsSync(promptLog) && fs.readFileSync(promptLog, "utf8").includes(`OD-1: ${text}`),
+      "the resumed run still quotes OD-1",
+    );
 
-    await waitFor(() => {
-      const log = fs.existsSync(promptLog) ? fs.readFileSync(promptLog, "utf8") : "";
-      return log.includes(correction) && log.includes(`OD-1: ${text}`) && log.includes(`OD-2: ${correction}`);
-    }, 90_000);
-    const finalLog = fs.readFileSync(promptLog, "utf8");
-    assert.ok(finalLog.includes(`OD-1: ${text}`), "the resumed run still quotes OD-1");
-    assert.ok(finalLog.includes(`OD-2: ${correction}`), "the correction is quoted as OD-2");
+    // Plan 07f1b (R5): the correction's path — the point it raises becomes its
+    // domain's repair, whose doneWhen passing is what closes it and accepts the
+    // phase — is covered by the dedicated test below, where a fix round is the
+    // domain's repair. A note is never that path: no ruling, no grant and no
+    // repair happened here.
+    assert.equal(after.findings.filter((f) => f.id.includes("owner-cmd-note")).length, 0, "a note raises no point");
   } finally {
     try {
       execFileSync(process.execPath, [CLI_PATH, "stop", setup.runDir, "--root", setup.runRoot], {
@@ -381,6 +526,95 @@ test("owner-directives: a directive survives a restart, and a correction at AWAI
     cleanupDir(setup.runRoot);
     cleanupDir(setup.scriptsDir);
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Plan 07f1b (R5): a correction is a POINT in the domain it names, never the
+// legacy correction that resolved requests and granted rounds. The conductor's
+// own round picks, evaluates and then runs the point in its domain's fixer
+// task; that fixer's commit makes the point's doneWhen pass, the conductor's
+// fact closes it, and the phase accepts: never a ruling that settles it before
+// any repair, and never a park. This is the real fix-round path, not a state
+// constructed in the test.
+test("owner-directives: the correction's point starts its domain's repair, whose doneWhen passing accepts the phase", async () => {
+  const setup = await setupConductor({
+    phase: fixPhase(),
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorker(1, "a"),
+    laneWorkerScriptFor: (lane, round) => laneWorker(round, lane),
+    laneReviewerScriptFor: (seat, candidate, state) => reviewerWithBookingPoint()(seat, candidate, state),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1, "a"),
+    fixerScriptFor: (domain: string) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: `printf '${domain} fixed\\n' > ${domain}-fixed.txt` },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    // The correction is a point in every state it arrives in (plan 07f A3), so
+    // it is sent at once — before the first candidate — and the conductor's own
+    // triage, fix task and fix round carry it from there.
+    const before = setup.conductor.state.phase;
+    const correction = [
+      "CORRECTION: a lone cancellation must not wait for the next tick",
+      "domain: gates",
+      "where: gates/b.ts:1 fn",
+      "expected: a lone cancellation does not wait for the next tick",
+      "doneWhen: test -f gates-fixed.txt",
+    ].join("\n");
+    writeCommand(setup.runDir, "cmd-corr", {
+      type: "correction",
+      text: correction,
+      binding: { runId: before.runId, phaseId: before.phaseId },
+    });
+    await waitFor(
+      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.id === "cmd-corr" && i.state === "noted"),
+      60_000,
+      20,
+      setup.runDir,
+    );
+    const point = (setup.conductor.state.phase.findings ?? []).find((f) => f.id.includes("owner-cmd-corr"))!;
+    assert.ok(point, "the correction is a point in the record");
+    assert.equal(point.domain, "gates", "the domain the input names owns it");
+    assert.equal(point.doneWhen, "test -f gates-fixed.txt", "the point carries its own proving fact");
+
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 240_000, 50, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    const fixed = phase.rounds?.[1]?.fixed;
+    assert.ok(fixed?.candidate, "the fix round produced a candidate");
+    const started = readEvents(setup.runDir).find((r) => r.kind === "fix_round_started");
+    const tasks = (started?.event as { tasks?: Array<{ domain: string; findingIds: string[] }> } | undefined)?.tasks ?? [];
+    const gatesTask = tasks.find((t) => t.domain === "gates");
+    assert.ok(gatesTask, `the correction's domain is a fixer task: ${JSON.stringify(tasks)}`);
+    assert.ok(gatesTask!.findingIds.includes(point.id), "the gates fixer's task names the correction's point");
+
+    const facts = eventsOfType(setup.runDir, "FINDING_FACT") as Array<{
+      findingId: string;
+      candidateSha: string;
+      exitCode: number | null;
+      passesOnBase?: boolean;
+    }>;
+    // The conductor proves the point on the lane winner first (where it still
+    // fails), then on the fix round's merged candidate (where the gates
+    // fixer's commit makes it pass). Take the passing fact.
+    const fact = facts.find((f) => f.findingId === point.id && f.exitCode === 0);
+    assert.ok(fact, "the conductor ran the correction point's doneWhen");
+    assert.equal(fact!.candidateSha, fixed!.candidate, "the fact was proven on the fix round's merged candidate");
+    assert.equal(fact!.passesOnBase, false, "the doneWhen failed on the base, so it proves the repair");
+
+    const repaired = phase.findings.find((f) => f.id === point.id)!;
+    assert.equal(repaired.status, "repaired", "the repair's own proving fact closed the point");
+    assert.equal((phase.rulings ?? []).length, 0, "no ruling settles the point: the repair's doneWhen does");
+    assert.equal(phase.ownerRequests.filter((r) => r.status === "open").length, 0, "acceptance leaves no open owner request");
+    assert.equal(phase.phase, "DONE", "the repaired phase is accepted, never parked");
+  } finally {
+    await teardownOwnerDirectives(setup);
   }
 });
 

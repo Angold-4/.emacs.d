@@ -21,7 +21,7 @@
 // conductor never calls `runRound`, and the single-candidate loop is byte for
 // byte what it was.
 
-import { candidateLabel, everyLaneLost, laneIds, laneMetItems, passingCandidates, pickWinner, revotePair, type PickGuard, type RoundWinner } from "./rounds.ts";
+import { candidateLabel, laneIds, passingCandidates, pickWinner, revotePair, type PickGuard, type RoundWinner } from "./rounds.ts";
 import type {
   ConsolidationTake,
   CriterionDispute,
@@ -133,6 +133,12 @@ export interface LaneHost {
   ): Promise<void>;
   /** Record one round event. */
   emit(event: Event): void;
+  /** 07g1b (R11): terminate a lane the round has stopped waiting for. Called
+   * once the round's pick is adopted: the lane's worker (or fixer) and its
+   * shell commands are killed, and nothing it does afterwards is read.
+   * Absent leaves the lane running to its own bound (its events are still
+   * ignored). */
+  stopLane?(round: number, lane: string): void;
   /** Plan 06n (A7): the phase's best candidate and the plan items the pick
    * compares each lane's reviews against. Undefined (no best candidate yet,
    * or an unstructured plan) keeps the old pick. */
@@ -175,6 +181,10 @@ export interface RoundOutcome {
    * stop was recorded, and the partial round is left in place for the next
    * start to finish. */
   stopped?: boolean;
+  /** 07g1b (R11): the lanes the round stopped waiting for once its pick was
+   * adopted. Their later submissions are never read; the work they landed
+   * green before the stop is the conductor's to turn into points. */
+  stoppedLanes?: readonly string[];
 }
 
 /** exex 01a2: at most this many fixes of a red candidate per lane per round;
@@ -184,31 +194,6 @@ export const MAX_LANE_FIXES = 5;
 
 function errorNote(err: unknown): string {
   return String((err as Error)?.message ?? err);
-}
-
-/** The per-lane starting points for a repeat of `last`. A round with a
- * passing candidate and no winner could not complete (a missing review or
- * pick vote; `runRound` picks whenever the set is complete), so each lane
- * whose candidate passed its checks restarts from that candidate, and (exex
- * 01a2) a lane whose candidate was still red when its time ran out continues
- * from that red candidate; only a lane with no candidate at all keeps `base`.
- * Derived from the round record, so it survives a conductor restart.
- *
- * Plan 06n (A7/R9b): a round that picked no lane because every passing lane
- * lost an item the best candidate met restarts EVERY lane from the best
- * candidate, never from its own regressing candidate. */
-export function repeatLaneBases(last: RoundRecord | undefined, guard?: PickGuard): Record<string, string> | undefined {
-  if (!last || last.picked) return undefined;
-  if (everyLaneLost(last, guard)) return Object.fromEntries(last.lanes.map((lane) => [lane, guard!.best.sha]));
-  const out: Record<string, string> = {};
-  for (const c of passingCandidates(last)) if (typeof c.sha === "string" && c.sha.length > 0) out[c.lane] = c.sha;
-  // exex 01a2: a lane whose candidate was still red when its time ran out
-  // continues from that candidate, never from the round's base: restarting
-  // threw away the lanes' whole removal three rounds running.
-  for (const c of last.candidates) {
-    if (out[c.lane] === undefined && c.ok === false && typeof c.sha === "string" && c.sha.length > 0) out[c.lane] = c.sha;
-  }
-  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** One round: K lanes from one base, one winner. See the module comment. */
@@ -250,8 +235,7 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
     ).then((results) => results.find((r): r is string => r !== undefined));
     reviewSets.set(lane, { sha, done });
   };
-  const cancelReviews = (lane: string): void => {
-    const set = reviewSets.get(lane);
+  const cancelReviews = (lane: string): void => {    const set = reviewSets.get(lane);
     if (!set) return;
     reviewSets.delete(lane);
     cancelled.push(set.done);
@@ -283,104 +267,205 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
   // takes the machine-wide lock, so the two checks still never overlap; only
   // the wait for a slow sibling is removed. A lane that produced no candidate
   // records no candidate at all: its note is what the status shows.
-  const builds = await Promise.all(
-    lanes.map(async (lane): Promise<LaneBuild> => {
-      const prior = existing?.candidates.find((c) => c.lane === lane);
-      if (prior && typeof prior.sha === "string" && prior.sha.length > 0) {
-        // Plan 06n (A3): a kept candidate brings back its recorded build, so
-        // its reviews and the hand-off see the lane's own payload; only an
-        // unchecked one is checked.
-        const sha = prior.sha;
-        const kept: LaneBuild = host.resumeLane?.(ctx.round, lane, sha) ?? { lane, sha };
-        if (prior.ok === false || host.stopRequested?.()) return kept;
-        // 09-2: a kept candidate that is not red is reviewed from now on —
-        // while its check runs, when it still needs one.
-        startReviews(lane, sha);
-        if (prior.ok === undefined) {
-          const check = await checkWithReviews(lane, sha);
-          if (host.stopRequested?.()) return kept;
-          host.emit({
-            type: "CANDIDATE_CHECKED",
-            round: ctx.round,
-            lane,
-            ok: check.ok,
-            ...(check.note ? { note: check.note } : {}),
-          });
+  //
+  // 07g1b (R11): each lane's latest check is tracked as it lands, so the round
+  // can adopt a passing candidate without waiting for another lane's fix — or
+  // for a lane that never submitted.
+  interface LaneState {
+    ok?: boolean;
+    done: boolean;
+    build?: LaneBuild;
+  }
+  const laneState = new Map<string, LaneState>(lanes.map((lane) => [lane, { done: false }]));
+  let wake: (() => void) | undefined;
+  const bump = (): void => {
+    const woken = wake;
+    wake = undefined;
+    woken?.();
+  };
+  const waitChange = (): Promise<void> =>
+    new Promise<void>((resolve) => {
+      wake = resolve;
+    });
+  const noteCheck = (lane: string, check: LaneCheck): void => {
+    laneState.get(lane)!.ok = check.ok;
+    bump();
+  };
+  const markDone = (lane: string, build: LaneBuild): LaneBuild => {
+    const s = laneState.get(lane)!;
+    s.done = true;
+    s.build = build;
+    bump();
+    return build;
+  };
+  // A lane the round stopped waiting for may not write into the round record.
+  const stopped = new Set<string>();
+  const emit = (lane: string, event: Event): void => {
+    if (!stopped.has(lane)) host.emit(event);
+  };
+  const tasks = lanes.map(async (lane): Promise<LaneBuild> => {
+    const prior = existing?.candidates.find((c) => c.lane === lane);
+    if (prior && typeof prior.sha === "string" && prior.sha.length > 0) {
+      // Plan 06n (A3): a kept candidate brings back its recorded build, so
+      // its reviews and the hand-off see the lane's own payload; only an
+      // unchecked one is checked.
+      const sha = prior.sha;
+      const kept: LaneBuild = host.resumeLane?.(ctx.round, lane, sha) ?? { lane, sha };
+      if (prior.ok !== undefined) noteCheck(lane, { ok: prior.ok, ...(prior.note ? { note: prior.note } : {}) });
+      if (prior.ok === false || host.stopRequested?.()) return markDone(lane, kept);
+      // 09-2: a kept candidate that is not red is reviewed from now on —
+      // while its check runs, when it still needs one.
+      startReviews(lane, sha);
+      if (prior.ok === undefined) {
+        const check = await checkWithReviews(lane, sha);
+        noteCheck(lane, check);
+        if (host.stopRequested?.()) return markDone(lane, kept);
+        emit(lane, {
+          type: "CANDIDATE_CHECKED",
+          round: ctx.round,
+          lane,
+          ok: check.ok,
+          ...(check.note ? { note: check.note } : {}),
+        });
+      }
+      return markDone(lane, kept);
+    }
+    // Plan 06n (A3): nothing new starts after a requested stop.
+    if (host.stopRequested?.()) return markDone(lane, { lane, note: "the run was stopped" });
+    let build: LaneBuild;
+    try {
+      build = await host.buildLane(lane, ctx.round, ctx.laneBases?.[lane] ?? ctx.base, prompt);
+    } catch (err) {
+      build = { lane, note: `the lane failed: ${errorNote(err)}` };
+    }
+    if (typeof build.sha === "string" && build.sha.length > 0) {
+      if (host.stopRequested?.()) return markDone(lane, build);
+      // 07g1b (R11): a lane the round already stopped waiting for starts no
+      // review and no check; what it landed before the stop is its own work
+      // (the conductor turns it into points), never a late candidate.
+      if (stopped.has(build.lane)) return markDone(lane, build);
+      emit(build.lane, { type: "CANDIDATE_SUBMITTED", round: ctx.round, lane: build.lane, sha: build.sha });
+      startReviews(build.lane, build.sha);
+      let check = await checkWithReviews(build.lane, build.sha);
+      noteCheck(build.lane, check);
+      if (host.stopRequested?.()) return markDone(lane, build);
+      emit(build.lane, {
+        type: "CANDIDATE_CHECKED",
+        round: ctx.round,
+        lane: build.lane,
+        ok: check.ok,
+        ...(check.note ? { note: check.note } : {}),
+      });
+      // exex 01a2: a red tree is never the lane's hand-in while it still
+      // has time. Its worker fixes the failure on its own candidate and
+      // submits again; each new commit is submitted, reviewed (09-2) and
+      // checked like the first. Only a green candidate, or a lane out of
+      // time, ends the loop.
+      let fixes = 0;
+      while (!check.ok && host.fixLane && fixes < MAX_LANE_FIXES && !host.stopRequested?.()) {
+        fixes += 1;
+        let fixed: LaneBuild;
+        try {
+          fixed = await host.fixLane(build.lane, ctx.round, build.sha!, check.note ?? "the checks failed");
+        } catch (err) {
+          fixed = { lane: build.lane, note: `the fix attempt failed: ${errorNote(err)}` };
         }
-        return kept;
-      }
-      // Plan 06n (A3): nothing new starts after a requested stop.
-      if (host.stopRequested?.()) return { lane, note: "the run was stopped" };
-      let build: LaneBuild;
-      try {
-        build = await host.buildLane(lane, ctx.round, ctx.laneBases?.[lane] ?? ctx.base, prompt);
-      } catch (err) {
-        build = { lane, note: `the lane failed: ${errorNote(err)}` };
-      }
-      if (typeof build.sha === "string" && build.sha.length > 0) {
-        if (host.stopRequested?.()) return build;
-        host.emit({ type: "CANDIDATE_SUBMITTED", round: ctx.round, lane: build.lane, sha: build.sha });
-        startReviews(build.lane, build.sha);
-        let check = await checkWithReviews(build.lane, build.sha);
-        if (host.stopRequested?.()) return build;
-        host.emit({
+        // 07g1b (R11): a lane the round stopped waiting for keeps fixing in
+        // its own worktree (its work is saved to a ref), but nothing it
+        // submits from now on is read.
+        if (stopped.has(build.lane)) break;
+        if (typeof fixed.sha !== "string" || fixed.sha.length === 0 || fixed.sha === build.sha) break;
+        build = fixed;
+        if (host.stopRequested?.()) return markDone(lane, build);
+        emit(build.lane, { type: "CANDIDATE_SUBMITTED", round: ctx.round, lane: build.lane, sha: build.sha! });
+        startReviews(build.lane, build.sha!);
+        check = await checkWithReviews(build.lane, build.sha!);
+        noteCheck(build.lane, check);
+        if (host.stopRequested?.()) return markDone(lane, build);
+        emit(build.lane, {
           type: "CANDIDATE_CHECKED",
           round: ctx.round,
           lane: build.lane,
           ok: check.ok,
           ...(check.note ? { note: check.note } : {}),
         });
-        // exex 01a2: a red tree is never the lane's hand-in while it still
-        // has time. Its worker fixes the failure on its own candidate and
-        // submits again; each new commit is submitted, reviewed (09-2) and
-        // checked like the first. Only a green candidate, or a lane out of
-        // time, ends the loop.
-        let fixes = 0;
-        while (!check.ok && host.fixLane && fixes < MAX_LANE_FIXES && !host.stopRequested?.()) {
-          fixes += 1;
-          let fixed: LaneBuild;
-          try {
-            fixed = await host.fixLane(build.lane, ctx.round, build.sha!, check.note ?? "the checks failed");
-          } catch (err) {
-            fixed = { lane: build.lane, note: `the fix attempt failed: ${errorNote(err)}` };
-          }
-          if (typeof fixed.sha !== "string" || fixed.sha.length === 0 || fixed.sha === build.sha) break;
-          build = fixed;
-          if (host.stopRequested?.()) return build;
-          host.emit({ type: "CANDIDATE_SUBMITTED", round: ctx.round, lane: build.lane, sha: build.sha! });
-          startReviews(build.lane, build.sha!);
-          check = await checkWithReviews(build.lane, build.sha!);
-          if (host.stopRequested?.()) return build;
-          host.emit({
-            type: "CANDIDATE_CHECKED",
-            round: ctx.round,
-            lane: build.lane,
-            ok: check.ok,
-            ...(check.note ? { note: check.note } : {}),
-          });
-        }
-      } else {
-        if (host.stopRequested?.()) return build;
-        host.emit({
-          type: "CANDIDATE_CHECKED",
-          round: ctx.round,
-          lane: build.lane,
-          ok: false,
-          note: build.note ?? "the lane produced no candidate",
-        });
       }
-      return build;
-    }),
-  );
+    } else {
+      if (host.stopRequested?.()) return markDone(lane, build);
+      noteCheck(lane, { ok: false });
+      emit(lane, {
+        type: "CANDIDATE_CHECKED",
+        round: ctx.round,
+        lane: build.lane,
+        ok: false,
+        note: build.note ?? "the lane produced no candidate",
+      });
+    }
+    return markDone(lane, build);
+  });
+
+  // 07g1b (R11): the pick never waits for a red lane. The round waits for a
+  // lane that has not reported a check yet (a two-lane round compares two
+  // candidates), but the moment one lane is green and no other lane can still
+  // hand in an unchecked candidate, the passing set is frozen and the pick
+  // starts: a red lane's fix — a lane that already failed its checks — is
+  // never waited for, however short it would be (exex 01c3a: the pick sat
+  // reading for a red lane's 75-minute attempt). Such a lane is stopped at the
+  // pick, and the work it landed before then arrives as points (R7), never as
+  // a late candidate.
+  const green = (): boolean => lanes.some((lane) => laneState.get(lane)!.ok === true);
+  const unchecked = (): boolean =>
+    lanes.some((lane) => {
+      const state = laneState.get(lane)!;
+      return !state.done && state.ok === undefined;
+    });
+  for (;;) {
+    if (lanes.every((lane) => laneState.get(lane)!.done) || host.stopRequested?.()) break;
+    if (green() && !unchecked()) break;
+    await waitChange();
+  }
+  const settled = (lane: string): boolean => laneState.get(lane)!.done;
+  const frozen = new Set(lanes.filter((lane) => laneState.get(lane)!.ok === true));
+  const stoppedLanes: string[] = [];
+  const stopLane = (lane: string): void => {
+    if (frozen.has(lane) || stopped.has(lane)) return;
+    stopped.add(lane);
+    if (!settled(lane)) stoppedLanes.push(lane);
+    cancelReviews(lane);
+    try {
+      host.stopLane?.(ctx.round, lane);
+    } catch {
+      // A lane that cannot be stopped ends on its own bound; its events are
+      // ignored either way.
+    }
+  };
+  // 07g1b (R11): freezing the passing set IS the adoption, so every lane that
+  // is still running is stopped right here — not after the pick — and nothing
+  // it lands from now on reaches the record.
+  for (const lane of lanes) if (!settled(lane)) stopLane(lane);
+  /** The round's outcome: any lane still unsettled is stopped (the pick was
+   * adopted, or the round failed), and the lanes' own builds are waited for,
+   * so no round leaves a live lane behind. */
+  const finish = async (out: Omit<RoundOutcome, "builds" | "stoppedLanes">): Promise<RoundOutcome> => {
+    for (const lane of lanes) if (!settled(lane)) stopLane(lane);
+    const builds = await Promise.all(tasks);
+    return { ...out, builds, ...(stoppedLanes.length > 0 ? { stoppedLanes } : {}) };
+  };
   // Plan 06n (A3): nothing after a requested stop is recorded, so the
   // reviews still in flight are ended too.
   if (host.stopRequested?.()) {
     for (const lane of [...reviewSets.keys()]) cancelReviews(lane);
-    return { round: ctx.round, base: ctx.base, lanes, builds, stopped: true };
+    return await finish({ round: ctx.round, base: ctx.base, lanes, stopped: true });
   }
 
-  const record = host.rounds().find((r) => r.round === ctx.round);
-  const passing = record ? passingCandidates(record) : [];
+  // 07g1b (R11): only the frozen passing set decides the round. A lane that
+  // turned green after the freeze is never a late candidate, so the reviews,
+  // the revote and the pick all read the record reduced to that set — a late
+  // green sibling can neither fail the round nor win it.
+  const frozenView = (held: RoundRecord | undefined): RoundRecord | undefined =>
+    held ? { ...held, candidates: held.candidates.filter((candidate) => frozen.has(candidate.lane)) } : undefined;
+  const frozenRecord = frozenView(host.rounds().find((r) => r.round === ctx.round));
+  const passing = frozenRecord ? passingCandidates(frozenRecord) : [];
 
   // 3. M, A and B each review every passing candidate — K × N reviews. A
   //    review that cannot be taken is NOT a candidate with fewer reviews: the
@@ -402,7 +487,7 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
   await Promise.allSettled(cancelled);
   let failure = reviewFailures.find((r): r is string => r !== undefined);
   if (!failure) {
-    const reviewed = host.rounds().find((r) => r.round === ctx.round);
+    const reviewed = frozenView(host.rounds().find((r) => r.round === ctx.round));
     for (const candidate of reviewed ? passingCandidates(reviewed) : []) {
       const count = (candidate.reviews ?? []).length;
       if (count < host.seats.length) {
@@ -417,7 +502,7 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
   //    seat must vote before a winner is picked.
   let missingVotes: string[] | undefined;
   if (!failure && passing.length > 1 && host.stopRequested?.()) {
-    return { round: ctx.round, base: ctx.base, lanes, builds, stopped: true };
+    return await finish({ round: ctx.round, base: ctx.base, lanes, stopped: true });
   }
   if (!failure && passing.length > 1) {
     // Every seat gets its pick turn; one seat's failure no longer stops the
@@ -446,12 +531,19 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
       // no missing vote could make another lane win, so the round picks and
       // records which seats did not vote. Otherwise the round fails as before:
       // a majority is never invented.
-      const decided = afterPick && passing.length === 2 ? pickWinner(afterPick, host.seats, host.leader, host.pickGuard?.()) : undefined;
+      const decidedRecord = afterPick ? frozenView(afterPick) : undefined;
+      const decided =
+        decidedRecord && passing.length === 2
+          ? pickWinner(decidedRecord, host.seats, host.leader, host.pickGuard?.())
+          : undefined;
       if (decided) missingVotes = missing;
       else failure = pickFailures[0] ?? `the pick turn is missing a vote from ${missing.join(", ")}`;
     }
   }
-  let finalRecord = host.rounds().find((r) => r.round === ctx.round);
+  // 07g1b (R11): the revote and the pick read the frozen passing set only, so
+  // a lane that turned green after the freeze can neither join a revote nor
+  // win one.
+  let finalRecord = frozenView(host.rounds().find((r) => r.round === ctx.round));
 
   // 4b. Plan 06h (A3): with three or more candidates and no strict majority,
   //     the top two by votes go to ONE revote. A tie in the revote is broken
@@ -469,7 +561,7 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
           break;
         }
       }
-      finalRecord = host.rounds().find((r) => r.round === ctx.round);
+      finalRecord = frozenView(host.rounds().find((r) => r.round === ctx.round));
       if (!failure && finalRecord) {
         const voted = new Set((finalRecord.revote?.votes ?? []).map((v) => v.seat));
         const missing = host.seats.filter((s) => !voted.has(s));
@@ -477,14 +569,14 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
       }
     }
   }
-  if (failure) return { round: ctx.round, base: ctx.base, lanes, builds, failure };
+  if (failure) return await finish({ round: ctx.round, base: ctx.base, lanes, failure });
 
   // 5. `pickWinner` — code, never a model — decides the round.
   const winner = finalRecord ? pickWinner(finalRecord, host.seats, host.leader, host.pickGuard?.()) : undefined;
   if (winner) {
     host.emit({ type: "CANDIDATE_PICKED", round: ctx.round, lane: winner.lane, sha: winner.sha, votes: winner.votes });
   }
-  return { round: ctx.round, base: ctx.base, lanes, winner, builds, ...(missingVotes ? { missingVotes } : {}) };
+  return await finish({ round: ctx.round, base: ctx.base, lanes, ...(winner ? { winner } : {}), ...(missingVotes ? { missingVotes } : {}) });
 }
 
 /** The lanes a plan's frozen contract runs. A plan without `#+TT_WORKERS`
@@ -522,141 +614,6 @@ export function laneFailureLines(round: RoundRecord | undefined): string[] {
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// tt 09 (change 3): combine the lanes
-// ---------------------------------------------------------------------------
-//
-// exex 01a2: the two lanes specialised — lane a finished the production
-// removal, lane b the test conversion — and three rounds never converged:
-// each round kept ONE winner and the next round started every lane from it,
-// so the losing lane's half was thrown away every time. Now, after a round
-// whose pick the phase did not accept, a consolidator starts from the winner
-// and takes the other lane's work for exactly the plan items that lane met
-// and the winner did not (07's reduce step). Its commit goes through the round
-// checks with the lane fix loop, and a green one is the next round's base for
-// every lane. The rules below are pure; the conductor runs the agent and the
-// checks through `ConsolidationHost`.
-
-/** True when a phase combines its lanes: it runs two or more lanes and its
- * plan did not say `#+TT_CONSOLIDATE: off`. A single-worker phase never
- * consolidates. */
-export function consolidationEnabled(contract: Pick<PhaseContract, "workers" | "consolidate">): boolean {
-  return isLaneRound(contract) && contract.consolidate !== false;
-}
-
-/** What one consolidation does: start from the round's winner and take each
- * listed lane's work for its listed items. */
-export interface ConsolidationPlan {
-  round: number;
-  winner: { lane: string; sha: string };
-  takes: ConsolidationTake[];
-}
-
-/** The trigger rule. A round that picked a winner (and whose pick was not
- * rejected as a regression) consolidates when another PASSING lane met a plan
- * item the winner did not — met meaning a strict majority of the seats said
- * `met` (or `fits` for an A), `laneMetItems`'s rule. Each such item is taken
- * once, from the first lane (in lane order) that met it. Undefined when no
- * lane met anything the winner lacks: nothing changes. Derived from the round
- * record alone, so it replays after a restart. The caller decides that the
- * phase is repairing (a round is only consolidated once its pick was not
- * accepted). */
-export function consolidationPlan(
-  round: RoundRecord | undefined,
-  itemIds: readonly string[],
-  seatCount: number,
-): ConsolidationPlan | undefined {
-  if (!round?.picked || round.regressed || itemIds.length === 0) return undefined;
-  const picked = round.picked;
-  const winner = round.candidates.find((c) => c.lane === picked.lane && c.sha === picked.sha);
-  if (!winner) return undefined;
-  const winnerMet = laneMetItems(winner, itemIds, seatCount);
-  const taken = new Set<string>();
-  const takes: ConsolidationTake[] = [];
-  for (const c of passingCandidates(round)) {
-    if (c.lane === picked.lane) continue;
-    const met = laneMetItems(c, itemIds, seatCount);
-    const items = itemIds.filter((id) => met.has(id) && !winnerMet.has(id) && !taken.has(id));
-    if (items.length === 0) continue;
-    for (const id of items) taken.add(id);
-    takes.push({ lane: c.lane, sha: c.sha as string, items });
-  }
-  return takes.length > 0 ? { round: round.round, winner: { lane: picked.lane, sha: picked.sha }, takes } : undefined;
-}
-
-/** The seats' evidence that one candidate met one item: `<seat>: <evidence>`
- * for each seat whose verdict was `met` (or `fits`), in `seats` order when
- * given (reviews are recorded in the order they arrived). The consolidator's
- * prompt quotes it so it knows where the work it takes lives. */
-export function itemEvidence(candidate: LaneCandidateRecord, id: string, seats?: readonly string[]): string[] {
-  const out: string[] = [];
-  const rank = (seat: string) => (seats && seats.includes(seat) ? seats.indexOf(seat) : Number.MAX_SAFE_INTEGER);
-  const reviews = [...(candidate.reviews ?? [])].sort((a, b) => rank(a.seat) - rank(b.seat));
-  for (const r of reviews) {
-    const item = (r.review.items ?? []).find((i) => i.id === id);
-    const arch = (r.review.arch ?? []).find((a) => a.id === id);
-    const hit = item?.verdict === "met" ? item : arch?.verdict === "fits" ? arch : undefined;
-    if (hit) out.push(`${r.seat}: ${hit.evidence}`);
-  }
-  return out;
-}
-
-/** Base selection: the commit every lane of the round after `beforeRound`'s
- * last pick starts from, when that pick was consolidated — the latest picked
- * round (before `beforeRound`) whose consolidation passed its checks and
- * started from that very pick. A round that picked no lane in between does
- * not change it (its lanes started from the same consolidated base). Undefined
- * when the latest pick was not consolidated, its consolidation failed, or the
- * pick regressed: the caller keeps today's base (the winner, or the best
- * candidate). */
-export function consolidatedBase(rounds: readonly RoundRecord[] | undefined, beforeRound = Number.POSITIVE_INFINITY): string | undefined {
-  let latest: RoundRecord | undefined;
-  for (const r of rounds ?? []) {
-    if (r.round >= beforeRound || !r.picked) continue;
-    if (!latest || r.round > latest.round) latest = r;
-  }
-  if (!latest || latest.regressed) return undefined;
-  const c = latest.consolidated;
-  return c?.ok && typeof c.sha === "string" && c.sha.length > 0 && c.from === latest.picked!.sha ? c.sha : undefined;
-}
-
-/** Plan 07c (D4.7): the fix round that repairs `beforeRound`'s predecessor,
- * when its merged candidate exists: the latest picked round before
- * `beforeRound` whose fix step produced a candidate, and only when no round
- * lies between it and `beforeRound`. Only the round IMMEDIATELY after the
- * fixed round is a single-lane round on that candidate, checked from the fix
- * round's base. A later round never replays it (packet X, B1): once a round
- * ran on the candidate and picked nothing, the next is today's two-lane
- * round from today's base. Undefined when the latest pick was not fixed, its
- * fixers all failed, the pick regressed, or a round ran since. */
-export function fixRoundCandidate(
-  rounds: readonly RoundRecord[] | undefined,
-  beforeRound = Number.POSITIVE_INFINITY,
-): { candidate: string; base: string } | undefined {
-  let latest: RoundRecord | undefined;
-  for (const r of rounds ?? []) {
-    if (r.round >= beforeRound || !r.picked) continue;
-    if (!latest || r.round > latest.round) latest = r;
-  }
-  if (!latest || latest.regressed) return undefined;
-  const fixedRound = latest.round;
-  if ((rounds ?? []).some((r) => r.round > fixedRound && r.round < beforeRound)) return undefined;
-  const fixed = latest.fixed;
-  if (!fixed || typeof fixed.candidate !== "string" || fixed.candidate.length === 0) return undefined;
-  return { candidate: fixed.candidate, base: fixed.base };
-}
-
-/** 07 (reduce by facts, G2): true when `round` ran on a fix round's merged
- * candidate — the round right after a fixed round. The regression guard never
- * undoes such a round's pick: the fixers repaired points from the same base,
- * and an item a seat now marks unmet is a point for the next fix round, not a
- * reason to restart every lane from an older candidate (exex 01b3p1, run
- * cb38791b: ITEMS_REGRESSED threw away a green fix round that added every
- * missing test). */
-export function isFixRound(rounds: readonly RoundRecord[] | undefined, round: number): boolean {
-  return fixRoundCandidate(rounds, round) !== undefined;
-}
-
 /** How a consolidated commit is named in the views: `C2-a+b` (round 2's
  * winner a, with lane b's items). */
 export function consolidatedLabel(round: number, winnerLane: string, takes: readonly ConsolidationTake[]): string {
@@ -691,126 +648,4 @@ export function latestConsolidationLine(rounds: readonly RoundRecord[] | undefin
   const from = list.find((r) => r.round < latest.round && r.consolidated?.ok && r.consolidated.sha === latest.base);
   const line = from ? consolidationLine(from) : undefined;
   return line ? `round ${latest.round} starts from ${line}` : undefined;
-}
-
-/** Everything `runConsolidation` asks the conductor to do. */
-export interface ConsolidationHost {
-  /** Run the consolidator from the winner and freeze its commit, or say why
-   * it produced none. */
-  build(): Promise<LaneBuild>;
-  /** The round checks on the consolidated commit, under the machine-wide
-   * lock, exactly as a lane candidate's. */
-  check(sha: string): Promise<LaneCheck>;
-  /** The consolidator fixes its own red commit (its session, its worktree),
-   * like `LaneHost.fixLane`; no sha means it could not. */
-  fix(sha: string, failure: string): Promise<LaneBuild>;
-  stopRequested?(): boolean;
-}
-
-export interface ConsolidationOutcome {
-  ok: boolean;
-  /** The green consolidated commit. */
-  sha?: string;
-  /** Why the consolidation failed; the next round starts from the winner. */
-  note?: string;
-  fixes: number;
-  /** What the consolidator says it changed beyond the taken work. */
-  added?: string[];
-  /** Plan 07c (C3): the consolidator's/fixer's own decision disclosures, so a
-   * fix round can carry them onto the merged candidate. */
-  disclosures?: DecisionDisclosure[];
-  /** Plan 07c (C3): the build changed nothing on the base (no commit), yet its
-   * submission is kept — the one failed outcome whose disclosures still
-   * reach the merged candidate. */
-  unchanged?: boolean;
-  /** The owner stopped the run mid-way: nothing is recorded. */
-  stopped?: boolean;
-}
-
-/** The combine step's sequence: build, check, and the lane's bounded fix loop
- * (at most MAX_LANE_FIXES fixes, ending early on a fix that changes nothing).
- * A consolidation that produced nothing or stayed red is a failure with its
- * reason — the caller then keeps today's behaviour (the next round starts
- * from the winner). */
-export async function runConsolidation(host: ConsolidationHost): Promise<ConsolidationOutcome> {
-  if (host.stopRequested?.()) return { ok: false, fixes: 0, stopped: true };
-  let build: LaneBuild;
-  try {
-    build = await host.build();
-  } catch (err) {
-    build = { lane: "consolidator", note: `the consolidator failed: ${errorNote(err)}` };
-  }
-  if (host.stopRequested?.()) return { ok: false, fixes: 0, stopped: true };
-  if (typeof build.sha !== "string" || build.sha.length === 0) {
-    return {
-      ok: false,
-      fixes: 0,
-      note: build.note ?? "the consolidator produced no commit",
-      ...submitted(build),
-      ...(build.unchanged === true ? { unchanged: true } : {}),
-    };
-  }
-  const check = async (sha: string): Promise<LaneCheck> => {
-    try {
-      return await host.check(sha);
-    } catch (err) {
-      return { ok: false, note: `the check could not run: ${errorNote(err)}` };
-    }
-  };
-  let result = await check(build.sha);
-  let fixes = 0;
-  let fixNote: string | undefined;
-  while (!result.ok && fixes < MAX_LANE_FIXES && !host.stopRequested?.()) {
-    fixes += 1;
-    let fixed: LaneBuild;
-    try {
-      fixed = await host.fix(build.sha!, result.note ?? "the checks failed");
-    } catch (err) {
-      fixed = { lane: "consolidator", note: `the fix attempt failed: ${errorNote(err)}` };
-    }
-    if (typeof fixed.sha !== "string" || fixed.sha.length === 0 || fixed.sha === build.sha) {
-      fixNote = fixed.note;
-      build = { ...build, disclosures: unionDisclosures(build.disclosures, fixed.disclosures) };
-      break;
-    }
-    build = { ...fixed, added: fixed.added ?? build.added, disclosures: unionDisclosures(build.disclosures, fixed.disclosures) };
-    result = await check(build.sha!);
-  }
-  if (host.stopRequested?.()) return { ok: false, fixes, stopped: true };
-  if (result.ok) return { ok: true, sha: build.sha, fixes, ...submitted(build) };
-  return {
-    ok: false,
-    fixes,
-    note: `its commit ${build.sha!.slice(0, 7)} failed the round checks: ${result.note ?? "a check command failed"}${fixNote ? ` (${fixNote})` : ""}`,
-    ...submitted(build),
-  };
-}
-
-/** Plan 07c (C3): what a consolidator's or fixer's submissions reported —
- * kept on every outcome, a failed one included, so a fixer's disclosures are
- * never lost with its commit. */
-function submitted(build: LaneBuild): Pick<ConsolidationOutcome, "added" | "disclosures"> {
-  return {
-    ...(build.added ? { added: build.added } : {}),
-    ...(build.disclosures && build.disclosures.length > 0 ? { disclosures: build.disclosures } : {}),
-  };
-}
-
-/** Plan 07c (C3): a fixer's decisions across its submissions (its build and
- * each fix), in order, each once — a later submission that leaves out an
- * earlier decision does not drop it. */
-function unionDisclosures(
-  earlier: readonly DecisionDisclosure[] | undefined,
-  later: readonly DecisionDisclosure[] | undefined,
-): DecisionDisclosure[] | undefined {
-  if (!earlier && !later) return undefined;
-  const seen = new Set<string>();
-  const out: DecisionDisclosure[] = [];
-  for (const d of [...(earlier ?? []), ...(later ?? [])]) {
-    const key = JSON.stringify(d);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(d);
-  }
-  return out;
 }

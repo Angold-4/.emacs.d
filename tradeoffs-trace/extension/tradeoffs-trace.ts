@@ -588,7 +588,8 @@ class RunSocketClient {
       | "submit_round_panel_votes"
       | "submit_brief"
       | "submit_pick_vote"
-      | "curate_entries",
+      | "curate_entries"
+      | "submit_domain_review",
     args: unknown,
     timeoutMs = 60000,
   ): Promise<SubmitReply> {
@@ -635,7 +636,7 @@ export default function (pi: ExtensionAPI) {
   const guardConfig = readGuardConfigFromEnv();
   let activeTools: string[] = [];
   const role =
-    (readEnv("TT_ROLE") as "worker" | "reviewer" | "evaluator" | "panel" | "curator" | "picker" | undefined) ?? "worker";
+    (readEnv("TT_ROLE") as "worker" | "reviewer" | "evaluator" | "panel" | "curator" | "picker" | "domain-review" | undefined) ?? "worker";
   const accepted = new Set<string>();
   // A reviewer's turn 2 starts with the first agent_start after its
   // discovery (turn 1) was accepted; before that, turn 1 is still running.
@@ -657,6 +658,8 @@ export default function (pi: ExtensionAPI) {
     // Plan 05j: the curator owes no submission; an empty proposals list is a
     // valid pass and settling without one is allowed.
     if (role === "curator") return undefined;
+    // 07g1: a stateless domain review owes exactly one review.
+    if (role === "domain-review") return accepted.has("submit_domain_review") ? undefined : "submit_domain_review";
     if (role === "evaluator") {
       // Decision briefs: the brief-writing pass ends when the conductor has a
       // brief for every item it listed, so the agent owes no single submission
@@ -699,6 +702,8 @@ export default function (pi: ExtensionAPI) {
       "You have not called submit_round_panel_votes yet. Return one {messageId, verdict: 'keep'|'drop', reason} for EVERY item the prompt listed, in one call.",
     submit_pick_vote:
       "You have not called submit_pick_vote yet. Vote for exactly one candidate of the round, by lane, with a one-line why.",
+    submit_domain_review:
+      "You have not called submit_domain_review yet. Judge EVERY point of your domain with { pointId, fixed, why, anchors } and return quality { ok, problems } and notes.",
   };
 
   pi.on("session_start", async () => {
@@ -805,7 +810,8 @@ export default function (pi: ExtensionAPI) {
       | "submit_panel_vote"
       | "submit_round_panel_votes"
       | "submit_brief"
-      | "curate_entries",
+      | "curate_entries"
+      | "submit_domain_review",
     args: unknown,
     markAccepted = true,
   ) {
@@ -1035,6 +1041,30 @@ export default function (pi: ExtensionAPI) {
         if (!valid.ok) return { isError: true, content: [{ type: "text" as const, text: `invalid arguments: ${valid.reason}` }] };
       }
       return submitTool("curate_entries", params, false);
+    },
+  });
+
+  pi.registerTool({
+    name: "submit_domain_review",
+    label: "Submit Domain Review",
+    description:
+      "Judge every point of one domain on one commit: { points: [{ pointId, fixed, why, anchors? }], quality: { ok, problems? }, notes? }. Read only; never commit or edit.",
+    promptSnippet: "Judge every point of your domain",
+    parameters: Type.Object({
+      points: Type.Array(
+        Type.Object({
+          pointId: Type.String(),
+          fixed: Type.Boolean(),
+          why: Type.String(),
+          anchors: Type.Optional(Type.Array(Type.String())),
+        }),
+      ),
+      quality: Type.Object({ ok: Type.Boolean(), problems: Type.Optional(Type.Array(Type.String())) }),
+      notes: Type.Optional(Type.Array(Type.String())),
+    }),
+    async execute(_toolCallId, params) {
+      params = dropEmptyStrings(params) as typeof params;
+      return submitTool("submit_domain_review", params);
     },
   });
 

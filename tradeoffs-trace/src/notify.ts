@@ -9,6 +9,11 @@
 //   * a wait still unbroken `reminderMs` later (default 30 min) appends one
 //     more record and runs the notifier once more, and never again for that
 //     wait;
+//   * 07e (E1): a wait given `everyMs` (the owner-wait bound) also reminds
+//     once per bound, counted from the wait's start and independent of the
+//     `reminderMs` reminder; one call appends at most one record, so a bound
+//     that falls due together with the ordinary reminder is one record — and
+//     the call still reports the bound in `NotifyResult.bound`;
 //   * the notifier is best-effort: a command that fails, times out or cannot
 //     be spawned is handed to `onError` and otherwise ignored, so a broken
 //     notifier can never stop a run or the scheduler.
@@ -17,7 +22,8 @@
 // restarts: it is derived from the state that created the wait (the newest
 // open owner request, or the blocked reason), so a restart that folds the
 // same state back and calls `notify` again sees the record already on disk
-// and does nothing. `reminder: true` marks the single allowed reminder.
+// and does nothing. `reminder: true` marks every record after the first, the
+// single `reminderMs` reminder or a bound reminder alike.
 //
 // This module is pure I/O with no conductor state: `conductor.ts` and
 // `program.ts` both call it, and `core/*` never does.
@@ -32,8 +38,8 @@ export const NOTIFY_REMINDER_MS = 30 * 60_000;
 /** One line of `notifications.jsonl`. `kind` and `id` name the run or the
  * program; `node` is set for a run that is one node of a program; `reason`
  * is the one-line why. `waitKey` is internal to dedup (it is still written,
- * so the file explains itself) and `reminder` marks the 30-minute second
- * notification. */
+ * so the file explains itself) and `reminder` marks any record after the
+ * wait's announcement (the 30-minute reminder or a bound reminder). */
 export interface NotificationRecord {
   id: string;
   kind: "run" | "program";
@@ -64,6 +70,11 @@ export interface NotifyOptions {
   env?: NodeJS.ProcessEnv;
   /** Override the 30-minute reminder window (tests). */
   reminderMs?: number;
+  /** 07e (E1): when set, the wait also reminds the owner every `everyMs` —
+   * the owner-wait bound. Unlimited while the wait stays open; each bound
+   * reminder is a `reminder: true` record and the call that writes it reports
+   * it in `NotifyResult.bound`. */
+  everyMs?: number;
   /** How long the notifier may run before it is killed and logged. */
   timeoutMs?: number;
   /** Called once with a message when the notifier fails or times out. Never
@@ -143,16 +154,57 @@ export function waitReason(phase: {
   return open.length === 1 ? reason : `${open.length} open: ${reason}`;
 }
 
+/** What one `notify` call did: the record it appended (`"initial"`,
+ * `"reminder"` or `"none"`) and, when `opts.everyMs` is set, the owner-wait
+ * bound this call reports. */
+export interface NotifyResult {
+  appended: "initial" | "reminder" | "none";
+  /** 07e (E2/A2): set when a bound's reminder is due now and this call is the
+   * one that reports it. It is true whether the appended record is the bound's
+   * own reminder or the ordinary reminder landing on the same lattice point,
+   * so the caller records `BOUND_REACHED` from this and never has to infer it
+   * from what the append turned out to be. */
+  bound?: { limitMs: number; elapsedMs: number };
+}
+
 /** Append a record and run the notifier if this wait has not been announced
- * yet, or if it is due its one reminder. Returns what (if anything)
- * happened: `"initial"`, `"reminder"` or `"none"`. Never throws. */
-export function notify(entry: NotifyEntry, opts: NotifyOptions): "initial" | "reminder" | "none" {
+ * yet, is due its one reminder, or is due a bound reminder. Never throws. */
+export function notify(entry: NotifyEntry, opts: NotifyOptions): NotifyResult {
   const now = opts.now?.() ?? Date.now();
   const reminderMs = opts.reminderMs ?? NOTIFY_REMINDER_MS;
+  const everyMs = opts.everyMs;
   const previous = readNotifications(opts.root).filter((r) => r.waitKey === entry.waitKey);
+  const first = previous[0];
   const last = previous[previous.length - 1];
-  if (last?.reminder) return "none";
-  if (last && now - Date.parse(last.at) < reminderMs) return "none";
+  // Today's rule, unchanged: one announcement, then exactly one reminder
+  // `reminderMs` later, never again for that wait (an unreadable timestamp
+  // still counts as due, as it did before).
+  const reminderDue = last === undefined || (!last.reminder && !(now - Date.parse(last.at) < reminderMs));
+  // 07e (E1/E2): the owner-wait bound keeps its OWN cadence, counted from the
+  // wait's start (its first record) and gated by the timestamp of the last
+  // record appended, so the ordinary 30-minute reminder can neither postpone
+  // the first bound (270 instead of 240 minutes at the defaults) nor suppress
+  // one when the two intervals coincide: a record appended at the same moment
+  // serves both, and this call still reports the bound. One call appends at
+  // most one record, so a late poll cannot append twice for the same bound.
+  let boundDue = false;
+  let bound: NotifyResult["bound"];
+  if (everyMs !== undefined && first !== undefined) {
+    const start = Date.parse(first.at);
+    if (Number.isFinite(start)) {
+      const elapsed = now - start;
+      const recordedAt = last === undefined ? Number.NaN : Date.parse(last.at);
+      const served = Number.isFinite(recordedAt) ? Math.floor((recordedAt - start) / everyMs) : 0;
+      if (Math.floor(elapsed / everyMs) > served) {
+        boundDue = true;
+        bound = { limitMs: everyMs, elapsedMs: Math.max(everyMs, elapsed) };
+      }
+    } else if (!(now - Date.parse(last!.at) < everyMs)) {
+      boundDue = true;
+      bound = { limitMs: everyMs, elapsedMs: everyMs };
+    }
+  }
+  if (!reminderDue && !boundDue) return { appended: "none" };
   const record: NotificationRecord = {
     ...entry,
     at: new Date(now).toISOString(),
@@ -164,12 +216,13 @@ export function notify(entry: NotifyEntry, opts: NotifyOptions): "initial" | "re
     // No record on disk means the next poll would see an unseen waitKey and
     // re-enter here, so failing to append must NOT fall through to the
     // notifier: that would run TT_NOTIFY_COMMAND on every inbox poll. Log it
-    // and report nothing done; the wait is already unannounceable.
+    // and report nothing done; the wait is already unannounceable, and a due
+    // bound is retried on the next poll because nothing was served.
     fail(opts, `notifications.jsonl: ${String((err as Error)?.message ?? err)}`);
-    return "none";
+    return { appended: "none" };
   }
   runNotifier(record, opts);
-  return last ? "reminder" : "initial";
+  return { appended: last ? "reminder" : "initial", ...(bound ? { bound } : {}) };
 }
 
 /** How the notifier is launched: an argv (no shell, so the record's own text

@@ -168,12 +168,6 @@ function escalate(itemId: string, reason: string, evidence: TriageEvidence): Dis
  * I/O, no model.
  */
 export function disposition(record: TriageRecord, evidence: TriageEvidence = {}): Disposition {
-  // An unclassified record escalates: the evaluator's impact class is what
-  // the rule reads, and guessing one is how a wrong value would silently
-  // become a trade-off.
-  if (evidence.unclassified === true || evidence.classified === false) {
-    return escalate(record.itemId, isNonEmpty(evidence.reason) ? evidence.reason : "the evaluator gave no impact classification", evidence);
-  }
   // A discovery that arrived after the round's ballot/evaluation window: the
   // owner ruled it must be visible but non-blocking, never dropped. The
   // DECISION lives here, not in the conductor; the conductor only records the
@@ -193,6 +187,34 @@ export function disposition(record: TriageRecord, evidence: TriageEvidence = {})
       isNonEmpty(evidence.reason) ? evidence.reason : "the original of this duplicate has no disposition",
       evidence,
     );
+  }
+  // Plan 07f (A2, exex 01b3p2 B-9/B-11): a discovered decision without an
+  // impact class is a TRADE-OFF settled by the seats' vote, never an owner
+  // request. Its choice, alternative and why are its own record's fields, so
+  // nothing is invented. (A decision with no ballots at all still escalates:
+  // there is no vote to settle it.)
+  if (record.source === "decision" && evidence.noBallots === true) {
+    return escalate(record.itemId, isNonEmpty(evidence.reason) ? evidence.reason : "a discovered decision received no ballots", evidence);
+  }
+  // A failed vote whose outcome would change the output is still an exception
+  // the owner decides, even when the evaluator left the decision unclassified:
+  // there is no passing vote to settle it.
+  if (record.source === "decision" && evidence.failedVoteChangesOutput !== true && (evidence.unclassified === true || evidence.classified === false)) {
+    if (isNonEmpty(evidence.chosen) && isNonEmpty(evidence.alternative) && isNonEmpty(evidence.why)) {
+      return { kind: "tradeoff", chosen: evidence.chosen, alternative: evidence.alternative, why: evidence.why };
+    }
+    return {
+      kind: "tradeoff",
+      chosen: "settled by the seats' vote",
+      alternative: "send it to the owner",
+      why: "a discovered decision without an impact class is a trade-off the seats vote on",
+    };
+  }
+  // An unclassified record escalates: the evaluator's impact class is what
+  // the rule reads, and guessing one is how a wrong value would silently
+  // become a trade-off.
+  if (evidence.unclassified === true || evidence.classified === false) {
+    return escalate(record.itemId, isNonEmpty(evidence.reason) ? evidence.reason : "the evaluator gave no impact classification", evidence);
   }
   // A wrong value, offer or output on a reachable path is a fix, whatever the
   // reviewer's label, whatever round it was raised in, and whatever the round
@@ -233,9 +255,6 @@ export function disposition(record: TriageRecord, evidence: TriageEvidence = {})
   // waits for the request.
   if (evidence.noBallots === true) {
     return escalate(record.itemId, isNonEmpty(evidence.reason) ? evidence.reason : "a discovered decision received no ballots", evidence);
-  }
-  if (evidence.failedVoteChangesOutput === true) {
-    return escalate(record.itemId, isNonEmpty(evidence.reason) ? evidence.reason : "a failed vote would change the output", evidence);
   }
   // A contract record that does not contradict the golden source or the plan
   // still needs the owner: it is not a judgement call.
@@ -674,9 +693,10 @@ export function evidenceForDecision(decision: Decision, phase: PhaseState, voteF
     wrongOutputConfirmed: check?.verdict === "confirmed" && impact === "wrong-output",
     contradictsGolden: cited,
     contradictsPlan: planCited || (contractImpact && !hasGolden),
-    chosen: check?.chosen,
-    alternative: check?.alternative,
-    why: check?.why,
+    chosen: check?.chosen ?? (classified ? undefined : decision.choice),
+    alternative:
+      check?.alternative ?? (classified ? undefined : decision.alternatives?.[0]?.option ?? "send it to the owner"),
+    why: check?.why ?? (classified ? undefined : decision.whyItMatters),
     reason: planCited
       ? `the decision cites a plan item or an in-force owner directive: ${check?.evidence ?? ""}`
       : contractImpact && hasGolden && !cited

@@ -587,9 +587,9 @@ test("plan 06b: the evaluator's substantive re-check overturns a review-only maj
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
       ],
     }),
-    // R2 is review-only: all three seats judge it unmet, so only the
-    // evaluator's own re-check can contradict the majority.
-    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: "unmet" })),
+    // R2 is review-only: M and A judge it unmet, B met. This is a split
+    // majority, not a unanimous verdict protected by 07g2 R7.
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: reviewer === "B" ? "met" : "unmet" })),
     evaluatorScriptFor: () => ({
       hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
       steps: [
@@ -615,6 +615,73 @@ test("plan 06b: the evaluator's substantive re-check overturns a review-only maj
     assert.equal(setup.conductor.state.phase.phase, "DONE", "the contradicted majority did not block");
     assert.ok(!setup.conductor.state.phase.findings.some((f) => f.itemId === "R2"), "no finding is raised for the contradicted item");
     assert.ok((setup.conductor.state.phase.itemChecks ?? []).some((c) => c.itemId === "R2" && c.verdict === "contradicted"));
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("an evaluator re-check never overturns a unanimous seat verdict", async () => {
+  // R7/A3: every seat marked R1 met. The evaluator contradicts R1 on the
+  // finding pass (R2 is the exception that starts the session: M met, A
+  // partial, B unmet), and the unanimous R1 verdict must stand — the
+  // disagreement is recorded for the lead, never applied as an overturn.
+  const setup = await setupConductor({
+    items: ITEMS,
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: WRITE_ROUNDS },
+        { kind: "call-submit", tool: "submit_coverage", args: coverage() },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => {
+      const verdicts = reviewer === "A" ? { R2: "partial" } : reviewer === "B" ? { R2: "unmet" } : {};
+      return reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review(verdicts));
+    },
+    evaluatorScriptFor: () => ({
+      hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_evaluation",
+          args: {
+            evaluations: [],
+            itemChecks: [
+              { id: "R1", verdict: "contradicted", evidence: "src/core/rounds.ts:1 does not implement R1" },
+              { id: "R2", verdict: "confirmed", evidence: "src/core/rounds.ts:1" },
+              { id: "C1", verdict: "confirmed", evidence: "src/core/rounds.ts:1" },
+              { id: "A1", verdict: "confirmed", evidence: "src/core/rounds.ts:1" },
+            ],
+          },
+        },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () => readEvents(setup.runDir).some((r) => r.kind === "event" && (r.event as { type?: string }).type === "LEAD_CALLED"),
+      120_000,
+      50,
+      setup.runDir,
+    );
+    const phase = setup.conductor.state.phase;
+    assert.deepEqual(
+      (phase.overturns ?? []).filter((o) => o.id === "R1"),
+      [],
+      "no evaluator re-check overturns the unanimous R1 verdict",
+    );
+    const lead = readEvents(setup.runDir).find((r) => r.kind === "event" && (r.event as { type?: string }).type === "LEAD_CALLED");
+    assert.match(
+      JSON.stringify((lead?.event as { reasons?: string[] }).reasons ?? []),
+      /R1 stays met: the evaluator's re-check disagrees with the unanimous seats/,
+      "the disagreement is recorded as an exception for the lead",
+    );
+    assert.ok((phase.itemChecks ?? []).some((c) => c.itemId === "R1" && c.verdict === "contradicted"), "the re-check itself is kept");
   } finally {
     await teardown(setup);
   }
@@ -730,7 +797,9 @@ test("plan 06b: a review-only majority unmet item with no evaluator item check i
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
       ],
     }),
-    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: "unmet" })),
+    // Two unmet votes and one met: a genuine split exception, not the
+    // retired unanimous-item evaluator re-check (§7a).
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: reviewer === "A" ? "met" : "unmet" })),
     evaluatorScriptFor: () => ({
       hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
       steps: [
@@ -766,7 +835,7 @@ test("plan 06b: an evaluator item check with an invalid anchor never overturns a
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
       ],
     }),
-    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: "unmet" })),
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: reviewer === "A" ? "met" : "unmet" })),
     evaluatorScriptFor: () => ({
       hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
       steps: [
@@ -810,7 +879,7 @@ test("plan 06c: a confirmed evaluator item check with invalid anchors is recorde
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
       ],
     }),
-    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: "unmet" })),
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: reviewer === "A" ? "met" : "unmet" })),
     // Plan 06k2 (A2): a `confirmed` check whose anchor does not resolve is
     // re-asked ONCE for a repo-relative path; only after that is it recorded
     // `unchecked by evaluator`, never as a confirmation. The script supplies
@@ -922,7 +991,7 @@ test("plan 06b: an evaluator that times out still records the item blocker as un
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
       ],
     }),
-    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: "unmet" })),
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: reviewer === "A" ? "met" : "unmet" })),
     // The evaluator settles without ever submitting: its dispatch times out.
     evaluatorScriptFor: () => ({ hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator }, steps: [] }),
   });
@@ -951,8 +1020,10 @@ test("plan 06b: an item blocker is never raised without an evaluator item check"
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
       ],
     }),
-    // R2 is only partial: it blocks, and ODP-2 requires a check even then.
-    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: "partial" })),
+    // Keep the legacy test name, but exercise its remaining §7a duty: a
+    // genuinely split item owes a check even when the majority is partial.
+    // A unanimous partial vote is mechanical and must not fabricate one.
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: reviewer === "A" ? "met" : "partial" })),
     evaluatorScriptFor: () => ({
       hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
       steps: [
@@ -1344,10 +1415,11 @@ test("plan-items: a met verdict citing a line that does not exist is refused; an
   }
 });
 
-test("plan 06c: a thin unanimous met verdict is sent to the evaluator as an item check and never withdrawn by code", async () => {
-  const promptLog = `/tmp/tt-06c-thin-${process.pid}-${Date.now()}.txt`;
+test("plan 07f (A-2): a thin unanimous met verdict is mechanically accepted and starts no evaluator", async () => {
+  const promptLog = `/tmp/tt-07f-thin-${process.pid}-${Date.now()}.txt`;
   // Every seat judges every item met/fits with a single anchor (the review()
-  // default), so each item is a thin unanimous met/fits.
+  // default), so each item is thin — but the seats are unanimous and the
+  // anchor resolves, so code decides it without an evaluator session.
   const setup = await setupConductor({
     items: ITEMS,
     phaseChecks: [CHECK_OUTPUT],
@@ -1363,69 +1435,26 @@ test("plan 06c: a thin unanimous met verdict is sent to the evaluator as an item
       ],
     }),
     reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({})),
-    // The evaluator is asked to audit the thin met items; it contradicts R2
-    // with valid anchors, which overturns the met verdict.
     evaluatorScriptFor: () => ({
       hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
-      steps: [
-        {
-          kind: "call-submit",
-          tool: "submit_evaluation",
-          args: {
-            evaluations: [],
-            itemChecks: [
-              { id: "R2", verdict: "contradicted", evidence: "src/core/rounds.ts:1 does not implement R2" },
-              { id: "R1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
-              { id: "C1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
-              { id: "A1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
-            ],
-          },
-        },
-      ],
+      steps: [{ kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [] } }],
     }),
   });
   try {
     await setup.conductor.start();
-    // The audit is listed in the evaluator's prompt.
-    await waitFor(() => fs.existsSync(promptLog) && fs.readFileSync(promptLog, "utf8").includes("Plan-item re-check"), 90_000, 50, setup.runDir);
-    const prompts = fs.readFileSync(promptLog, "utf8");
-    assert.match(prompts, /Plan-item re-check/);
-    assert.match(prompts, /- R2 .*thin unanimous evidence/, "the thin met R2 is an owed item check");
-    // The evaluator's contradiction overturns the thin met verdict (it is the
-    // evaluator's check, never the code, that withdrew it).
-    await waitFor(() => (setup.conductor.state.phase.overturns ?? []).some((o) => o.id === "R2"), 90_000, 50, setup.runDir);
-    const overturn = (setup.conductor.state.phase.overturns ?? []).find((o) => o.id === "R2")!;
-    assert.equal(overturn.effect, "flip");
-    assert.match(overturn.reason, /thin met verdict/);
-    assert.ok((setup.conductor.state.phase.itemChecks ?? []).some((c) => c.itemId === "R2" && c.verdict === "contradicted"));
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
+    const events = readEvents(setup.runDir).filter((r) => r.kind === "event").map((r) => (r.event as { type?: string }).type);
+    assert.ok(events.includes("EVALUATION_SKIPPED"), "no exception: the mechanical verdict stands");
+    assert.ok(
+      !readEvents(setup.runDir).some(
+        (r) => r.kind === "intent" && (r.event as { agentId?: string }).agentId?.startsWith("evaluator-"),
+      ),
+      "thin evidence alone starts no evaluator",
+    );
+    assert.deepEqual(setup.conductor.state.phase.overturns ?? [], [], "code never withdraws a thin met verdict");
   } finally {
     await teardown(setup);
     fs.rmSync(promptLog, { force: true });
-  }
-
-  // Control: with no contradiction the thin met verdict is never withdrawn by
-  // code — the phase reaches DONE with R2 still met.
-  const control = await setupConductor({
-    items: ITEMS,
-    phaseChecks: [CHECK_OUTPUT],
-    stubReviews: false,
-    deadlines: FAST,
-    workerScript: () => ({
-      hello: defaultWorkerHello(),
-      steps: [
-        { kind: "call-sh", command: WRITE_ROUNDS },
-        { kind: "call-submit", tool: "submit_coverage", args: coverage() },
-        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
-      ],
-    }),
-    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({})),
-  });
-  try {
-    await control.conductor.start();
-    await waitFor(() => control.conductor.state.phase.phase === "DONE", 120_000, 50, control.runDir);
-    assert.deepEqual(control.conductor.state.phase.overturns ?? [], [], "code never withdraws a thin met verdict");
-  } finally {
-    await teardown(control);
   }
 });
 
@@ -2183,7 +2212,7 @@ function anchorCoverage() {
 }
 
 /** One conductor run: the candidate writes the given tracked files, the
- * reviewers mark R1 unmet (so the evaluator owes an item check), and the
+ * reviewers split on R1 (two unmet, one met, so an exception is owed), and the
  * evaluator's check cites `tests/config_files.rs:312`. */
 async function runAnchorScenario(fileCount: 1 | 2): Promise<{ check: { verdict?: string; evidence?: string } | undefined; events: ReturnType<typeof readEvents> }> {
   const write =
@@ -2207,6 +2236,7 @@ async function runAnchorScenario(fileCount: 1 | 2): Promise<{ check: { verdict?:
     reviewerScriptFor: (reviewer, state) => ({
       hello: defaultReviewerHello(),
       steps: [
+        { kind: "call-tool", tool: "read", args: { path: "crates/foo/tests/config_files.rs" } },
         { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
         { kind: "wait-for-prompt" },
         {
@@ -2219,7 +2249,7 @@ async function runAnchorScenario(fileCount: 1 | 2): Promise<{ check: { verdict?:
             contractVersion: state.phase.contract.contractVersion,
             correctionStatements: [],
             findingStatements: [],
-            items: [{ id: "R1", verdict: "unmet", evidence: "crates/foo/tests/config_files.rs:1 the review item is unmet" }],
+            items: [{ id: "R1", verdict: reviewer === "A" ? "met" : "unmet", evidence: "crates/foo/tests/config_files.rs:1 the split item needs an anchor ruling" }],
             arch: [],
           },
         },

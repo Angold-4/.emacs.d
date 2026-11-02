@@ -199,6 +199,17 @@ export function ownerCommandToEvent(command: OwnerCommand, commandId: string): E
       };
     case "miss":
       return { type: "MISS_RECORDED", recordId: command.recordId, sample: command.sample };
+    case "ruling":
+      return {
+        type: "RULING_RECORDED",
+        ruling: {
+          id: `RUL-${commandId}`,
+          text: command.text,
+          recordIds: command.recordIds,
+          ...(typeof command.candidate === "string" && command.candidate.trim().length > 0 ? { candidate: command.candidate.trim() } : {}),
+          by: "owner",
+        },
+      };
     case "steer":
     case "pause":
     case "resume":
@@ -439,6 +450,34 @@ export function normalizeDecisionViewCommand(raw: unknown, commandId: string): N
       if (b.recordId === "") return { ok: false, reason: "a miss command needs 'binding.recordId'" };
       const sample = typeof r.recordKind === "string" ? r.recordKind : undefined;
       return { ok: true, runId: b.runId, phaseId: b.phaseId, event: { type: "MISS_RECORDED", recordId: b.recordId, sample } };
+    }
+    case "ruling": {
+      // Plan 07f (A3, §3.3): one command rules on any finding or decision,
+      // whatever its kind, at once. The binding only needs the run and phase:
+      // a ruling is final when recorded and is not voted on.
+      if (typeof r.text !== "string" || r.text.trim().length === 0) {
+        return { ok: false, reason: "a ruling command needs a non-empty 'text'" };
+      }
+      const recordIds = Array.isArray(r.recordIds)
+        ? r.recordIds.filter((id): id is string => typeof id === "string" && id.length > 0)
+        : [];
+      if (recordIds.length === 0) return { ok: false, reason: "a ruling command needs 'recordIds' naming at least one record" };
+      return {
+        ok: true,
+        runId: b.runId,
+        phaseId: b.phaseId,
+        event: {
+          type: "RULING_RECORDED",
+          ruling: {
+            id: `RUL-${commandId}`,
+            text: r.text,
+            recordIds,
+            // 07g1b (R12): the structured candidate the repair builds on.
+            ...(typeof r.candidate === "string" && r.candidate.trim().length > 0 ? { candidate: r.candidate.trim() } : {}),
+            by: "owner",
+          },
+        },
+      };
     }
     default:
       return { ok: false, reason: `decision-view command type '${r.type}' is not a conductor-state command this phase applies` };

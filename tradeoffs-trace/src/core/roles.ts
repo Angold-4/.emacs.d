@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
  * tests. */
 export const PI_VERSION = "1.4.0";
 
-export type Role = "worker" | "reviewer" | "evaluator" | "panel" | "curator" | "picker";
+export type Role = "worker" | "reviewer" | "evaluator" | "panel" | "curator" | "picker" | "domain-review";
 
 /** tt 09 (change 3): the roles a MODEL is resolved for. The consolidator is
  * a worker by its tools (it edits a worktree and calls submit_phase), but it
@@ -127,6 +127,8 @@ export function planModelSelector(
       }
       return models.reviewer;
     }
+    // 07g1: the domain review is an evaluator duty and runs on its model.
+    if (role === "domain-review") return models.evaluator;
     if (role === "panel") {
       if (seat !== undefined) {
         const own = models.panelSeats?.[String(seat)];
@@ -174,6 +176,9 @@ export const ROLE_TOOLS: Record<Role, string[]> = {
   // and the candidate's diff, and returns a single `block`/`downgrade` vote
   // through `submit_panel_vote`.
   panel: ["read", "grep", "find", "ls", "submit_panel_vote", "submit_round_panel_votes"],
+  // 07g1: a fresh, stateless domain review. It judges each point of one
+  // domain on one commit; it reads only and never commits or edits.
+  "domain-review": ["read", "grep", "find", "ls", "submit_domain_review"],
 };
 
 /** The skeleton extension's own file, resolved relative to this module so

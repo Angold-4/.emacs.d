@@ -1,17 +1,23 @@
-// Plan 07c (design D4/D5): fix rounds. After a round whose pick the phase
-// did not accept, the open findings triaged `fix` — and the decisions the
-// seats voted down or vetoed — are grouped by their declared domain and one
-// fixer runs per domain, in parallel, from the same base. This module is the
-// ONE place that decides those tasks; the conductor only runs what it
-// returns. It is pure: no clock, no I/O, no model.
+// 07g1 (design A3): the fix-round task rule. A fix round takes POINTS only —
+// an open finding triaged `fix`, with the domain of the files it cites — and
+// groups them by domain, one fixer per domain. A decision the seats vetoed or
+// the evaluator triaged is never fixer work: it goes to the seats' vote or to
+// the owner. This module is the ONE place that decides those tasks; the
+// conductor only runs what it returns. It is pure: no clock, no I/O, no model.
 
 import { domainOf, whereKey, type Domain } from "./domains.ts";
+import { testNames } from "./test-names.ts";
 import type { Disposition } from "./triage.ts";
-import type { Ballot, Decision, DecisionClass, Finding, FindingFact } from "./types.ts";
+import type { Finding, FindingFact } from "./types.ts";
 
 /** Plan 07c (D4): the default `#+TT_FIXERS` — the most fixer tasks (one per
  * domain) a fix round may run. */
 export const DEFAULT_FIXERS = 4;
+
+/** 07g2 (A1): the default `#+TT_INTEGRATE_MAX` — how many attempts the
+ * integrate duty gets on one conflicted merge before the last domain is
+ * dropped to the next loop. */
+export const DEFAULT_INTEGRATE_MAX = 2;
 
 /** A finding as `fixTasks` reads it: the frozen finding plus its triage
  * disposition, when the evaluator has recorded one. A finding with no
@@ -21,189 +27,147 @@ export interface FixFinding extends Finding {
   disposition?: Disposition;
 }
 
-/** Fix packet Z: a decision bound to the picked candidate whose vote failed
- * or that the leader seat vetoed, as a fixer point. The seats already chose:
- * the fixer applies their alternative (or removes the vetoed change) and
- * decides nothing itself. It has no doneWhen — the re-vote on the next
- * candidate closes it. Built only by `decisionFixPoint`. */
-export interface DecisionFixPoint {
-  source: "decision";
-  id: string;
-  class: DecisionClass;
-  choice: string;
-  /** `vetoed`: the leader seat rejected it; `failed`: too few seats approved. */
-  outcome: "vetoed" | "failed";
-  domain?: string;
-  /** The plan item the decision is anchored to, when it names one. */
-  item?: string;
-  /** The dissent evidence path the domain was read from, when it was. */
-  where?: string;
-  /** One line per rejecting seat: `<seat>: <rationale> (evidence …)`. */
-  reasons: string[];
-  /** The alternative the seats recommend. */
-  alternative: string;
-  /** What the fixer must reach: the reasons plus the alternative. */
-  expected: string;
-}
-
-/** One point `fixTasks` reads: a finding or a voted-down decision. */
-export type FixPoint = FixFinding | DecisionFixPoint;
-
-export function isDecisionPoint(p: FixPoint): p is DecisionFixPoint {
-  return p.source === "decision";
-}
+/** One point `fixTasks` reads. Plan 07g1 (A3): a point is a finding; a
+ * decision is never fixer work. */
+export type FixPoint = FixFinding;
 
 /** One fixer task: one domain and the points it owns, in point order.
- * `findingIds` names every point (finding and decision ids alike); it is what
- * the fixer's brief names and what `ROUND_FIXED` records. */
+ * `findingIds` names every point; it is what the fixer's brief names and what
+ * `ROUND_FIXED` records. */
 export interface FixTask {
   domain: string;
   findingIds: string[];
   findings: FixFinding[];
-  decisions: DecisionFixPoint[];
 }
 
 /** Plan 07c (D4.4): the fixer's duty, in the brief's fixed first position.
  * Exported so the conductor's prompt and its tests name exactly one text. */
 export const FIXER_DUTY =
-  "You are a fixer. You fix exactly the findings below and nothing else: change only what they need. " +
-  "A decision point below is a choice the reviewer seats voted down or vetoed: apply the alternative the seats chose (or remove the vetoed change) — the seats decided it, you still decide no trade-off yourself. An owner (reserved) decision is never your task. " +
-  "You decide no trade-off; if you meet a decision that changes scope, behaviour or cost, report it as a disclosure in submit_phase instead of deciding it. " +
+  "You are a fixer. You fix exactly the points below and nothing else: change only what they need. " +
+  "A voted-down or vetoed decision is never your task — it goes to the seats or the owner; you still decide no trade-off yourself. " +
+  "If you meet a decision that changes scope, behaviour or cost, report it as a disclosure in submit_phase instead of deciding it. " +
   "When you are done, call submit_phase with your decisions, assumptions and deviations; you owe no item coverage and no answers to other findings.";
 
 function nonEmpty(v: string | undefined): v is string {
   return typeof v === "string" && v.trim().length > 0;
 }
 
-/** True when a point becomes fixer work: an OPEN finding triaged `fix`, or a
- * decision point that is not a reserved (owner) decision; either with a
- * domain. */
-function isFixWork(p: FixPoint): boolean {
-  if (!nonEmpty(p.domain)) return false;
-  if (isDecisionPoint(p)) return p.class !== "reserved";
-  return p.status === "open" && p.disposition?.kind === "fix";
+/** The domain a point belongs to: its own `domain`, else the domain of the
+ * file its `where` cites. Plan 07g1 (A3): every point with a file reaches a
+ * domain, so nothing with a file falls back to a whole-round repair. */
+export function pointDomain(point: FixFinding, domains: readonly Domain[]): string | undefined {
+  if (nonEmpty(point.domain)) return point.domain;
+  const where = point.where ?? "";
+  if (!nonEmpty(where)) return undefined;
+  return domainOf(whereKey(where).split(" ")[0], domains);
 }
 
-/** Plan 07c (D4.2): the fixer tasks for one fix round. Every OPEN finding
- * whose triage disposition is `fix` and every decision point (fix packet Z:
- * a non-reserved decision the seats voted down or vetoed), each with a
- * domain, is grouped by that domain, in the domains' declaration order, in
- * point order within a domain; at most `cap` domains become tasks (the rest
- * wait for a later round). A finding triaged `tradeoff` or `escalate`, a
- * closed finding, a reserved decision and a point without a domain are in no
- * task. The only place the task rule lives. */
+/** True when a point becomes fixer work: an OPEN finding triaged `fix` with a
+ * domain (its own or the one its cited file belongs to). A decision-shaped
+ * record is never fixer work, even when a caller hands it a domain, an open
+ * status and a `fix` disposition: it goes to the seats' vote or the owner. */
+function isFixWork(p: FixFinding, domains: readonly Domain[]): boolean {
+  if ((p as { source?: string }).source === "decision") return false;
+  return p.status === "open" && p.disposition?.kind === "fix" && pointDomain(p, domains) !== undefined;
+}
+
+/** Plan 07g1 (A3): the fixer tasks for one fix round. Every OPEN finding
+ * whose triage disposition is `fix` is grouped by its domain, in the domains'
+ * declaration order, in point order within a domain; at most `cap` domains
+ * become tasks (the rest wait for a later round). A finding triaged
+ * `tradeoff` or `escalate`, a closed finding and a point without a domain are
+ * in no task. A decision is never passed here: the seats' vote or the owner
+ * settles it. The only place the task rule lives. */
 export function fixTasks(points: readonly FixPoint[], domains: readonly Domain[], cap: number): FixTask[] {
   const limit = Number.isFinite(cap) && cap > 0 ? Math.floor(cap) : 0;
   if (limit === 0 || domains.length === 0) return [];
   const tasks: FixTask[] = [];
   for (const domain of domains) {
-    const group = points.filter((p) => isFixWork(p) && p.domain === domain.name);
+    const group = points.filter((p) => isFixWork(p, domains) && pointDomain(p, domains) === domain.name);
     if (group.length === 0) continue;
-    tasks.push({
-      domain: domain.name,
-      findingIds: group.map((p) => p.id),
-      findings: group.filter((p): p is FixFinding => !isDecisionPoint(p)),
-      decisions: group.filter(isDecisionPoint),
-    });
+    tasks.push({ domain: domain.name, findingIds: group.map((p) => p.id), findings: group });
     if (tasks.length >= limit) break;
   }
   return tasks;
 }
 
-/** What `decisionFixPoint` reads besides the decision: facts the conductor
- * established (the vote outcome comes from the predicate, which this module
- * must not import). */
-export interface DecisionPointFacts {
-  /** Every ballot of the phase; only the decision's current ones are read. */
-  ballots: readonly Ballot[];
-  /** The seats in order, and the leader whose reject is a veto. */
-  seats: readonly string[];
-  leader: string;
-  /** The decision is settled (passed its vote, overridden, ruled). */
-  settled: boolean;
-  /** The `:DOMAIN:` of the decision's plan item, when it names one. */
-  itemDomain?: string;
-  domains: readonly Domain[];
-  /** The evaluator's `alternative` for this decision, when it gave one. */
-  evaluatorAlternative?: string;
+/** 07g1: test removals a mapper may make. An allowance names either a test
+ * file (`test/a.test.ts`) or one test (`test/a.test.ts: the test name`). */
+function testRemovalAllowed(entry: string, allowed: readonly string[]): boolean {
+  const value = entry.trim();
+  return allowed.some((a) => {
+    const allow = a.trim();
+    return allow === value || allow === value.split(/::|:/)[0].trim();
+  });
 }
 
-/** Fix packet Z: the fixer point for one decision, or undefined when it is
- * not fixer work. A point is a `delegated` decision (never a reserved/owner
- * one, an amendment, or a `detail`) that is live, was balloted on its
- * candidate and version, and did not settle — the leader vetoed it or too few
- * seats approved. Its domain is its plan item's `:DOMAIN:`, else the domain
- * of the first dissent evidence path (`where`/anchor) a declared domain owns;
- * without one it is still returned, domainless, and `fixTasks` leaves it out
- * (it stays an owner request, as before). */
-export function decisionFixPoint(decision: Decision, facts: DecisionPointFacts): DecisionFixPoint | undefined {
-  if (decision.class !== "delegated" || decision.amendment) return undefined;
-  if (decision.supersededBy || decision.supersededByCorrection) return undefined;
-  if (facts.settled) return undefined;
-  const current = facts.ballots.filter(
-    (b) => b.decisionId === decision.id && b.boundCandidateSha === decision.boundCandidateSha && b.boundRecordVersion === decision.version,
-  );
-  if (current.length === 0) return undefined;
-  // The latest ballot per seat, leader first, then the other seats in order.
-  const order = [facts.leader, ...facts.seats.filter((s) => s !== facts.leader)];
-  for (const b of current) {
-    if (!order.includes(b.reviewer)) order.push(b.reviewer);
-  }
-  const latest = order
-    .map((seat) => [...current].reverse().find((b) => b.reviewer === seat))
-    .filter((b): b is Ballot => b !== undefined);
-  const dissent = latest.filter((b) => b.vote === "reject");
-  const vetoed = dissent.some((b) => b.reviewer === facts.leader);
-  const reasons = dissent.map((b) => `${b.reviewer}: ${b.rationale.trim()}${b.evidence.length > 0 ? ` (evidence: ${b.evidence.join(", ")})` : ""}`);
-  let domain = nonEmpty(facts.itemDomain) ? facts.itemDomain : undefined;
-  let where: string | undefined;
-  if (!domain) {
-    for (const b of dissent) {
-      for (const e of b.evidence) {
-        const p = whereKey(e).split(" ")[0];
-        const d = domainOf(p, facts.domains);
-        if (d) {
-          domain = d;
-          where = e;
-          break;
-        }
-      }
-      if (domain) break;
+/** 07g1: removed test files and test functions not named by
+ * `#+TT_TEST_REMOVALS`. A deleted test file is always a violation unless the
+ * owner allowed that exact file; a function removed from a file that still
+ * exists is a violation unless allowed by file or by `file: name`. */
+export function testRemovalViolations(files: readonly { path: string; base?: string; candidate?: string }[], allowed: readonly string[] = []): string[] {
+  const out: string[] = [];
+  const inCandidate = new Set<string>();
+  for (const f of files) if (f.candidate !== undefined) for (const n of testNames(f.path, f.candidate)) inCandidate.add(`${f.path}::${n}`);
+  for (const f of files) {
+    if (f.base === undefined) continue;
+    const baseTests = testNames(f.path, f.base);
+    if (f.candidate === undefined) {
+      const fileAllowed = allowed.some((a) => a.trim() === f.path || a.trim().startsWith(`${f.path}::`));
+      if (baseTests.length > 0 && !fileAllowed) out.push(f.path);
+      continue;
+    }
+    for (const n of baseTests) {
+      const key = `${f.path}::${n}`;
+      if (!inCandidate.has(key) && !testRemovalAllowed(key, allowed)) out.push(key);
     }
   }
-  const alternative = nonEmpty(facts.evaluatorAlternative)
-    ? facts.evaluatorAlternative.trim()
-    : decision.alternatives.length > 0
-      ? decision.alternatives.map((a) => `${a.option} (${a.consequence})`).join("; ")
-      : "remove the vetoed change";
-  const outcome: DecisionFixPoint["outcome"] = vetoed ? "vetoed" : "failed";
-  const expected = [
-    `The seats did not approve "${decision.choice}" (${vetoed ? `vetoed by ${facts.leader}` : "its vote failed"}).`,
-    reasons.length > 0 ? `Their reasons: ${reasons.join("; ")}.` : "No seat gave a reason.",
-    `The alternative the seats recommend: ${alternative}. Apply it, or remove the vetoed change.`,
-  ].join(" ");
-  return {
-    source: "decision",
-    id: decision.id,
-    class: decision.class,
-    choice: decision.choice,
-    outcome,
-    ...(domain ? { domain } : {}),
-    ...(decision.itemId ? { item: decision.itemId } : {}),
-    ...(where ? { where } : {}),
-    reasons,
-    alternative,
-    expected,
-  };
+  return out;
 }
 
-/** Plan 07c (D4.4): the one-line index of the OTHER tasks the fixer's brief
- * carries — each other task's domain and point ids, never its points'
- * fields. */
-export function otherTaskIndexLines(tasks: readonly FixTask[], own: FixTask): string[] {
-  return tasks
-    .filter((t) => t.domain !== own.domain)
-    .map((t) => `- fix-${t.domain}: ${t.findingIds.join(", ")} (domain ${t.domain})`);
+/** 07g1: the domain review's deterministic brief, built from the task and the
+ * recorded loop history (never from live memory), so a stop/resume produces
+ * the same text for the same log. The task's point details are the log's own
+ * point records; the loop history carries every fact, verdict and quality
+ * remark recorded before this review. */
+export function domainReviewBrief(task: FixTask, records: readonly DomainLoopRecord[]): string {
+  const pointLines: string[] = [];
+  for (const id of task.findingIds) {
+    const f = task.findings.find((x) => x.id === id);
+    pointLines.push(`- ${id}${f?.item ? ` (item ${f.item})` : ""}: ${f?.where ?? "(no file named)"}`);
+    if (f?.evidence) pointLines.push(`  why it is open: ${f.evidence}`);
+    if (f?.expected) pointLines.push(`  expected (the plan/design it cites): ${f.expected}`);
+    if (f?.doneWhen) pointLines.push(`  doneWhen: ${f.doneWhen}`);
+    if (f?.from) pointLines.push(`  from: ${f.from.sha} (${f.from.paths.join(", ")})`);
+  }
+  const lines = [
+    `You are the evaluator on its domain-review duty (conceptual integrity §2): judge one domain's fix against its points and for quality.`,
+    `You are the domain reviewer for ${task.domain}. You are a fresh, stateless reviewer: judge the points below on the commit you are shown, not on a fixer's story.`,
+    "You have read-only tools. Never edit, commit or run a mutating shell command; call submit_domain_review once.",
+    "",
+    `Points of domain ${task.domain}:`,
+    ...pointLines,
+  ];
+  const history = [...records].sort((a, b) => a.iteration - b.iteration);
+  if (history.length > 0) {
+    lines.push("", "The loop so far (oldest first):");
+    for (const r of history) {
+      lines.push(`- pass ${r.iteration}, commit ${r.sha ? r.sha.slice(0, 9) : "(none)"}: ${r.note ?? "checked"}`);
+      for (const p of r.facts?.points ?? []) {
+        lines.push(
+          `  - ${p.id}: ${p.onHead ? "passes" : "FAILS"} its doneWhen on the head${p.onBase ? " (also passes on the base: it proves nothing)" : ""}${p.outputTail ? ` — ${p.outputTail.split("\n").slice(-4).join(" / ")}` : ""}`,
+        );
+      }
+      for (const v of r.review?.points ?? []) lines.push(`  - review: ${v.pointId} ${v.fixed ? "fixed" : "NOT fixed"}: ${v.why}`);
+      if (r.review && !r.review.quality.ok) lines.push(`  - quality: ${(r.review.quality.problems ?? []).join("; ") || "not ok"}`);
+      if (r.review?.notes && r.review.notes.length > 0) lines.push(`  - notes: ${r.review.notes.join("; ")}`);
+    }
+  }
+  lines.push(
+    "",
+    "Call submit_domain_review with one entry for EVERY point id above: { pointId, fixed, why, anchors }. Set fixed=false for anything you cannot verify yourself on this commit; name the code anchors you read. Add quality { ok, problems } for anything outside the points that would make this domain's work unsafe: a quality problem that names a plan item id or a design line (§N, file.md:line) it breaks sends the work back to the same fixer, exactly as an unfixed point does; any other quality remark is recorded as a note on this domain's approval and costs no fixer round. Add notes for the next fixer.",
+  );
+  return lines.join("\n");
 }
 
 /** 07 (reduce by facts): true when `finding` is a domain point whose

@@ -8,21 +8,24 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { DEFAULT_DEADLINES, rebuildTimelineWithEvents, runPaths, type RunPlanFile, type Timeline } from "./conductor.ts";
+import { boundText, type BoundKind } from "./core/bounds.ts";
 import { loopTapeHead, renderLoopTape, tapeLabel, type ChartModels } from "./charts.ts";
 import { laneRoundPhase } from "./core/loop-view.ts";
-import { effectiveChecks } from "./core/checks.ts";
+import { effectiveChecks, parseCheckRecord } from "./core/checks.ts";
 import { planModelSelector, type PlanModels, type RoleModel } from "./core/roles.ts";
 // 06a finding #24: the `models` line also carries the models check's result.
 import { parseWorkerPromptRecord, workerPromptLineText } from "./core/worker-prompt.ts";
 import { modelsCheckStatusText, parseModelsCheck, type ModelsCheck } from "./core/models-check.ts";
 // Plan 01f: the gate stage's own record (the conductor's live proof).
 import { gateOutcomeText, parseGateRecord, type GateRecord } from "./core/gate.ts";
-import { decisionStatus, isLiveDecision } from "./core/predicate.ts";
+import { acceptanceBlockers, decisionStatus, isLiveDecision, itemMinorityNotes, setSeatAnchorResolver } from "./core/predicate.ts";
+import { evaluationExceptions } from "./core/verdict.ts";
+import { recordedRunnerRevision } from "./effects/runner.ts";
 import { baselineCoversCommands, baselineStatusLine, parseBaseline, type Baseline } from "./core/test-failures.ts";
 // Plan 05i: the environment block's one-line reason and the resolved tool rows.
 import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
-import { notAcceptedReasons, reviewerOutcomes, tradeoffEntries, type ReviewerOutcome, type TradeoffEntry } from "./core/verdict.ts";
-import { countsLine, isStructured, matrixMarkdown, overturnCounts, phaseItemCounts } from "./core/items.ts";
+import { reviewerOutcomes, tradeoffEntries, type ReviewerOutcome, type TradeoffEntry } from "./core/verdict.ts";
+import { countsLine, evidenceHasAnchor, isStructured, matrixMarkdown, overturnCounts, phaseItemCounts, phaseItemOutcomes } from "./core/items.ts";
 // Plan 05c: the status view's `review' row is counted from the same messages
 // the review renderer shows, so the two views never disagree.
 import { reviewSummary } from "./render.ts";
@@ -110,6 +113,9 @@ const STAGE_OF: Record<string, string> = {
   REPAIRING: "implement",
   FREEZING: "freeze",
   CHECKING: "checks",
+  // Plan 07e (E3/A4): the final check is its own running unit, with its own
+  // `#+TT_FINAL_CHECK_MINUTES` bound — never folded into the ordinary check.
+  FINAL_CHECKING: "final-check",
   PROBING: "probe",
   REVIEWING: "review",
   EVALUATING: "evaluate",
@@ -124,7 +130,17 @@ const STAGE_OF: Record<string, string> = {
 
 /** The stages the conductor runs itself: no agent is expected to be active,
  * so "no agent activity" there is not idleness. */
-export const CONDUCTOR_STAGES = new Set(["baseline", "freeze", "checks", "probe", "evaluate", "resolve", "gate", "publish"]);
+export const CONDUCTOR_STAGES = new Set([
+  "baseline",
+  "freeze",
+  "checks",
+  "final-check",
+  "probe",
+  "evaluate",
+  "resolve",
+  "gate",
+  "publish",
+]);
 
 function stageDeadlineMs(): Record<string, number> {
   return {
@@ -132,6 +148,7 @@ function stageDeadlineMs(): Record<string, number> {
     implement: DEFAULT_DEADLINES.workerAttemptMs,
     freeze: DEFAULT_DEADLINES.freezeMs,
     checks: DEFAULT_DEADLINES.checkMs,
+    "final-check": DEFAULT_DEADLINES.finalCheckMs,
     probe: DEFAULT_DEADLINES.probeMs,
     gate: DEFAULT_DEADLINES.gateMs,
     review: DEFAULT_DEADLINES.reviewMs,
@@ -143,17 +160,54 @@ function stageDeadlineMs(): Record<string, number> {
  * `#+TT_*_MINUTES` overrides applied (a plan that sets a 45-minute gate must
  * not be shown as "over by" while the conductor is running within it). */
 export function stageLimits(plan: Pick<RunPlanFile, "deadlines">): Record<string, number> {
-  const d = { ...DEFAULT_DEADLINES, ...(plan.deadlines ?? {}) };
+  const given = plan.deadlines ?? {};
+  const d = { ...DEFAULT_DEADLINES, ...given };
+  // Plan 07e (E1/A4): the final check follows the ordinary check unless the
+  // plan sets its own keyword, exactly as the conductor's deadlines do (and as
+  // the Emacs parser writes them). A plan that only sets
+  // `#+TT_CHECK_MINUTES` must not be shown the bare default for the final
+  // check.
+  const finalCheckMs = given.finalCheckMs ?? given.checkMs ?? DEFAULT_DEADLINES.finalCheckMs;
   return {
     baseline: d.checkMs,
     implement: d.workerAttemptMs,
     freeze: d.freezeMs,
     checks: d.checkMs,
+    "final-check": finalCheckMs,
     probe: d.probeMs,
     gate: d.gateMs,
     review: d.reviewMs,
     evaluate: d.evaluateMs,
   };
+}
+
+/** Plan 07e (E3): the bound kind a pipeline stage spends. */
+export function stageBoundKind(stage: string): BoundKind | undefined {
+  switch (stage) {
+    case "implement":
+      return "worker-attempt";
+    case "baseline":
+    case "checks":
+      return "check";
+    case "probe":
+      return "check";
+    case "final-check":
+      return "final-check";
+    case "review":
+      return "review";
+    case "evaluate":
+      return "evaluate";
+    case "gate":
+      return "gate";
+    default:
+      return undefined;
+  }
+}
+
+/** `check 2m/5m` for one stage, or undefined when the stage has no bound. */
+export function stageBoundText(stage: string, elapsedMs: number, limitMs: number | undefined): string | undefined {
+  const kind = stageBoundKind(stage);
+  return kind && limitMs !== undefined ? boundText(kind, elapsedMs, limitMs) : undefined;
 }
 
 export interface StageSpan {
@@ -317,7 +371,10 @@ export function pipelineLine(spans: StageSpan[], limits: Record<string, number |
       // THIS attempt; a stage past its limit reads `limit reached`, never a
       // cumulative "over by".
       const left = limit === undefined ? "" : limit < s.ms ? " (limit reached)" : ` (${formatDuration(limit - s.ms)} left)`;
-      return `${name} ${d}…${left}`;
+      // Plan 07e (E3): name the bound and the used/limit pair in the same
+      // line, e.g. `checks 2m00s… (3m00s left) [check 2m/5m]`.
+      const bound = stageBoundText(s.stage, s.ms, limit);
+      return `${name} ${d}…${left}${bound ? ` [${bound}]` : ""}`;
     }
     return `${name}${s.failed ? " ✗" : ""} ${d}`;
   });
@@ -550,6 +607,10 @@ export interface RunView {
    * `views/review.org' renders. */
   review: string;
   needsYou: number;
+  /** Plan 07e (E3): the current stage's bound, `check 2m/5m`. */
+  bounds?: string;
+  /** Plan 07e (E4): the run whose check paused this run's worker. */
+  pausedBy?: string;
   /** Plan 01h: the few trade-offs that matter while the run is live, most
    * important first, at most 6. Undefined when there is nothing to show. */
   tradeoffs?: TradeoffEntry[];
@@ -681,6 +742,145 @@ export function runCost(timeline: Timeline, spans: StageSpan[], now: Date): RunC
   };
 }
 
+/** Plan 07f (A4/A2): the review-lint anchor rule the conductor installs as
+ * `acceptanceBlockers` decides an item's seat majority (see
+ * `setSeatAnchorResolver`). It is stateless, so a process that reads the log
+ * without a conductor — `tt why`, `tt status` — installs the same rule before
+ * reading the ONE blocker list: the default resolver would otherwise resolve a
+ * seat's `file:line` against THIS process's cwd instead of the candidate the
+ * review was ingested against, and report an item the conductor's own accept()
+ * never would. It is installed BEFORE the replay, so the transitions the
+ * replay itself evaluates call `accept()` with the same rule. */
+function installSeatAnchorRule(): void {
+  setSeatAnchorResolver((evidence) => evidenceHasAnchor(evidence));
+}
+
+/** Plan 07f1b (A1): the commands a red check's blockers name, read from the
+ * record of the candidate the phase is explaining. The predicate takes them as
+ * an explicit argument, so two runs read in one process never share a source
+ * and no mutable state is installed. */
+function failedCheckCommands(runDir: string, phase: PhaseState): string[] | undefined {
+  const candidateSha = phase.checks?.candidateSha ?? phase.candidate?.sha;
+  if (!candidateSha) return undefined;
+  try {
+    const record = parseCheckRecord(
+      JSON.parse(fs.readFileSync(path.join(runPaths(runDir).checks, candidateSha, "record.json"), "utf8")),
+    );
+    if (!record) return undefined;
+    // Plan 07f1b (B-88): the file is keyed by candidate SHA alone, so a
+    // `final` run overwrites the candidate's `round` record. The evidence must
+    // be the run the phase's check result names: a mismatched tier is another
+    // run's record and names no command here (an old log's absent tier is
+    // `round`).
+    if (record.tier !== (phase.checks?.tier ?? "round")) return undefined;
+    return record.commands.filter((c) => !c.passed).map((c) => c.command);
+  } catch {
+    return undefined;
+  }
+}
+
+/** R9: each blocker names its own command's last shell step and output.
+ * Never substitute the phase's first-failure summary for another command. */
+function failingStepNote(runDir: string, phase: PhaseState, command: string): string {
+  const candidateSha = phase.checks?.candidateSha ?? phase.candidate?.sha;
+  if (!candidateSha) return "";
+  try {
+    const record = parseCheckRecord(
+      JSON.parse(fs.readFileSync(path.join(runPaths(runDir).checks, candidateSha, "record.json"), "utf8")),
+    );
+    if (!record || record.tier !== (phase.checks?.tier ?? "round")) return "";
+    const failed = record.commands.find((c) => !c.passed && c.command === command);
+    if (!failed?.failingStep) return "";
+    const output = failed.failingStepOutput?.trim().split("\n")[0];
+    return ` (failing step: \`${failed.failingStep}\`${failed.failingStepSilent ? ", silent" : output ? `, output: ${output}` : ""})`;
+  } catch {
+    return "";
+  }
+}
+
+export interface WhyBlocker {
+  kind: string;
+  detail: string;
+  command: string;
+}
+
+/** Plan 07f (R3/A4): the report behind `tt why <run>`. It is built from the
+ * log alone (`rebuildTimelineWithEvents`), so it answers a stopped run too and
+ * never asks a conductor to speak. Every blocker carries the command that
+ * clears it. */
+export interface WhyReport {
+  runId: string;
+  phaseId: string;
+  phase: string;
+  accepted: boolean;
+  candidate?: string;
+  blockers: WhyBlocker[];
+  exceptions: string[];
+  /** 07g2 (R6): a strict majority decided the item and a seat still disagreed.
+   * Its reason is a follow-up note — shown, never blocking and never sent to
+   * the evaluator. */
+  followUpNotes: string[];
+  runnerRevision?: string;
+  bounds: Array<{ kind: string; scope: string; limitMs: number; elapsedMs: number }>;
+}
+
+export function whyReport(runDir: string, plan: RunPlanFile): WhyReport {
+  installSeatAnchorRule();
+  const { timeline, events } = rebuildTimelineWithEvents(runDir, plan);
+  const phase = timeline.state.phase;
+  const blockers = acceptanceBlockers(phase, failedCheckCommands(runDir, phase));
+  const revision = recordedRunnerRevision(runDir);
+  const bounds = events
+    .filter((e): e is Extract<typeof e, { type: "BOUND_REACHED" }> => e.type === "BOUND_REACHED")
+    .map((e) => ({ kind: e.kind, scope: e.scope, limitMs: e.limitMs, elapsedMs: e.elapsedMs }));
+  return {
+    runId: path.basename(runDir),
+    phaseId: phase.phaseId,
+    phase: phase.phase,
+    accepted: blockers.length === 0,
+    ...(phase.candidate ? { candidate: phase.candidate.sha } : {}),
+    blockers: blockers.map((b) => ({
+      kind: b.kind,
+      detail: b.detail + (b.kind === "check" ? failingStepNote(runDir, phase, b.command) : ""),
+      command: b.command,
+    })),
+    exceptions: evaluationExceptions(phase).map((e) => `${e.kind}: ${e.detail}`),
+    followUpNotes: isStructured(phase.contract)
+      ? phaseItemOutcomes(phase).flatMap((o) =>
+          o.outcome === "met" || o.outcome === "fits" ? itemMinorityNotes(o) : [],
+        )
+      : [],
+    ...(revision !== undefined ? { runnerRevision: revision } : {}),
+    bounds,
+  };
+}
+
+export function whyText(report: WhyReport): string {
+  const lines = [
+    `run ${report.runId} · phase ${report.phaseId} · ${report.phase}`,
+    report.accepted ? "accepted: yes — no acceptance blocker" : `accepted: no — ${report.blockers.length} blocker(s)`,
+  ];
+  if (report.candidate) lines.push(`candidate: ${report.candidate}`);
+  if (report.runnerRevision) lines.push(`runner revision: ${report.runnerRevision}`);
+  if (report.blockers.length > 0) {
+    lines.push("", "Blockers:");
+    for (const b of report.blockers) lines.push(`- [${b.kind}] ${b.detail}`, `  ${b.command}`);
+  }
+  if (report.exceptions.length > 0) {
+    lines.push("", "Open evaluation exceptions:");
+    for (const e of report.exceptions) lines.push(`- ${e}`);
+  }
+  if (report.followUpNotes.length > 0) {
+    lines.push("", "Follow-up notes (the majority decided; not work for this phase):");
+    for (const n of report.followUpNotes) lines.push(`- ${n}`);
+  }
+  if (report.bounds.length > 0) {
+    lines.push("", "Bounds reached:");
+    for (const b of report.bounds) lines.push(`- ${b.kind} (${b.scope}): ${b.elapsedMs}ms of ${b.limitMs}ms`);
+  }
+  return lines.join("\n");
+}
+
 export function buildView(
   runDir: string,
   plan: RunPlanFile,
@@ -688,7 +888,11 @@ export function buildView(
   now = new Date(),
 ): RunView & { timeline: Timeline; tape: string; seatsTable: string; seatTable: SeatTable } {
   // One read of the control log gives both the timeline and the events the
-  // balance metrics need, so nothing here parses the log twice.
+  // balance metrics need, so nothing here parses the log twice. Like `tt why`
+  // (see `installSeatAnchorRule`), it installs the conductor's seat-anchor rule
+  // before the replay, so the status reads the ONE blocker list exactly as the
+  // conductor's own `accept()` did.
+  installSeatAnchorRule();
   const { timeline, events, records } = rebuildTimelineWithEvents(runDir, plan);
   const phase = timeline.state.phase;
   const spans = stageSpans(timeline, now, alive ? undefined : lastEventAt(runDir));
@@ -697,7 +901,15 @@ export function buildView(
   const repairing = (stage === "implement" && phase.attempt.n > 1) || stage === "needs you";
   const C = phase.candidate?.sha;
   const reviewers = reviewerOutcomes(phase);
-  const reasons = notAcceptedReasons(phase);
+  // Plan 07f (F1/C3): the status reads the ONE blocker list and ends each
+  // blocker line with the command that clears it.
+  // 07g2 (A4/R9): a failed check's status line names the failing step (the
+  // simple command the shell ran last before the non-zero exit) and marks a
+  // step that printed nothing as silent. The step comes from the check record
+  // the conductor wrote, never from re-running the check here.
+  const reasons = acceptanceBlockers(phase, failedCheckCommands(runDir, phase)).map(
+    (b) => `${b.detail}${b.kind === "check" ? failingStepNote(runDir, phase, b.command) : ""} — ${b.command}`,
+  );
   // Plan 06n (A6): the header's round is the round of the last ROUND_STARTED,
   // so it always equals the events. The old `timeline.rounds.length + 1`
   // inferred it from completed freezes, which drifts when a round was
@@ -795,11 +1007,30 @@ export function buildView(
   const envBlocked = phase.env?.blocked ? envBlockedLine(phase.env.blocked) : undefined;
   const envTools = envToolsLines(phase.env?.tools);
 
+  // Plan 07e (E4): a worker paused by another run's check window is shown as
+  // exactly that, never as idle.
+  const pausedBy = (() => {
+    const paused = new Map<string, string>();
+    for (const r of records) {
+      if (r.kind === "worker_paused") {
+        const e = r.event as { agentId?: unknown; by?: unknown };
+        paused.set(String(e.agentId), typeof e.by === "string" && e.by.length > 0 ? e.by : "another");
+      } else if (r.kind === "worker_resumed") {
+        paused.delete(String((r.event as { agentId?: unknown }).agentId));
+      }
+    }
+    return paused.size > 0 ? [...paused.values()][0] : undefined;
+  })();
+
   let attention: string | undefined;
   if (envBlocked) attention = envBlocked;
   else if (phase.phase === "BLOCKED") attention = "BLOCKED";
   else if (needsYou > 0 || phase.phase === "AWAITING_OWNER") attention = "needs you";
+  // Plan 07e (E5, decision disc-B): a pause explains a LIVE run's workers
+  // only. An unmatched `worker_paused` record survives watcher cleanup, so a
+  // stopped conductor is always reported as stopped — never as paused.
   else if (!alive && phase.phase !== "DONE") attention = "conductor stopped";
+  else if (pausedBy) attention = `paused by run ${pausedBy}'s check`;
   else if (idleMinutes !== undefined && idleMinutes > 5) attention = `idle ${Math.round(idleMinutes)}m`;
   else if (t && t.byCategory.polling.ms > t.elapsedMs / 4) attention = "heavy polling";
   // Decision briefs: the `needs you` line names the owner's actual question.
@@ -843,6 +1074,8 @@ export function buildView(
   // Plan 06k2 (A1): the lane round's own sub-phase, so the loop view shows
   // LANE REVIEW / PICK and the attempt clock stops when both lanes submit.
   const lanePhase = laneRoundPhase(phase);
+  const limits = stageLimits(plan);
+  const bounds = current ? stageBoundText(stage, current.ms, limits[stage]) : undefined;
   const tapeInput = {
     label: tapeLabel(phase.phaseId),
     round,
@@ -856,7 +1089,7 @@ export function buildView(
     stops: timeline.stops ?? [],
     restarts: timeline.restarts ?? [],
     models: chartModelsFromPlan(plan.models, seatsOf(phase.contract)),
-    limits: stageLimits(plan),
+    limits,
     ...(lanePhase ? { lanePhase } : {}),
   };
   const tape = renderLoopTape(tapeInput);
@@ -911,7 +1144,9 @@ export function buildView(
     stage,
     stageElapsed: formatDuration(current?.ms ?? 0),
     elapsed: firstAt ? formatDuration(endAt - Date.parse(firstAt)) : "0s",
-    pipeline: pipelineLine(spans, lanePhase ? { ...stageLimits(plan), implement: undefined } : stageLimits(plan)),
+    pipeline: pipelineLine(spans, lanePhase ? { ...limits, implement: undefined } : limits),
+    ...(bounds ? { bounds } : {}),
+    ...(pausedBy ? { pausedBy } : {}),
     gates,
     gate: gateRecord && gateRecord.candidateSha === C ? gateSummaryLine(gateRecord, phase.integrationHead) : undefined,
     baseline: baselineStatusLine(baseline),

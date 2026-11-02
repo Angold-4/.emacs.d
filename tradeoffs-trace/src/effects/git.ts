@@ -31,6 +31,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { removedTests } from "../core/test-names.ts";
+import { testRemovalViolations } from "../core/fix-rounds.ts";
 
 const IDENTITY_ARGS = ["-c", "user.name=tradeoffs-trace", "-c", "user.email=tradeoffs-trace@localhost"];
 const NO_HOOKS_ARGS = ["-c", "core.hooksPath=/dev/null"];
@@ -571,42 +572,6 @@ export function publishCAS(repo: string, branch: string, I: string, H: string): 
 }
 
 // ---------------------------------------------------------------------------
-// Plan 07c (D4.5): merge one fixer's commit into the fix worktree
-// ---------------------------------------------------------------------------
-
-/** Plan 07c (D4.5): merge one green fixer commit into `worktree` (a fresh
- * worktree at the fix round's base) with `--no-ff`, using the same identity
- * and no-hooks arguments `probe` uses. A conflict aborts the merge
- * (`git merge --abort`) and returns the merge output; the worktree is left
- * clean at whatever it held before. */
-export function mergeFixer(worktree: string, sha: string): { ok: true } | { ok: false; output: string } {
-  const merge = gitCapturingFailure(
-    [
-      "-C",
-      worktree,
-      ...IDENTITY_ARGS,
-      ...NO_HOOKS_ARGS,
-      "merge",
-      "--no-ff",
-      "--no-verify",
-      "-m",
-      `merge fixer commit ${sha}\n\nTT-Action: fix-merge-${sha}`,
-      sha,
-    ],
-    { cwd: worktree },
-  );
-  if (!merge.ok) {
-    try {
-      git(["-C", worktree, "merge", "--abort"]);
-    } catch {
-      // Nothing to abort, or already clean.
-    }
-    return { ok: false, output: merge.output };
-  }
-  return { ok: true };
-}
-
-// ---------------------------------------------------------------------------
 // Diff introspection (work packet 2a: boundary triggers, §3.5 sampling)
 // ---------------------------------------------------------------------------
 
@@ -665,6 +630,25 @@ export function removedTestsBetween(repo: string, base: string, candidateSha: st
     candidate: show(candidateSha, path),
   }));
   return removedTests(files);
+}
+
+/** 07g1: test files/functions removed between `base` and `candidateSha`
+ * without a `#+TT_TEST_REMOVALS` allowance. Unlike `removedTestsBetween`, a
+ * deleted test FILE is a violation too. */
+export function testRemovalViolationsBetween(repo: string, base: string, candidateSha: string, allowed: readonly string[] = []): string[] {
+  const show = (rev: string, file: string): string | undefined => {
+    try {
+      return execFileSync("git", ["-C", repo, "show", `${rev}:${file}`], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] });
+    } catch {
+      return undefined;
+    }
+  };
+  const files = diffNameOnly(repo, base, candidateSha).map((path) => ({
+    path,
+    base: show(base, path),
+    candidate: show(candidateSha, path),
+  }));
+  return testRemovalViolations(files, allowed);
 }
 
 /** exex 01a2: the commit a worktree's HEAD is at, or undefined when it cannot

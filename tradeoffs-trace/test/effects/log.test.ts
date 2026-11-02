@@ -29,17 +29,94 @@ test("append fsyncs after every record", () => {
   }
 });
 
+test("plan 07e (E3): ENOSPC is reported once, fails the append visibly, and later appends are no-ops", () => {
+  const logPath = path.join(dir, "events.jsonl");
+  const enospc = Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
+  const writeMock = mock.method(fs, "writeSync", () => {
+    throw enospc;
+  });
+  const onDiskFull = mock.fn();
+  const log = new EventLog(logPath, [], onDiskFull);
+  try {
+    const first = log.append("state", { a: 1 });
+    assert.equal(first, undefined, "a refused append hands back no record — the action failed, never 'recorded'");
+    assert.equal(log.diskFull, true);
+    assert.equal(log.droppedAppends, 1, "the append did not reach the disk — the action failed, not succeeded");
+    assert.equal(onDiskFull.mock.callCount(), 1);
+    const second = log.append("state", { a: 2 });
+    assert.equal(second, undefined, "an append dropped while the disk stays full is not passed off as written");
+    assert.equal(writeMock.mock.callCount(), 1, "no later append retries the full disk");
+    assert.equal(onDiskFull.mock.callCount(), 1, "the notice is not repeated");
+    assert.equal(log.droppedAppends, 2, "the dropped records are counted, never passed off as durable");
+    assert.deepEqual(readLog(logPath).records, [], "nothing the caller was told about is on disk");
+  } finally {
+    writeMock.mock.restore();
+    log.close();
+  }
+});
+
+test("plan 07e (E4): the shutdown and final-failure records retry once after ENOSPC, bounded", () => {
+  const logPath = path.join(dir, "events.jsonl");
+  const enospc = Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
+  const writeMock = mock.method(fs, "writeSync", () => {
+    throw enospc;
+  });
+  const log = new EventLog(logPath, [], mock.fn());
+  try {
+    log.append("state", { a: 1 });
+    assert.equal(writeMock.mock.callCount(), 1);
+    const critical = log.appendCritical("stop", { reason: "conductor stopped" });
+    assert.equal(critical, undefined, "a critical append the disk refused hands back no record either");
+    // One bounded retry: two attempts for this record, never a loop.
+    assert.equal(writeMock.mock.callCount(), 3, "the shutdown record is retried exactly once");
+    assert.equal(log.droppedAppends, 3, "every failed attempt is counted");
+  } finally {
+    writeMock.mock.restore();
+    log.close();
+  }
+});
+
+test("plan 07e (E4): a shutdown record lands on disk when storage recovers after ENOSPC", () => {
+  const logPath = path.join(dir, "events.jsonl");
+  const enospc = Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
+  const realWriteSync = fs.writeSync;
+  let calls = 0;
+  const writeMock = mock.method(fs, "writeSync", (...args: Parameters<typeof fs.writeSync>) => {
+    calls += 1;
+    if (calls === 1) throw enospc;
+    return realWriteSync.apply(fs, args);
+  });
+  const log = new EventLog(logPath, [], mock.fn());
+  try {
+    log.append("state", { a: 1 });
+    assert.equal(log.diskFull, true);
+    const critical = log.appendCritical("stop", { reason: "conductor stopped" });
+    assert.ok(critical, "a retry that landed hands back the durable record");
+    assert.equal(critical.seq, 2);
+    assert.equal(log.diskFull, false, "the retried write landed, so the disk is writable again");
+    assert.equal(log.droppedAppends, 1);
+    log.close();
+    const { records } = readLog(logPath);
+    assert.deepEqual(records.map((r) => r.kind), ["stop"], "the shutdown state was preserved");
+    assert.deepEqual(records[0].event, { reason: "conductor stopped" });
+  } finally {
+    writeMock.mock.restore();
+  }
+});
+
 test("seq is monotonic within a session and across reopen", () => {
   const logPath = path.join(dir, "events.jsonl");
   const log1 = new EventLog(logPath);
   const r1 = log1.append("state", { a: 1 });
   const r2 = log1.append("state", { a: 2 });
+  assert.ok(r1 && r2, "both appends landed");
   assert.equal(r1.seq, 1);
   assert.equal(r2.seq, 2);
   log1.close();
 
   const log2 = new EventLog(logPath);
   const r3 = log2.append("state", { a: 3 });
+  assert.ok(r3, "the reopened log's append landed");
   assert.equal(r3.seq, 3);
   log2.close();
 

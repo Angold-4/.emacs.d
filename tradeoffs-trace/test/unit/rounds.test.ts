@@ -29,7 +29,6 @@ import {
   revotePair,
   roundBudget,
 } from "../../src/core/rounds.ts";
-import { repeatLaneBases } from "../../src/core/lanes.ts";
 import type { Finding, LaneCandidateRecord, Review, RoundRecord } from "../../src/core/types.ts";
 
 function round(overrides: Partial<RoundRecord> = {}): RoundRecord {
@@ -410,20 +409,6 @@ test("plan 06n (R9a): a lane that lost an item the best candidate met cannot be 
   assert.equal(pickWinner(r2, SEATS, "M", guard)?.lane, "b");
   // Without a best candidate (round 1), the votes decide as before.
   assert.equal(pickWinner(r2, SEATS, "M", undefined)?.lane, "a");
-});
-
-test("plan 06n (R9b): when both lanes lose an item, no lane is picked and both restart from the best candidate", () => {
-  const guard = { best: bestCandidate([ROUND1], IDS, 3, 2)!, itemIds: IDS, seatCount: 3 };
-  const r2 = round({
-    round: 2,
-    candidates: [reviewed("a", "C2a", R1_UNMET), reviewed("b", "C2b", R2_UNMET)],
-    votes: SEATS.map((seat) => ({ seat, lane: "a", why: "a" })),
-  });
-  assert.equal(pickWinner(r2, SEATS, "M", guard), undefined, "no lane is picked");
-  assert.deepEqual(everyLaneLost(r2, guard), { a: ["R1"], b: ["R2"] }, "each lane's lost items are named");
-  assert.deepEqual(repeatLaneBases(r2, guard), { a: "C1a", b: "C1a" }, "both lanes restart from the best candidate, not their own");
-  // A no-pick round for a missing vote still restarts each lane from its own.
-  assert.deepEqual(repeatLaneBases(round({ round: 2, candidates: [reviewed("a", "C2a", ALL_MET), reviewed("b", "C2b", ALL_MET)] }), guard), { a: "C2a", b: "C2b" });
 });
 
 test("plan 06n (R9c/R9d): a lost item is a regression only when its evidence anchors in a file the pick changed", () => {

@@ -65,12 +65,16 @@ test("correction-closure: the ACCEPTED event marks the correction resolved, in t
   assert.equal(correction.status, "resolved");
 });
 
-test("correction-closure (reverse): a single 'not honored' review keeps the candidate from being accepted", () => {
+test("correction-closure (reverse): an unaddressed correction does not gate acceptance, but a false resolution claim is refused", () => {
   const state = resolvingStateWithCorrection({ M: "honored", A: "not_honored", B: "honored" });
   const correction = state.phase.corrections[0];
   assert.equal(addressed(correction, state.phase, "C2", K), false);
-  assert.equal(accept(state.phase, "C2", K), false);
+  // Plan 07f (C2): the addressed report fails closed, but acceptance no longer
+  // waits for a correction to reach a worker.
+  assert.equal(accept(state.phase, "C2", K), true);
 
+  // Claiming the correction resolved in ACCEPTED is still checked: acceptance
+  // does not make an unaddressed correction resolved.
   const result = reduce(state, { type: "ACCEPTED", resolvedCorrectionIds: ["C-p2-01"] });
   assert.equal(result.ok, false);
   assert.equal(result.state.phase.phase, "RESOLVING");

@@ -295,3 +295,32 @@ test("plan-lint: an old-format phase (no structured items) is unchanged", () => 
   };
   assert.deepEqual(lintPlan(plan), []);
 });
+
+test("07g1b: a plan with a test-verified item and no declared command for it fails lint", () => {
+  const requirements = [{ id: "R1", title: "r", text: "r", arch: [], verify: ['test "test/r1.test.ts::R1 holds"'], line: 15, verifyLine: 16 }];
+  // No checks anywhere and no #+TT_RERUN: a lost-test point would have no
+  // doneWhen, so the plan is refused before any run (never guessed from the
+  // file's extension at runtime).
+  const none: LintPlanInput = { sourceFile: "/x/PLAN.org", phases: [{ id: "p1", architecture: [], requirements, constraints: [] }] };
+  const finding = lintPlan(none).find((f) => f.rule === "item-verify");
+  assert.ok(finding, "the item is refused");
+  assert.equal(finding!.severity, "error");
+  assert.equal(finding!.line, 16);
+  assert.match(finding!.problem, /has no declared command/);
+  // A #+TT_RERUN template the verify cannot fill ({file} on a bare name) is
+  // still no command.
+  const bare = [{ ...requirements[0], verify: ['test "R1 holds"'] }];
+  assert.ok(
+    lintPlan({ rerun: "./run-one {file} -- {name}", phases: [{ id: "p1", architecture: [], requirements: bare, constraints: [] }] }).some(
+      (f) => f.rule === "item-verify" && /has no declared command/.test(f.problem),
+    ),
+  );
+  // Declared: the plan's checks, the phase's :CHECKS:, or a #+TT_RERUN the
+  // verify fills — each makes it lint-clean.
+  const clean = (plan: LintPlanInput) => assert.equal(lintPlan(plan).some((f) => f.rule === "item-verify"), false);
+  clean({ checks: ["make check"], phases: [{ id: "p1", architecture: [], requirements, constraints: [] }] });
+  clean({ phases: [{ id: "p1", architecture: [], requirements, constraints: [], checks: ["make check"] }] });
+  clean({ rerun: "./run-one {file} -- {name}", phases: [{ id: "p1", architecture: [], requirements, constraints: [] }] });
+  // A review-only item needs no command.
+  clean({ phases: [{ id: "p1", architecture: [], requirements: [{ ...requirements[0], verify: ["review"] }], constraints: [] }] });
+});

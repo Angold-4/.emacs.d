@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { baselineCoversCommands, baselineFailedCommands, baselineFlakeNames, baselineFailureNames, baselineKey, baselineStatusLine, classifyCheckFailure, classifyRerun, escapeRegExp, failedNormally, parseBaseline, parseTestFailures, parseTestFailuresDetailed, rerunCommandsFor, rerunProvesTheTestRan, rerunTemplateIssue, shellQuote, singleTestCommand, type Baseline, type BaselineCommand, testIsNamedIn } from "../../src/core/test-failures.ts";
+import { baselineCoversCommands, baselineFailedCommands, baselineFlakeNames, baselineFailureNames, baselineKey, baselineStatusLine, classifyCheckFailure, classifyRerun, escapeRegExp, failedNormally, lostTestsDoneWhen, parseBaseline, parseTestFailures, parseTestFailuresDetailed, rerunCommandsFor, rerunProvesTheTestRan, rerunTemplateIssue, shellQuote, singleTestCommand, declaredVerifyCommand, type Baseline, type BaselineCommand, testIsNamedIn } from "../../src/core/test-failures.ts";
 
 // A real `cargo test` tail: the per-test FAILED lines, the summary list, and
 // the result line. Only the `test <name> ... FAILED` lines are names.
@@ -312,6 +312,59 @@ test("test-failures: a re-run of a test a subset check names uses that test's ow
       },
     ],
   );
+});
+
+// 07g1b (A4/R7/R13): a point made from an item another candidate landed must
+// carry a doneWhen that is the plan's OWN declared command for that test
+// verify: the `#+TT_RERUN:` template filled from the verify's declared name
+// (and `file::` path), else the phase's check command. Never a command guessed
+// from the test file's extension or from a check's output. An item may name
+// more than one test and the pick may lose either, so its point's doneWhen
+// proves every lost test.
+test("test-failures: a lost item's test verify builds a doneWhen with no failing line", () => {
+  const checks = { checks: ["make check"] };
+  const rerun = { rerun: "node --test --test-name-pattern {name} {file}", checks: ["make check"] };
+  // No #+TT_RERUN: the phase's declared check command, verbatim — never a
+  // `node --test` or `cargo test` built from the file's extension.
+  assert.equal(declaredVerifyCommand({ name: "R3 holds", file: "test/r3.test.ts" }, checks), "make check");
+  assert.equal(declaredVerifyCommand({ name: "cancels_order", file: "tests/x.rs" }, checks), "make check");
+  assert.equal(declaredVerifyCommand({ name: "probe-failing-test", file: "test/x.el" }, checks), "make check");
+  assert.equal(declaredVerifyCommand({ name: "R3 holds" }, checks), "make check");
+  // Two declared check commands: both, each as its own subshell.
+  assert.equal(declaredVerifyCommand({ name: "R3 holds" }, { checks: ["a; b", "c"] }), "( a; b ) && ( c )");
+  // A `test final` verify also runs under the final checks.
+  assert.equal(declaredVerifyCommand({ name: "R3 holds", final: true }, { checks: ["c"], finalChecks: ["f"] }), "( c ) && ( f )");
+  // A #+TT_RERUN template is filled from the verify's own declared name/file.
+  assert.equal(
+    declaredVerifyCommand({ name: "R3 holds", file: "test/r3.test.ts" }, rerun),
+    "node --test --test-name-pattern 'R3 holds' 'test/r3.test.ts'",
+  );
+  // A template the verify cannot fill (no declared file) falls back to the
+  // declared check, never to a guess.
+  assert.equal(declaredVerifyCommand({ name: "R3 holds" }, rerun), "make check");
+  // Nothing declared: no command (tt lint refuses such a plan).
+  assert.equal(declaredVerifyCommand({ name: "R3 holds", file: "test/r3.test.ts" }, { checks: [] }), undefined);
+  assert.equal(declaredVerifyCommand({ name: "R3 holds", file: "test/r3.test.ts" }, { checks: ["  "] }), undefined);
+  // Two lost tests: one command proves both, in plan order.
+  assert.equal(
+    lostTestsDoneWhen(
+      [
+        { name: "R3 holds", file: "test/r3.test.ts" },
+        { name: "R4 holds", file: "test/r4.test.ts" },
+      ],
+      rerun,
+    ),
+    "node --test --test-name-pattern 'R3 holds' 'test/r3.test.ts' && node --test --test-name-pattern 'R4 holds' 'test/r4.test.ts'",
+  );
+  // A command shared by both lost tests (the phase check) appears once.
+  assert.equal(lostTestsDoneWhen([{ name: "R3 holds" }, { name: "R4 holds" }], checks), "make check");
+  // One test with no declared command means no fact at all: a partial
+  // doneWhen could close the point while the other test is still lost.
+  assert.equal(
+    lostTestsDoneWhen([{ name: "R3 holds", file: "test/r3.test.ts" }, { name: "R5" }], { rerun: rerun.rerun, checks: [] }),
+    undefined,
+  );
+  assert.equal(lostTestsDoneWhen([], checks), undefined);
 });
 
 test("test-failures: a #+TT_RERUN template substitutes {name}/{file}/{crate} as shell words", () => {

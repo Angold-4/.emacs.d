@@ -126,87 +126,6 @@ function pickVote(
   return { hello: { role: "picker" as const, tools: ROLE_TOOLS.picker }, steps };
 }
 
-test("plan 06k1: a pick vote without loserHad is re-asked, and a majority yes carries the loser's anchors into the next repair prompt", async () => {
-  const promptLog = fs.mkdtempSync("/tmp/tt-06k1-lv-prompts-");
-  const setup = await setupConductor({
-    phase: lanePhase(),
-    checks: ["true"],
-    phaseChecks: ["true"],
-    stubReviews: true,
-    deadlines: FAST,
-    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: path.join(promptLog, "prompts.txt") },
-    workerScript: () => laneWorker("a"),
-    laneWorkerScriptFor: (lane) => laneWorker(lane),
-    laneReviewerScriptFor: (seat, _candidate, state) => {
-      const K = state.phase.contract.contractVersion;
-      const round = liveRound(state);
-      if (round === 1) {
-        // M raises one blocking finding naming the acceptance item, so round 1
-        // is not accepted and round 2 runs from the winner.
-        return seat === "M"
-          ? laneReview("M", K, {
-              findings: [
-                { kind: "defect", severity: "blocking", evidence: "it works is unmet: src/lane-a.txt:1 the output is wrong" },
-              ],
-            })
-          : laneReview(seat as Reviewer, K);
-      }
-      const open = (state.phase.findings ?? []).filter((f) => f.status === "open" && f.raisedBy === "M");
-      return seat === "M"
-        ? laneReview("M", K, {
-            findingStatements: open.map((f) => ({ findingId: f.id, status: "withdraw", evidence: "fixed in this candidate" })),
-          })
-        : laneReview(seat as Reviewer, K);
-    },
-    pickScriptFor: (seat, state) => {
-      const round = liveRound(state);
-      // Lane b wins 2-1: M and A pick b, B picks a. M's first vote omits
-      // loserHad and is re-asked; M and A say the losing lane (a) had
-      // something the winner lacked.
-      if (seat === "B") return pickVote("B" as Reviewer, round, "a", { yes: false, anchors: [] });
-      return pickVote(
-        seat as Reviewer,
-        round,
-        "b",
-        { yes: true, anchors: ["src/lane-a.txt:1", "lane a keeps the marker file"] },
-        seat === "M",
-      );
-    },
-  });
-  try {
-    await setup.conductor.start();
-    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 150_000, 50, setup.runDir);
-    const phase = setup.conductor.state.phase;
-    assert.equal(phase.rounds?.length, 2, "the phase ran two rounds");
-    const first = phase.rounds![0];
-
-    // The re-ask is recorded, and the final vote carries loserHad.
-    const events = readEvents(setup.runDir).filter((r) => r.kind === "event");
-    assert.ok(events.some((r) => (r.event as { type?: string }).type === "PICK_VOTE"), "the pick votes were recorded");
-    const firstVotes = first.votes;
-    assert.equal(firstVotes.length, 3, "all three seats voted in round 1");
-    const m = firstVotes.find((v) => v.seat === "M");
-    assert.ok(m?.loserHad, "M's final vote carries loserHad");
-    assert.equal(m!.loserHad!.yes, true);
-    assert.deepEqual(m!.loserHad!.anchors, ["src/lane-a.txt:1", "lane a keeps the marker file"]);
-    assert.equal(first.picked?.lane, "b");
-
-    // Round 2's repair prompt lists the losing lane's anchors.
-    const prompts = fs.readFileSync(path.join(promptLog, "prompts.txt"), "utf8");
-    const secondRound = prompts.split("=====").filter((p) => p.includes("Round 2 of this phase"));
-    assert.equal(secondRound.length, 2, "both lanes were prompted in round 2");
-    for (const prompt of secondRound) {
-      assert.match(prompt, /had something the winner lacked/);
-      assert.match(prompt, /src\/lane-a\.txt:1/);
-      assert.match(prompt, /lane a keeps the marker file/);
-    }
-    assert.equal(phase.phase, "DONE");
-  } finally {
-    await teardown(setup);
-    cleanupDir(promptLog);
-  }
-});
-
 test("a pick vote whose inspected misses a passing lane is refused and re-asked; only the full vote counts", async () => {
   const setup = await setupConductor({
     phase: lanePhase(),
@@ -248,78 +167,90 @@ test("a pick vote whose inspected misses a passing lane is refused and re-asked;
   }
 });
 
-test("a worker decision the next round marks `changed` is on the lane review and its ballot is demanded there", async () => {
-  // Settlement 01c: a round-1 worker decision, changed by the round-2 worker
-  // through priorDecisions, reached the phase only at the hand-off, after
-  // every lane review. No seat was ever asked to ballot it, and the gate
-  // failed it ("missing ballot") in every later round.
-  const disclosure = {
-    choice: "R7 trusts per-install tests instead of a full differential",
-    whyItMatters: "it decides how much the differential proves",
-    alternatives: [{ option: "extend the differential", consequence: "more setup" }],
-    recommendation: { choice: "trust per-install tests", reason: "smaller" },
-    classProposal: "delegated",
-  };
+test("a decision a fixer discloses in a fix loop is balloted by the acceptance seats", async () => {
+  // Settlement 01c's intent survives without a round-2 worker or lane review:
+  // a new fixer's disclosure must exist BEFORE the ordinary ACCEPT ballots.
+  const choice = "The fixer caches booking validation between requests";
+  const promptDir = fs.mkdtempSync("/tmp/tt-fixer-ballots-");
+  const promptLog = path.join(promptDir, "prompts.txt");
   const setup = await setupConductor({
-    phase: lanePhase(),
-    checks: ["true"],
-    phaseChecks: ["true"],
-    stubReviews: true,
-    deadlines: FAST,
+    phase: lanePhase({ domains: [{ name: "booking", globs: ["booking/**"] }, { name: "gates", globs: ["gates/**"] }], fixChecks: "true", finalChecks: ["true"], rounds: 3, domainLoopMax: 1 }),
+    checks: ["true"], phaseChecks: ["true"], stubReviews: false,
+    deadlines: { ...FAST, reviewMs: 20_000 },
+    extraReviewerEnv: () => ({ FAKE_PI_PROMPT_LOG: promptLog }),
     workerScript: () => laneWorker("a"),
-    laneWorkerScriptFor: (lane, round, state) => {
-      const worker = laneWorker(lane);
-      const submit = worker.steps[worker.steps.length - 1] as { args: Record<string, unknown> };
-      if (round === 1) {
-        submit.args = { ...submit.args, decisions: [disclosure] };
-      } else {
-        worker.steps[0] = { kind: "call-sh", command: `printf 'lane ${lane} round ${round}\n' > lane-${lane}.txt` };
-        const prior = state.phase.decisions.find((d) => d.source === "worker" && d.choice === disclosure.choice);
-        submit.args = {
-          ...submit.args,
-          priorDecisions: prior
-            ? [{ id: prior.id, status: "changed", choice: "R7 extends the differential to every listed input", whyItMatters: disclosure.whyItMatters, alternatives: disclosure.alternatives, recommendation: { choice: "extend", reason: "the plan lists them" } }]
-            : [],
-        };
-      }
-      return worker;
-    },
+    laneWorkerScriptFor: (lane) => ({ hello: defaultWorkerHello(), steps: [
+      { kind: "call-sh", command: `mkdir -p booking; echo '${lane}' > booking/a.txt` },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+    ] }),
     laneReviewerScriptFor: (seat, _candidate, state) => {
-      const K = state.phase.contract.contractVersion;
-      // Ballot each lane's own worker decision and every worker decision
-      // already on the phase (the carried one, round 2); an extra ballot for
-      // the other lane's record is ignored.
-      const shas = (state.phase.rounds?.[state.phase.rounds.length - 1]?.candidates ?? []).map((c) => c.sha ?? "");
-      const ids = new Set([
-        ...shas.filter(Boolean).map((sha) => `D-p1-${sha.slice(0, 8)}-1`),
-        ...state.phase.decisions.filter((d) => d.source === "worker").map((d) => d.id),
-      ]);
-      const ballots = [...ids].map((decisionId) => ({ decisionId, vote: "approve", rationale: "fine", evidence: [`lane-${seat === "B" ? "b" : "a"}.txt:1`] }));
-      return liveRound(state) === 1 && seat === "M"
-        ? laneReview("M", K, { ballots, findings: [{ kind: "defect", severity: "blocking", evidence: "it works is unmet: lane-a.txt:1 incomplete" }] })
-        : laneReview(seat as Reviewer, K, { ballots });
+      const script = laneReview(seat as Reviewer, state.phase.contract.contractVersion, { findings: seat === "M" ? [{
+        kind: "defect", severity: "blocking", evidence: "booking/a.txt:1 needs the domain fix",
+        domain: "booking", item: "R1", where: "booking/a.txt:1", expected: "the booking fix is present", doneWhen: "test -f booking/fixed.txt",
+      }, {
+        kind: "defect", severity: "blocking", evidence: "booking/a.txt:1 needs the gates fix too",
+        domain: "gates", item: "R1", where: "booking/a.txt:1", expected: "the gates fix is present", doneWhen: "test -f gates/fixed.txt",
+      }] : [] });
+      script.steps.splice(2, 0, { kind: "call-tool", tool: "read", args: { path: "booking/a.txt" } });
+      return script;
     },
     pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", { yes: false, anchors: [] }),
+    // Loop 2's approved booking fixer discloses. The gates point stays open
+    // until loop 3, whose fixer has no disclosure: hand-off must retain loop 2.
+    fixerScriptFor: (domain, round) => ({ hello: defaultWorkerHello(), steps: [
+      { kind: "call-sh", command: domain === "booking" ? "echo fixed > booking/fixed.txt" : round === 3 ? "mkdir -p gates; echo fixed > gates/fixed.txt" : "true" },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: domain === "booking" ? [{
+        choice, whyItMatters: "caching changes when validation runs",
+        alternatives: [{ option: "validate every time", consequence: "more work per request" }],
+        recommendation: { choice: "cache", reason: "bounded repeated work" }, classProposal: "delegated",
+      }] : [], assumptions: [], deviations: [] } },
+    ] }),
+    reviewerScriptFor: (seat, state) => {
+      const decision = state.phase.decisions.find((d) => d.choice === choice)!;
+      const args = (ballots: unknown[]) => ({ reviewer: seat, phaseId: "p1", candidateSha: state.phase.candidate!.sha,
+        contractVersion: state.phase.contract.contractVersion, correctionStatements: [], findingStatements: [], findings: [], ballots });
+      return { hello: defaultReviewerHello(), steps: [
+        { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+        { kind: "wait-for-prompt" },
+        { kind: "call-tool", tool: "read", args: { path: "booking/fixed.txt" } },
+        ...(seat === "M" ? [
+          { kind: "call-submit" as const, tool: "submit_review", args: args([]) },
+          { kind: "sleep" as const, ms: 1_500 },
+        ] : []),
+        { kind: "call-submit", tool: "submit_review", args: args(decision ? [{ decisionId: decision.id, vote: "approve", rationale: "the trade-off is explicit", evidence: ["booking/fixed.txt:1"] }] : []) },
+      ] };
+    },
   });
   try {
     await setup.conductor.start();
-    const priorId = () =>
-      setup.conductor.state.phase.decisions.find((d) => d.source === "worker" && d.choice.startsWith("R7 "))?.id;
-    const demandedInRound2 = () =>
-      readEvents(setup.runDir).some((r) => {
-        if (r.kind !== "ballot_demanded") return false;
-        const e = r.event as { agentId?: string; records?: Array<{ id: string; choice: string }> };
-        return (
-          (e.agentId ?? "").startsWith("lane-review-2-") &&
-          (e.records ?? []).some((rec) => rec.id === priorId() && rec.choice.startsWith("R7 extends"))
-        );
-      });
-    await waitFor(demandedInRound2, 150_000, 50, setup.runDir);
-    assert.ok(priorId(), "round 1's worker decision exists");
+    await waitFor(() => readEvents(setup.runDir).some((r) => r.kind === "intent" &&
+      (r.event as { agentId?: string }).agentId?.startsWith("reviewer-")), 60_000, 25, setup.runDir);
+    const decision = setup.conductor.state.phase.decisions.find((d) => d.choice === choice)!;
+    assert.ok(decision, "loop 2's fixer disclosure exists before loop 3's acceptance dispatch");
+    await waitFor(() => readEvents(setup.runDir).some((r) => r.kind === "incomplete_review_rejected"), 60_000, 25, setup.runDir);
+    const rejected = readEvents(setup.runDir).find((r) => r.kind === "incomplete_review_rejected")!.event as { missing: string[] };
+    assert.ok(rejected.missing.includes(decision.id), "the missing ballot on the fixer decision is rejected");
+    assert.ok(!coreAccepted(setup.runDir), "missing ballots never pass acceptance");
+    assert.equal(setup.conductor.state.phase.reviews.M?.review, undefined, "the incomplete M review is not accepted");
+    assert.ok(fs.readFileSync(promptLog, "utf8").includes(choice), "the acceptance brief carries the fixer decision");
+    const demands = readEvents(setup.runDir).filter((r) => r.kind === "ballot_demanded").map((r) => r.event as { agentId?: string; records?: Array<{ id: string }> });
+    assert.equal(demands.filter((d) => d.agentId?.startsWith("reviewer-") && d.records?.some((r) => r.id === decision.id)).length, 3, "all acceptance seats demand its ballot");
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 60_000, 50, setup.runDir);
+    assert.equal(setup.conductor.state.phase.ballots.filter((b) => b.decisionId === decision.id && b.vote === "approve").length, 3);
+    assert.equal(setup.conductor.state.phase.rounds!.length, 3, "acceptance waits for the second fix loop");
+    assert.ok(setup.conductor.state.phase.rounds![1].fixed?.disclosures?.some((d) => d.choice === choice), "loop 2 recorded the disclosure");
+    assert.deepEqual(setup.conductor.state.phase.rounds![2].fixed?.disclosures ?? [], [], "loop 3 discloses nothing");
+    assert.equal(setup.conductor.state.phase.decisions.filter((d) => d.choice === choice).length, 1, "the disclosure is balloted once");
+    assert.ok(setup.conductor.state.phase.rounds!.slice(1).every((r) => r.lanes.length === 0 && !r.picked), "the entire fix path is lane-free");
   } finally {
     await teardown(setup);
+    cleanupDir(promptDir);
   }
 });
+
+function coreAccepted(runDir: string): boolean {
+  return readEvents(runDir).some((r) => r.kind === "event" && (r.event as { type?: string }).type === "ACCEPTED");
+}
 
 test("plan 06k1: loser-had-something counts only yes-votes from seats that picked the winning lane, on the deciding votes", () => {
   const round = (overrides: Partial<import("../../src/core/types.ts").RoundRecord>): import("../../src/core/types.ts").RoundRecord => ({

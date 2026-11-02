@@ -89,6 +89,10 @@ export function defaultReviewerHello() {
   return { role: "reviewer" as const, tools: ROLE_TOOLS.reviewer };
 }
 
+export function defaultDomainReviewHello() {
+  return { role: "domain-review" as const, tools: ROLE_TOOLS["domain-review"] };
+}
+
 export interface TestConductorSetup {
   repo: TestRepo;
   runRoot: string;
@@ -116,6 +120,8 @@ export async function setupConductor(opts: {
   /** The phase contract's own `:CHECKS:` list. Defaults to `checks`, then
    * `["true"]`. */
   phaseChecks?: string[];
+  /** The plan's `#+TT_RERUN:` single-test template. Absent: none. */
+  rerun?: string;
   workerScript: (setup: { repo: TestRepo }) => { hello?: unknown; steps: FakePiStep[] };
   /** Work packet 2a: an attempt-aware alternative to the static
    * `workerScript` — needed by tests where a repair round's second attempt
@@ -130,16 +136,19 @@ export async function setupConductor(opts: {
    * The script's `submit_review` names its candidate with the
    * `$TT_CANDIDATE_SHA` token, which fake-pi substitutes at dispatch time. */
   laneReviewerScriptFor?: (seat: string, candidate: string, state: State, lane?: string) => { hello?: unknown; steps: FakePiStep[] };
+  /** 07g2 (A1): one script per integrate-duty attempt
+   * (`integrate-<round>-<attempt>-…`). Absent: the duty settles without
+   * changing anything, so the merge is dropped after its attempts. */
+  integrateScriptFor?: (round: number, attempt: number, state: State) => { hello?: unknown; steps: FakePiStep[] };
   /** Plan 06g2: one script per pick seat (`pick-<round>-<seat>-…`). */
   pickScriptFor?: (seat: string, state: State) => { hello?: unknown; steps: FakePiStep[] };
-  /** tt 09 (change 3): one script per consolidator run
-   * (`consolidate-<round>-…`), `n` counting this round's runs from 1 (the
-   * build, then each fix). Absent: the worker script. */
-  consolidatorScriptFor?: (round: number, n: number, state: State) => { hello?: unknown; steps: FakePiStep[] };
   /** Plan 07c (D4): one script per fixer run (`fix-<round>-<domain>-…`), `n`
    * counting this round's runs for that domain from 1 (the build, then each
    * fix). Absent: the worker script. */
   fixerScriptFor?: (domain: string, round: number, n: number, state: State) => { hello?: unknown; steps: FakePiStep[] };
+  /** 07g1: a fresh stateless domain review's own script. Absent: the default
+   * review approves every open point of that domain. */
+  domainReviewScriptFor?: (domain: string, round: number, iteration: number, state: State) => { hello?: unknown; steps: FakePiStep[] };
   reviewerScriptFor?: (reviewer: Reviewer, state: State) => { hello?: unknown; steps: FakePiStep[] };
   /** Plan 04a: the EVALUATING stage's fresh evaluator, ONE PER MESSAGE TYPE.
    * The default script returns an empty `submit_evaluation`, which the
@@ -173,6 +182,10 @@ export async function setupConductor(opts: {
   /** Plan 05e: the default round-panel vote for every item. */
   defaultRoundPanelVote?: "keep" | "drop" | "downgrade";
   deadlines?: ConductorOptions["deadlines"];
+  /** Plan 07e: `#+TT_ROUNDS` (the rounds bound). */
+  rounds?: number;
+  /** Plan 07e (E4): the plan's `#+TT_CHECK_WINDOW` opt-in. */
+  checkWindow?: "exclusive" | "off";
   /** Extra argv tokens prepended before fake-pi.ts's own path — fake-pi
    * never parses argv, so these are inert except as a unique, greppable
    * marker in every agent process's command line (`ps`/`pgrep -f`), e.g.
@@ -274,10 +287,13 @@ export async function setupConductor(opts: {
     repo: repo.dir,
     integrationBranch: "main",
     checks: opts.globalChecks ?? opts.checks ?? ["true"],
+    ...(opts.checkWindow ? { checkWindow: opts.checkWindow } : {}),
     ...(opts.secrets ? { secrets: opts.secrets } : {}),
     ...(opts.envFile ? { envFile: opts.envFile } : {}),
     ...(opts.models ? { models: opts.models } : {}),
     ...(opts.workerPrompt ? { workerPrompt: opts.workerPrompt } : {}),
+    ...(opts.rounds !== undefined ? { rounds: opts.rounds } : {}),
+    ...(opts.rerun ? { rerun: opts.rerun } : {}),
     phases: [
       opts.phase ?? {
         id: "p1",
@@ -302,8 +318,9 @@ export async function setupConductor(opts: {
   const laneWorkerScriptPaths = new Map<string, string>();
   const laneReviewerScriptPaths = new Map<string, string>();
   const pickScriptPaths = new Map<string, string>();
-  const consolidatorScriptPaths = new Map<string, string>();
   const fixerScriptPaths = new Map<string, string>();
+  const integrateScriptPaths = new Map<string, string>();
+  const domainReviewScriptPaths = new Map<string, string>();
   const evaluatorScriptPaths = new Map<string, string>();
   const briefScriptPaths = new Map<string, string>();
   const curatorScriptPaths = new Map<string, string>();
@@ -400,6 +417,25 @@ export async function setupConductor(opts: {
     };
   };
 
+  const defaultDomainReviewScript = (domain: string, state: State) => {
+    const points = (state.phase.findings ?? []).filter(
+      (f) => f.status === "open" && (!f.domain || f.domain === domain),
+    );
+    return {
+      hello: defaultDomainReviewHello(),
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_domain_review",
+          args: {
+            points: points.map((p) => ({ pointId: p.id, fixed: true, why: `README.md:1 the point is fixed on the reviewed commit (${p.id})` })),
+            quality: { ok: true },
+          },
+        },
+      ],
+    };
+  };
+
   const conductor = new Conductor({
     runDir,
     plan,
@@ -424,16 +460,6 @@ export async function setupConductor(opts: {
     checkLockPath: opts.checkLockPath ?? path.join(runRoot, "check.lock"),
     ...(opts.checkSlots !== undefined ? { checkSlots: opts.checkSlots } : {}),
     piEnvFor: (role, agentId) => {
-      // tt 09 (change 3): the consolidator's own script, one per run.
-      const consolidate = agentId.match(/^consolidate-(\d+)-/);
-      if (role === "worker" && consolidate && opts.consolidatorScriptFor) {
-        const round = Number(consolidate[1]);
-        if (!consolidatorScriptPaths.has(agentId)) {
-          const n = [...consolidatorScriptPaths.keys()].filter((k) => k.startsWith(`consolidate-${round}-`)).length + 1;
-          consolidatorScriptPaths.set(agentId, writeScript(scriptsDir, agentId, opts.consolidatorScriptFor(round, n, conductor.state)));
-        }
-        return { FAKE_PI_SCRIPT: consolidatorScriptPaths.get(agentId)!, ...(opts.extraWorkerEnv ?? {}) };
-      }
       // Plan 07c (D4): a fixer's own script, one per run, keyed by round and
       // domain (`fix-<round>-<domain>-fixer-<seq>-<rand>`).
       const fixer = agentId.match(/^fix-(\d+)-(.+?)-fixer-\d+-[0-9a-f]+$/);
@@ -446,7 +472,38 @@ export async function setupConductor(opts: {
         }
         return { FAKE_PI_SCRIPT: fixerScriptPaths.get(agentId)!, ...(opts.extraWorkerEnv ?? {}) };
       }
+      // 07g1: a fresh domain review, keyed by round/domain/iteration.
+      const domainReview = agentId.match(/^domain-review-(\d+)-(.+?)-(\d+)-/);
+      if (role === "domain-review" && domainReview) {
+        const round = Number(domainReview[1]);
+        const domain = domainReview[2];
+        const iteration = Number(domainReview[3]);
+        const key = `${round}-${domain}-${iteration}-${agentId}`;
+        if (!domainReviewScriptPaths.has(key)) {
+          const script = opts.domainReviewScriptFor
+            ? opts.domainReviewScriptFor(domain, round, iteration, conductor.state)
+            : defaultDomainReviewScript(domain, conductor.state);
+          domainReviewScriptPaths.set(key, writeScript(scriptsDir, key, script));
+        }
+        return { FAKE_PI_SCRIPT: domainReviewScriptPaths.get(key)! };
+      }
       // Plan 06g2: a lane agent's own script, keyed by its lane/round/seat.
+      // 07g2 (A1/C4): the integrate duty's own script, keyed by round and
+      // attempt. The default settles with a submission but changes nothing, so
+      // the conflicted files keep their markers and the attempt is refused.
+      const integrate = agentId.match(/^integrate-(\d+)-(\d+)-/);
+      if (role === "worker" && integrate) {
+        const round = Number(integrate[1]);
+        const attempt = Number(integrate[2]);
+        const key = `integrate-${agentId}`;
+        if (!integrateScriptPaths.has(key)) {
+          const script = opts.integrateScriptFor
+            ? opts.integrateScriptFor(round, attempt, conductor.state)
+            : { hello: defaultWorkerHello(), steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } }] };
+          integrateScriptPaths.set(key, writeScript(scriptsDir, key, script));
+        }
+        return { FAKE_PI_SCRIPT: integrateScriptPaths.get(key)!, ...(opts.extraWorkerEnv ?? {}) };
+      }
       const laneWorker = agentId.match(/^lane-(\d+)-([a-z])-/);
       if (role === "worker" && laneWorker && opts.laneWorkerScriptFor) {
         const round = Number(laneWorker[1]);
@@ -556,6 +613,27 @@ export async function setupConductor(opts: {
       if (!reviewerScriptPaths.has(agentId) && opts.reviewerScriptFor) {
         const script = opts.reviewerScriptFor(reviewer, conductor.state);
         reviewerScriptPaths.set(agentId, writeScript(scriptsDir, agentId, script));
+      }
+      // Domain loops now use ordinary candidate seats at ACCEPT, not a
+      // synthetic lane review. Lane-oriented fixtures get an empty acceptance
+      // review unless they explicitly script the acceptance seats themselves.
+      if (!reviewerScriptPaths.has(agentId) && opts.laneReviewerScriptFor && conductor.state.phase.rounds?.at(-1)?.lanes.length === 0) {
+        const phase = conductor.state.phase;
+        reviewerScriptPaths.set(agentId, writeScript(scriptsDir, agentId, {
+          hello: defaultReviewerHello(),
+          steps: [
+            ...((opts.stubReviews ?? true) ? [] : [
+              { kind: "call-submit" as const, tool: "submit_discovery", args: { discoveries: [] } },
+              { kind: "wait-for-prompt" as const },
+            ]),
+            { kind: "call-tool", tool: "read", args: { path: "README.md" } },
+            { kind: "call-submit", tool: "submit_review", args: {
+            reviewer, phaseId: phase.phaseId, candidateSha: phase.candidate?.sha,
+            contractVersion: phase.contract.contractVersion, correctionStatements: [], findingStatements: [], ballots: [], findings: [],
+            items: [...(phase.contract.requirements ?? []), ...(phase.contract.constraints ?? [])].map((item) => ({ id: item.id, verdict: "met", evidence: "README.md:1" })),
+            arch: (phase.contract.architecture ?? []).map((item) => ({ id: item.id, verdict: "fits", evidence: "README.md:1" })),
+          } }],
+        }));
       }
       const p = reviewerScriptPaths.get(agentId);
       return p ? { FAKE_PI_SCRIPT: p, ...(opts.extraReviewerEnv?.(reviewer) ?? {}) } : undefined;

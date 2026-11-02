@@ -272,6 +272,22 @@ export interface CheckRecordCommand {
   timedOut: boolean;
   durationMs: number;
   passed: boolean;
+  /** Plan 07e (E3): why a failed command produced no useful failure, kept
+   * distinct from an ordinary red check. `silent` exited non-zero with no
+   * output; `interrupted` was cut off by the owner's stop; `disk-full` could
+   * not record its output. */
+  failureClass?: "silent" | "interrupted" | "disk-full";
+  /** 07e (A4): how the command ended, including a silent or interrupted check. */
+  class?: "passed" | "failed" | "silent" | "interrupted" | "disk-full";
+  /** 07e (A4): the one-line reason, e.g. `check exited 3 with no output`. */
+  note?: string;
+  /** 07g2 (A4/R9): the simple command the shell ran last before the non-zero
+   * exit, named inside the chain (`test -z x`), with its own output. */
+  failingStep?: string;
+  /** 07g2 (A4/R9): the failing step's own output (empty when it was silent). */
+  failingStepOutput?: string;
+  /** 07g2 (A4/R9): the failing step produced no output at all. */
+  failingStepSilent?: boolean;
   /** The log file name under the candidate's checks directory. */
   log?: string;
 }
@@ -337,6 +353,14 @@ export function parseCheckRecord(value: unknown): CheckRecord | undefined {
       timedOut: e.timedOut,
       durationMs: e.durationMs,
       passed: e.passed,
+      ...(e.failureClass === "silent" || e.failureClass === "interrupted" || e.failureClass === "disk-full"
+        ? { failureClass: e.failureClass }
+        : {}),
+      ...(e.class === "passed" || e.class === "failed" || e.class === "silent" || e.class === "interrupted" || e.class === "disk-full" ? { class: e.class } : {}),
+      ...(typeof e.note === "string" ? { note: e.note } : {}),
+      ...(typeof e.failingStep === "string" ? { failingStep: e.failingStep } : {}),
+      ...(typeof e.failingStepOutput === "string" ? { failingStepOutput: e.failingStepOutput } : {}),
+      ...(typeof e.failingStepSilent === "boolean" ? { failingStepSilent: e.failingStepSilent } : {}),
       ...(typeof e.log === "string" ? { log: e.log } : {}),
     });
   }

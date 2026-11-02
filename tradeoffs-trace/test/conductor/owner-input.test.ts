@@ -4,9 +4,9 @@
 //     `deliver.intent` before sending and `deliver.done` on acknowledgement;
 //   - a steer intent with no acknowledgement is shown `delivery uncertain`
 //     and never resent;
-//   - input while the phase is AWAITING_OWNER is a correction: it resolves
-//     the open owner requests, grants 3 fresh repair rounds and starts a
-//     repair attempt whose prompt contains the text verbatim;
+//   - input while the phase is AWAITING_OWNER: a correction is refused with
+//     guidance (no domain owns its point here, plan 07f A3), so it resolves
+//     no request and grants no round;
 //   - input after DONE is refused visibly;
 //   - `tt stop` ends a run's conductor cleanly within 15 s and `tt resume`
 //     continues it.
@@ -233,7 +233,7 @@ test("owner-input: a steer intent with no acknowledgement is shown delivery unce
   }
 });
 
-test("owner-input: input while AWAITING_OWNER is a correction that resolves the requests, grants 3 rounds and repairs with the text verbatim (correction-after-budget)", async () => {
+test("owner-input: a correction at AWAITING_OWNER outside domain mode is a point that resolves no request", async () => {
   const dir = fs.mkdtempSync("/tmp/tt-input-correction-");
   const promptLog = path.join(dir, "worker-prompts.log");
   const setup = await setupConductor({
@@ -252,23 +252,35 @@ test("owner-input: input while AWAITING_OWNER is a correction that resolves the 
     const requests = openRequests(setup.conductor.state);
     assert.ok(requests.length > 0, "expected open owner requests at AWAITING_OWNER");
     const grantedBefore = setup.conductor.state.phase.repairRoundsGranted;
-    const text = "CORRECTION: a lone cancellation must not wait for the next tick";
+    const text = [
+      "CORRECTION: a lone cancellation must not wait for the next tick",
+      "domain: conductor",
+      "where: src/conductor.ts:4066",
+      "expected: a lone cancellation does not wait for the next tick",
+      "doneWhen: node --test test/conductor/owner-input.test.ts",
+    ].join("\n");
     writeCommand(setup.runDir, "cmd-correction-1", {
       type: "correction",
       text,
       binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" },
     });
 
-    await waitFor(() => setup.conductor.state.phase.phase !== "AWAITING_OWNER", 15_000);
-    assert.equal(openRequests(setup.conductor.state).length, 0, "a correction resolves every open owner request");
-    assert.equal(setup.conductor.state.phase.repairRoundsGranted, grantedBefore + 3, "a correction grants 3 fresh rounds");
-
-    await waitFor(() => fs.existsSync(promptLog) && fs.readFileSync(promptLog, "utf8").includes(text), 20_000);
-    assert.match(fs.readFileSync(promptLog, "utf8"), new RegExp(text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-
-    const recorded = (setup.conductor.state.phase.ownerInputs ?? []).find((i) => i.id === "cmd-correction-1");
-    assert.ok(recorded, "the correction is recorded for the status view");
-    assert.equal(recorded!.state, "correction-started");
+    // Plan 07f (A3/§3.3): this phase declares no domain, which no longer
+    // refuses the correction: an owner input is a ruling, a point or a
+    // withdraw, and only a point can carry the code work. It is a point in the
+    // domain the input names — never applied as a repair, never a note.
+    await waitFor(
+      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.id === "cmd-correction-1" && i.state === "noted"),
+      30_000,
+    );
+    const point = (setup.conductor.state.phase.findings ?? []).find((f) => f.id.includes("owner-cmd-correction-1"));
+    assert.ok(point, "the correction is a point in the record");
+    assert.equal(point!.status, "open", "open until its doneWhen fact passes");
+    assert.equal(point!.domain, "conductor", "the domain the input names owns it");
+    assert.equal(setup.conductor.state.phase.phase, "AWAITING_OWNER", "a point moves no phase");
+    assert.equal(openRequests(setup.conductor.state).length, requests.length, "it resolves no open owner request");
+    assert.equal(setup.conductor.state.phase.repairRoundsGranted, grantedBefore, "it grants no round");
+    assert.ok(!(setup.conductor.state.phase.ownerNotes ?? []).some((n) => n.includes(text)), "its text is not kept as a note");
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);
@@ -420,15 +432,16 @@ test("owner-input: tt stop ends a run's conductor cleanly within 15s and tt resu
   }
 });
 
-test("plan 06d: a correction written as an inbox file during REVIEWING and a steer written during CHECKING are queued and reach the next worker attempt's prompt", async () => {
+test("plan 06d: a note written as an inbox file during REVIEWING and a steer written during CHECKING are queued and reach the next worker attempt's prompt", async () => {
   const dir = fs.mkdtempSync("/tmp/tt-06d-queue-");
   const promptLog = path.join(dir, "worker-prompts.log");
-  const correctionText = "CORRECTION-QUEUED-06D: the retry loop must cap at 64";
+  const noteText = "NOTE-QUEUED-06D: the retry loop must cap at 64";
   const steerText = "STEER-QUEUED-06D: keep the lock hold under 50us";
   // Round 1 and round 2 each raise a blocking finding, so round 3 is a real
-  // worker attempt. The correction is written during round 1's REVIEWING and
-  // the steer during round 2's CHECKING; both are queued, and round 3's prompt
-  // must carry them.
+  // worker attempt. The note is written during round 1's REVIEWING and the
+  // steer during round 2's CHECKING; both are queued, and round 3's prompt
+  // must carry them. (Plan 07f A3: a correction is a point, not a note; only a
+  // note is queued owner text.)
   const setup = await setupConductor({
     checks: ["true"],
     // The real two-turn review protocol, like the other repair-driving tests:
@@ -478,19 +491,19 @@ test("plan 06d: a correction written as an inbox file during REVIEWING and a ste
   await setup.conductor.start();
   try {
     await waitFor(() => setup.conductor.state.phase.phase === "REVIEWING", 60_000);
-    writeCommand(setup.runDir, "cmd-06d-correction", {
-      type: "correction",
-      text: correctionText,
+    writeCommand(setup.runDir, "cmd-06d-note", {
+      type: "note",
+      text: noteText,
       binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" },
     });
     await waitFor(
-      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.id === "cmd-06d-correction" && i.state === "queued"),
+      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.id === "cmd-06d-note" && i.state === "noted"),
       30_000,
       50,
       setup.runDir,
     );
 
-    // The repair attempt after round 1 carries the queued correction.
+    // The repair attempt after round 1 carries the queued note.
     await waitFor(() => setup.conductor.state.phase.phase === "CHECKING" && (setup.conductor.state.phase.round ?? 0) >= 2, 90_000, 50, setup.runDir);
     writeCommand(setup.runDir, "cmd-06d-steer", {
       type: "steer",
@@ -502,13 +515,15 @@ test("plan 06d: a correction written as an inbox file during REVIEWING and a ste
       30_000,
     );
 
-    // Both are shown queued in views/status.txt (Emacs reads this, not state).
+    // Both are shown as recorded in views/status.txt (Emacs reads this, not
+    // state): the note is `noted` while a steer with no live worker stays
+    // `queued` (a correction in this phase would be refused — no domain).
     // The view is refreshed on its own beat, so wait for the file to catch up.
     await waitFor(
       () => {
         const file = runPaths(setup.runDir).status;
         const status = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
-        return status.includes(correctionText) && status.includes(steerText) && (status.match(/ — queued /g) ?? []).length >= 2;
+        return status.includes(noteText) && status.includes(steerText) && (status.match(/ — (queued|noted) /g) ?? []).length >= 2;
       },
       30_000,
       100,
@@ -519,11 +534,11 @@ test("plan 06d: a correction written as an inbox file during REVIEWING and a ste
     await waitFor(() => {
       if (!fs.existsSync(promptLog)) return false;
       const prompts = fs.readFileSync(promptLog, "utf8");
-      return prompts.includes(correctionText) && prompts.includes(steerText);
+      return prompts.includes(noteText) && prompts.includes(steerText);
     }, 90_000);
     assert.ok(
       (setup.conductor.state.phase.ownerInputs ?? []).every((i) => i.state !== "refused"),
-      "a queued correction or steer is never refused",
+      "a queued note or steer is never refused",
     );
   } finally {
     await setup.conductor.stop();
@@ -547,12 +562,12 @@ test("plan 06d: corrections bound with the run directory id and with the readabl
 
     writeCommand(setup.runDir, "cmd-aaa-dir", {
       type: "correction",
-      text: "DIR-ID-CORRECTION: applied now",
+      text: "DIR-ID-CORRECTION: refused for its kind, never for its binding",
       binding: { runId: dirId, phaseId: "p1" },
     });
     writeCommand(setup.runDir, "cmd-bbb-readable", {
       type: "correction",
-      text: "READABLE-ID-CORRECTION: accepted",
+      text: "READABLE-ID-CORRECTION: refused for its kind, never for its binding",
       binding: { runId: readableId, phaseId: "p1" },
     });
     writeCommand(setup.runDir, "cmd-ccc-unknown", {
@@ -561,36 +576,30 @@ test("plan 06d: corrections bound with the run directory id and with the readabl
       binding: { runId: "no-such-run", phaseId: "p1" },
     });
 
+    const outcome = (id: string) => (setup.conductor.state.phase.ownerInputs ?? []).find((i) => i.id === id);
     await waitFor(
-      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.id === "cmd-aaa-dir" && i.state === "correction-started"),
-      30_000,
-    );
-    await waitFor(
-      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.id === "cmd-bbb-readable" && i.state === "queued"),
-      30_000,
-    );
-    await waitFor(
-      () => readEvents(setup.runDir).some((r) => r.kind === "command_rejected" && (r.event as { commandId?: string }).commandId === "cmd-ccc-unknown"),
+      () => ["cmd-aaa-dir", "cmd-bbb-readable", "cmd-ccc-unknown"].every((id) => outcome(id)?.state === "refused"),
       30_000,
     );
 
-    assert.equal(
-      (setup.conductor.state.phase.ownerInputs ?? []).find((i) => i.id === "cmd-aaa-dir")!.state,
-      "correction-started",
-      "the run directory id bound the correction and it applied",
-    );
-    assert.equal(
-      (setup.conductor.state.phase.ownerInputs ?? []).find((i) => i.id === "cmd-bbb-readable")!.state,
-      "queued",
-      "the readable id bound the correction and it was accepted (queued)",
-    );
-    const refused = (setup.conductor.state.phase.ownerInputs ?? []).find((i) => i.id === "cmd-ccc-unknown")!;
-    assert.equal(refused.state, "refused");
+    // Plan 07f (A3): both bound corrections are refused for what they omit
+    // (a point needs its own fields), which proves their bindings resolved — a
+    // binding refusal reads differently. No domain is needed: the phase's own
+    // shape never refuses a correction.
+    for (const id of ["cmd-aaa-dir", "cmd-bbb-readable"]) {
+      const record = outcome(id)!;
+      assert.match(record.reason ?? "", /doneWhen/, `${id} names the field a point needs: ${record.reason}`);
+      assert.doesNotMatch(record.reason ?? "", /declares no domain/, `${id} is not refused for the phase's shape`);
+      assert.doesNotMatch(record.reason ?? "", /no-such-run|does not name this run/, `${id} was not refused for its binding`);
+    }
+    assert.equal(readEvents(setup.runDir).filter((r) => r.kind === "command_rejected").length, 3, "each refusal is recorded");
+    // A command for a run id that does not exist is never applied.
+    const unknown = outcome("cmd-ccc-unknown")!;
+    assert.equal(unknown.state, "refused");
     // The reason lists all three ids that would have bound.
-    assert.match(refused.reason ?? "", new RegExp(runId));
-    assert.match(refused.reason ?? "", new RegExp(dirId));
-    assert.match(refused.reason ?? "", new RegExp(readableId));
-    assert.equal(readEvents(setup.runDir).filter((r) => r.kind === "command_rejected").length, 1, "only the unknown id is refused");
+    assert.match(unknown.reason ?? "", new RegExp(runId));
+    assert.match(unknown.reason ?? "", new RegExp(dirId));
+    assert.match(unknown.reason ?? "", new RegExp(readableId));
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);
@@ -602,25 +611,25 @@ test("plan 06d: every inbox command ends applied, queued or refused with a recor
   const setup = await setupAwaitingOwner(["false"]);
   try {
     const runId = setup.conductor.state.phase.runId;
-    // Name-sorted so the steer (no worker, still AWAITING_OWNER) queues before
-    // the correction applies now (AWAITING_OWNER); the mis-addressed note is
-    // refused. One of each outcome.
+    // Name-sorted: the steer (no worker, still AWAITING_OWNER) queues, the
+    // correction is refused for the fields a point needs (it carries none) and
+    // the mis-addressed note is refused for its binding.
     writeCommand(setup.runDir, "cmd-aaa-steer", { type: "steer", text: "queued steer", binding: { runId, phaseId: "p1" } });
-    writeCommand(setup.runDir, "cmd-bbb-correction", { type: "correction", text: "applied now", binding: { runId, phaseId: "p1" } });
+    writeCommand(setup.runDir, "cmd-bbb-correction", { type: "correction", text: "refused: no domain", binding: { runId, phaseId: "p1" } });
     writeCommand(setup.runDir, "cmd-ccc-unknown", { type: "note", text: "unknown id", binding: { runId: "no-such-run", phaseId: "p1" } });
 
     await waitFor(() => fs.readdirSync(inboxDir(setup.runDir)).filter((n) => n.endsWith(".json")).length === 0, 30_000);
     const inputs = setup.conductor.state.phase.ownerInputs ?? [];
     assert.equal(inputs.find((i) => i.id === "cmd-aaa-steer")!.state, "queued", "queued");
-    assert.equal(inputs.find((i) => i.id === "cmd-bbb-correction")!.state, "correction-started", "applied");
+    assert.equal(inputs.find((i) => i.id === "cmd-bbb-correction")!.state, "refused", "refused (a point needs its own fields)");
     assert.equal(inputs.find((i) => i.id === "cmd-ccc-unknown")!.state, "refused", "refused");
-    // Every outcome is an OWNER_INPUT_RECORDED event; the refusal additionally
-    // has its command_rejected record.
+    // Every outcome is an OWNER_INPUT_RECORDED event; the refusals additionally
+    // have their command_rejected record.
     const recorded = eventsOfType(setup.runDir, "OWNER_INPUT_RECORDED") as Array<{ input?: { id?: string; state?: string } }>;
     for (const id of ["cmd-aaa-steer", "cmd-bbb-correction", "cmd-ccc-unknown"]) {
       assert.ok(recorded.some((r) => r.input?.id === id), `${id} has a recorded outcome event`);
     }
-    assert.equal(readEvents(setup.runDir).filter((r) => r.kind === "command_rejected").length, 1);
+    assert.equal(readEvents(setup.runDir).filter((r) => r.kind === "command_rejected").length, 2);
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);

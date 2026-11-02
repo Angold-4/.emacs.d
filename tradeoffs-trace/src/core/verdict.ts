@@ -4,10 +4,14 @@
 // A ✓ B ✓" read as all approved while M had vetoed and a blocking finding was
 // open).
 
-import { decisionStatus, isLiveDecision } from "./predicate.ts";
+import { acceptanceBlockers, decisionStatus, isLiveDecision, itemIsSplit, pointHasProvingFact, pointNeedsEvaluation, shortId } from "./predicate.ts";
+import { isStructured, phaseItemOutcomes } from "./items.ts";
+import { discoveredDecisions, openFindings, recordClassified } from "./triage.ts";
 import { seatsOf } from "./seats.ts";
 import { currentBallot, isValidBallot } from "./tally.ts";
-import type { PhaseState, Reviewer } from "./types.ts";
+import type { MessageType, PhaseState, Reviewer } from "./types.ts";
+
+export { shortId } from "./predicate.ts";
 
 /** The default seats, kept for callers that predate `#+TT_REVIEWERS`. */
 export const REVIEWERS: readonly Reviewer[] = ["M", "A", "B"];
@@ -60,36 +64,83 @@ export function reviewerOutcomes(phase: PhaseState): ReviewerOutcome[] {
 
 /** Why the current candidate is not (or not yet) accepted, one short clause
  * each; empty when nothing stands in the way. Only failures that already
- * happened are listed; a gate still running is not a reason. */
+ * happened are listed; a gate still running is not a reason. The status
+ * view reads `acceptanceBlockers` itself so each line carries its command. */
 export function notAcceptedReasons(phase: PhaseState): string[] {
-  const C = phase.candidate?.sha;
-  if (!C) return [];
-  const reasons: string[] = [];
-  if (phase.checks?.candidateSha === C && phase.checks.passed === false) reasons.push("checks failed");
-  if (phase.probe?.candidateSha === C && phase.probe.passed === false) reasons.push("integration probe failed");
-  // Failed records, grouped by why: "D-3 vetoed by M", or "16 trade-offs
-  // failed (missing ballot from M)" rather than sixteen clauses. Plan 05c:
-  // the owner reads trade-off vocabulary, never the retired word `decisions'.
-  const failedBy = new Map<string, string[]>();
-  for (const d of phase.decisions) {
-    if (!isLiveDecision(d) || d.boundCandidateSha !== C) continue;
-    // Plan 01g: a failed amendment is not a reason the candidate was not
-    // accepted — it leaves the criterion unchanged and blocks nothing.
-    if (d.amendment) continue;
-    const s = decisionStatus(d, phase);
-    if (s.status !== "failed") continue;
-    const why = s.reason ?? "failed";
-    failedBy.set(why, [...(failedBy.get(why) ?? []), shortId(d.id)]);
+  if (!phase.candidate?.sha) return [];
+  // Plan 07f (C3/F1): the SAME list `accept` reads. There is no second
+  // derivation of "why not accepted" here or in the status view.
+  return acceptanceBlockers(phase).map((b) => b.detail);
+}
+
+/** Plan 07f (F0): the records that may still change scope, behaviour or cost,
+ * and therefore the only records an evaluator session is started for:
+ *
+ *   - a raw/owner-refused message awaiting evaluation;
+ *   - a plan item the seats split on;
+ *   - an open point with no proving doneWhen fact (a failing fact keeps it
+ *     open, whatever an evaluator drop says);
+ *   - an open finding or discovered decision whose impact is not classified.
+ *
+ * A unanimous item with resolving anchors is mechanically decided; thin
+ * evidence alone never starts an evaluator session. Empty ⇒ no evaluator
+ * starts; the mechanical verdict stands and an EVALUATION_SKIPPED record is
+ * written. */
+export type EvaluationExceptionKind = "message" | "item" | "point" | "decision";
+
+export interface EvaluationException {
+  kind: EvaluationExceptionKind;
+  id: string;
+  detail: string;
+  messageType?: MessageType;
+}
+
+export function evaluationExceptions(phase: PhaseState): EvaluationException[] {
+  const out: EvaluationException[] = [];
+  for (const message of phase.messages ?? []) {
+    if (message.state !== "raw" && message.state !== "refused") continue;
+    out.push({
+      kind: "message",
+      id: message.id,
+      detail: `${message.type} message ${shortId(message.id)} (${message.state}): ${message.title}`,
+      messageType: message.type,
+    });
   }
-  for (const [why, ids] of failedBy) {
-    const veto = /([A-Za-z0-9_]+) veto/.exec(why);
-    const verb = veto ? `vetoed by ${veto[1]}` : `failed (${why})`;
-    reasons.push(ids.length <= 2 ? `${ids.join(", ")} ${verb}` : `${ids.length} trade-offs ${verb}`);
+  if (isStructured(phase.contract)) {
+    for (const outcome of phaseItemOutcomes(phase)) {
+      if (!itemIsSplit(outcome)) continue;
+      out.push({
+        kind: "item",
+        id: outcome.item.id,
+        detail:
+          `${outcome.item.id} ${outcome.item.title}: ${outcome.outcome} (the seats split on it)`,
+      });
+    }
   }
-  for (const f of phase.findings) {
-    if (f.status === "open" && f.severity === "blocking") reasons.push(`blocking finding ${shortId(f.id)} open`);
+  for (const finding of openFindings(phase)) {
+    if (!finding.domain && !finding.doneWhen) {
+      if (recordClassified(phase, "finding", finding.id)) continue;
+      out.push({ kind: "point", id: finding.id, detail: `finding ${shortId(finding.id)} needs an impact classification` });
+      continue;
+    }
+    if (!pointNeedsEvaluation(phase, finding)) continue;
+    out.push({
+      kind: "point",
+      id: finding.id,
+      detail: pointHasProvingFact(phase, finding)
+        ? `point ${shortId(finding.id)}${finding.domain ? ` in ${finding.domain}` : ""} needs an impact classification`
+        : `point ${shortId(finding.id)}${finding.domain ? ` in ${finding.domain}` : ""} has no proving doneWhen fact on this candidate`,
+    });
   }
-  return reasons;
+  for (const decision of discoveredDecisions(phase)) {
+    if (recordClassified(phase, "decision", decision.id)) continue;
+    out.push({
+      kind: "decision",
+      id: decision.id,
+      detail: `discovered decision ${shortId(decision.id)} needs an impact classification`,
+    });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -230,11 +281,3 @@ function oneLine(text: string, max: number): string {
   return t.length > max ? `${t.slice(0, max - 1)}…` : t;
 }
 
-/** A record id without its phase and candidate prefix: "D-p2d-x-dbe24445-4"
- * → "D-4", "F-p2d-x-M-3" → "F-M-3". */
-export function shortId(id: string): string {
-  const m = id.match(/^([A-Z]+)-.*?-((?:[MAB]-)?(?:[a-z]+-)?\d+)$/);
-  if (!m) return id;
-  const tail = m[2].replace(/^(?:disc|trigger)-/, "");
-  return `${m[1]}-${tail}`;
-}

@@ -118,23 +118,36 @@ export function pendingIntents(records: readonly LogRecord[]): LogRecord[] {
   return records.filter((r) => r.kind === "intent" && r.actionId !== undefined && !completed.has(r.actionId));
 }
 
+/** Plan 07e (E4): how many times one critical append (the final failure, the
+ * shutdown state) may try to write after the disk reported ENOSPC. One retry
+ * is bounded on purpose: it preserves the evidence if storage recovers
+ * between the failure and shutdown, without adding an unbounded wait to a
+ * stopping conductor. */
+const CRITICAL_APPEND_ATTEMPTS = 2;
+
 /** An open handle on a run's `events.jsonl`. Appends are synchronous and
  * each one is followed by `fsyncSync` before the call returns, so a caller
- * that has received `append`'s return value knows the record is durable. */
+ * that receives a `LogRecord` back knows the record is durable. An append the
+ * disk refused returns `undefined` — the record was NOT written, and the
+ * caller must treat its action as failed rather than as recorded. */
 export class EventLog {
   #fd: number;
   #seq: number;
   #path: string;
   #secrets: readonly Secret[];
+  #onDiskFull: ((err: Error) => void) | undefined;
+  #diskFull = false;
+  #dropped = 0;
 
   /** `secrets` (plan 01a): every appended record's payload is redacted before
    * it is serialized, so no value ever lands in `events.jsonl` — the file a
    * crash-recovered conductor, `tt state` and every view read back. The same
    * redaction the offline `tt redact` path uses, so a value used as a JSON key
    * is masked here too and a number is never touched. */
-  constructor(path: string, secrets: readonly Secret[] = []) {
+  constructor(path: string, secrets: readonly Secret[] = [], onDiskFull?: (err: Error) => void) {
     this.#path = path;
     this.#secrets = secrets;
+    this.#onDiskFull = onDiskFull;
     let lastSeq = 0;
     // Reopening: continue the seq counter from whatever is already on
     // disk (including a torn final line's seq if it happened to parse a
@@ -148,17 +161,78 @@ export class EventLog {
 
   /** Appends one record and fsyncs before returning. The record's `event`
    * payload is redacted (see the constructor), never the caller's own
-   * object. */
-  append(kind: string, event: unknown, actionId?: string): LogRecord {
+   * object. `undefined` means the write did not land (a full disk): the
+   * action failed and no record exists for it. */
+  append(kind: string, event: unknown, actionId?: string): LogRecord | undefined {
+    return this.#append(kind, event, actionId, false);
+  }
+
+  /** Plan 07e (E4): records the final failure or the shutdown state even
+   * after an ENOSPC, with one bounded retry — the seats vetoed making those
+   * last appends permanent no-ops, so the evidence still lands if storage
+   * frees up before the conductor exits. `undefined` when every attempt was
+   * refused too. */
+  appendCritical(kind: string, event: unknown, actionId?: string): LogRecord | undefined {
+    return this.#append(kind, event, actionId, true);
+  }
+
+  #append(kind: string, event: unknown, actionId: string | undefined, critical: boolean): LogRecord | undefined {
     this.#seq += 1;
     const redacted = redactRecord(event, this.#secrets);
     const record: LogRecord =
       actionId === undefined
         ? { seq: this.#seq, ts: new Date().toISOString(), kind, event: redacted }
         : { seq: this.#seq, ts: new Date().toISOString(), kind, actionId, event: redacted };
-    fs.writeSync(this.#fd, `${JSON.stringify(record)}\n`);
-    fs.fsyncSync(this.#fd);
-    return record;
+    // A full disk already failed this logger: an ordinary append is dropped
+    // and counted, never retried, so a stopping run cannot sit on the full
+    // disk rewriting bytes. Only a critical append retries, bounded. A
+    // dropped record is never handed back — the caller must not mistake it
+    // for a durable one.
+    if (this.#diskFull && !critical) {
+      this.#dropped += 1;
+      return undefined;
+    }
+    const attempts = critical ? CRITICAL_APPEND_ATTEMPTS : 1;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      try {
+        fs.writeSync(this.#fd, `${JSON.stringify(record)}\n`);
+        fs.fsyncSync(this.#fd);
+        // Plan 07e (E4): the write landed, so the disk is writable again and
+        // later appends are honest rather than silently dropped.
+        this.#diskFull = false;
+        return record;
+      } catch (err) {
+        // Plan 07e (E3/E4): a full disk fails the action, visibly, and never
+        // crashes the conductor on an uncaught write error. The callback stops
+        // the run cleanly; `droppedAppends` counts the records that never
+        // reached the disk so no caller mistakes them for durable.
+        if ((err as NodeJS.ErrnoException)?.code === "ENOSPC") {
+          this.#dropped += 1;
+          if (!this.#diskFull) {
+            this.#diskFull = true;
+            this.#onDiskFull?.(err as Error);
+          }
+          continue;
+        }
+        throw err;
+      }
+    }
+    // Every attempt was refused by the disk: no record exists, so none is
+    // returned.
+    return undefined;
+  }
+
+  /** Plan 07e (E3): true once an append saw ENOSPC and no write has landed
+   * since. */
+  get diskFull(): boolean {
+    return this.#diskFull;
+  }
+
+  /** Plan 07e (E4): how many records this logger failed to make durable —
+   * the visible failure of an append, so a caller never treats a dropped
+   * record as written. */
+  get droppedAppends(): number {
+    return this.#dropped;
   }
 
   /** Generates a fresh, stable action ID of the form `<kind>-<seq>-<rand>`,
@@ -170,14 +244,15 @@ export class EventLog {
 
   /** Records that effect `actionId` (`action`, e.g. `{pgid}` or
    * `{worktreePath, baseSha}`) is about to be performed. Must be written
-   * before the effect happens (design §9.3). */
-  intent(actionId: string, action: unknown): LogRecord {
+   * before the effect happens (design §9.3); `undefined` when the disk refused
+   * the record. */
+  intent(actionId: string, action: unknown): LogRecord | undefined {
     return this.append("intent", action, actionId);
   }
 
   /** Records that effect `actionId` finished, with `outcome` describing
-   * the result. */
-  completion(actionId: string, outcome: unknown): LogRecord {
+   * the result; `undefined` when the disk refused the record. */
+  completion(actionId: string, outcome: unknown): LogRecord | undefined {
     return this.append("completion", outcome, actionId);
   }
 

@@ -23,6 +23,7 @@ phase states:
       +- RECHECK_REQUESTED (recheckAvailableRound) -> CHECKING        [recheck-requested-from-implementing]
       +- RECHECK_REQUESTED (recheckAvailableFinal) -> FINAL_CHECKING  [recheck-requested-final-from-implementing]
       +- REVISE                    -> REPAIRING       [revise-from-implementing]
+      +- LOOP_BOUND_REACHED        -> AWAITING_OWNER  [implementing-loop-bound-reached]
 
   +----------------+
   | REPAIRING      |  entered 1x - 10s
@@ -158,7 +159,8 @@ phase states:
   +----------------+
       +- FINAL_CHECKS_PASSED (acceptHoldsAndNoGate) -> ACCEPTED        [final-checks-passed-accepted]
       +- FINAL_CHECKS_PASSED (acceptHoldsAndGateDeclared) -> GATING          [final-checks-passed-gated]
-      +- FINAL_CHECKS_PASSED (queuedCorrectionBlocksAcceptance) -> REPAIRING       [final-checks-passed-correction-queued]
+      +- FINAL_CHECKS_PASSED (acceptDoesNotHoldOnFinalPassAndBudgetRemains) -> REPAIRING       [final-checks-passed-not-accepted]
+      +- FINAL_CHECKS_PASSED (acceptDoesNotHoldOnFinalPassAndBudgetExhausted) -> AWAITING_OWNER  [final-checks-passed-budget-exhausted]
       +- FINAL_CHECKS_FAILED (budgetRemains) -> REPAIRING       [final-checks-failed-to-repairing]
       +- FINAL_CHECKS_FAILED (budgetExhausted) -> AWAITING_OWNER  [final-checks-failed-budget-exhausted]
 

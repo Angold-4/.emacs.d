@@ -408,7 +408,7 @@ test("failed records read as trade-offs, and no status or review text says `deci
     },
   });
   const reasons = notAcceptedReasons(phase);
-  assert.match(reasons.join("; "), /16 trade-offs failed \(missing ballot from M/);
+  assert.equal((reasons.join("; ").match(/D-\d+ failed \(missing ballot from M/g) ?? []).length, 16, "one blocker per unsettled decision");
   assert.doesNotMatch(reasons.join("; "), /decisions/);
   const summary = reviewSummary(phase.messages);
   const status = renderStatusView({
@@ -431,7 +431,7 @@ test("failed records read as trade-offs, and no status or review text says `deci
     ownerDirectives: [],
   } as unknown as StatusViewInput);
   assert.doesNotMatch(status, /decisions/);
-  assert.match(status, /16 trade-offs failed/);
+  assert.match(status, /D-1 failed \(missing ballot from M/);
 });
 
 test("the status `review` line counts the same messages review.org shows, with no `decisions`", () => {

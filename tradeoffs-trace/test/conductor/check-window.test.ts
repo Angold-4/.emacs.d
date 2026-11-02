@@ -2,6 +2,9 @@
 // machine, another run's worker is SIGSTOPped and its attempt clock does not
 // advance; it resumes (SIGCONT) when the check ends.
 
+// Preserve both lanes' check-window scenarios in the targeted test entry point.
+import "./check-window-imported.ts";
+
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync } from "node:fs";
@@ -119,6 +122,7 @@ test("plan 06k1: a check in one run pauses the workers of another run and resume
     phaseChecks: ["sleep 4"],
     stubReviews: true,
     deadlines: { ...FAST, workerAttemptMs: 20_000 },
+    checkWindow: "exclusive",
     extraPiArgsPrefix: [markerA],
     checkLockPath,
     workerScript: () => submittingWorker(),
@@ -131,6 +135,7 @@ test("plan 06k1: a check in one run pauses the workers of another run and resume
     // Without the pause, B's worker would time out at 12 s, before its 14 s
     // of work is done.
     deadlines: { ...FAST, workerAttemptMs: 12_000 },
+    checkWindow: "exclusive",
     extraPiArgsPrefix: [markerB],
     checkLockPath,
     workerScript: () => slowWorker(14_000),
@@ -159,6 +164,44 @@ test("plan 06k1: a check in one run pauses the workers of another run and resume
     const bEvents = readFileSync(`${setupB.runDir}/events.jsonl`, "utf8");
     assert.match(bEvents, /worker_paused/);
     assert.match(bEvents, /worker_resumed/);
+  } finally {
+    await teardown(setupA, setupB);
+    try {
+      execFileSync("rm", ["-rf", path.dirname(checkLockPath)]);
+    } catch {
+      // best effort
+    }
+  }
+});
+
+test("plan 07e: a plan without #+TT_CHECK_WINDOW keeps working through another run's check", async () => {
+  const checkLockPath = path.join(mkdtempSync("/tmp/tt-07e-window-"), "check.lock");
+  const setupA = await setupConductor({
+    checks: ["sleep 6"],
+    phaseChecks: ["sleep 6"],
+    stubReviews: true,
+    deadlines: { ...FAST, workerAttemptMs: 20_000 },
+    checkWindow: "exclusive",
+    checkLockPath,
+    workerScript: () => submittingWorker(),
+    reviewerScriptFor: (seat, state) => stubReviewer(seat, state),
+  });
+  const setupB = await setupConductor({
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    // If the old default (pause) were still in force, this 5 s worker would
+    // be SIGSTOPped by A's 6 s check and its record would name a pause.
+    deadlines: { ...FAST, workerAttemptMs: 12_000 },
+    checkLockPath,
+    workerScript: () => slowWorker(5_000),
+    reviewerScriptFor: (seat, state) => stubReviewer(seat, state),
+  });
+  try {
+    await Promise.all([setupA.conductor.start(), setupB.conductor.start()]);
+    await waitFor(() => setupB.conductor.state.phase.phase === "DONE", 45_000, 100, setupB.runDir);
+    const bEvents = readFileSync(`${setupB.runDir}/events.jsonl`, "utf8");
+    assert.doesNotMatch(bEvents, /worker_paused/);
   } finally {
     await teardown(setupA, setupB);
     try {

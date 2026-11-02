@@ -895,7 +895,76 @@ and an unknown id is refused by that command."
     (should (= (alist-get 'gateMs d) 2700000))
     ;; 02k: the review (and pick) turn limit, for large candidates.
     (should (= (alist-get 'reviewMs d) 1800000))
+    ;; Plan 07e: the final check follows the check when it has no keyword of
+    ;; its own, so a plan that sets only TT_CHECK_MINUTES is unchanged.
+    (should (= (alist-get 'finalCheckMs d) 1800000))
     (should-not (assq 'deadlines (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))))
+
+(ert-deftest tradeoffs-trace-plan-deadlines-07e ()
+  "Plan 07e (E1/E3): the six new bound keywords reach plan deadlines through the Emacs parser and default to today's values.
+Raw values and lines reach lint, and the check-window opt-in is kept as
+written."
+  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_EVALUATE_MINUTES: 11\n"
+                                                   "#+TT_FACT_MINUTES: 6\n"
+                                                   "#+TT_FIX_ATTEMPT_MINUTES: 40\n"
+                                                   "#+TT_MERGE_MINUTES: 9\n"
+                                                   "#+TT_FINAL_CHECK_MINUTES: 7\n"
+                                                   "#+TT_OWNER_WAIT_MINUTES: 200\n"
+                                                   "#+TT_CHECK_WINDOW: exclusive\n"
+                                                   +tt-test--valid-plan))
+                          :plan))
+         (d (alist-get 'deadlines plan))
+         (bounds (alist-get 'bounds plan))
+         (lines (alist-get 'boundLines plan)))
+    (should (= (alist-get 'evaluateMs d) 660000))
+    (should (= (alist-get 'reproductionMs d) 360000))
+    (should (= (alist-get 'fixerAttemptMs d) 2400000))
+    (should (= (alist-get 'mergeMs d) 540000))
+    (should (= (alist-get 'finalCheckMs d) 420000))
+    (should (= (alist-get 'ownerWaitMs d) 12000000))
+    (should (equal (cdr (assoc "TT_EVALUATE_MINUTES" bounds)) "11"))
+    (should (= (cdr (assoc "TT_OWNER_WAIT_MINUTES" lines)) 6))
+    (should (equal (alist-get 'checkWindow plan) "exclusive"))
+    ;; A final-check keyword alone leaves the round check at its default.
+    (should-not (assq 'checkMs d)))
+  ;; Today's defaults, written out: each keyword at its default value produces
+  ;; the same deadline it always had.
+  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_EVALUATE_MINUTES: 10\n"
+                                                   "#+TT_FACT_MINUTES: 5\n"
+                                                   "#+TT_FIX_ATTEMPT_MINUTES: 45\n"
+                                                   "#+TT_MERGE_MINUTES: 10\n"
+                                                   "#+TT_FINAL_CHECK_MINUTES: 5\n"
+                                                   "#+TT_OWNER_WAIT_MINUTES: 240\n"
+                                                   +tt-test--valid-plan))
+                          :plan))
+         (d (alist-get 'deadlines plan)))
+    (should (= (alist-get 'evaluateMs d) 600000))
+    (should (= (alist-get 'reproductionMs d) 300000))
+    (should (= (alist-get 'fixerAttemptMs d) 2700000))
+    (should (= (alist-get 'mergeMs d) 600000))
+    (should (= (alist-get 'finalCheckMs d) 300000))
+    (should (= (alist-get 'ownerWaitMs d) 14400000)))
+  ;; A plan that leaves them unwritten writes no field, so the conductor's
+  ;; own default — today's value — applies to each one.
+  (let ((d (alist-get 'deadlines (plist-get (+tt-test--parse +tt-test--valid-plan) :plan))))
+    (dolist (field '(evaluateMs reproductionMs fixerAttemptMs mergeMs finalCheckMs ownerWaitMs))
+      (should-not (alist-get field d))))
+  ;; An invalid value is never silently accepted: Emacs writes no deadline
+  ;; field for it, while the raw text and its line still reach lint, which
+  ;; refuses it (plan 07e E3/R8).
+  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_FACT_MINUTES: -1\n"
+                                                   "#+TT_MERGE_MINUTES: none\n"
+                                                   +tt-test--valid-plan))
+                          :plan))
+         (d (alist-get 'deadlines plan))
+         (bounds (alist-get 'bounds plan))
+         (lines (alist-get 'boundLines plan)))
+    (should (equal (cdr (assoc "TT_FACT_MINUTES" bounds)) "-1"))
+    (should (equal (cdr (assoc "TT_MERGE_MINUTES" bounds)) "none"))
+    (should (= (cdr (assoc "TT_FACT_MINUTES" lines)) 1))
+    (should (= (cdr (assoc "TT_MERGE_MINUTES" lines)) 2))
+    (should-not (alist-get 'reproductionMs d))
+    (should-not (alist-get 'mergeMs d))))
 
 (ert-deftest tradeoffs-trace-plan-gate ()
   "Plan 01f: :GATE: and :GATE_CLEANUP: parse into the phase."

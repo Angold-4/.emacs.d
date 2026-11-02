@@ -14,6 +14,7 @@
 
 import * as path from "node:path";
 
+import { boundKeywords } from "./bounds.ts";
 import { expandPromptPath } from "./worker-prompt.ts";
 import { parseDomains, type Domain } from "./domains.ts";
 import { finalTestsOf } from "./items.ts";
@@ -169,6 +170,10 @@ function parsePhaseNode(
   globalFixRounds?: string,
   globalFixers?: number,
   globalFixChecks?: string,
+  globalDomainLoopMax?: number,
+  globalIntegrateMax?: number,
+  globalForbidden?: string[],
+  globalTestRemovals?: string[],
 ): LintPhaseInput {
   const byTitle = (name: string) => node.children.find((c) => c.title === name);
   const goalNode = byTitle("Goal");
@@ -230,6 +235,10 @@ function parsePhaseNode(
     ...(globalFixRounds ? { fixRounds: globalFixRounds } : {}),
     ...(globalFixers !== undefined ? { fixers: globalFixers } : {}),
     ...(globalFixChecks ? { fixChecks: globalFixChecks } : {}),
+    ...(globalDomainLoopMax !== undefined ? { domainLoopMax: globalDomainLoopMax } : {}),
+    ...(globalIntegrateMax !== undefined ? { integrateMax: globalIntegrateMax } : {}),
+    ...(globalForbidden && globalForbidden.length > 0 ? { forbidden: globalForbidden } : {}),
+    ...(globalTestRemovals && globalTestRemovals.length > 0 ? { testRemovals: globalTestRemovals } : {}),
   };
   if (structured) {
     phase.architecture = (architecture?.children ?? []).map((c) => itemInput(c, "architecture"));
@@ -398,10 +407,22 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   const globalFixers = globalFixersKeyword ? parseCount(globalFixersKeyword) : undefined;
   const globalFixChecksKeyword = first("TT_FIX_CHECKS");
   const globalFixChecks = globalFixChecksKeyword ? globalFixChecksKeyword.value.trim() : undefined;
+  // 07g1: the domain-loop bound, forbidden shell patterns and test-removal
+  // allowances are per-plan switches, carried onto every phase.
+  const globalDomainLoopMaxKeyword = first("TT_DOMAIN_LOOP_MAX");
+  const globalDomainLoopMax = globalDomainLoopMaxKeyword ? parseCount(globalDomainLoopMaxKeyword) : undefined;
+  // 07g2 (A1): the integration-conflict bound, carried onto every phase like
+  // the domain-loop bound.
+  const globalIntegrateMaxKeyword = first("TT_INTEGRATE_MAX");
+  const globalIntegrateMax = globalIntegrateMaxKeyword ? parseCount(globalIntegrateMaxKeyword) : undefined;
+  const globalForbiddenKeyword = first("TT_FORBIDDEN");
+  const globalForbidden = globalForbiddenKeyword ? splitCommands(globalForbiddenKeyword.value) : undefined;
+  const globalTestRemovalsKeyword = first("TT_TEST_REMOVALS");
+  const globalTestRemovals = globalTestRemovalsKeyword ? splitCommands(globalTestRemovalsKeyword.value) : undefined;
   const phases = roots
     .filter((r) => r.level === 1)
     .map((r) =>
-      parsePhaseNode(r, [], globalFinalChecks, globalGenerated, globalRegen, globalWidePaths, globalDomains, globalFixRounds, globalFixers, globalFixChecks),
+      parsePhaseNode(r, [], globalFinalChecks, globalGenerated, globalRegen, globalWidePaths, globalDomains, globalFixRounds, globalFixers, globalFixChecks, globalDomainLoopMax, globalIntegrateMax, globalForbidden, globalTestRemovals),
     );
   const rerun = first("TT_RERUN");
   const envFile = first("TT_ENV_FILE")?.value;
@@ -419,6 +440,18 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   // tt 09-1: the global round checks, as one command (as Emacs sends it), so
   // the cheap-final-check rule sees what every candidate already runs.
   const globalChecks = first("TT_CHECKS")?.value?.trim();
+  // Plan 07e (E3): every bound keyword's raw text and line. Emacs silently
+  // drops an invalid number; lint must not.
+  const bounds: Record<string, string> = {};
+  const boundLines: Record<string, number> = {};
+  for (const keyword of boundKeywords()) {
+    const kw = first(keyword);
+    if (!kw) continue;
+    bounds[keyword] = kw.value.trim();
+    boundLines[keyword] = kw.line;
+  }
+  const checkWindowKeyword = first("TT_CHECK_WINDOW");
+  const checkWindow = checkWindowKeyword?.value.trim();
   return {
     ...(sourceFile ? { sourceFile } : {}),
     ...(globalChecks ? { checks: [globalChecks] } : {}),
@@ -444,6 +477,13 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
     ...(globalFixRounds ? { fixRounds: globalFixRounds, fixRoundsLine: globalFixRoundsKeyword!.line } : {}),
     ...(globalFixers !== undefined ? { fixers: globalFixers, fixersLine: globalFixersKeyword!.line } : {}),
     ...(globalFixChecks ? { fixChecks: globalFixChecks, fixChecksLine: globalFixChecksKeyword!.line } : {}),
+    ...(globalDomainLoopMax !== undefined ? { domainLoopMax: globalDomainLoopMax } : {}),
+    ...(globalIntegrateMax !== undefined ? { integrateMax: globalIntegrateMax } : {}),
+    ...(globalForbidden && globalForbidden.length > 0 ? { forbidden: globalForbidden } : {}),
+    ...(globalTestRemovals && globalTestRemovals.length > 0 ? { testRemovals: globalTestRemovals } : {}),
+    ...(globalTestRemovalsKeyword ? { testRemovalsLine: globalTestRemovalsKeyword.line } : {}),
+    ...(Object.keys(bounds).length > 0 ? { bounds, boundLines } : {}),
+    ...(checkWindow ? { checkWindow, checkWindowLine: checkWindowKeyword!.line } : {}),
   };
 }
 

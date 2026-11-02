@@ -11,11 +11,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { parseVerify } from "./items.ts";
+import { testNames } from "./test-names.ts";
 import {
   emptyRepoFacts,
   type LintPlanInput,
   type RepoFacts,
   type RepoPackage,
+  type TestRemovalBaseFacts,
   type TestSelection,
   type VerifyReachFacts,
   type VerifySite,
@@ -206,6 +208,31 @@ function readCiCommands(root: string): string[] {
     }
   }
   return out;
+}
+
+/** 07g1: the test names each file declares at the repository's base (HEAD),
+ * for the `#+TT_TEST_REMOVALS` lint. The base is the checkout `tt lint`
+ * runs in; a file git cannot read yields no fact, never a refusal. */
+export function readTestNamesAtBase(root: string): TestRemovalBaseFacts {
+  const cache = new Map<string, readonly string[] | undefined>();
+  return {
+    namesIn(file: string): readonly string[] | undefined {
+      if (cache.has(file)) return cache.get(file);
+      let text: string | undefined;
+      try {
+        text = execFileSync("git", ["-C", root, "show", `HEAD:${file}`], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+          maxBuffer: 64 * 1024 * 1024,
+        });
+      } catch {
+        text = undefined;
+      }
+      const names = text === undefined ? undefined : testNames(file, text);
+      cache.set(file, names);
+      return names;
+    },
+  };
 }
 
 /** Build the `RepoFacts` `checkCoverageWarnings` reads. Never throws: an

@@ -319,10 +319,13 @@ export function crateOf(name: string): string | undefined {
  * Every substituted value is one single-quoted shell word, and a template
  * that uses a placeholder whose value is unknown (`{file}` without the
  * reporter locating one, `{crate}` without a `::` path) cannot be built — so
- * a half-applied template never runs the wrong test. */
-export function singleTestCommand(name: string, output: string, template?: string): string | undefined {
+ * a half-applied template never runs the wrong test. `knownFile` is the file
+ * the caller already knows for the test (a plan item's `test file::name`
+ * verify), used for `{file}` when the output names none: a test that PASSED
+ * writes no failing line, so the reporter never locates it. */
+export function singleTestCommand(name: string, output: string, template?: string, knownFile?: string): string | undefined {
   const named = runnerAndFileFor(output, name);
-  const file = named?.file;
+  const file = named?.file ?? knownFile;
   // `{crate}` is the failing test's own module path root (`a::b::c` → `a`); a
   // name with no `::` has none, so a `{crate}` template is then never run.
   const crate = crateOf(name);
@@ -361,8 +364,7 @@ export function singleTestCommand(name: string, output: string, template?: strin
 /** The single-test commands for every name in `names`, in order. A name whose
  * command cannot be built stays in the list with `command: undefined`, so the
  * caller records it as `reproduces alone` (unproven flake = real failure)
- * instead of silently dropping it. */
-export function rerunCommandsFor(
+ * instead of silently dropping it. */export function rerunCommandsFor(
   output: string,
   names: readonly string[],
   template?: string,
@@ -371,6 +373,68 @@ export function rerunCommandsFor(
     const command = singleTestCommand(name, output, template);
     return command === undefined ? { name } : { name, command };
   });
+}
+
+/** 07g1b (A4/R7/R13): the commands a plan declares for running its tests —
+ * the only sources a lost-test point's doneWhen is taken from. */
+export interface DeclaredTestCommands {
+  /** The plan's `#+TT_RERUN:` single-test template, when it declares one. */
+  rerun?: string;
+  /** The round's check commands: the plan's `#+TT_CHECKS` then the phase's
+   * own `:CHECKS:` (the commands whose output resolves a `test` verify). */
+  checks: readonly string[];
+  /** The phase's final checks, which also run a `test final` verify. */
+  finalChecks?: readonly string[];
+}
+
+/** 07g1b (A4/R7/R13): the plan's own declared command for ONE `test` verify.
+ * The `#+TT_RERUN:` template, filled from the verify's own declared name (and
+ * its `file::` path, `{crate}` from a cargo `::` name), when the plan declares
+ * one that the verify can fill; otherwise the phase's check command — the
+ * declared command whose output resolves the verify (`( a ) && ( b )` when the
+ * phase declares more than one). Never a command guessed from the test file's
+ * extension or from a check's output. Undefined only when the plan declares
+ * neither, which `tt lint` refuses (rule item-verify) before any run. */
+export function declaredVerifyCommand(
+  test: { name: string; file?: string; final?: boolean },
+  declared: DeclaredTestCommands,
+): string | undefined {
+  const template = declared.rerun;
+  if (template !== undefined && template.trim().length > 0) {
+    const values: Record<string, string | undefined> = { name: test.name, file: test.file, crate: crateOf(test.name) };
+    if (rerunPlaceholders(template).every((p) => values[p] !== undefined)) {
+      return template.replace(/\{(name|file|crate)\}/g, (_m, key: string) => shellQuote(values[key]!));
+    }
+  }
+  const commands: string[] = [];
+  for (const raw of [...declared.checks, ...(test.final ? (declared.finalChecks ?? []) : [])]) {
+    const command = raw.trim();
+    if (command.length > 0 && !commands.includes(command)) commands.push(command);
+  }
+  if (commands.length === 0) return undefined;
+  return commands.length === 1 ? commands[0] : commands.map((c) => `( ${c} )`).join(" && ");
+}
+
+/** 07g1b (A4/R7/R13): the ONE doneWhen of a point made from an item's LOST
+ * tests — each lost test's `declaredVerifyCommand`, `&&`-joined in plan order
+ * (a command shared by several tests, e.g. the phase check, appears once). An
+ * item may name more than one test and the pick may lose either of them.
+ * Undefined when no test was lost, or when the plan declares no command for
+ * one of them (a lint error, so unreachable for a linted plan): a doneWhen
+ * that proved only some of them would let a fixer close the point while
+ * another is still lost. */
+export function lostTestsDoneWhen(
+  tests: readonly { name: string; file?: string; final?: boolean }[],
+  declared: DeclaredTestCommands,
+): string | undefined {
+  if (tests.length === 0) return undefined;
+  const commands: string[] = [];
+  for (const test of tests) {
+    const command = declaredVerifyCommand(test, declared);
+    if (command === undefined) return undefined;
+    if (!commands.includes(command)) commands.push(command);
+  }
+  return commands.join(" && ");
 }
 
 /** One re-run's outcome, as the caller observed it. */

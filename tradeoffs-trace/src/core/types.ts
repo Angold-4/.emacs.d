@@ -127,6 +127,18 @@ export interface PhaseContract {
   /** Plan 07c (D4): `#+TT_FIX_CHECKS` — the fast command every fixer's own
    * commit must pass before it is merged. */
   fixChecks?: string;
+  /** 07g1: how many domain-loop reviews one domain may spend before it is
+   * dropped. Absent means 3. */
+  domainLoopMax?: number;
+  /** 07g2 (A1): `#+TT_INTEGRATE_MAX` — how many conflicted integration
+   * attempts one fix round may spend before it drops the last domain. Absent
+   * means 2. */
+  integrateMax?: number;
+  /** 07g1: `#+TT_FORBIDDEN` — shell patterns a mapper must never run. */
+  forbidden?: string[];
+  /** 07g1: `#+TT_TEST_REMOVALS` — test files/functions the owner allowed a
+   * mapper to remove. */
+  testRemovals?: string[];
   /** Plan 06g: `#+TT_WORKERS:` frozen into the contract — how many lanes one
    * round runs. Absent (or 1) is today's single-candidate loop. */
   workers?: number;
@@ -629,6 +641,26 @@ export interface RuledDecision {
   by: string;
 }
 
+/** Plan 07f (A3, §3.2): a recorded owner ruling — the third record kind. It
+ * settles the records it names at once and is final when recorded: no
+ * ballots, no evaluator pass, no repair round, and it is read by every later
+ * reducer brief. */
+export interface Ruling {
+  /** Stable id (`RUL-<command id>`). */
+  id: string;
+  /** The owner's text, verbatim. */
+  text: string;
+  /** The finding and decision ids it settles. */
+  recordIds: string[];
+  /** 07g1b (R12): the candidate the next repair builds on — a label
+   * `C<round>-<lane>` or its SHA (a prefix of 7 or more). The ruling replaces
+   * that round's pick. The only way a ruling names a candidate: its text is
+   * never scanned for a SHA. */
+  candidate?: string;
+  by: "owner" | "lead";
+  at?: string;
+}
+
 export interface Correction {
   id: string;
   version: number;
@@ -910,6 +942,17 @@ export interface MissCommand {
   sample?: string;
 }
 
+/** Plan 07f (A3, §3.3): the owner's `ruling` input. It names the records it
+ * settles and is applied at once — it never enters `queuedCorrections` and
+ * never forces a repair round. */
+export interface RulingCommand {
+  kind: "ruling";
+  text: string;
+  recordIds: string[];
+  /** 07g1b (R12): the candidate the next repair builds on (see Ruling). */
+  candidate?: string;
+}
+
 export interface PauseResumeModeCommand {
   kind: "pause" | "resume" | "mode";
   mode?: "delegate" | "co-work";
@@ -937,6 +980,7 @@ export type OwnerCommand =
   | UnneededCommand
   | VerdictCommand
   | MissCommand
+  | RulingCommand
   | PauseResumeModeCommand;
 
 // ---------------------------------------------------------------------------
@@ -1125,6 +1169,10 @@ export interface ChecksResult {
    * re-run alone), so the worker's repair prompt labels a real failure and a
    * flake apart (finding #35). Cleared when the next candidate freezes. */
   failures?: CheckFailureClass[];
+  /** 07g2 (A4/R9): the simple command that failed inside the check chain, and
+   * whether it was silent, so the status line names the failing step. */
+  failingStep?: string;
+  failingStepSilent?: boolean;
 }
 
 /** Plan 05d: the last check failure of a candidate, kept across the repair
@@ -1198,6 +1246,10 @@ export interface PhaseState {
    * every later candidate whose decision has the same id and choice, with no
    * ballots and no re-tally. */
   ruledDecisions?: RuledDecision[];
+  /** Plan 07f (A3): every owner ruling recorded in this phase, in order. A
+   * ruling is final when recorded and is quoted in every later reducer
+   * brief. */
+  rulings?: Ruling[];
   ballots: Ballot[];
   overrides: Override[];
   /** Outstanding dispatches next() must not re-emit (design §9.3's intent
@@ -1303,7 +1355,12 @@ export interface PhaseState {
    * set by that type's `EVALUATOR_FINISHED` (or its timeout); `timedOut`
    * records that only that type's raw messages were published unevaluated;
    * `interruptedOnce` is the same one-redispatch bookkeeping as `baseline`. */
-  evaluation?: { types?: Partial<Record<MessageType, EvaluatorOutcome>> };
+  evaluation?: {
+    types?: Partial<Record<MessageType, EvaluatorOutcome>>;
+    /** Plan 07f (F1): no evaluator session was needed this round; the
+     * mechanical verdict stands. Recorded once inside EVALUATING. */
+    skipped?: boolean;
+  };
   /** Plan 04b: the blocker panel's state, one entry per raw blocker message
    * of this round (keyed by the blocker message id). Plan 05e adds the
    * round panel for trade-offs and blocking findings. EVALUATING completes
@@ -1473,13 +1530,15 @@ export interface RoundRevote {
 export interface RoundRecord {
   round: number;
   base: string;
+  /** BUILD/REVIEW lanes; empty after the pick for a domain FIX/REDUCE loop. */
   lanes: string[];
   candidates: LaneCandidateRecord[];
   votes: PickVote[];
   /** Plan 06h (A3): present only when 3+ candidates split with no strict
    * majority and the top two went to a revote. */
   revote?: RoundRevote;
-  picked?: { lane: string; sha: string; votes: number };
+  /** 07g1: `ruling` names the owner/lead ruling that replaced the vote pick. */
+  picked?: { lane: string; sha: string; votes: number; ruling?: string };
   /** Plan 06n (A7): set by ITEMS_REGRESSED when the evaluated pick lost items
    * the phase's best candidate met, in code it changed. The pick is not
    * adopted as the next round's base; the next round restarts from the best
@@ -1490,11 +1549,56 @@ export interface RoundRecord {
    * not. `ok` with a `sha` makes that commit the next round's base for every
    * lane; `ok` false records why the next round starts from the winner. */
   consolidated?: RoundConsolidation;
-  /** Plan 07c (D4): set by ROUND_FIXED once the round's open fix findings
-   * were grouped by domain and one fixer per domain ran from the same base.
-   * With a `candidate`, the next round is a single-lane round on that merged
-   * commit; without one it is today's two-lane round. */
+  /** Set by ROUND_FIXED once the domain MAP and integration finish. In a
+   * lane-free loop, `base` is the loop's start and `candidate` is its integrated
+   * head (absent when the tree is unchanged). No lane pick is needed. Old
+   * lane-only logs retain their original fixed record unchanged. */
   fixed?: RoundFixed;
+}
+
+/** 07g1: one domain loop's outcome, recorded with the fix round. */
+export interface EvDomainChecked {
+  type: "DOMAIN_CHECKED";
+  round: number;
+  domain: string;
+  iteration: number;
+  sha: string;
+  base: string;
+  facts: DomainFacts;
+}
+export interface EvDomainReviewed {
+  type: "DOMAIN_REVIEWED";
+  round: number;
+  domain: string;
+  iteration: number;
+  sha: string;
+  brief: string;
+  review: DomainReview;
+}
+export interface EvDomainApproved {
+  type: "DOMAIN_APPROVED";
+  round: number;
+  domain: string;
+  sha: string;
+  reviews: number;
+  /** 07g1 (A2): the review's notes for the next fixer, kept on the approval.
+   * A quality problem goes back to the same fixer instead of being recorded
+   * here, so an approved domain's review has quality ok. */
+  notes?: string[];
+}
+export interface EvDomainDropped {
+  type: "DOMAIN_DROPPED";
+  round: number;
+  domain: string;
+  reason: string;
+  reviews: number;
+}
+export interface EvForbiddenRefused {
+  type: "FORBIDDEN_REFUSED";
+  agentId: string;
+  pattern: string;
+  command: string;
+  at?: string;
 }
 
 /** tt 09 (change 3): one lane's work a consolidation takes onto the winner —
@@ -1553,6 +1657,8 @@ export interface RoundFixed {
   /** Plan 07c (C3): the fixers' own assumptions and deviations, unioned, so
    * their free-form notes are kept rather than discarded. */
   added?: string[];
+  /** 07g1: every domain loop's history, in task order. */
+  domains?: DomainLoopRecord[];
 }
 
 export interface FlakeObservation {
@@ -1627,6 +1733,37 @@ export interface EvBaselineInterrupted {
 }
 export interface EvAttemptTimedOut {
   type: "ATTEMPT_TIMED_OUT";
+}
+
+/** Plan 07e (E2/A2): a named bound was reached. Record-only: it changes no
+ * phase state, accepts nothing and rejects nothing. `action` is the table's
+ * own sentence for what the conductor did next. */
+export interface EvBoundReached {
+  type: "BOUND_REACHED";
+  kind: "worker-attempt" | "check" | "review" | "evaluate" | "gate" | "sh" | "fact" | "fixer-attempt" | "merge" | "final-check" | "owner-wait" | "rounds";
+  scope: string;
+  limitMs: number;
+  elapsedMs: number;
+  action: string;
+}
+
+/** Plan 07e (E2/A3): the rounds budget ran out. It names today's not-accepted
+ * reasons and leaves the state where it was: the existing
+ * REPAIR_BUDGET_EXHAUSTED transition still parks in AWAITING_OWNER. */
+export interface EvLeadCalled {
+  type: "LEAD_CALLED";
+  reasons: string[];
+}
+
+/** 07g2 (A2/R4): the fix/inspect loop spent the phase's round budget with
+ * points still open. It parks the phase (IMPLEMENTING -> AWAITING_OWNER) so no
+ * further loop and no seat acceptance review starts; the conductor records
+ * BOUND_REACHED (rounds) and LEAD_CALLED beside it. */
+export interface EvLoopBoundReached {
+  type: "LOOP_BOUND_REACHED";
+  round: number;
+  loops: number;
+  reason: string;
 }
 
 /** Plan 04a: one message type's evaluator state inside EVALUATING. */
@@ -1740,6 +1877,14 @@ export interface EvEvaluationInterrupted {
 /** Plan 04a: all dispatched evaluators settled; EVALUATING -> RESOLVING. */
 export interface EvEvaluationCompleted {
   type: "EVALUATION_COMPLETED";
+}
+
+/** Plan 07f (F1): there was no exception for an evaluator to judge, so no
+ * session started; the mechanical verdict stands. A record event inside
+ * EVALUATING. */
+export interface EvEvaluationSkipped {
+  type: "EVALUATION_SKIPPED";
+  reason: string;
 }
 
 /** Plan 04b: one panel seat's vote on one raw blocker, a record event inside
@@ -1879,6 +2024,8 @@ export interface EvRoundFixed {
   tasks: FixTaskRecord[];
   merges: { sha: string }[];
   candidate?: string;
+  /** 07g1: every domain loop's history, in task order. */
+  domains?: DomainLoopRecord[];
   /** Plan 07c (C3): the fixers' unioned decision disclosures, replayed into
    * the merged candidate's synthetic lane build at the hand-off. */
   disclosures?: DecisionDisclosure[];
@@ -1935,6 +2082,10 @@ export interface EvChecksFailed {
    * classification. Absent for a check whose output named no test (the strict
    * rule), which stores no classifications. */
   failures?: CheckFailureClass[];
+  /** 07g2 (A4/R9): the failing step inside the check chain, and whether it
+   * said nothing. */
+  failingStep?: string;
+  failingStepSilent?: boolean;
 }
 export interface EvChecksInterrupted {
   type: "CHECKS_INTERRUPTED";
@@ -2103,6 +2254,48 @@ export interface FindingFact {
    * repairs. Absent when the base run could not be made. */
   passesOnBase?: boolean;
 }
+export interface DomainPointVerdict {
+  pointId: string;
+  fixed: boolean;
+  why: string;
+  anchors?: string[];
+}
+
+/** 07g1: one fresh, stateless domain review's judgement. */
+export interface DomainReview {
+  points: DomainPointVerdict[];
+  quality: { ok: boolean; problems?: string[] };
+  notes?: string[];
+}
+
+/** 07g1: one point's facts on one domain-loop commit. */
+export interface DomainPointFact {
+  id: string;
+  onBase: boolean;
+  onHead: boolean;
+  doneWhen?: string;
+  outputTail?: string;
+}
+
+/** 07g1: the facts a domain loop establishes before it may start a review. */
+export interface DomainFacts {
+  checkPassed: boolean;
+  checkNote?: string;
+  points: DomainPointFact[];
+  /** Test files/functions removed without a `#+TT_TEST_REMOVALS` allowance. */
+  testRemovals?: string[];
+}
+
+/** 07g1: one domain loop's history, recorded on every pass so a resumed
+ * conductor builds the same review brief from the log alone. */
+export interface DomainLoopRecord {
+  iteration: number;
+  sha?: string;
+  facts?: DomainFacts;
+  review?: DomainReview;
+  note?: string;
+}
+
 export interface EvFindingFact {
   type: "FINDING_FACT";
   findingId: string;
@@ -2340,6 +2533,24 @@ export interface EvOwnerCorrectionQueued {
 export interface EvOwnerInputRecorded {
   type: "OWNER_INPUT_RECORDED";
   input: OwnerInputRecord;
+}
+
+/** Plan 07f (A3): one owner ruling, recorded. It settles every record it
+ * names (a decision by id and unchanged choice, any finding by acceptance)
+ * and answers any open owner request linked to them. Record-only: it moves no
+ * phase-state name and forces no loop. */
+export interface EvRulingRecorded {
+  type: "RULING_RECORDED";
+  ruling: Ruling;
+}
+
+/** Plan 07f (A2/C1): a decision the phase has moved past — it is bound to an
+ * older candidate or contract version — is closed, never left blocking. The
+ * reason is recorded in the log with the event. */
+export interface EvDecisionClosed {
+  type: "DECISION_CLOSED";
+  decisionId: string;
+  reason: string;
 }
 
 /** Plan 01i: records one owner directive (`OD-<seq>`) the moment it is
@@ -2800,6 +3011,8 @@ export interface EvCandidatePicked {
   lane: string;
   sha: string;
   votes: number;
+  /** 07g1: set when an owner/lead ruling replaced the vote pick. */
+  ruling?: string;
 }
 
 /** Plan 06g2: one seat's review of one lane candidate, recorded while the
@@ -2846,6 +3059,7 @@ export type Event =
   | EvBaselineTimedOut
   | EvBaselineInterrupted
   | EvEvaluationCompleted
+  | EvEvaluationSkipped
   | EvEvaluationTimedOut
   | EvEvaluationInterrupted
   | EvEvaluatorFinished
@@ -2861,12 +3075,20 @@ export type Event =
   | EvCandidateApproved
   | EvSubmitPhase
   | EvAttemptTimedOut
+  | EvBoundReached
+  | EvLeadCalled
+  | EvLoopBoundReached
   | EvAttemptNoSubmission
   | EvAttemptInterrupted
   | EvWorkerResumed
   | EvItemsRegressed
   | EvRoundConsolidated
   | EvRoundFixed
+  | EvDomainChecked
+  | EvDomainReviewed
+  | EvDomainApproved
+  | EvDomainDropped
+  | EvForbiddenRefused
   | EvFreezeCompleted
   | EvFreezeTimedOut
   | EvFreezeInterrupted
@@ -2921,6 +3143,8 @@ export type Event =
   | EvNoteAdded
   | EvOwnerCorrectionQueued
   | EvOwnerInputRecorded
+  | EvRulingRecorded
+  | EvDecisionClosed
   | EvDirectiveAdded
   | EvDirectiveWithdrawn
   | EvDirectiveDelivered

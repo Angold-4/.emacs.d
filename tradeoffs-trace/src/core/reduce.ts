@@ -23,6 +23,7 @@ import {
   applyItemCarried,
   applyOverrideCast,
   applyOwnerRequestResolved,
+  autoResolveLinkedRequest,
   checkFindingAcceptedByOwner,
   checkItemCarried,
   checkOverrideCast,
@@ -31,7 +32,9 @@ import {
   recordRulings,
 } from "./owner-commands.ts";
 import { isLiveDecision, panelOutcome, panelSeatNumbers, panelSeatSettled, panelSeatsSettled, reviewIngestionIssue, sameVersion } from "./predicate.ts";
+import { factKeepsOpen } from "./fix-rounds.ts";
 import { seatsOf } from "./seats.ts";
+import { namedCandidate } from "./ruling-picks.ts";
 import { findOwnerRequest } from "./triage.ts";
 import { rowsFor } from "./transitions.ts";
 import type {
@@ -52,6 +55,7 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "BASELINE_TIMED_OUT",
   "BASELINE_INTERRUPTED",
   "EVALUATION_COMPLETED",
+  "EVALUATION_SKIPPED",
   "EVALUATION_TIMED_OUT",
   "EVALUATION_INTERRUPTED",
   "EVALUATOR_FINISHED",
@@ -60,6 +64,8 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "PANEL_DECIDED",
   "SUBMIT_PHASE",
   "ATTEMPT_TIMED_OUT",
+  "BOUND_REACHED",
+  "LEAD_CALLED",
   "ATTEMPT_NO_SUBMISSION",
   "ATTEMPT_INTERRUPTED",
   "WORKER_RESUMED",
@@ -101,6 +107,8 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "ROUND_PANEL_DECIDED",
   "CANDIDATE_APPROVED",
   "OWNER_REQUEST_OPENED",
+  "RULING_RECORDED",
+  "DECISION_CLOSED",
   "OWNER_REQUEST_RESOLVED",
   "ACCEPTED",
   "PUBLISH_INTENT",
@@ -108,6 +116,7 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "PUBLISH_STALE",
   "REPAIR_ATTEMPT_STARTED",
   "REPAIR_BUDGET_EXHAUSTED",
+  "LOOP_BOUND_REACHED",
   "RESOLVING_INCOMPLETE",
   "GATE_REQUIRED",
   "GATE_FAILED",
@@ -142,6 +151,11 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "ITEMS_REGRESSED",
   "ROUND_CONSOLIDATED",
   "ROUND_FIXED",
+  "DOMAIN_CHECKED",
+  "DOMAIN_REVIEWED",
+  "DOMAIN_APPROVED",
+  "DOMAIN_DROPPED",
+  "FORBIDDEN_REFUSED",
   "ROUND_REVIEW_SUBMITTED",
   "ITEM_CARRIED",
   "DECISION_ADDED",
@@ -527,8 +541,8 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
     }
 
     case "ROUND_STARTED": {
-      if (event.round < 1 || event.lanes.length === 0) {
-        return rejected(state, "ROUND_STARTED needs a round number and at least one lane");
+      if (event.round < 1) {
+        return rejected(state, "ROUND_STARTED needs a positive round number");
       }
       const others = (p.rounds ?? []).filter((r) => r.round !== event.round);
       return ok({
@@ -650,7 +664,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       }
       return ok({
         ...state,
-        phase: { ...p, rounds: replaceRound(p.rounds, { ...round, picked: { lane: event.lane, sha: event.sha, votes: event.votes } }) },
+        phase: { ...p, rounds: replaceRound(p.rounds, { ...round, picked: { lane: event.lane, sha: event.sha, votes: event.votes, ...(event.ruling ? { ruling: event.ruling } : {}) } }) },
       });
     }
 
@@ -704,7 +718,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // two-lane round), and to never re-run the fixers after it.
       const round = (p.rounds ?? []).find((r) => r.round === event.round);
       if (!round) return rejected(state, `ROUND_FIXED for round ${event.round}, which has not started`);
-      if (!round.picked) return rejected(state, `ROUND_FIXED for round ${event.round}, which picked no lane`);
+      if (round.lanes.length > 0 && !round.picked) return rejected(state, `ROUND_FIXED for round ${event.round}, which picked no lane`);
       if (event.tasks.length === 0) return rejected(state, `ROUND_FIXED for round ${event.round} names no task`);
       const fixed: import("./types.ts").RoundFixed = {
         base: event.base,
@@ -718,9 +732,19 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         ...(event.candidate ? { candidate: event.candidate } : {}),
         ...(event.disclosures && event.disclosures.length > 0 ? { disclosures: event.disclosures } : {}),
         ...(event.added && event.added.length > 0 ? { added: event.added } : {}),
+        ...(event.domains && event.domains.length > 0 ? { domains: event.domains } : {}),
       };
       return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, fixed }) } });
     }
+
+    case "DOMAIN_CHECKED":
+    case "DOMAIN_REVIEWED":
+    case "DOMAIN_APPROVED":
+    case "DOMAIN_DROPPED":
+    case "FORBIDDEN_REFUSED":
+      // 07g1: record-only. The domain loop's history is replayed from the log
+      // by the fix round; no acceptance, rejection or phase-name change moves.
+      return ok(state);
 
     case "DECISION_ADDED": {
       // Work packet 2a: a reviewer-discovered decision or a conductor
@@ -829,6 +853,15 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       }
       if (!event.evidence || event.evidence.trim().length === 0) {
         return rejected(state, `finding ${event.findingId} repaired by evaluator requires the evidence anchor`);
+      }
+      // Plan 07f (F0/A2/R5): the evaluator never closes a point whose
+      // doneWhen fact fails or times out on the current candidate. The fact
+      // is the proof; an evaluator's `repaired` entry is not one.
+      if (factKeepsOpen(finding, p.doneWhenFacts ?? [], event.candidateSha)) {
+        return rejected(
+          state,
+          `finding ${event.findingId} has a failing doneWhen fact on candidate ${event.candidateSha}; the evaluator cannot close it`,
+        );
       }
       const findings = p.findings.map((f) =>
         f.id === event.findingId ? { ...f, status: "repaired" as const, repairedByCandidateSha: event.candidateSha } : f,
@@ -960,6 +993,95 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       return ok({ ...state, phase: applyOwnerRequestResolved(p, event) });
     }
 
+    case "RULING_RECORDED": {
+      // Plan 07f (A3/§3.2/§3.3, OD-1.3): a ruling is final when recorded. It
+      // settles EVERY record it names at once — a decision by id and unchanged
+      // choice, a trade-off finding by acceptance, and a point (a finding with
+      // `domain` and/or `doneWhen`) too: the owner's ruling is the authority
+      // that closes it, so the point is never left open waiting for a fact it
+      // may never get, and the ruling never queues a correction. It also
+      // answers the open owner requests about those records. It is
+      // record-only: no loop, no queue, no repair round.
+      const ruling = (event as Extract<Event, { type: "RULING_RECORDED" }>).ruling;
+      if (!ruling || typeof ruling.text !== "string" || ruling.text.trim().length === 0) {
+        return rejected(state, "a ruling needs non-empty text");
+      }
+      if (!Array.isArray(ruling.recordIds) || ruling.recordIds.length === 0) {
+        return rejected(state, "a ruling must name at least one record id");
+      }
+      const unknown = ruling.recordIds.filter(
+        (id) =>
+          !p.decisions.some((d) => d.id === id) &&
+          !p.findings.some((f) => f.id === id) &&
+          !namedCandidate(p, id),
+      );
+      if (unknown.length > 0) return rejected(state, `a ruling names unknown record(s): ${unknown.join(", ")}`);
+      // 07g1b (R12): a named candidate must be one this phase recorded.
+      if (ruling.candidate !== undefined && !namedCandidate(p, ruling.candidate)) {
+        return rejected(state, `a ruling's candidate ${ruling.candidate} names no candidate of this phase`);
+      }
+      // Plan 07f (A3, OD-1.3): everything the ruling names is settled at once,
+      // points included — a named point is closed by the ruling itself, never
+      // silently left open.
+      const settledIds = ruling.recordIds;
+      const decided = new Map(p.decisions.map((d) => [d.id, d]));
+      const rulings = [...(p.rulings ?? [])];
+      if (!rulings.some((r) => r.id === ruling.id)) rulings.push(ruling);
+      const ruledDecisions = [...(p.ruledDecisions ?? [])];
+      for (const id of settledIds) {
+        const decision = decided.get(id);
+        if (!decision) continue;
+        const kept = ruledDecisions.filter((r) => r.id !== id);
+        ruledDecisions.length = 0;
+        ruledDecisions.push(...kept, { id, choice: decision.choice, by: ruling.id });
+      }
+      const findings = p.findings.map((f) =>
+        settledIds.includes(f.id) && f.status === "open"
+          ? {
+              ...f,
+              status: "accepted" as const,
+              // Plan 07f1a (A1): a point the ruling names is closed by the
+              // ruling itself, and its reason is the ruling's id. A trade-off
+              // keeps the ruling text as its accepted scope (the owner's
+              // reasoning), exactly as before.
+              acceptedScope: f.domain !== undefined || f.doneWhen !== undefined ? ruling.id : ruling.text,
+              version: f.version + 1,
+            }
+          : f,
+      );
+      let next: PhaseState = { ...p, rulings, ruledDecisions, findings };
+      for (const id of settledIds) {
+        next = autoResolveLinkedRequest(next, id, "ruled", p.candidate?.sha ?? "", p.contract.contractVersion);
+      }
+      return ok({ ...state, phase: next });
+    }
+
+    case "DECISION_CLOSED": {
+      // Plan 07f (A2/C1): a record bound to an older candidate or contract
+      // version is closed when the phase moves, with its reason in the log.
+      // Record-only, and idempotent (a second close leaves the record as it
+      // is).
+      const closed = event as Extract<Event, { type: "DECISION_CLOSED" }>;
+      const decision = p.decisions.find((d) => d.id === closed.decisionId);
+      if (!decision) return rejected(state, `unknown decision ${closed.decisionId}`);
+      if (typeof closed.reason !== "string" || closed.reason.trim().length === 0) {
+        return rejected(state, "a closed decision needs its reason");
+      }
+      const decisions = p.decisions.map((d) =>
+        d.id === closed.decisionId && isLiveDecision(d)
+          ? { ...d, supersededBy: closed.reason, version: d.version + 1 }
+          : d,
+      );
+      const next = autoResolveLinkedRequest(
+        { ...p, decisions },
+        closed.decisionId,
+        "closed",
+        p.candidate?.sha ?? "",
+        p.contract.contractVersion,
+      );
+      return ok({ ...state, phase: next });
+    }
+
     case "BRIEF_RETRY_ATTEMPTED": {
       // Plan 05k (OD-6): remember that the backstop for each item was retried
       // once on this candidate, so a later park does not dispatch again.
@@ -1015,6 +1137,16 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const inFlight = { ...p.inFlight };
       delete inFlight[key];
       return ok({ ...state, phase: { ...p, inFlight } });
+    }
+
+    case "EVALUATION_SKIPPED": {
+      // Plan 07f (F1): no exception existed, so no evaluator ran. Record-only
+      // inside EVALUATING; the mechanical verdict stands.
+      if (p.phase !== "EVALUATING") {
+        return rejected(state, `EVALUATION_SKIPPED is only valid in EVALUATING, not ${p.phase}`);
+      }
+      if (p.evaluation?.skipped) return ok(state);
+      return ok({ ...state, phase: { ...p, evaluation: { ...(p.evaluation ?? {}), skipped: true } } });
     }
 
     case "EVALUATOR_FINISHED": {
@@ -1652,6 +1784,31 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       return ok(state);
     }
 
+    // Plan 07e (E2/A2): a named bound was reached. Record-only: no phase
+    // state changes, no candidate is accepted or rejected, and the owner is
+    // still the judge. `scope` and `action` make the log self-describing.
+    case "BOUND_REACHED": {
+      if (typeof event.kind !== "string" || event.kind.length === 0) {
+        return rejected(state, "a bound-reached event must name the bound kind");
+      }
+      if (typeof event.scope !== "string" || event.scope.length === 0) {
+        return rejected(state, "a bound-reached event must name its scope");
+      }
+      if (!Number.isFinite(event.limitMs) || event.limitMs < 0 || !Number.isFinite(event.elapsedMs) || event.elapsedMs < 0) {
+        return rejected(state, "a bound-reached event must carry non-negative limit and elapsed milliseconds");
+      }
+      return ok(state);
+    }
+
+    // Plan 07e (E2/A3): the rounds budget ran out. Record-only: the existing
+    // REPAIR_BUDGET_EXHAUSTED transition still decides where the phase goes.
+    case "LEAD_CALLED": {
+      if (!Array.isArray(event.reasons) || event.reasons.some((r) => typeof r !== "string")) {
+        return rejected(state, "a lead-called event must carry an array of reason strings");
+      }
+      return ok(state);
+    }
+
     case "OWNER_VERDICT": {
       const message = (p.messages ?? []).find((m) => m.id === event.messageId);
       if (!message) return rejected(state, `unknown message ${event.messageId}`);
@@ -1814,6 +1971,17 @@ export function reduce(state: State, event: unknown): ReduceResult {
     }
 
     const nextState = matching.apply(working, ev);
+    if (ev.type === "FREEZE_COMPLETED") {
+      // Plan 07f1a (R3): applied/reverted amendments stay bound to the
+      // candidate and contract they changed, so the conductor closes them
+      // with its phase-moved reason rather than silently carrying them live.
+      const historical = new Map(working.phase.decisions
+        .filter((d) => d.amendment && d.amendment.status !== "proposed")
+        .map((d) => [d.id, d]));
+      return ok({ ...nextState, phase: { ...nextState.phase,
+        decisions: nextState.phase.decisions.map((d) => historical.get(d.id) ?? d),
+      } });
+    }
     return ok(nextState);
   } catch (err) {
     return rejected(state, `reduce threw and was recovered: ${String((err as Error)?.message ?? err)}`);

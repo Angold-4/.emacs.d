@@ -31,11 +31,12 @@ import {
   isProgramInput,
   lintPlan,
   lintProgram,
+  lintTestRemovals,
   type LintFinding,
   type LintPlanInput,
   type LintProgramInput,
 } from "./core/plan-lint.ts";
-import { readRepoFacts, readVerifyReachFacts } from "./core/repo-facts.ts";
+import { readRepoFacts, readTestNamesAtBase, readVerifyReachFacts } from "./core/repo-facts.ts";
 import { PLAN_TEMPLATE, parseOrgPlan } from "./core/org-plan.ts";
 import { EventLog, readLog } from "./effects/log.ts";
 import { acquireLock } from "./effects/lock.ts";
@@ -52,7 +53,7 @@ import { CHANGED_TEST_BUDGET_MS, checkTestFiles, effectiveChecks, testFilesImpor
 // any run is created, so a missing toolchain refuses visibly instead of
 // creating runs that are immediately environment-blocked.
 import { envPreflight } from "./core/env-preflight.ts";
-import { buildView, chartModelsFromPlan, prSummary, timingReport, timingText } from "./view.ts";
+import { buildView, chartModelsFromPlan, prSummary, timingReport, timingText, whyReport, whyText } from "./view.ts";
 import { removedTestsBetween } from "./effects/git.ts";
 import { deliver, restack } from "./effects/deliver.ts";
 import {
@@ -87,7 +88,7 @@ const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>] [--env-file <KEY=value file>] [--skip-models-check]\n       tt lint <plan.json|program.json|plan.org>   (findings; non-zero on errors)\n       tt plan template                  (print the plan skeleton)\n       tt steer <run-dir-or-id> <text|@file> [--program-wide] [--run-id <id> --phase-id <id>]   (deliver to every live lane worker)\n       tt note <run-dir-or-id> <text|@file> [--program-wide] [--run-id <id> --phase-id <id>]\n       tt correct <run-dir-or-id> <text|@file> [--program-wide] [--run-id <id> --phase-id <id>]\n       tt input <run-dir-or-id> [<command.json>]   (a structured owner command; waits and prints its outcome)\n       tt withdraw <run-dir-or-id> OD-n\n       tt evidence <run-dir-or-id> <item> <file-or-text>\n       tt deliver <program|run> [--apply]\n       tt restack <program> --onto <ref> [--apply]\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt seats <run-dir-or-id|program-id> [--root <dir>]   (per-seat cost and findings table)\n       tt test --changed [--run <run-dir>|--plan <plan.json>] [--base <sha>] [--budget <minutes>] [--repo <dir>]   (the narrow test loop)\n       tt program start <program.json> [--source <org-file>] [--skip-models-check] | status <id> | state <id> | stop <id> | pause <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt models check <plan.json|program.json>   (probe each configured model)\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt defer <run-dir-or-id> <finding-or-decision-id> [--test <name>] [--owner-ruling <id>] [--to <phase>]   (a deferral needs a guard)\n       tt recheck <run-dir-or-id> --reason <why the failure is the machine>   (re-run a failed candidate's checks; no worker, no round)\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>] [--env-file <KEY=value file>] [--skip-models-check]\n       tt lint <plan.json|program.json|plan.org>   (findings; non-zero on errors)\n       tt plan template                  (print the plan skeleton)\n       tt steer <run-dir-or-id> <text|@file> [--program-wide] [--run-id <id> --phase-id <id>]   (deliver to every live lane worker)\n       tt note <run-dir-or-id> <text|@file> [--program-wide] [--run-id <id> --phase-id <id>]\n       tt correct <run-dir-or-id> <text|@file> [--program-wide] [--run-id <id> --phase-id <id>]\n       tt input <run-dir-or-id> [<command.json>]   (a structured owner command; waits and prints its outcome)\n       tt withdraw <run-dir-or-id> OD-n\n       tt evidence <run-dir-or-id> <item> <file-or-text>\n       tt deliver <program|run> [--apply]\n       tt restack <program> --onto <ref> [--apply]\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt seats <run-dir-or-id|program-id> [--root <dir>]   (per-seat cost and findings table)\n       tt test --changed [--run <run-dir>|--plan <plan.json>] [--base <sha>] [--budget <minutes>] [--repo <dir>]   (the narrow test loop)\n       tt program start <program.json> [--source <org-file>] [--skip-models-check] | status <id> | state <id> | stop <id> | pause <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt models check <plan.json|program.json>   (probe each configured model)\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt why <run-dir-or-id> [--json] [--root <dir>]   (acceptance blockers, each with its command)\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt defer <run-dir-or-id> <finding-or-decision-id> [--test <name>] [--owner-ruling <id>] [--to <phase>]   (a deferral needs a guard)\n       tt recheck <run-dir-or-id> --reason <why the failure is the machine>   (re-run a failed candidate's checks; no worker, no round)\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -125,7 +126,27 @@ function coverageFindings(json: unknown): LintFinding[] {
  * repository coverage. `tt lint` and both start commands use this one
  * function, so the warnings they show are the same. */
 function allFindings(json: unknown): LintFinding[] {
-  return [...lintJson(json), ...coverageFindings(json), ...verifyReachFindings(json)];
+  return [...lintJson(json), ...coverageFindings(json), ...verifyReachFindings(json), ...testRemovalFindings(json)];
+}
+
+/** 07g1: every `#+TT_TEST_REMOVALS` entry must name a test the base declares,
+ * so an allowance cannot silently cover a different test. Read per plan like
+ * coverage, and prefixed per program entry the same way. */
+function testRemovalFindings(json: unknown): LintFinding[] {
+  if (isProgramInput(json)) {
+    const out: LintFinding[] = [];
+    for (const entry of (json as LintProgramInput).entries ?? []) {
+      const plan = entry.plan;
+      if (!plan?.repo) continue;
+      for (const f of lintTestRemovals(plan, readTestNamesAtBase(plan.repo))) {
+        out.push({ ...f, phaseId: entry.id ? `${entry.id}/${f.phaseId}` : f.phaseId });
+      }
+    }
+    return out;
+  }
+  const plan = json as LintPlanInput;
+  if (!plan?.repo) return [];
+  return lintTestRemovals(plan, readTestNamesAtBase(plan.repo));
 }
 
 /** 06k1's lesson: a named test the phase's checks never run (an error). Read
@@ -1950,10 +1971,17 @@ async function cmdVerdict(
   const p = runPaths(runDir);
   const maskable = resolveSecrets(secretNames(plan.secrets)).maskable;
   const log = new EventLog(p.events, maskable);
+  let recorded = true;
   try {
-    log.append("event", event);
+    // Plan 07e (E4): a record the disk refused is not a recorded verdict.
+    recorded = log.append("event", event) !== undefined;
   } finally {
     log.close();
+  }
+  if (!recorded) {
+    process.stderr.write("tt: disk full — the verdict was not recorded\n");
+    process.exitCode = 1;
+    return;
   }
   const after = rebuildState(runDir, plan, { lenient: true });
   writeFileSync(p.messages, projectMessages(after.phase));
@@ -2465,10 +2493,18 @@ async function cmdEntry(positional: string[], root: string, reason: string | und
   const p = runPaths(runDir);
   const maskable = resolveSecrets(secretNames(plan.secrets)).maskable;
   const log = new EventLog(p.events, maskable);
+  let recorded = true;
   try {
-    for (const event of expanded.events) log.append("event", event);
+    // Plan 07e (E4): an entry change is recorded only when every one of its
+    // events reached the disk.
+    for (const event of expanded.events) if (log.append("event", event) === undefined) recorded = false;
   } finally {
     log.close();
+  }
+  if (!recorded) {
+    process.stderr.write("tt: disk full — the entry change was not fully recorded\n");
+    process.exitCode = 1;
+    return;
   }
   const after = rebuildState(runDir, plan, { lenient: true });
   const entryReview = projectEntryReview(
@@ -2560,6 +2596,12 @@ async function main(): Promise<void> {
       // a run whose views directory is missing still prints the text
     }
     process.stdout.write(statusText);
+  } else if (cmd === "why") {
+    if (positional.length !== 1) usage();
+    const runDir = resolveRunDir(positional[0], runRoot);
+    delegateToRecordedRunner(runDir, runRoot);
+    const report = whyReport(runDir, readPlan(runDir));
+    process.stdout.write(json ? `${JSON.stringify(report)}\n` : `${whyText(report)}\n`);
   } else if (cmd === "resume") {
     if (positional.length !== 1) usage();
     const runDir = resolveRunDir(positional[0], runRoot);

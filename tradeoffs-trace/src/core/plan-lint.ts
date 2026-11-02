@@ -23,11 +23,12 @@
 
 import * as fs from "node:fs";
 
+import { boundByKeyword, boundIssue } from "./bounds.ts";
 import { expandPromptPath, isLaneId } from "./worker-prompt.ts";
 import { matchesGlob } from "./boundaries.ts";
 import { domainDeclarationIssues, type Domain } from "./domains.ts";
 import { parseVerify, verifyKindIssue } from "./items.ts";
-import { rerunTemplateIssue } from "./test-failures.ts";
+import { declaredVerifyCommand, rerunTemplateIssue } from "./test-failures.ts";
 
 export type LintSeverity = "error" | "warning";
 
@@ -66,9 +67,16 @@ export type LintRule =
   | "cheap-final-check"
   // tt 09 (change 3): `#+TT_CONSOLIDATE` is `on` or `off`.
   | "consolidate"
+  // Plan 07e (E3): every bound keyword is a positive whole number, and the
+  // check-window opt-in is a known value.
+  | "bound"
+  | "check-window"
   // Plan 07c (D4): `#+TT_FIX_ROUNDS` needs `#+TT_DOMAINS`; the value is
   // `domains`, and `#+TT_FIXERS` is a positive whole number.
-  | "fix-rounds";
+  | "fix-rounds"
+  // 07g1: every `#+TT_TEST_REMOVALS` entry must name a test that exists on
+  // the base, so an allowance cannot silently cover a different test.
+  | "test-removals";
 
 /** The roles #+TT_MODELS may assign a model to. */
 // tt 09 (change 3): `consolidator` — the model that combines the lanes.
@@ -226,6 +234,9 @@ export interface LintPhaseInput {
   /** Plan 07c (D4): `#+TT_FIX_CHECKS:` — the fast command a fixer's own
    * commit must pass. */
   fixChecks?: unknown;
+  /** 07g1: `#+TT_TEST_REMOVALS` — test files/functions the owner allowed a
+   * mapper to remove. Carried onto every phase by the parser. */
+  testRemovals?: string[];
 }
 
 export interface LintPlanInput {
@@ -322,6 +333,20 @@ export interface LintPlanInput {
   fixChecks?: unknown;
   /** Lint-only: the 1-based line of `#+TT_FIX_CHECKS:`. */
   fixChecksLine?: number;
+  /** 07g1: the plan's `#+TT_TEST_REMOVALS` allowances (`file::name` or a
+   * whole file), carried onto every phase. */
+  testRemovals?: string[];
+  /** Lint-only: the 1-based line of `#+TT_TEST_REMOVALS:`. */
+  testRemovalsLine?: number;
+  /** Plan 07e (E3): every bound keyword's raw value, by keyword, and the
+   * 1-based line each was written on. */
+  bounds?: Record<string, unknown>;
+  boundLines?: Record<string, number>;
+  /** Plan 07e (E4): the `#+TT_CHECK_WINDOW:` opt-in, kept open so lint can
+   * name a value other than `exclusive`/`off`. */
+  checkWindow?: unknown;
+  /** Lint-only: the 1-based line of `#+TT_CHECK_WINDOW:`. */
+  checkWindowLine?: number;
   /** `#+TT_WORKER_PROMPT`: lane to the files appended to its worker. Kept
    * open (`unknown`) so a malformed value still reaches the linter. */
   workerPrompt?: Record<string, unknown>;
@@ -620,6 +645,45 @@ export function lintRerun(plan: LintPlanInput): LintFinding[] {
   ];
 }
 
+/** 07g1b (A4/R7/R13): every `test` verify needs a command the plan declares
+ * for it — the `#+TT_RERUN:` template it fills, or the phase's checks (plus
+ * the final checks for `test final`). A point the pick makes from a lost test
+ * takes that command as its doneWhen, so a test-verified item with none would
+ * reach a run as a point no fact can close; it is refused here instead, never
+ * left to an empty doneWhen at runtime or a command guessed from the file. */
+export function lintVerifyCommands(plan: LintPlanInput): LintFinding[] {
+  const out: LintFinding[] = [];
+  for (const phase of plan.phases ?? []) {
+    const declared = {
+      ...(typeof plan.rerun === "string" ? { rerun: plan.rerun } : {}),
+      checks: [...(plan.checks ?? []), ...(phase.checks ?? [])],
+      finalChecks: phase.finalChecks ?? [],
+    };
+    for (const item of [...(phase.architecture ?? []), ...(phase.requirements ?? []), ...(phase.constraints ?? [])]) {
+      for (const raw of item.verify ?? []) {
+        if (verifyKindIssue(raw) !== undefined) continue;
+        for (const v of parseVerify(raw)) {
+          if (v.kind !== "test" || v.name.trim().length === 0) continue;
+          // A final-only test with no final checks is lintItems' own error.
+          if (v.final && !declared.finalChecks.some((c) => c.trim().length > 0)) continue;
+          if (declaredVerifyCommand(v, declared) !== undefined) continue;
+          out.push({
+            severity: "error",
+            rule: "item-verify",
+            phaseId: phase.id ?? "?",
+            item: (item.text ?? item.title ?? item.id ?? "(item)").split("\n")[0],
+            line: item.verifyLine ?? item.line,
+            sourceFile: plan.sourceFile,
+            problem: `the test verify ${JSON.stringify(v.name)} of ${item.id ?? "(no id)"} has no declared command: the phase has no checks and no #+TT_RERUN the verify fills, so a point for a lost test would have no doneWhen`,
+            fix: "declare the command that runs the test: #+TT_CHECKS (or the phase's :CHECKS:), or a #+TT_RERUN template the verify can fill ({file} needs a test file::name verify)",
+          });
+        }
+      }
+    }
+  }
+  return out;
+}
+
 /** Lines of `rawText` that the parsed `text` does not carry: the proof that a
  * parser dropped part of an item (a sub-list or a source block cut off at the
  * first blank line, the #41 failure). Property-drawer and blank lines are not
@@ -830,12 +894,15 @@ export function lintPlan(plan: LintPlanInput): LintFinding[] {
   const out: LintFinding[] = [
     ...lintModels(plan),
     ...lintRerun(plan),
+    ...lintVerifyCommands(plan),
     ...lintWorkers(plan),
     ...lintWorkerPrompt(plan),
     ...lintCheapFinalChecks(plan),
     ...lintConsolidate(plan),
     ...lintDomains(plan),
     ...lintFixRounds(plan),
+    ...lintBounds(plan),
+    ...lintCheckWindow(plan),
   ];
   for (const phase of plan.phases ?? []) {
     const phaseId = phase.id ?? "?";
@@ -1158,6 +1225,48 @@ function consolidateFinding(keyword: string, value: unknown, phaseId: string, li
   };
 }
 
+/** Plan 07e (E3): a bound keyword set to zero, a negative number or a
+ * non-number is an error naming the keyword and its line. Emacs drops such a
+ * value silently; the linter must not. */
+export function lintBounds(plan: LintPlanInput): LintFinding[] {
+  const out: LintFinding[] = [];
+  for (const [keyword, raw] of Object.entries(plan.bounds ?? {})) {
+    const issue = boundIssue(raw);
+    if (!issue) continue;
+    const bound = boundByKeyword(keyword);
+    out.push({
+      severity: "error",
+      rule: "bound",
+      phaseId: "bounds",
+      item: `${keyword}: ${String(raw)}`,
+      line: plan.boundLines?.[keyword],
+      sourceFile: plan.sourceFile,
+      problem: `${keyword} ${issue}${bound ? ` (${bound.kind} bound, default ${bound.defaultValue}${bound.unit === "minutes" ? "m" : ""})` : ""}`,
+      fix: `set ${keyword} to a positive whole number${bound?.unit === "minutes" ? " of minutes" : ""}, or remove the keyword to keep the default`,
+    });
+  }
+  return out;
+}
+
+/** Plan 07e (E4): the check window is off unless the plan says `exclusive`. */
+export function lintCheckWindow(plan: LintPlanInput): LintFinding[] {
+  if (plan.checkWindow === undefined) return [];
+  const value = String(plan.checkWindow).trim();
+  if (value === "exclusive" || value === "off") return [];
+  return [
+    {
+      severity: "error",
+      rule: "check-window",
+      phaseId: "check-window",
+      item: `#+TT_CHECK_WINDOW: ${value}`,
+      line: plan.checkWindowLine,
+      sourceFile: plan.sourceFile,
+      problem: `#+TT_CHECK_WINDOW must be \`exclusive\` (opt in) or \`off\`, got "${value}"`,
+      fix: "write #+TT_CHECK_WINDOW: exclusive to pause workers for another run's check, or remove the keyword (off)",
+    },
+  ];
+}
+
 /** tt 09 (change 3): lint the plan's `#+TT_CONSOLIDATE:` value. */
 export function lintConsolidate(plan: LintPlanInput): LintFinding[] {
   if (plan.consolidate === undefined || isConsolidateValue(plan.consolidate)) return [];
@@ -1181,6 +1290,43 @@ export function lintDomains(plan: LintPlanInput): LintFinding[] {
     problem,
     fix: "write each domain as <name>=<glob>[,<glob>…] with a unique [a-z0-9-]+ name and at least one glob",
   }));
+}
+
+/** 07g1: the base's test names, as the `#+TT_TEST_REMOVALS` lint reads them.
+ * `namesIn` returns undefined when the file cannot be read at the base, so a
+ * missing fact never turns into a false refusal. */
+export interface TestRemovalBaseFacts {
+  namesIn(file: string): readonly string[] | undefined;
+}
+
+/** 07g1: refuse a `#+TT_TEST_REMOVALS` entry that names no test on the base.
+ * An entry is `file::name` (that exact test) or a whole file; an unreadable
+ * base file is left alone because the lint cannot judge it. */
+export function lintTestRemovals(plan: LintPlanInput, base: TestRemovalBaseFacts): LintFinding[] {
+  const entries = plan.testRemovals ?? (plan.phases ?? []).find((p) => p.testRemovals && p.testRemovals.length > 0)?.testRemovals ?? [];
+  const out: LintFinding[] = [];
+  for (const raw of entries) {
+    const entry = raw.trim();
+    if (entry.length === 0) continue;
+    const split = entry.indexOf("::");
+    const file = split === -1 ? entry : entry.slice(0, split);
+    const name = split === -1 ? undefined : entry.slice(split + 2);
+    const names = base.namesIn(file);
+    if (names === undefined) continue;
+    const missing = name === undefined ? names.length === 0 : !names.includes(name);
+    if (!missing) continue;
+    out.push({
+      severity: "error",
+      rule: "test-removals",
+      phaseId: "test-removals",
+      item: `#+TT_TEST_REMOVALS: ${entry}`,
+      line: plan.testRemovalsLine,
+      sourceFile: plan.sourceFile,
+      problem: `#+TT_TEST_REMOVALS names ${entry}, but ${name === undefined ? `${file} declares no test on the base` : `${file} has no test named ${name} on the base`}`,
+      fix: "name a test that exists on the base as file::name, or a file that declares at least one test",
+    });
+  }
+  return out;
 }
 
 /** Plan 07c (D4): lint the fix-round keywords. `#+TT_FIX_ROUNDS` needs

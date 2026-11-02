@@ -30,30 +30,19 @@ import { renderPhaseChart, statsFromTimeline } from "./charts.ts";
 import { metricEvents, projectMetrics, type MetricEvent } from "./metrics.ts";
 import { acceptInput, expandEntryCommand, normalizeDecisionViewCommand, ownerCommandToEvent, type InputKind } from "./core/owner-inbox.ts";
 import { unchangedResubmissionRequesters } from "./core/owner-commands.ts";
+import { namedCandidate } from "./core/ruling-picks.ts";
 // Plan 06g: the round's only decision points — `pickWinner`, `blocksAcceptance`
 // and `roundBudget` (architecture A3 and A6). Nothing in this file decides a
 // winner or whether a finding blocks by itself.
-import { advisoryReason, bestCandidate, blocksAcceptance, candidateLabel, carryBallotsForward, carryDecisionsForward, everyLaneLost, losingLanes, loserAnchors, regressedItems, roundBudget, type AcceptanceGate, type FindingGround, type PickGuard } from "./core/rounds.ts";
+import { advisoryReason, bestCandidate, blocksAcceptance, candidateLabel, carryBallotsForward, carryDecisionsForward, laneMetItems, losingLanes, loserAnchors, roundBudget, type AcceptanceGate, type FindingGround, type PickGuard } from "./core/rounds.ts";
 // Plan 06g2 (A1): `runRound` is the round's only orchestrator. The conductor
 // implements its `LaneHost` with the worktree, agent, check, review and vote
 // machinery below and calls it; it decides nothing about lanes itself.
 import {
-  consolidatedBase,
-  consolidatedLabel,
-  consolidationEnabled,
-  consolidationLine,
-  consolidationPlan,
   isLaneRound,
-  itemEvidence,
   laneFailureLines,
   lanesOfContract,
-  repeatLaneBases,
-  runConsolidation,
   runRound,
-  fixRoundCandidate,
-  isFixRound,
-  type ConsolidationOutcome,
-  type ConsolidationPlan,
   type LaneBuild,
   type LaneCheck,
   type LaneHost,
@@ -61,6 +50,8 @@ import {
 // Plan 06h (A1/A2): the seat list, its leader and the lane count are the
 // plan's, read from one place (`seatsOf`/`leaderOf`).
 import { leaderOf, seatsOf, seatsRecordOf, workerCountOf } from "./core/seats.ts";
+// Plan 07e (E1/A1): the one named table of every bound kind.
+import { boundDefaultMs, boundDefinition, type BoundKind } from "./core/bounds.ts";
 // Plan 06i: triage — the only place fix / trade-off / escalate is decided.
 import {
   blockingTriageRecords,
@@ -121,10 +112,13 @@ import {
   parseBaseline,
   parseTestFailures,
   rerunCommandsFor,
+  shellQuote,
   rerunProvesTheTestRan,
+  lostTestsDoneWhen,
   baselineHasEnvironmentFailure,
   type Baseline,
   type BaselineCommand,
+  type DeclaredTestCommands,
   type TestRerunOutcome,
 } from "./core/test-failures.ts";
 import { clampMessageTitle, contentHashOf, ledgerEntries, MESSAGE_TITLE_MAX, type MessageContent } from "./core/messages.ts";
@@ -138,6 +132,9 @@ import type {
   Decision,
   DecisionBrief,
   DecisionDisclosure,
+  DomainFacts,
+  DomainLoopRecord,
+  DomainReview,
   EvFlakeObserved,
   DirectiveAnswer,
   DirectiveScope,
@@ -157,6 +154,7 @@ import type {
   OwnerInputState,
   PhaseContract,
   PhaseState,
+  Ruling,
   Review,
   Reviewer,
   RoundRecord,
@@ -164,20 +162,21 @@ import type {
   State,
 } from "./core/types.ts";
 import { computeBoundaryTriggerPaths, computeUnreferencedHunks } from "./core/boundaries.ts";
-import { whereKey, type Domain } from "./core/domains.ts";
+import { domainOf, whereKey, type Domain } from "./core/domains.ts";
 // Plan 07c (D4): the fix-round task rule and the fixer's fixed duty text.
 import {
-  decisionFixPoint,
+  domainReviewBrief,
   factKeepsOpen,
   DEFAULT_FIXERS,
+  DEFAULT_INTEGRATE_MAX,
   FIXER_DUTY,
   fixTasks,
-  otherTaskIndexLines,
-  type DecisionFixPoint,
+  testRemovalViolations,
   type FixFinding,
   type FixPoint,
   type FixTask,
 } from "./core/fix-rounds.ts";
+import { failingDomainOf, integrateBrief, resolutionOutsideConflicted, runDomainLoop, unmergedPaths, type DomainLoopHost } from "./fix-loop.ts";
 import {
   assertToolSet,
   launchArgs,
@@ -194,6 +193,7 @@ import {
   decisionStatus,
   findingCitesAcceptanceOrReserved,
   isLiveDecision,
+  itemIsSplit,
   reviewIngestionIssue,
   panelMajority,
   ownerRuledDecision,
@@ -211,8 +211,8 @@ import {
 import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { FAILED_VOTE_OPTIONS, isRepairForcingOption, openFindingOptions } from "./core/owner-requests.ts";
 import { BRIEF_GLOSSARY, briefIssue, enrichBriefRelated, evidenceFile, fallbackBrief, fallbackDecisionBrief, fallbackEntryBrief, parseCatalogs, renderGlossaryOrg, stripCodeTokens, stripCounts, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
-import { notAcceptedReasons } from "./core/verdict.ts";
-import { itemsNeedingEvaluatorReverify, pendingEvidenceItems } from "./core/predicate.ts";
+import { evaluationExceptions, notAcceptedReasons } from "./core/verdict.ts";
+import { evaluationSettled, itemsNeedingEvaluatorReverify, pendingEvidenceItems, setSeatAnchorResolver } from "./core/predicate.ts";
 // Plan 06b: the pure item machinery (coverage, test-verify resolution,
 // verdict validation, per-item majority, the matrix and the status counts).
 import {
@@ -228,7 +228,9 @@ import {
   coverageNoteLines,
   emptyCoverage,
   evidenceFileAnchors,
+  evidenceHasAnchor,
   itemsFromPhase,
+  itemTestVerifies,
   requirementAndConstraintItems,
   phaseItemOutcomes,
   repairItemLines,
@@ -241,15 +243,16 @@ import {
   reverify,
   symbolPresent,
   tallyItems,
+  testOutcomeIn,
   testResultLines,
   testVerifyProblems,
-  thinMetItems,
   verdictIssues,
   type Coverage,
   type FlatItem,
   type ItemOutcome,
   type PlanItems,
   type SeatItemVerdict,
+  type TestVerify,
   type VerdictContext,
   type VerifyResolution,
 } from "./core/items.ts";
@@ -257,8 +260,8 @@ import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
 import { validate } from "./core/schema.ts";
 
 import { EventLog, readLog, type LogRecord } from "./effects/log.ts";
-import { acquireCheckSlot, acquireLock, acquireWaitingLock, anyCheckWindowOpen, DEFAULT_CHECK_SLOTS, openCheckWindow, PausableTimer, type Lock } from "./effects/lock.ts";
-import { childEnv, runCommand, type RunCommandResult } from "./effects/shell.ts";
+import { acquireCheckSlot, acquireLock, acquireWaitingLock, DEFAULT_CHECK_SLOTS, openCheckWindow, otherCheckWindowOwner, PausableTimer, type Lock } from "./effects/lock.ts";
+import { childEnv, runCommand, type CommandStep, type RunCommandResult } from "./effects/shell.ts";
 import { groupStartedBefore, killGroup, loggedHeld, processAlive, signalProcess, sweep, type SweepResult } from "./effects/sweep.ts";
 import {
   createWorktree,
@@ -276,7 +279,7 @@ import {
   removeWorktree,
   candidateTree,
   saveUnsubmittedWork as gitSaveUnsubmittedWork,
-  verifyIntegrity, removedTestsBetween, headOf, mergeFixer, type DisposableCheckout } from "./effects/git.ts";
+  verifyIntegrity, removedTestsBetween, testRemovalViolationsBetween, headOf, type DisposableCheckout } from "./effects/git.ts";
 import { RunSocketServer, type HelloResult, type SubmitResult } from "./effects/socket.ts";
 import { PiAgent, spawnPiAgent } from "./effects/pi-rpc.ts";
 import { redactBytes, redactRecord, redactText, resolveSecrets, secretNames, secretPromptLines, utf16Kind, type Secret } from "./effects/secrets.ts";
@@ -347,6 +350,19 @@ export interface Deadlines {
   panelMs: number;
   reviewMs: number;
   reproductionMs: number;
+  /** Plan 07e (E1): one fixer attempt's own deadline (`#+TT_FIX_ATTEMPT_MINUTES`,
+   * default 45, today's value). */
+  fixerAttemptMs: number;
+  /** Plan 07e (E1/E2): how long one fixer commit's merge may take
+   * (`#+TT_MERGE_MINUTES`, default 10). */
+  mergeMs: number;
+  /** Plan 07e (E1): the final check's own deadline
+   * (`#+TT_FINAL_CHECK_MINUTES`); defaults to today's check value. */
+  finalCheckMs: number;
+  /** Plan 07e (E1/E2): how long the owner's desk may hold a parked run before
+   * another reminder (`#+TT_OWNER_WAIT_MINUTES`, default 240). A reminder only:
+   * the request stays open and the owner still decides. */
+  ownerWaitMs: number;
   abortGraceMs: number;
   termGraceMs: number;
   /** Plan 2d: how long `stop()` waits for an agent to exit after abort before
@@ -399,8 +415,12 @@ export const DEFAULT_DEADLINES: Deadlines = {
   evaluateMs: 10 * 60_000,
   briefMs: 90_000,
   panelMs: 10 * 60_000,
-  reviewMs: 15 * 60_000,
-  reproductionMs: 5 * 60_000,
+  reviewMs: boundDefaultMs("review"),
+  reproductionMs: boundDefaultMs("fact"),
+  fixerAttemptMs: boundDefaultMs("fixer-attempt"),
+  mergeMs: boundDefaultMs("merge"),
+  finalCheckMs: boundDefaultMs("final-check"),
+  ownerWaitMs: boundDefaultMs("owner-wait"),
   abortGraceMs: 30_000,
   termGraceMs: 10_000,
   stopAbortGraceMs: 2_000,
@@ -489,6 +509,15 @@ export interface RunPlanPhase {
   /** Plan 07c (D4): `#+TT_FIX_CHECKS` — the fast command every fixer's own
    * commit must pass before it is merged. */
   fixChecks?: string;
+  /** 07g1: how many reviews one domain may spend before it is dropped. */
+  domainLoopMax?: number;
+  /** 07g2 (A1): `#+TT_INTEGRATE_MAX` — how many conflicted integration
+   * attempts one fix round may spend before dropping the last domain. */
+  integrateMax?: number;
+  /** 07g1: shell patterns a mapper must never run. */
+  forbidden?: string[];
+  /** 07g1: test files/functions the owner allowed a mapper to remove. */
+  testRemovals?: string[];
   /** Plan 06i (A3): the phase's golden note (`#+TT_GOLDEN:`, overridden by
    * the phase's `:GOLDEN:`). A choice justified only by an earlier drafting
    * decision is re-checked against it; a `contract` classification must cite
@@ -526,6 +555,12 @@ export interface RunPlanFile {
   seats?: string[];
   /** Plan 06h (A1): the plan's `#+TT_LEADER:`. Absent means the first seat. */
   leader?: string;
+  /** 07g1: plan-wide domain-loop bound, forbidden patterns and test removals. */
+  domainLoopMax?: number;
+  /** 07g2 (A1): plan-wide `#+TT_INTEGRATE_MAX` (default 2). */
+  integrateMax?: number;
+  forbidden?: string[];
+  testRemovals?: string[];
   /** Plan 01c: the Org file this JSON plan was parsed from, recorded by Emacs
    * so `tt lint` can name the file the owner edited rather than its temporary
    * JSON copy. Never read by the conductor. */
@@ -543,6 +578,9 @@ export interface RunPlanFile {
    * TT_ATTEMPT_MINUTES), for repositories whose builds and suites take
    * longer than the defaults (e.g. a Rust workspace). */
   deadlines?: Partial<Deadlines>;
+  /** Plan 07e (E4/A5): `#+TT_CHECK_WINDOW: exclusive`. Off by default: a run
+   * pauses its own workers for another run's check only when it opts in. */
+  checkWindow?: "exclusive" | "off";
   /** Documents the plan cites that live outside the repository (absolute
    * paths; Emacs collects them from #+TT_REFS and from the plan text). They
    * are copied into <run>/refs at creation, so a run keeps the version it
@@ -855,6 +893,14 @@ class EnvFailure extends Error {
   }
 }
 
+/** 07g2 (A4/R9): the simple command a traced check's shell ran last before it
+ * exited non-zero, with its own output. Undefined for a command that was not
+ * traced (a probe, a fact, an old path). */
+function lastStep(result: RunCommandResult): CommandStep | undefined {
+  const steps = result.steps;
+  return steps && steps.length > 0 ? steps[steps.length - 1] : undefined;
+}
+
 /** The last `n` lines of a command's output, for an environment failure's
  * evidence (the same tail shape the gate finding quotes). */
 function lastLines(text: string, n: number): string {
@@ -920,6 +966,10 @@ export function buildContract(phase: RunPlanPhase): PhaseContract {
     ...(typeof phase.fixRounds === "string" && phase.fixRounds.trim().toLowerCase() === "domains" ? { fixRounds: "domains" as const } : {}),
     ...(typeof phase.fixers === "number" && Number.isFinite(phase.fixers) && phase.fixers > 0 ? { fixers: Math.floor(phase.fixers) } : {}),
     ...(typeof phase.fixChecks === "string" && phase.fixChecks.trim().length > 0 ? { fixChecks: phase.fixChecks.trim() } : {}),
+    ...(typeof phase.domainLoopMax === "number" && Number.isFinite(phase.domainLoopMax) && phase.domainLoopMax > 0 ? { domainLoopMax: Math.floor(phase.domainLoopMax) } : {}),
+    ...(typeof phase.integrateMax === "number" && Number.isFinite(phase.integrateMax) && phase.integrateMax > 0 ? { integrateMax: Math.floor(phase.integrateMax) } : {}),
+    ...(phase.forbidden && phase.forbidden.length > 0 ? { forbidden: phase.forbidden.map((p) => p.trim()).filter((p) => p.length > 0) } : {}),
+    ...(phase.testRemovals && phase.testRemovals.length > 0 ? { testRemovals: phase.testRemovals.map((p) => p.trim()).filter((p) => p.length > 0) } : {}),
     acceptance,
     checks: phase.checks,
     boundaries: phase.boundaries,
@@ -970,8 +1020,17 @@ export function initialState(
    * its own seats even if the plan changed. Absent (an old log) means the
    * plan's own seats, and `M A B` when it declares none. */
   initSeats?: Seats,
+  /** 07g1: plan-level defaults for the phase-level domain-loop fields. */
+  planDefaults?: Pick<RunPlanFile, "domainLoopMax" | "integrateMax" | "forbidden" | "testRemovals">,
 ): State {
-  const built = buildContract(phase);
+  const effectivePhase: RunPlanPhase = {
+    ...phase,
+    ...(phase.domainLoopMax === undefined && planDefaults?.domainLoopMax !== undefined ? { domainLoopMax: planDefaults.domainLoopMax } : {}),
+    ...(phase.integrateMax === undefined && planDefaults?.integrateMax !== undefined ? { integrateMax: planDefaults.integrateMax } : {}),
+    ...(phase.forbidden === undefined && planDefaults?.forbidden !== undefined ? { forbidden: planDefaults.forbidden } : {}),
+    ...(phase.testRemovals === undefined && planDefaults?.testRemovals !== undefined ? { testRemovals: planDefaults.testRemovals } : {}),
+  };
+  const built = buildContract(effectivePhase);
   const contract: PhaseContract = initSeats
     ? {
         ...built,
@@ -1165,7 +1224,7 @@ export function rebuildState(runDir: string, plan: RunPlanFile, opts: { lenient?
     integrationHead = currentHead(plan.repo, plan.integrationBranch);
   }
   return foldEvents(
-    initialState(runId, plan.phases[0], integrationHead, plan.ownerDirectives ?? [], initSeats),
+    initialState(runId, plan.phases[0], integrationHead, plan.ownerDirectives ?? [], initSeats, plan),
     records,
     opts.lenient === true,
   );
@@ -1224,7 +1283,7 @@ export function restartInstants(records: readonly LogRecord[]): string[] {
 
 function timelineFromRecords(records: readonly LogRecord[], plan: RunPlanFile): Timeline {
   const init = records.find((r) => r.kind === "init")?.event as { runId: string; integrationHead: string; seats?: Seats } | undefined;
-  let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "", plan.ownerDirectives ?? [], init?.seats);
+  let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "", plan.ownerDirectives ?? [], init?.seats, plan);
   const phases: Timeline["phases"] = [];
   const rounds: Timeline["rounds"] = [];
   const restarts = restartInstants(records);
@@ -1335,6 +1394,12 @@ function worktreeNumstat(worktree: string): Promise<Map<string, [number, number]
 // The conductor
 // ---------------------------------------------------------------------------
 
+/** Plan 07e (E4): who asked the conductor to stop. `stop()`'s public caller is
+ * the owner (`tt stop`, SIGTERM/SIGINT); the conductor's own callers (an env
+ * block, a terminal phase, a full disk) pass their own cause, so a check the
+ * stop killed is never reported as the owner's doing. */
+export type StopCause = "owner" | "conductor" | "disk full";
+
 interface AgentHandle {
   agent: PiAgent;
   role: Role;
@@ -1373,16 +1438,15 @@ interface AgentHandle {
   /** Plan 06g2: a lane worker's `submit_coverage` payload, kept for the
    * winner's hand-off. */
   laneCoverage?: unknown;
-  /** tt 09 (change 3): set on the consolidator — the round it combines and
-   * its own worktree. Its submissions belong to the combine step, never to a
-   * lane or the phase. */
-  consolidation?: { round: number; worktree: string };
-  /** tt 09 (change 3): the consolidator's `submit_phase` report of what it
-   * changed beyond the taken work (its `deviations` and `assumptions`). */
-  consolidationAdded?: string[];
-  /** Plan 07c (C3): the consolidator's/fixer's own `decisions` disclosures,
-   * kept so a fix round can carry them onto the merged candidate. */
-  consolidationDisclosures?: DecisionDisclosure[];
+  /** tt 09 (change 3): set on a mapper that submits its own commit (a fixer).
+   * Its submissions belong to its task, never to a lane or the phase. */
+  mapper?: { round: number; worktree: string };
+  /** The mapper's `submit_phase` report of what it changed (its
+   * `deviations` and `assumptions`). */
+  submissionAdded?: string[];
+  /** Plan 07c (C3): the mapper's own `decisions` disclosures, kept so a fix
+   * round can carry them onto the merged candidate. */
+  submissionDisclosures?: DecisionDisclosure[];
   /** Plan 06g2: the seat this agent votes as, in the round's pick turn. */
   pickSeat?: string;
   /** Plan 06h (A3): true when this pick turn is the top-two revote. */
@@ -1390,6 +1454,11 @@ interface AgentHandle {
   /** Plan 06g2: the (round, lane, candidate, seat) a lane review records its
    * `submit_review` against. */
   laneReview?: { round: number; lane: string; sha: string; seat: string };
+  /** 07g1: the domain loop a stateless domain-review agent belongs to. Its
+   * submit_domain_review is accepted only for these points and this commit. */
+  domainReview?: { round: number; domain: string; sha: string; iteration: number; pointIds: string[]; result?: DomainReview };
+  domainReviewResolve?: (review: DomainReview) => void;
+  domainReviewPromise?: Promise<DomainReview>;
   /** Plan 06g2: a lane reviewer's turn-1 discoveries, kept per lane until the
    * winner's hand-off applies them (the phase has no candidate to bind them to
    * while the round runs). */
@@ -1468,6 +1537,143 @@ function defaultCheckLockPath(runDir: string): string {
 /** Plan 06g2: a lane round's winner awaiting its reviews' promotion. */
 type PendingLaneWinner = { round: number; lane: string; sha: string; build: LaneBuild; reviews: Array<{ seat: string; review: Review }> };
 
+/** Plan 07f (A3/§3.2/§3.3): the fields an owner correction must name for the
+ * conductor to admit it as a point. Nothing is inferred from free text. */
+export interface OwnerPointFields {
+  domain: string;
+  item?: string;
+  where: string;
+  expected: string;
+  doneWhen: string;
+}
+
+/** What an owner correction does: it is a point in the domain it names, in
+ * every phase state, and it is refused for clarification only when the input
+ * omits what a point needs or names records the plan does not declare. It is
+ * never kept as a note (§3.3). */
+export type OwnerCorrectionDecision =
+  | { kind: "point"; event: Event }
+  | { kind: "refused"; reason: string };
+
+const OWNER_POINT_KEYS: Record<string, keyof OwnerPointFields> = {
+  domain: "domain",
+  item: "item",
+  where: "where",
+  expected: "expected",
+  donewhen: "doneWhen",
+  "done when": "doneWhen",
+};
+
+/** Plan 07f (A3/D-5/D-6): read the fields an owner correction names on its own
+ * lines (`domain: conductor`, `where: src/conductor.ts:1`, `expected: …`,
+ * `doneWhen: node --test test/x.test.ts`, optional `item: A3`). Only explicit
+ * fields count — a path in prose, or a phase with one declared domain, never
+ * routes a correction by itself. `missing` names the fields the input did not
+ * give, in the order the owner has to supply them. */
+export function parseOwnerPointFields(text: string): { fields: Partial<OwnerPointFields>; missing: string[] } {
+  const fields: Partial<OwnerPointFields> = {};
+  for (const line of text.split(/\r?\n/)) {
+    const m = /^\s*([A-Za-z][A-Za-z _-]*?)\s*:\s*(.+?)\s*$/.exec(line);
+    if (!m) continue;
+    const key = OWNER_POINT_KEYS[m[1].trim().toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ")];
+    if (!key) continue;
+    const value = m[2].replace(/^`+|`+$/g, "").trim();
+    if (value.length > 0) fields[key] = value;
+  }
+  const missing = (["domain", "where", "expected", "doneWhen"] as const).filter((k) => !fields[k]);
+  return { fields, missing };
+}
+
+/** Plan 07f (A3/§3.2/§3.3): what an owner correction does, whichever state it
+ * arrives in (mid-state, before the first candidate, or AWAITING_OWNER). It is
+ * a point in the domain the input names — with `where`, `expected` and a
+ * `doneWhen` that can prove it — because a point without `domain` and
+ * `doneWhen` is refused at entry (X:UNPROVABLE, §3.4): never admitted
+ * unprovable, and never silently kept as a note no domain owns. Nothing is
+ * inferred from prose: a path in the text or a phase with one declared domain
+ * routes nothing.
+ *
+ * The shape of the phase never refuses it: a correction that arrives before
+ * the first candidate exists is admitted unbound (the first candidate's
+ * `doneWhen` facts prove it, and `accept()` has no candidate to judge), and in
+ * a phase that declares no domain the domain the input names owns the point —
+ * an owner input is a ruling, a point or a withdraw (§3.3), and neither a
+ * ruling nor a withdraw performs the code work. The only refusal left is an
+ * input that omits what a point needs, or names a domain or item the plan does
+ * not declare: the owner can resend it with those fields. */
+export function ownerPointForCorrection(
+  phase: PhaseState,
+  commandId: string,
+  text: string,
+  itemIds: readonly string[],
+): OwnerCorrectionDecision {
+  const domains = phase.contract.domains ?? [];
+  const { fields, missing } = parseOwnerPointFields(text);
+  if (missing.length > 0) {
+    return {
+      kind: "refused",
+      reason:
+        `an owner correction is a point for its domain's next fix loop, so it needs its own proving fact; ` +
+        `name ${missing.join(", ")} on its own line (for example \`doneWhen: node --test test/x.test.ts\`) ` +
+        `— the conductor infers none of them`,
+    };
+  }
+  const wanted = fields.domain!.trim().toLowerCase();
+  const domain = domains.find((d) => d.name.trim().toLowerCase() === wanted);
+  // A phase with no declared domain has no list to check against: the domain
+  // the input names owns the point (§3.3: a correction is a point, never a
+  // refusal the owner can only answer with a ruling or a withdraw).
+  if (domains.length > 0 && !domain) {
+    return {
+      kind: "refused",
+      reason: `the correction names domain '${fields.domain}', but the plan declares ${domainNames(domains)}`,
+    };
+  }
+  // An `item` is optional, but a named one must exist: a point citing a plan
+  // item that is not there proves nothing.
+  let item: string | undefined;
+  if (fields.item) {
+    if (!itemIds.includes(fields.item)) {
+      return {
+        kind: "refused",
+        reason: `the correction names item '${fields.item}', which is not an item of this plan (${itemIds.join(", ")})`,
+      };
+    }
+    item = fields.item;
+  }
+  return {
+    kind: "point",
+    event: {
+      type: "FINDING_RAISED",
+      finding: {
+        id: `F-${phase.phaseId}-owner-${commandId}`,
+        version: 1,
+        phaseId: phase.phaseId,
+        kind: "defect",
+        severity: "blocking",
+        evidence: text,
+        raisedBy: "owner",
+        status: "open",
+        // Plan 07f (A3): a correction that arrives before the first candidate
+        // is admitted unbound rather than refused. Nothing that a point reads
+        // goes through this field (its doneWhen fact is keyed by the point id
+        // and the phase's candidate), so the first candidate's facts prove it
+        // exactly like any other point.
+        boundCandidateSha: phase.candidate?.sha ?? "",
+        domain: domain?.name ?? fields.domain!.trim(),
+        ...(item ? { item } : {}),
+        where: fields.where!,
+        expected: fields.expected!,
+        doneWhen: fields.doneWhen!,
+      },
+    },
+  };
+}
+
+function domainNames(domains: readonly Domain[]): string {
+  return domains.map((d) => d.name).join(", ");
+}
+
 export class Conductor {
   #runDir: string;
   #paths: ReturnType<typeof runPaths>;
@@ -1508,6 +1714,12 @@ export class Conductor {
    * owner resolving one request of several stays in the same episode and is
    * not re-banner-stormed, while a genuinely new park is announced again. */
   #awaitingEpisode = 0;
+  /** Plan 07e (E2): the exhaustion already reported for a phase/round, so the
+   * action path and the transition it causes cannot record it twice. */
+  #roundsBoundReported = "";
+  /** Plan 07e (E3): the disk-full notice is written once, not once per
+   * append while the disk stays full. */
+  #diskFullNotified = false;
   /** Plan 01f: the machine-wide gate lock's path (default
    * `~/.tradeoffs-trace/gate.lock`). Held only while the gate command runs,
    * so two phases never gate at once. */
@@ -1540,6 +1752,9 @@ export class Conductor {
    * persisted in its `record.json`. Only the picked candidate's are emitted as
    * events; a loser's never repair anything. */
   #laneFacts = new Map<string, FindingFact[]>();
+  /** 07g2 (R7): item ids whose evaluator disagreement was already reported for
+   * this phase, so LEAD_CALLED names each one once. */
+  #itemDisagreements: Set<string> | undefined;
   /** Packet X: each doneWhen's result on a round base, keyed by
    * `<base sha>\0<finding id>`, so both lanes of a round (and a lane fix)
    * run it on the base once. */
@@ -1683,6 +1898,9 @@ export class Conductor {
    * gate) that are still running, each with the time it was recorded. */
   #liveStageGroups = new Map<number, number>();
   #stopRequested = false;
+  /** Plan 07e (E4): why the stop was requested, read by the honest check
+   * record. Set with `#stopRequested`; never read before it is true. */
+  #stopCause: StopCause = "conductor";
   /** Plan 06n (A3): set when this start reconciled a lane round's dispatch
    * that a clean `tt stop` ended, so the next `#runLaneRound` resumes that
    * round under its own number even when every lane was already checked (a
@@ -1693,7 +1911,6 @@ export class Conductor {
    * restarts every lane from it (the previous pick regressed, or every lane
    * lost an item), so a lane whose own candidate is not that base starts a
    * fresh session. Set by `#runLaneRound` before the round's lanes start. */
-  #laneRoundRestartFromBest: string | undefined;
   #integrationBranch: string;
   /** The worker handle a `submit_phase` was just accepted from — set by
    * #onSubmit, consumed by #runFreeze (the "freeze" action's dispatch runs
@@ -1745,6 +1962,16 @@ export class Conductor {
     this.#paths = runPaths(opts.runDir);
     this.#plan = opts.plan;
     this.#deadlines = { ...DEFAULT_DEADLINES, ...opts.deadlines };
+    // Fixers shared the worker attempt before the dedicated keyword existed.
+    if (opts.deadlines?.fixerAttemptMs === undefined) {
+      this.#deadlines.fixerAttemptMs = this.#deadlines.workerAttemptMs;
+    }
+    // Plan 07e (E1): the final check follows the ordinary check unless the
+    // plan sets its own keyword, exactly as `TT_CHECK_MINUTES` has always
+    // covered both.
+    if (opts.deadlines?.finalCheckMs === undefined && opts.deadlines?.checkMs !== undefined) {
+      this.#deadlines.finalCheckMs = opts.deadlines.checkMs;
+    }
     this.#piCommand = opts.piCommand;
     this.#piCommandFor = opts.piCommandFor;
     this.#piArgsPrefixFor = opts.piArgsPrefixFor;
@@ -1767,6 +1994,14 @@ export class Conductor {
     this.#checkSlots = opts.checkSlots ?? (Number(process.env.TT_CHECK_SLOTS) || DEFAULT_CHECK_SLOTS);
     this.#integrationBranch = opts.plan.integrationBranch;
     this.#budgetRemainingMs = this.#deadlines.runBudgetMs;
+    // Plan 07f (A2/C1): a review reaches the phase only after `verdictIssues`
+    // resolved every file:line it cites against the candidate (an unresolvable
+    // anchor is refused at ingestion), so a stored anchor IS resolved. The
+    // conductor installs the review-lint anchor rule (a file:line-range, a
+    // test name, or a command the reviewer ran) as the resolver acceptance
+    // reads. It is stateless, so it stays installed after the conductor stops:
+    // a logged ACCEPTED event must still reduce when replayed (rebuildState).
+    setSeatAnchorResolver((evidence) => evidenceHasAnchor(evidence));
   }
 
   get state(): State {
@@ -1826,7 +2061,7 @@ export class Conductor {
     this.#secretMaskable = resolved.maskable;
     this.#missingSecrets = resolved.missing;
     this.#tooShortSecrets = resolved.tooShort;
-    this.#log = new EventLog(this.#paths.events, this.#secretMaskable);
+    this.#log = new EventLog(this.#paths.events, this.#secretMaskable, (err) => this.#noteDiskFull(err));
     // Plan 06k1 (A6): record the check environment once, before any check or
     // resume can need it.
     this.#recordCheckEnv();
@@ -1850,7 +2085,7 @@ export class Conductor {
           `run was started under runner ${init.runnerRevision}; this conductor is ${mine} — refusing to resume (reinstall that runner, or start a new run)`,
         );
       }
-      this.#state = initialState(init.runId, this.#plan.phases[0], init.integrationHead, this.#plan.ownerDirectives ?? [], init.seats);
+      this.#state = initialState(init.runId, this.#plan.phases[0], init.integrationHead, this.#plan.ownerDirectives ?? [], init.seats, this.#plan);
       // `#+TT_WORKER_PROMPT`: a resumed run keeps the copies its first start
       // made. A copy that is gone would reach Pi as literal prompt text, so
       // the resume refuses instead.
@@ -1884,7 +2119,7 @@ export class Conductor {
         seats: effectiveSeats,
         ...(this.#workerPrompts ? { workerPrompts: this.#workerPrompts } : {}),
       });
-      this.#state = initialState(runId, phase0, head, this.#plan.ownerDirectives ?? [], effectiveSeats);
+      this.#state = initialState(runId, phase0, head, this.#plan.ownerDirectives ?? [], effectiveSeats, this.#plan);
     }
     this.#state = foldEvents(this.#state, records);
     // Plan 06c (A5/OD-3): a conductor that starts on an existing, non-terminal
@@ -1913,7 +2148,7 @@ export class Conductor {
     // environment is fixed); it is never a code failure. A run already
     // ENV_BLOCKED whose tools now resolve is unblocked here and continues.
     if (!this.#envPreflightGate()) {
-      await this.stop();
+      await this.stop("conductor");
       return;
     }
     // Plan 05j: backfill the entry ledger from any messages that predate it
@@ -1958,10 +2193,30 @@ export class Conductor {
       cwdFor: (agentId) => this.#cwdFor(agentId),
       onShIntent: (agentId, commandId, pgid) => this.#onShIntent(agentId, commandId, pgid),
       onShExit: (_agentId, _commandId, pgid) => void this.#liveShGroups.delete(pgid),
+      // Plan 07e (E2): every sh timeout is a named bound, scoped to its agent.
+      onShTimeout: (agentId, _command, deadlineMs) => this.#recordBound("sh", agentId, deadlineMs, deadlineMs),
       // Plan 01a: a command carrying a secret's literal value is refused
       // here as well as in the agent's extension guard — a scripted agent
       // (fake-pi) sends its `sh` messages straight to this socket.
-      refuseSh: (_agentId, command) => secretUseInCommand(command, this.#secretNames),
+      refuseSh: (agentId, command) => {
+        const leak = secretUseInCommand(command, this.#secretNames);
+        if (leak !== undefined) return leak;
+        // 07g1: `#+TT_FORBIDDEN` patterns are refused for every mapper's
+        // shell tool and recorded, never run.
+        const handle = this.#agents.get(agentId);
+        if (handle?.role !== "worker") return undefined;
+        const pattern = this.#forbiddenPattern(command);
+        if (pattern === undefined) return undefined;
+        this.#applyEvent({
+          type: "FORBIDDEN_REFUSED",
+          agentId,
+          pattern,
+          command: redactText(command, this.#secretMaskable),
+          at: new Date().toISOString(),
+        });
+        this.#log.append("forbidden_refused", { agentId, pattern, command: redactText(command, this.#secretMaskable) });
+        return `refused: the command matches the phase's forbidden pattern ${JSON.stringify(pattern)} (#+TT_FORBIDDEN)`;
+      },
       // Plan 06l (A2): `tt test --changed` gets its own budget (20 min),
       // never the conductor's shell cap; every other command keeps the cap.
       shDeadline: (command: string) => ({
@@ -2656,9 +2911,13 @@ export class Conductor {
     return decisions;
   }
 
-  stop(): Promise<void> {
+  /** Stops the run. `cause` (plan 07e E4) names who asked: the owner by
+   * default, because the public callers are `tt stop` and the signal
+   * handlers; the conductor's own stops pass their own cause. */
+  stop(cause: StopCause = "owner"): Promise<void> {
     if (!this.#stopping) {
       this.#closed = true;
+      this.#stopCause = cause;
       this.#stopping = this.#doStop();
     }
     return this.#stopping;
@@ -2681,7 +2940,9 @@ export class Conductor {
     // is logged (with why) before anything is torn down, so the record is
     // durable even if a later step is slow or fails.
     try {
-      this.#log?.append("stop", { reason: "conductor stopped", at: new Date().toISOString() });
+      // Plan 07e (E4): the shutdown record is retried once after an ENOSPC,
+      // so the last state survives a disk that frees up before the exit.
+      this.#log?.appendCritical("stop", { reason: "conductor stopped", cause: this.#stopCause, at: new Date().toISOString() });
     } catch {
       // the log may already be closed (a second stop call); never fatal.
     }
@@ -2709,6 +2970,11 @@ export class Conductor {
     // worker's orphaned command), or one that started while stopping.
     await this.#killLiveShGroups();
     await this.#killLiveStageGroups();
+    // Plan 07e (E5/A5): the agents' own teardown may have resumed a worker
+    // that another run's check window had paused, so the status view is
+    // flushed once more AFTER that (see `#watchCheckWindow`'s stop function):
+    // a stopped run must not keep reading as "paused by run <id>'s check".
+    this.#writeStatusViewSafe();
     await this.#socket?.close();
     await this.#lock?.release();
     this.#log?.close();
@@ -2778,7 +3044,19 @@ export class Conductor {
     // Plan 01b: a fresh park is a new notification episode; resolving some of
     // a park's requests (which bounces through AWAITING_OWNER back to itself)
     // is not.
-    if (before !== "AWAITING_OWNER" && this.#state.phase.phase === "AWAITING_OWNER") this.#awaitingEpisode += 1;
+    if (before !== "AWAITING_OWNER" && this.#state.phase.phase === "AWAITING_OWNER") {
+      this.#awaitingEpisode += 1;
+      // Plan 07e (E2/A3): a failure transition guarded by `budgetExhausted`
+      // parks directly, without ever emitting the `repair_budget_exhausted`
+      // action. The open budget request is the FSM's own marker of that park.
+      if (
+        this.#state.phase.ownerRequests.some(
+          (r) => r.status === "open" && r.origin === "repair_budget_exhausted",
+        )
+      ) {
+        this.#recordRoundsExhausted(this.#state.phase);
+      }
+    }
     // Plan 06f (A2): the Emacs mode line reads `live.json`; every phase change
     // rewrites this run's row (and only this run's row) there.
     if (before !== this.#state.phase.phase) this.#writeLive();
@@ -2798,6 +3076,66 @@ export class Conductor {
       this.#driveSuspended = false;
     }
     this.drive();
+  }
+
+  /** Plan 07e (E2/A2): record one named bound. Record-only, so every timeout
+   * branch uses the same payload and no branch can accidentally accept,
+   * reject or rule. */
+  #recordBound(kind: BoundKind, scope: string, limitMs: number, elapsedMs: number): void {
+    this.#applyEvent({
+      type: "BOUND_REACHED",
+      kind,
+      scope,
+      limitMs: Math.max(0, Math.round(limitMs)),
+      elapsedMs: Math.max(0, Math.round(elapsedMs)),
+      action: boundDefinition(kind).action,
+    });
+  }
+
+  /** Plan 07e (E2/A3): the rounds bound ran out. It is reported when a failure
+   * transition parks the phase (the real path) and, if the FSM ever asks for
+   * `repair_budget_exhausted`, once for the same phase/round only. */
+  #recordRoundsExhausted(phase: State["phase"]): void {
+    const key = `${phase.phaseId}:${phase.repairRoundsUsed}`;
+    if (this.#roundsBoundReported === key) return;
+    this.#roundsBoundReported = key;
+    const limit = phase.contract.roundsAllowed ?? this.#plan.rounds ?? boundDefinition("rounds").defaultValue;
+    this.#recordBound("rounds", phase.phaseId, limit, phase.repairRoundsUsed);
+    this.#applyEvent({ type: "LEAD_CALLED", reasons: notAcceptedReasons(phase) });
+  }
+
+  /** Plan 07e (E3): a disk-full error is reported once and stops the run
+   * cleanly; it is never retried forever and never crashes on a closed log. */
+  #noteDiskFull(err: unknown, where = "events"): void {
+    this.#stopCause = "disk full";
+    this.#stopRequested = true;
+    if (!this.#diskFullNotified) {
+      this.#diskFullNotified = true;
+      process.stderr.write(`tt: disk full — ${String((err as Error)?.message ?? err)}\n`);
+    }
+    // Record the distinct cause when the log itself is still writable (a
+    // check-output write can fail while events.jsonl succeeds). Plan 07e
+    // (E4): this is the final failure record, so it gets one bounded retry
+    // instead of being a permanent no-op — if storage frees up, recovery
+    // still sees why the run stopped.
+    this.#log.appendCritical("check_disk_full", {
+      where,
+      reason: "disk full",
+      error: String((err as Error)?.message ?? err),
+    });
+    void this.stop("disk full");
+  }
+
+  /** Plan 07e (E4/A5): only an opt-in run pauses its workers for another
+   * run's check window. */
+  #checkWindowExclusive(): boolean {
+    return this.#plan.checkWindow === "exclusive";
+  }
+
+  /** Every check advertises its window; only workers in an exclusive run
+   * opt into pausing for it. */
+  #openCheckWindow(): { release: () => void } {
+    return openCheckWindow(this.#checkLockPath, this.#state.phase.runId);
   }
 
   // -- inbox: owner commands (design §7.4, §9.3) --------------------------
@@ -3909,19 +4247,35 @@ export class Conductor {
         this.#processSteerCommand(file, commandId, raw, inputText, effectiveScope);
         return;
       }
-      // A queued note or correction is carried as a note so it reaches the
-      // next worker attempt's prompt verbatim; an applied correction at
-      // AWAITING_OWNER resolves the open requests and starts a repair.
-      const queueAsNote = outcome.kind === "queued";
-      // Plan 06k1 (A5): a correction that arrives while the phase is
-      // reviewing, evaluating, final-checking or parked is queued as a note
-      // for the next attempt AND grants its own round, so a spent budget
-      // cannot drop it. A plain note just queues.
-      const event: Event = queueAsNote
-        ? inputKind === "correction"
-          ? { type: "OWNER_CORRECTION_QUEUED", phaseId: this.#state.phase.phaseId, correctionId: `C-${commandId}`, text: inputText, grantedRounds: 3 }
-          : { type: "NOTE_ADDED", phaseId: this.#state.phase.phaseId, text: inputText }
-        : { type: "OWNER_CORRECTION", correctionId: `C-${commandId}`, text: inputText };
+      // Plan 07f (A3/§3.3): a note is carried as a note so it reaches the next
+      // worker attempt's prompt verbatim. A correction never takes this path:
+      // it is a point in its domain, or it is refused for the fields it omits
+      // (below).
+      // Plan 07f (A3/§3.3): an input that needs code work is a point for its
+      // domain's next session in every state it arrives in — mid-state, before
+      // the first candidate, or AWAITING_OWNER — never a legacy queued
+      // correction, never an OWNER_CORRECTION that starts a repair, and never
+      // an acceptance obligation. The correction must name its own domain,
+      // where, expected and doneWhen; without them it is refused for
+      // clarification (a point without a proving fact is X:UNPROVABLE, §3.2),
+      // not admitted unprovable and not silently kept as a note. No other
+      // refusal exists: a ruling or a withdraw cannot do the code work, so a
+      // correction in a phase with no declared domain (or with no candidate
+      // yet) is still a point. A ruling never enters here (it is applied at
+      // once).
+      const decision =
+        inputKind === "correction" ? this.#ownerPointForCorrection(commandId, inputText) : ({ kind: "note" } as const);
+      if (decision.kind === "refused") {
+        this.#recordOwnerInput(commandId, inputKind, inputText, "refused", undefined, decision.reason);
+        this.#rejectInboxFile(file, commandId, decision.reason);
+        return;
+      }
+      // A point is the correction's whole effect. Every other input here is a
+      // note for the next worker attempt (a steer with a live worker was
+      // handled above).
+      const point = decision.kind === "point" ? decision.event : undefined;
+      const event: Event =
+        point ?? { type: "NOTE_ADDED", phaseId: this.#state.phase.phaseId, text: inputText };
       const result = reduce(this.#state, event);
       if (!result.ok) {
         this.#recordOwnerInput(commandId, inputKind, inputText, "refused", undefined, result.reason);
@@ -3935,16 +4289,10 @@ export class Conductor {
       // quoted in every later prompt.
       if (programWide) this.#forwardProgramDirective(commandId, inputText);
       else this.#addDirective(inputText, effectiveScope, commandId);
-      // The recorded effect the status view reads, never an inference: a
-      // queued correction or steer is `queued`; a note is `noted`; a
-      // correction applied at AWAITING_OWNER started a repair.
-      if (queueAsNote && inputKind === "note") {
-        this.#recordOwnerInput(commandId, "note", inputText, "noted");
-      } else if (queueAsNote) {
-        this.#recordOwnerInput(commandId, inputKind, inputText, "queued");
-      } else {
-        this.#recordOwnerInput(commandId, "correction", inputText, "correction-started");
-      }
+      // The recorded effect the status view reads, never an inference: a queued
+      // note or steer is `noted`; a correction is `noted` too — it is a point
+      // in the record, never a note and never an acceptance gate.
+      this.#recordOwnerInput(commandId, inputKind === "correction" ? "correction" : "note", inputText, "noted");
       crashAt("before_inbox_move");
       this.#moveInboxFile(file, this.#paths.inboxApplied);
       return;
@@ -4023,6 +4371,9 @@ export class Conductor {
     }
     this.#appliedCommandIds.add(commandId);
     this.#applyEvent(event, commandId);
+    // 07g1b (R12): a ruling that names a candidate replaces the round's pick,
+    // so the next repair builds on the candidate the owner named.
+    if (event.type === "RULING_RECORDED") this.#adoptRulingPick(event.ruling);
     crashAt("before_inbox_move");
     this.#moveInboxFile(file, this.#paths.inboxApplied);
   }
@@ -4102,24 +4453,34 @@ export class Conductor {
     // The user-visible run id is the directory's name (`tt list`), not the
     // conductor's own `phase.runId` (a separate uuid in the init record).
     const runId = path.basename(this.#runDir);
-    notify(
-      {
-        id: runId,
-        kind: "run",
-        title: redactText(this.#plan.title, this.#secretMaskable),
-        ...(node ? { node } : {}),
-        phase: phase.phaseId,
-        reason: redactText(waitReason(phase), this.#secretMaskable),
-        ...(answeringCommand(runId, phase) ? { command: redactText(answeringCommand(runId, phase)!, this.#secretMaskable) } : {}),
-        waitKey: `${runId}:${wait}`,
-      },
-      {
-        root: path.dirname(this.#runDir),
-        now: this.#now,
-        reminderMs: this.#deadlines.notifyReminderMs,
-        onError: (message) => this.#logUnexpected("notify", new Error(message)),
-      },
-    );
+    const entry = {
+      id: runId,
+      kind: "run" as const,
+      title: redactText(this.#plan.title, this.#secretMaskable),
+      ...(node ? { node } : {}),
+      phase: phase.phaseId,
+      reason: redactText(waitReason(phase), this.#secretMaskable),
+      ...(answeringCommand(runId, phase) ? { command: redactText(answeringCommand(runId, phase)!, this.#secretMaskable) } : {}),
+      waitKey: `${runId}:${wait}`,
+    };
+    // 07e (E1/E2): an open owner request also reminds on the owner-wait bound.
+    // It never decides anything (C3) and never closes the request; each bound
+    // reminder is recorded as BOUND_REACHED so the log shows the cadence. A
+    // BLOCKED phase keeps today's single reminder, not this bound. The
+    // ordinary reminder and the bound are ONE call and one record: `notify`
+    // reports the bound itself, so an ordinary reminder landing on the same
+    // lattice point can neither swallow the bound nor make this branch depend
+    // on what its own append happened to be classified as.
+    const result = notify(entry, {
+      root: path.dirname(this.#runDir),
+      now: this.#now,
+      reminderMs: this.#deadlines.notifyReminderMs,
+      ...(phase.phase === "AWAITING_OWNER" ? { everyMs: this.#deadlines.ownerWaitMs } : {}),
+      onError: (message) => this.#logUnexpected("notify", new Error(message)),
+    });
+    if (result.bound) {
+      this.#recordBound("owner-wait", `phase ${phase.phaseId}`, result.bound.limitMs, result.bound.elapsedMs);
+    }
   }
 
   /** The program node this run is, if the scheduler started it (`program.json`
@@ -4241,8 +4602,11 @@ export class Conductor {
    * holds the machine for minutes does not time the worker out. Resumes
    * (SIGCONT) the moment the window closes. Returns a stop function. */
   #watchCheckWindow(agentId: string, agent: PiAgent, ...timers: Array<PausableTimer<"timeout" | "steer">>): () => void {
+    // Plan 07e (E4/A5): opt-in only. A plan without `#+TT_CHECK_WINDOW:
+    // exclusive` keeps its workers running through another run's check.
+    if (!this.#checkWindowExclusive()) return () => undefined;
     let paused = false;
-    const pause = () => {
+    const pause = (by: string) => {
       paused = true;
       for (const timer of timers) timer.pause();
       const a = this.#activity.get(agentId);
@@ -4252,9 +4616,9 @@ export class Conductor {
       } catch {
         // the agent may have exited; the attempt race handles that
       }
-      this.#log.append("worker_paused", { agentId, reason: "another run's check window is open" });
+      this.#log.append("worker_paused", { agentId, reason: `paused by run ${by}'s check`, by });
     };
-    const resume = () => {
+    const resume = (reason = "the check window closed") => {
       paused = false;
       for (const timer of timers) timer.resume();
       const a = this.#activity.get(agentId);
@@ -4267,25 +4631,32 @@ export class Conductor {
       } catch {
         // best effort
       }
-      this.#log.append("worker_resumed", { agentId, reason: "the check window closed" });
+      this.#log.append("worker_resumed", { agentId, reason });
+    };
+    /** The stop function itself can run after `stop()` closed the log (the
+     * attempt's race settles during teardown), so this one record is written
+     * best-effort and never throws EBADF from a dead log. */
+    const resumeSafely = (reason: string): void => {
+      try {
+        resume(reason);
+      } catch {
+        // the log is already closed; the pause simply stays unpaired
+      }
     };
     const iv = setInterval(() => {
       if (this.#closed) return;
-      const open = anyCheckWindowOpen(this.#checkLockPath, this.#state.phase.runId);
-      if (open && !paused) pause();
-      else if (!open && paused) resume();
+      const by = otherCheckWindowOwner(this.#checkLockPath, this.#state.phase.runId);
+      if (by !== undefined && !paused) pause(by);
+      else if (by === undefined && paused) resume();
     }, 100);
     iv.unref?.();
     return () => {
       clearInterval(iv);
-      if (paused) {
-        paused = false;
-        try {
-          process.kill(-agent.pgid, "SIGCONT");
-        } catch {
-          // best effort
-        }
-      }
+      // Plan 07e (E5/A5): an attempt that ends while the worker is paused still
+      // pairs its `worker_paused` with a `worker_resumed`, so status never
+      // keeps claiming "paused by run <id>'s check" for a worker that is gone
+      // and the pause's duration is counted honestly.
+      if (paused) resumeSafely("the paused worker's attempt ended");
     };
   }
 
@@ -4393,7 +4764,7 @@ export class Conductor {
       this.#state.phase.phase === "BLOCKED" ||
       this.#state.run === "ENV_BLOCKED"
     ) {
-      void this.stop();
+      void this.stop("conductor");
     }
   }
 
@@ -4486,6 +4857,16 @@ export class Conductor {
           this.#applyEvent({ type: "TRIAGE_FAILED", reason });
           return;
         }
+        // Decide items and triage first: only the resulting exception list
+        // can establish whether evaluation was unnecessary. Mechanical item
+        // points remain fixes; they do not turn a unanimous vote into a call.
+        if (evaluationExceptions(this.#state.phase).length === 0 && this.#state.phase.evaluation?.skipped !== true) {
+          this.#applyEvent({
+            type: "EVALUATION_SKIPPED",
+            reason: "no exception remains after item outcomes and triage; non-split item points require a fix, not evaluation",
+          });
+        }
+        if (!evaluationSettled(this.#state.phase)) return;
         try {
           this.#recordCandidateApproval();
         } catch (err) {
@@ -4540,7 +4921,9 @@ export class Conductor {
         // and `core/lanes.ts`'s `runRound` orchestrates it. The conductor
         // decides nothing about lanes beyond calling it.
         if (this.#laneRoundEnabled()) {
-          void this.#runLaneRound(actionId).catch((err) => this.#logUnexpected("run_round", err));
+          const picked = (this.#state.phase.rounds ?? []).some((r) => r.picked);
+          const run = picked ? this.#runDomainRounds(actionId) : this.#runLaneRound(actionId);
+          void run.catch((err) => this.#logUnexpected("run_round", err));
           return;
         }
         void this.#runWorkerAttempt(actionId).catch((err) => this.#logUnexpected("dispatch_worker", err));
@@ -4658,9 +5041,15 @@ export class Conductor {
       case "repair_attempt_started":
         this.#applyEvent({ type: "REPAIR_ATTEMPT_STARTED" });
         return;
-      case "repair_budget_exhausted":
+      case "repair_budget_exhausted": {
+        // Plan 07e (E2/A3): the rounds bound is named before the existing
+        // transition parks the phase. LEAD_CALLED carries today's
+        // not-accepted reasons; the transition itself (AWAITING_OWNER) is
+        // unchanged, so the owner is still the judge.
+        this.#recordRoundsExhausted(this.#state.phase);
         this.#applyEvent({ type: "REPAIR_BUDGET_EXHAUSTED" });
         return;
+      }
       default:
         this.#logUnexpected("dispatch", new Error(`unhandled action type ${action.type}`));
     }
@@ -4715,26 +5104,54 @@ export class Conductor {
   async #onSubmitChecked(agentId: string, msg: SubmitMessage): Promise<SubmitResult> {
     const handle = this.#agents.get(agentId);
     if (!handle) return { ok: false, reason: "unknown agent" };
-    // tt 09 (change 3): the consolidator's submissions belong to the combine
-    // step, not to a lane or the phase. Its commit is judged by the round
-    // checks and then by the next round's reviews of the lanes built on it,
-    // so no coverage, finding-answer or directive gate applies to it.
-    if (handle.consolidation) {
+    // 07g1: a domain review may submit only its one review, for exactly the
+    // points and commit it was dispatched on. It never commits or edits.
+    if (handle.domainReview) {
+      if (msg.tool !== "submit_domain_review") {
+        return { ok: false, reason: "a domain review submits only submit_domain_review" };
+      }
+      const review = msg.args as DomainReview;
+      if (!review || !Array.isArray(review.points) || !review.quality || typeof review.quality.ok !== "boolean") {
+        return { ok: false, reason: "submit_domain_review needs points[] and quality { ok }" };
+      }
+      const seen = new Set<string>();
+      for (const p of review.points) {
+        if (!p || typeof p.pointId !== "string" || typeof p.fixed !== "boolean" || typeof p.why !== "string" || p.why.trim().length === 0) {
+          return { ok: false, reason: "every domain verdict needs pointId, fixed and a non-empty why" };
+        }
+        if (!handle.domainReview.pointIds.includes(p.pointId)) {
+          return { ok: false, reason: `${p.pointId} is not a point of domain ${handle.domainReview.domain}` };
+        }
+        if (seen.has(p.pointId)) return { ok: false, reason: `the domain review judged ${p.pointId} twice` };
+        seen.add(p.pointId);
+      }
+      const missing = handle.domainReview.pointIds.filter((id) => !seen.has(id));
+      if (missing.length > 0) return { ok: false, reason: `the domain review did not judge: ${missing.join(", ")}` };
+      handle.domainReview.result = review;
+      handle.domainReviewResolve?.(review);
+      handle.doneResolve();
+      return { ok: true };
+    }
+    // A mapper (a fixer) submits its own commit; its submissions belong to
+    // its task, not to a lane or the phase. Its commit is judged by the
+    // domain facts and review, so no coverage, finding-answer or directive
+    // gate applies to it.
+    if (handle.mapper) {
       if (msg.tool === "submit_coverage") return { ok: true };
       if (msg.tool === "submit_phase") {
         const args = msg.args as SubmitPhaseArgs;
         // Plan 07c (C3): a fixer's out-of-task trade-off is a `decisions`
         // disclosure; keep it (and its assumptions and deviations) so the
         // merged candidate's hand-off can record it.
-        handle.consolidationDisclosures = Array.isArray(args.decisions) ? args.decisions : [];
-        handle.consolidationAdded = [...(args.assumptions ?? []), ...(args.deviations ?? [])].filter(
+        handle.submissionDisclosures = Array.isArray(args.decisions) ? args.decisions : [];
+        handle.submissionAdded = [...(args.assumptions ?? []), ...(args.deviations ?? [])].filter(
           (d) => typeof d === "string" && d.trim().length > 0,
         );
         handle.doneResolve();
         return { ok: true };
       }
       if (msg.tool === "raise_tradeoff") {
-        return { ok: false, reason: "the consolidator raises no trade-off: take the listed lane's work, and name anything you changed beyond it in submit_phase's deviations" };
+        return { ok: false, reason: "a fixer raises no trade-off: fix its points, and name anything it changed beyond them in submit_phase's deviations" };
       }
     }
     if (msg.tool === "submit_coverage") {
@@ -5291,9 +5708,8 @@ export class Conductor {
         return { ok: false, reason: "submit_evaluation needs an evaluations array" };
       }
       // Plan 06b (OD-2 A3): ONE item-check form, submit_evaluation.itemChecks[]
-      // = { id, verdict, evidence }. For every item with a review-only
-      // majority unmet/deviates the evaluator owes a check: a missing one is
-      // re-prompted once, then recorded `unchecked` (visible, never silent).
+      // = { id, verdict, evidence }. Only exception records owe checks;
+      // a missing check is re-prompted once, then recorded `unchecked`.
       // Plan 06i: the same form carries a finding's/discovered decision's
       // impact class. Parsed BEFORE the B-16 whole-submission check, because a
       // triage classification is independent of the message evaluations: a
@@ -6184,10 +6600,27 @@ export class Conductor {
         termGraceMs: this.#deadlines.termGraceMs,
       });
       const result = await running.result;
+      // Plan 07e (E2): this command spends the check bound.
+      if (result.timedOut) this.#recordBound("check", `runnable:${candidateSha}`, this.#deadlines.checkMs, this.#deadlines.checkMs);
       return { exitCode: result.exitCode, timedOut: result.timedOut, tail: result.output.slice(-2000) };
     } finally {
       checkout.dispose();
     }
+  }
+
+  /** Plan 07f (A3/§3.2/§3.3): an owner correction is a point in its domain,
+   * whichever state it arrives in, and goes to that domain's next fix loop
+   * (`ownerPointForCorrection` decides). The phase's shape never refuses it: no
+   * candidate yet, or no declared domain, still admits the point. A refusal is
+   * visible: the input is recorded refused with its reason and the inbox file
+   * is rejected, so the owner is told which fields to add. */
+  #ownerPointForCorrection(commandId: string, text: string): OwnerCorrectionDecision {
+    return ownerPointForCorrection(
+      this.#state.phase,
+      commandId,
+      text,
+      flatItems(this.#planItems()).map((i) => i.id),
+    );
   }
 
   /** Plan 05e (3a/3b): record a finding whose claim the record (or its own
@@ -6608,6 +7041,7 @@ export class Conductor {
    * command, via its own process group). */
   async #runReproduction(command: string, candidateSha: string): Promise<"reproduced" | "not_reproduced" | "inconclusive"> {
     const checkout = disposableCheckout(this.#plan.repo, candidateSha);
+    const startedAt = Date.now();
     try {
       const running = runCommand({
         command,
@@ -6616,6 +7050,8 @@ export class Conductor {
         termGraceMs: this.#deadlines.termGraceMs,
       });
       const result = await running.result;
+      // Plan 07e (E2): the reproduction command spends the fact bound too.
+      if (result.timedOut) this.#recordBound("fact", `reproduce:${candidateSha}`, this.#deadlines.reproductionMs, Date.now() - startedAt);
       if (result.timedOut) return "inconclusive";
       return result.exitCode === 0 ? "reproduced" : "not_reproduced";
     } finally {
@@ -6630,6 +7066,7 @@ export class Conductor {
     candidateSha: string,
   ): Promise<{ exitCode: number | null; timedOut: boolean; tail: string }> {
     const checkout = disposableCheckout(this.#plan.repo, candidateSha);
+    const startedAt = Date.now();
     try {
       const running = runCommand({
         command,
@@ -6638,6 +7075,8 @@ export class Conductor {
         termGraceMs: this.#deadlines.termGraceMs,
       });
       const result = await running.result;
+      // Plan 07e (E2): a timed-out reproduction names the fact bound.
+      if (result.timedOut) this.#recordBound("fact", `rerun:${candidateSha}`, this.#deadlines.reproductionMs, Date.now() - startedAt);
       return { exitCode: result.exitCode, timedOut: result.timedOut, tail: result.output.slice(-2000) };
     } finally {
       checkout.dispose();
@@ -7071,6 +7510,22 @@ export class Conductor {
     );
   }
 
+  /** 07g1: the first `#+TT_FORBIDDEN` pattern a mapper's command matches. A
+   * pattern is a regular expression; a pattern that is not a valid regular
+   * expression is matched literally, so a plan can forbid `rm -rf` without
+   * escaping it. */
+  #forbiddenPattern(command: string): string | undefined {
+    for (const pattern of this.#state.phase.contract.forbidden ?? []) {
+      if (!pattern) continue;
+      try {
+        if (new RegExp(pattern).test(command)) return pattern;
+      } catch {
+        if (command.includes(pattern)) return pattern;
+      }
+    }
+    return undefined;
+  }
+
   #onShIntent(agentId: string, _commandId: string, pgid: number): void {
     if (this.#stopRequested) {
       // runCommand resumes the group (SIGCONT) right after this returns;
@@ -7133,8 +7588,8 @@ export class Conductor {
     // worker) or in the candidate it reviews — never in another lane's tree.
     if (handle.laneReview) return path.join(this.#paths.candidates, handle.laneReview.sha);
     if (handle.lane !== undefined) return this.#laneWorktree(handle.lane);
-    // tt 09 (change 3): the consolidator works in its own worktree.
-    if (handle.consolidation) return handle.consolidation.worktree;
+    // A mapper works in its own worktree.
+    if (handle.mapper) return handle.mapper.worktree;
     return handle.role === "worker" ? this.#paths.worktree : this.#candidateDir();
   }
 
@@ -7499,6 +7954,11 @@ export class Conductor {
         // committed to a ref, never discarded.
         this.#saveUnsubmittedWork("a", this.#state.phase.attempt.n, this.#paths.worktree);
         await this.#sweepAndClear(handle);
+        // Plan 07e (E2): the time bound is named; a token cap is a different
+        // bound and is not recorded as the attempt clock.
+        if (outcome === "timeout") {
+          this.#recordBound("worker-attempt", this.#state.phase.phaseId, this.#deadlines.workerAttemptMs, this.#deadlines.workerAttemptMs);
+        }
         this.#applyEvent({ type: "ATTEMPT_TIMED_OUT" });
         return;
       }
@@ -7836,11 +8296,9 @@ export class Conductor {
     });
   }
 
-  /** Plan 06b (OD-2 A3, ODP-2): the item ids the evaluator owes a check for.
-   * The duty sits with the FINDING pass only (disc-M-89), and covers every
-   * outcome that is not met/fits (ODP-2: never raise an item blocker without
-   * a check). An architecture deviation the owner already accepted is not a
-   * blocker and owes no check. */
+  /** §7a: checks are owed only for exception records. Item checks belong to
+   * the FINDING pass and only split items qualify; classification checks for
+   * findings/decisions use the same exception list as dispatch and briefs. */
   #owedItemCheckIds(messageType: MessageType): string[] {
     const ids = new Set<string>();
     // Plan 06i (A3): a discovered decision is published as a `tradeoff`
@@ -7851,28 +8309,22 @@ export class Conductor {
       for (const d of discoveredDecisions(this.#state.phase)) {
         if (!recordClassified(this.#state.phase, "decision", d.id)) ids.add(d.id);
       }
-      return [...ids];
+      const exceptions = new Set(evaluationExceptions(this.#state.phase).map((e) => e.id));
+      return [...ids].filter((id) => exceptions.has(id));
     }
     if (messageType !== "finding") return [];
-    if (this.#itemsEnforced() && itemsNeedingEvaluatorReverify(this.#state.phase)) {
-      const accepted = new Set(this.#state.phase.acceptedDeviations ?? []);
+    if (this.#itemsEnforced()) {
       for (const o of phaseItemOutcomes(this.#state.phase)) {
-        if (o.outcome === "met" || o.outcome === "fits") continue;
-        if (o.item.kind === "architecture" && accepted.has(o.item.id)) continue;
-        ids.add(o.item.id);
+        if (itemIsSplit(o)) ids.add(o.item.id);
       }
-      // Plan 06c (A4/R9): a unanimous thin met/fits is an OWED item check too.
-      // A missing one is re-prompted once, then recorded `unchecked`; a
-      // `contradicted` check with valid anchors overturns it, and code never
-      // withdraws the verdict on its own.
-      for (const o of thinMetItems(phaseItemOutcomes(this.#state.phase), this.#workerAnchors())) ids.add(o.item.id);
     }
     // Plan 06i (A3): every open finding owes its impact classification
     // through the same form.
     for (const f of openFindings(this.#state.phase)) {
       if (!recordClassified(this.#state.phase, "finding", f.id)) ids.add(f.id);
     }
-    return [...ids];
+    const exceptions = new Set(evaluationExceptions(this.#state.phase).map((e) => e.id));
+    return [...ids].filter((id) => exceptions.has(id));
   }
 
   #itemOverturns(outcomes: readonly ItemOutcome[]): import("./core/items.ts").Overturn[] {
@@ -7884,37 +8336,54 @@ export class Conductor {
     };
     for (const o of outcomes) {
       const ctx = this.#verdictContext(o.item, (o.seats[0]?.seat ?? "M") as Reviewer);
+      // 07g2 (R7): every seat gave the same verdict — no evaluator re-check may
+      // overturn it. It is a disagreement for the lead instead (A3/R7).
+      const unanimous = o.seats.length > 0 && o.seats.every((s) => s.verdict === o.seats[0]!.verdict);
       const testOverturns = reverify(o.item, o.seats, ctx, readsBySeat);
       if (testOverturns.length > 0) {
         out.push(...testOverturns);
         continue;
       }
-      // Plan 06b (OD-1 R3b): the evaluator's substantive re-check. A
-      // `contradicted` check overturns every seat whose verdict made the
-      // majority, recorded with what the evaluator checked.
-      if (o.outcome === "unmet" || o.outcome === "deviates") {
+      // Plan 07f (F0) / 07g2 (R7/A3): a unanimous verdict — met/fits or
+      // unmet/deviates — is never overturned by an evaluator re-check. A
+      // unanimous item is not an evaluator exception at all, so the re-check
+      // judges against the plan item's text and its disagreement is recorded
+      // for the lead instead; nothing the seats agreed on is flipped.
+      if (unanimous) {
         const check = (this.#state.phase.itemChecks ?? []).find((c) => c.itemId === o.item.id && c.verdict === "contradicted");
-        // OD-2 A3: a contradicted check overturns only when its evidence
-        // anchors are valid (each cited file exists and its lines are in
-        // range), exactly like a reviewer verdict.
         if (check && this.#itemCheckAnchorsValid(check.evidence, ctx)) {
-          for (const v of o.seats.filter((s) => s.verdict === o.outcome)) {
-            out.push({ seat: v.seat, id: o.item.id, kind: o.item.kind, verdict: v.verdict, effect: "flip", reason: `evaluator re-check contradicted it: ${check.evidence}` });
-          }
+          this.#recordItemDisagreement(o.item.id, o.outcome, check.evidence);
         }
+        continue;
       }
-      // Plan 06c (R5): a unanimous thin met/fits the evaluator contradicts
-      // (with valid anchors) is overturned too.
-      if ((o.outcome === "met" || o.outcome === "fits") && thinMetItems([o], this.#workerAnchors()).length > 0) {
+      // Plan 07f (F0): a split item is exactly what the evaluator rules on. A
+      // `contradicted` check with valid anchors overturns the seats that made
+      // the majority, whichever direction that majority went. OD-2 A3: the
+      // check overturns only when its evidence anchors are valid (each cited
+      // file exists and its lines are in range), exactly like a reviewer
+      // verdict.
+      if (itemIsSplit(o)) {
         const check = (this.#state.phase.itemChecks ?? []).find((c) => c.itemId === o.item.id && c.verdict === "contradicted");
         if (check && this.#itemCheckAnchorsValid(check.evidence, ctx)) {
           for (const v of o.seats.filter((s) => s.verdict === o.outcome)) {
-            out.push({ seat: v.seat, id: o.item.id, kind: o.item.kind, verdict: v.verdict, effect: "flip", reason: `evaluator re-check contradicted the thin met verdict: ${check.evidence}` });
+            out.push({ seat: v.seat, id: o.item.id, kind: o.item.kind, verdict: v.verdict, effect: "flip", reason: `evaluator re-check contradicted the split majority: ${check.evidence}` });
           }
         }
       }
     }
     return out;
+  }
+
+  /** 07g2 (R7): record an evaluator re-check that disagrees with a unanimous
+   * seat verdict as an exception for the lead. It flips nothing: the item keeps
+   * the seats' verdict, and LEAD_CALLED names the disagreement once. */
+  #recordItemDisagreement(itemId: string, outcome: string, evidence: string): void {
+    const phaseId = this.#state.phase.phaseId;
+    if ((this.#itemDisagreements ?? new Set<string>()).has(`${phaseId}:${itemId}`)) return;
+    (this.#itemDisagreements ??= new Set<string>()).add(`${phaseId}:${itemId}`);
+    const reason = `${itemId} stays ${outcome}: the evaluator's re-check disagrees with the unanimous seats (${evidence})`;
+    this.#log.append("item_check_disagreement", { phaseId, itemId, outcome, evidence });
+    this.#applyEvent({ type: "LEAD_CALLED", reasons: [reason] });
   }
 
   /** Plan 06b (layer 1): for an architecture item with `:WHERE:` and a named
@@ -7970,6 +8439,30 @@ export class Conductor {
     }
   }
 
+  /** Plan 07f (A2): close every live decision bound to an older candidate or
+   * contract version. It is record-only (`DECISION_CLOSED` carries the
+   * reason) and idempotent: only live decisions are closed. */
+  #closeStaleDecisions(): void {
+    const phase = this.#state.phase;
+    if (!phase.candidate) return;
+    const C = phase.candidate.sha;
+    const K = phase.contract.contractVersion;
+    for (const decision of phase.decisions) {
+      // Plan 07f (A2/R3): an amendment is a decision like any other here. The
+      // stale one that blocked acceptance (bound to C1/v1 after the phase moved
+      // to C3/v3) must be closed with its reason, not skipped because it is an
+      // amendment.
+      if (!isLiveDecision(decision)) continue;
+      const sameCandidate = decision.boundCandidateSha === C;
+      const sameContract = sameVersion(decision.boundContractVersion, K);
+      if (sameCandidate && sameContract) continue;
+      const reason = !sameCandidate
+        ? `the phase moved past candidate ${decision.boundCandidateSha.slice(0, 8)}`
+        : `the contract moved past version ${decision.boundContractVersion.version}`;
+      this.#applyEvent({ type: "DECISION_CLOSED", decisionId: decision.id, reason });
+    }
+  }
+
   /** Plan 06i: the triage pass — after the reviews and the evaluator's
    * item checks, before the item tally. EVERY finding and EVERY discovered
    * decision of the ledger gets exactly one disposition from `disposition()`
@@ -7983,6 +8476,11 @@ export class Conductor {
    * explicitly left `unchecked` after its one re-prompt) is UNCLASSIFIED and
    * escalates — the conductor never guesses an impact. */
   #applyTriage(): void {
+    // Plan 07f (A2): a decision bound to an older candidate or contract
+    // version is closed when the phase moves, with its reason in the log, so
+    // no past record can linger as blocker or trade-off. Closed BEFORE the
+    // snapshot below, so this pass sees the closed records.
+    this.#closeStaleDecisions();
     const phase = this.#state.phase;
     if (!phase.candidate) return;
     const C = phase.candidate.sha;
@@ -8180,10 +8678,10 @@ export class Conductor {
     }
   }
 
-  /** ODP-2: an item blocker is never raised without an evaluator item check.
-   * When the evaluator gave none (even after its re-prompt), the conductor
-   * records its own `unchecked` check so the blocker is never silent. */
+  /** Only a split item owed an evaluator check. A mechanically decided item
+   * must never acquire a fabricated `unchecked` re-check. */
   #ensureItemCheck(id: string): void {
+    if (!phaseItemOutcomes(this.#state.phase).some((o) => o.item.id === id && itemIsSplit(o))) return;
     if ((this.#state.phase.itemChecks ?? []).some((c) => c.itemId === id)) return;
     this.#applyEvent({ type: "ITEM_CHECK_RECORDED", itemId: id, verdict: "unchecked", evidence: "no evaluator item check was recorded" });
   }
@@ -8339,24 +8837,37 @@ export class Conductor {
     return path.join(this.#runDir, "worktrees", `lane-${lane}`);
   }
 
+  /** A repeat of a round that failed only for a missing review or vote: each
+   * lane that passed its checks restarts from its own candidate, and a lane
+   * whose candidate was still red continues from that red candidate. Derived
+   * from the round record, so it survives a conductor restart. */
+  #continuedLaneStarts(last: RoundRecord | undefined): Record<string, string> | undefined {
+    if (!last || last.picked) return undefined;
+    const out: Record<string, string> = {};
+    for (const c of last.candidates) {
+      if (c.ok !== false && typeof c.sha === "string" && c.sha.length > 0) out[c.lane] = c.sha;
+    }
+    for (const c of last.candidates) {
+      if (out[c.lane] === undefined && c.ok === false && typeof c.sha === "string" && c.sha.length > 0) out[c.lane] = c.sha;
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
   /** Plan 06k3 (A4): the candidate a lane's submission started from — its
-   * per-lane base. A lane restarted from its own losing candidate (02k's
-   * `repeatLaneBases`) compares against that candidate, not the phase's own. */
+   * per-lane base. */
   #laneStartSha(lane: string, round: number | undefined): string | undefined {
     if (round === undefined) return this.#state.phase.candidate?.sha;
     const rounds = this.#state.phase.rounds ?? [];
     const prev = rounds.find((x) => x.round === round - 1);
-    // A lane restarted from its own previous candidate (02k's per-lane base)
-    // compares against THAT candidate.
-    const repeated = repeatLaneBases(prev)?.[lane];
-    if (repeated) return repeated;
-    // tt 09 (change 3): a round after a consolidation starts every lane from
-    // the consolidated commit.
-    const consolidated = consolidatedBase(rounds, round);
-    if (consolidated) return consolidated;
-    // Otherwise the lane started from the phase's own candidate (a repair
-    // round). Round 1 starts from the integration head, which is not a
-    // candidate: an unchanged submission there is not a resubmission.
+    // A lane restarted from its own previous candidate (a round that failed
+    // only for a missing review or vote) compares against THAT candidate.
+    if (prev && !prev.picked) {
+      const own = prev.candidates.find((c) => c.lane === lane && typeof c.sha === "string" && c.sha.length > 0);
+      if (own) return own.sha;
+    }
+    // Round 1 starts from the integration head, which is not a candidate: an
+    // unchanged submission there is not a resubmission. A later round starts
+    // from the phase's own candidate (a repair round).
     return this.#state.phase.candidate?.sha;
   }
 
@@ -8437,6 +8948,9 @@ export class Conductor {
    * registers its handle, exactly like the single-lane dispatches do. */
   #spawnLaneAgent(opts: {
     role: Role;
+    /** Plan 07g2 (G3): the integrate duty writes, so it keeps the worker
+     * role's write tools but runs on the evaluator's model. */
+    modelRole?: ModelRole;
     agentId: string;
     cwd: string;
     sessionDir: string;
@@ -8445,16 +8959,16 @@ export class Conductor {
     lane?: string;
     laneRound?: number;
     laneReview?: { round: number; lane: string; sha: string; seat: string };
+    /** 07g1: a fresh domain review's loop identity. */
+    domainReview?: { round: number; domain: string; sha: string; iteration: number; pointIds: string[] };
     pickSeat?: string;
     pickRevote?: boolean;
     /** Plan 06n (A1): start a lane worker in a FRESH session even when one
      * exists — the losing lane after the other lane won must not continue
      * from its own lost edits. */
     freshSession?: boolean;
-    /** tt 09 (change 3): the consolidator — a worker by its tools, on the
-     * `consolidator` model (`#+TT_MODELS consolidator=…`, else the leader
-     * seat's). */
-    consolidation?: { round: number; worktree: string; fixer?: boolean };
+    /** tt 09 (change 3): a mapper that submits its own commit (a fixer). */
+    mapper?: { round: number; worktree: string };
   }): AgentHandle {
     let helloResolve!: (r: HelloResult) => void;
     const helloPromise = new Promise<HelloResult>((resolve) => {
@@ -8468,15 +8982,19 @@ export class Conductor {
     const discoveryPromise = new Promise<void>((resolve) => {
       discoveryResolve = resolve;
     });
+    let domainReviewResolve!: (review: DomainReview) => void;
+    const domainReviewPromise = new Promise<DomainReview>((resolve) => {
+      domainReviewResolve = resolve;
+    });
     fs.mkdirSync(opts.sessionDir, { recursive: true });
-    // A fixer (07c) is a mapper: it runs on the worker model, like a lane.
-    // Only the consolidator that combines the lanes runs on the leader's.
-    const providerModel = opts.consolidation && !opts.consolidation.fixer
-      ? this.#providerModelFor?.("consolidator", this.#laneLeader())
-      : opts.role === "worker"
+    // 07g1b (C3/A4): a mapper — a lane worker or a domain fixer — runs on the
+    // worker model, like a lane. The consolidator that combined the lanes is
+    // gone, so no agent here runs on the leader's model.
+    const providerModel =
+      opts.role === "worker"
         ? // Plan 06g2: `worker.1`/`worker.2` name a lane by its 1-based
           // position, which the caller passes as `seat`.
-          this.#providerModelFor?.("worker", opts.seat ?? opts.lane)
+          this.#providerModelFor?.(opts.modelRole ?? "worker", opts.seat ?? opts.lane)
         : // A pick seat runs on its own reviewer seat's model.
           this.#providerModelFor?.(opts.role === "picker" ? "reviewer" : opts.role, opts.seat);
     const command = this.#resolvePiCommand(opts.role);
@@ -8534,9 +9052,12 @@ export class Conductor {
       ...(opts.lane !== undefined ? { lane: opts.lane } : {}),
       ...(opts.laneRound !== undefined ? { laneRound: opts.laneRound } : {}),
       ...(opts.laneReview ? { laneReview: opts.laneReview } : {}),
+      ...(opts.domainReview
+        ? { domainReview: opts.domainReview, domainReviewResolve, domainReviewPromise }
+        : {}),
       ...(opts.pickSeat !== undefined ? { pickSeat: opts.pickSeat } : {}),
       ...(opts.pickRevote ? { pickRevote: true } : {}),
-      ...(opts.consolidation ? { consolidation: opts.consolidation } : {}),
+      ...(opts.mapper ? { mapper: opts.mapper } : {}),
     };
     this.#agents.set(opts.agentId, handle);
     // Plan 06g2: record the lane agent's own process group, so a crashed
@@ -8553,67 +9074,31 @@ export class Conductor {
   #laneWorkerPrompt(round: number, base: string): string {
     const previous = (this.#state.phase.rounds ?? []).find((r) => r.round === round - 1);
     const failures = laneFailureLines(previous);
+    const laneCount = this.#lanes().length;
     const lines: string[] = [
-      `Round ${round} of this phase starts from ${base.slice(0, 7)} and runs ${this.#lanes().length} lanes. You are the worker of one lane; another worker builds a second candidate from the same base with this same prompt, in its own worktree. Do not touch another lane's worktree.`,
+      // 07g1b (A4/R6): lanes exist only in round 1. Every later round runs on
+      // the adopted pick, in one worktree.
+      laneCount > 1 && !previous?.picked
+        ? `Round ${round} of this phase starts from ${base.slice(0, 7)} and runs ${laneCount} lanes. You are the worker of one lane; another worker builds a second candidate from the same base with this same prompt, in its own worktree. Do not touch another lane's worktree.`
+        : `Round ${round} of this phase starts from ${base.slice(0, 7)} and runs one worker in one worktree.`,
     ];
     if (failures.length > 0) {
       lines.push(`The previous round's lanes (round ${previous!.round}):`, ...failures.map((f) => `- ${f}`));
     }
-    // Plan 06n (A1): name the winning lane and its candidate as the base, and
-    // tell the losing lane its own previous candidate is not in the worktree.
-    // Plan 06n (A7/R9c): a pick that regressed was not adopted; every lane
-    // restarts from the best candidate.
-    if (previous?.picked && previous.regressed) {
-      const winner = previous.picked;
+    // 07g1b (A4/R7): the other lanes' work the pick did not carry is a point
+    // with `from`, named here so the worker builds on it instead of redoing it.
+    const fromPoints = this.#state.phase.findings.filter((f) => f.status === "open" && f.from);
+    if (fromPoints.length > 0) {
       lines.push(
-        `Round ${previous.round} picked lane ${winner.lane} (candidate ${winner.sha.slice(0, 7)}), but its evaluation lost ${previous.regressed.items.join(", ")}, which the best candidate ${base.slice(0, 7)} met, in code it changed. It was not adopted: every lane's worktree was reset to the best candidate ${base.slice(0, 7)}, so no lane's previous candidate is in the worktree. Keep what the best candidate met; ${winner.sha.slice(0, 7)} is for reference only.`,
+        "Another lane's work that the pick does not carry arrived as points, each naming the commit it is in:",
+        ...fromPoints.map((f) => `- ${f.itemId ?? f.id}: from ${f.from!.sha.slice(0, 7)} (${f.from!.paths.join(", ") || "no paths recorded"})${f.doneWhen ? `, doneWhen \`${f.doneWhen}\`` : ""}`),
       );
-    } else if (previous?.picked && previous.consolidated?.ok && previous.consolidated.sha === base) {
-      // tt 09 (change 3): the winner was combined with what the other lanes
-      // met; every lane starts from the consolidated commit and is told which
-      // items it carries, so no lane redoes them or drops them.
-      const winner = previous.picked;
-      const c = previous.consolidated;
-      const label = consolidatedLabel(previous.round, winner.lane, c.took);
-      lines.push(
-        `Round ${previous.round} picked lane ${winner.lane} (candidate ${winner.sha.slice(0, 7)}), and a consolidator combined it with the plan items another lane met and it did not: ${c.took.map((t) => `lane ${t.lane}'s ${t.items.join(", ")} (from ${t.sha.slice(0, 7)})`).join("; ")}. Every lane's worktree was reset to that consolidated commit ${label} ${base.slice(0, 7)} — this round's base — so no lane's own previous candidate is in the worktree. Keep everything it meets, including ${c.took.flatMap((t) => t.items).join(", ")}; build on it, do not redo or drop that work.`,
-      );
-    } else if (previous?.picked) {
+    }
+    if (previous?.picked) {
       const winner = previous.picked;
       const losers = previous.lanes.filter((l) => l !== winner.lane);
       lines.push(
-        `Round ${previous.round} picked lane ${winner.lane} (candidate ${winner.sha.slice(0, 7)}). Every lane's worktree was reset to that candidate, so the losing lane${losers.length === 1 ? "" : "s"} (${losers.join(", ")}) ${losers.length === 1 ? "has" : "have"} its own previous candidate no longer in the worktree.`,
-      );
-      // tt 09 (change 3): a consolidation that failed leaves the round on the
-      // winner; the items the other lane met are named with where they are.
-      if (previous.consolidated && !previous.consolidated.ok) {
-        lines.push(
-          `Combining it with what the other lane met failed (${previous.consolidated.note ?? "no reason recorded"}). These plan items were met by another lane and not by the winner — take that work from its candidate: ${previous.consolidated.took.map((t) => `lane ${t.lane} ${t.sha.slice(0, 7)}: ${t.items.join(", ")}`).join("; ")}.`,
-        );
-      }
-    }
-    // Plan 06n (A7/R9b): every lane lost an item the best candidate met, so
-    // the round picked no lane and every lane restarts from the best
-    // candidate, each told which items it lost.
-    const previousGuard = previous ? this.#pickGuard(previous.round) : undefined;
-    const lostByLane = previous ? everyLaneLost(previous, previousGuard) : undefined;
-    if (lostByLane) {
-      const best = previousGuard!.best;
-      lines.push(
-        `Round ${previous!.round} picked no lane: every lane lost a plan item that the best candidate ${best.sha.slice(0, 7)} (round ${best.round}, lane ${best.lane}) met — ${Object.entries(lostByLane)
-          .map(([l, ids]) => `lane ${l} lost ${ids.join(", ")}`)
-          .join("; ")}. Every lane's worktree was reset to the best candidate ${best.sha.slice(0, 7)}, so no lane's previous candidate is in the worktree. Keep what the best candidate met.`,
-      );
-    }
-    // 02k: a lane whose candidate passed in a round that could not complete
-    // restarts from that candidate (repeatLaneBases); say so, so the worker
-    // continues from its own work instead of rebuilding it.
-    const restarted = lostByLane ? undefined : repeatLaneBases(previous);
-    if (restarted) {
-      lines.push(
-        `Round ${previous!.round} could not complete (a review or pick vote was missing), not because of your code. A lane whose candidate passed its checks (${Object.entries(restarted)
-          .map(([l, sha]) => `lane ${l}: ${sha.slice(0, 7)}`)
-          .join(", ")}) starts this round from that candidate, so your worktree already holds your previous work: continue from it and fix what the reviews found.`,
+        `Round ${previous.round} picked lane ${winner.lane} (candidate ${winner.sha.slice(0, 7)}). This round's worktree holds that pick${losers.length > 0 ? `; the losing lane${losers.length === 1 ? "" : "s"} (${losers.join(", ")}) ${losers.length === 1 ? "has" : "have"} its own previous candidate no longer in the worktree` : ""}.`,
       );
     }
     // Plan 06k3 (A2): a lane whose previous attempt missed its deadline starts
@@ -8697,10 +9182,7 @@ export class Conductor {
     // it is fixing — except a fix of the fixers' merge (packet X), which this
     // lane's session never saw.
     const freshSession =
-      fix?.freshSession === true ||
-      (!fix &&
-        ((previous?.picked !== undefined && previous.picked.lane !== lane) ||
-          (this.#laneRoundRestartFromBest === base && own !== undefined && own !== base)));
+      fix?.freshSession === true || (!fix && previous?.picked !== undefined && previous.picked.lane !== lane);
     // Recorded so a test (and the owner) can see the session decision; the
     // production session dir still exists, the fresh start just skips
     // `--continue`.
@@ -8823,6 +9305,8 @@ export class Conductor {
       stopCheckWindowWatch();
       if (outcome !== "submitted") {
         await handle.agent.terminate();
+        // Plan 07e (E2): name the lane's attempt bound.
+        if (outcome === "timeout") this.#recordBound("worker-attempt", `${this.#state.phase.phaseId}:${lane}`, attemptMs, attemptMs);
         // Plan 06k3 (A2): the work the lane did not submit in time is
         // committed to a ref, never discarded; the next round starts from it.
         this.#saveUnsubmittedWork(lane, this.#state.phase.attempt.n, worktree);
@@ -8881,8 +9365,7 @@ export class Conductor {
   /** exex 01a2: a lane never hands in a red tree. Its worker gets the
    * failing checks back on its own candidate, continuing its own session, with
    * the attempt time it has left, and submits again. A lane with almost no
-   * time left keeps its red candidate for this round (the next round starts
-   * from it, `repeatLaneBases`). */
+   * time left keeps its red candidate for this round. */
   async #fixLane(lane: string, round: number, sha: string, failure: string): Promise<LaneBuild> {
     const started = this.#laneStartedAt.get(`${round}-${lane}`) ?? Date.now();
     const remainingMs = this.#deadlines.workerAttemptMs - (Date.now() - started);
@@ -8894,29 +9377,6 @@ export class Conductor {
     }
     const digest = this.#laneCheckFailureDigest(sha);
     this.#log.append("lane_fix_started", { lane, round, sha, remainingMs });
-    // Packet X: a fix round's synthetic lane holds the fixers' merge, not
-    // this lane worker's own work. Its first fix starts a FRESH session with
-    // a prompt that names the merge; a later fix (of that fix's own commit)
-    // continues that session as usual.
-    const fixRound = lane === "a" ? fixRoundCandidate(this.#state.phase.rounds, round) : undefined;
-    if (fixRound && fixRound.candidate === sha) {
-      const mergePrompt = [
-        `Commit ${sha.slice(0, 7)} is the fixers' merge: the previous round's fixer commits merged onto base ${fixRound.base.slice(0, 7)}. It FAILED the round checks, so its reviews were cancelled. A lane never hands in a red tree.`,
-        "",
-        "This worktree holds that merge; you did not write it, and this is a fresh session. Fix exactly what fails. Keep the fixers' work; do not delete, skip or #[ignore] a test, weaken an assertion, or remove required work to make a check pass (ODP-2) — if the failure is a real limit, raise it as a BLOCKER with the exact error instead.",
-        "Run the failing command yourself until it passes, then run the full round checks, then call submit_coverage and submit_phase with your complete payload (your disclosures, the coverage of the commit as it stands, and your answers).",
-        `You have about ${Math.max(1, Math.floor(remainingMs / 60_000))} minutes of this attempt left.`,
-        "",
-        `The failure: ${failure}`,
-        ...(digest ? ["", "Its output (errors first):", "```", digest, "```"] : []),
-      ].join("\n");
-      const fixed = await this.#buildLane(lane, round, sha, mergePrompt, { of: sha, timeoutMs: remainingMs, freshSession: true });
-      if (fixed.sha && treeOf(this.#plan.repo, fixed.sha) === treeOf(this.#plan.repo, sha)) {
-        this.#log.append("lane_fix_unchanged", { lane, round, sha, fixedSha: fixed.sha });
-        return { lane, note: `the lane's fix of ${sha.slice(0, 7)} changed nothing` };
-      }
-      return fixed;
-    }
     const prompt = [
       `Your round-${round} candidate ${sha.slice(0, 7)} FAILED the round checks, so its reviews were cancelled. A lane never hands in a red tree: a candidate's reviews count only once its checks pass.`,
       "",
@@ -8966,174 +9426,12 @@ export class Conductor {
     return keep.join("\n").trim();
   }
 
-  // -------------------------------------------------------------------------
-  // tt 09 (change 3): combine the lanes
-  // -------------------------------------------------------------------------
-
-  /** The consolidator's own worktree, beside the lanes'. */
-  #consolidationWorktree(): string {
-    return path.join(this.#runDir, "worktrees", "consolidator");
-  }
-
-  /** tt 09 (change 3): the combine step after round `roundNo`, whose pick the
-   * phase evaluated and did not accept. When another passing lane met plan
-   * items the winner did not (`consolidationPlan`, the seats' per-item
-   * verdicts), a consolidator starts from the winner in its own worktree,
-   * takes that lane's work for exactly those items, and its commit goes
-   * through the round checks with the lane fix loop (`runConsolidation`).
-   * ROUND_CONSOLIDATED records the result either way: a green commit is the
-   * next round's base for every lane; a failure keeps today's base (the
-   * winner) and says why. Returns "stopped" when the owner's stop or a
-   * recheck ended it mid-way — nothing is recorded then. */
-  async #consolidateRound(roundNo: number): Promise<"stopped" | undefined> {
-    const record = (this.#state.phase.rounds ?? []).find((r) => r.round === roundNo);
-    if (!record?.picked || record.consolidated || record.regressed) return undefined;
-    if (!consolidationEnabled(this.#state.phase.contract) || !this.#itemsEnforced()) return undefined;
-    // Only a pick the phase adopted and evaluated is combined (a round that
-    // was handed off and then not accepted).
-    if (this.#state.phase.candidate?.sha !== record.picked.sha) return undefined;
-    const itemIds = flatItems(this.#planItems()).map((i) => i.id);
-    const plan = consolidationPlan(record, itemIds, this.#laneSeats().length);
-    if (!plan) return undefined;
-    this.#log.append("consolidation_started", { round: roundNo, from: plan.winner.sha, lane: plan.winner.lane, took: plan.takes });
-    const startedAt = Date.now();
-    const stopped = (): boolean => this.#stopRequested || this.#recheckCancelledLaneRound;
-    const outcome = await runConsolidation({
-      build: () => this.#buildConsolidation(plan, this.#consolidationPrompt(plan)),
-      check: (sha) => this.#checkConsolidation(plan, sha),
-      fix: async (sha, failure) => {
-        const remainingMs = this.#deadlines.workerAttemptMs - (Date.now() - startedAt);
-        // The lane rule: too little time left to fix anything keeps the red
-        // commit, and the next round starts from the winner.
-        if (remainingMs < Math.min(60_000, this.#deadlines.workerAttemptMs / 10)) {
-          this.#log.append("consolidation_fix_skipped", { round: roundNo, sha, reason: "no attempt time left" });
-          return { lane: "consolidator", note: "its attempt time is spent" };
-        }
-        this.#log.append("consolidation_fix_started", { round: roundNo, sha, remainingMs });
-        const digest = this.#laneCheckFailureDigest(sha);
-        const prompt = [
-          `Your consolidated commit ${sha.slice(0, 7)} FAILED the round checks, so it cannot be the next round's base.`,
-          "",
-          "Fix exactly what fails, in this worktree (it holds your commit). Keep the winner's work and the work you took; do not delete, skip or #[ignore] a test, weaken an assertion, or drop a taken item to make a check pass.",
-          "Run the failing command until it passes, then call submit_phase again (decisions [], assumptions [], and in deviations every change you made beyond the taken work).",
-          `You have about ${Math.max(1, Math.floor(remainingMs / 60_000))} minutes left.`,
-          "",
-          `The failure: ${failure}`,
-          ...(digest ? ["", "Its output (errors first):", "```", digest, "```"] : []),
-        ].join("\n");
-        const fixed = await this.#buildConsolidation(plan, prompt, { of: sha, timeoutMs: remainingMs });
-        if (fixed.sha && treeOf(this.#plan.repo, fixed.sha) === treeOf(this.#plan.repo, sha)) {
-          this.#log.append("consolidation_fix_unchanged", { round: roundNo, sha, fixedSha: fixed.sha });
-          return { lane: "consolidator", note: `its fix of ${sha.slice(0, 7)} changed nothing` };
-        }
-        return fixed;
-      },
-      stopRequested: stopped,
-    });
-    if (outcome.stopped || stopped()) {
-      this.#log.append("consolidation_stopped", { round: roundNo, reason: this.#stopRequested ? "the owner stopped the run" : "a recheck stopped it" });
-      return "stopped";
-    }
-    // The consolidator's own diff beyond the taken lanes' files, measured
-    // (07: its extra diff must be small and reported, not just requested).
-    let extraFiles: string[] | undefined;
-    if (outcome.ok && outcome.sha) {
-      try {
-        const taken = new Set(plan.takes.flatMap((t) => diffNameOnly(this.#plan.repo, plan.winner.sha, t.sha)));
-        extraFiles = diffNameOnly(this.#plan.repo, plan.winner.sha, outcome.sha).filter((f) => !taken.has(f));
-      } catch {
-        extraFiles = undefined;
-      }
-    }
-    this.#log.append(outcome.ok ? "consolidation_passed" : "consolidation_failed", {
-      round: roundNo,
-      from: plan.winner.sha,
-      took: plan.takes,
-      ...(outcome.sha ? { sha: outcome.sha } : {}),
-      ...(outcome.note ? { note: outcome.note } : {}),
-      ...(outcome.added ? { added: outcome.added } : {}),
-      ...(extraFiles ? { extraFiles } : {}),
-      fixes: outcome.fixes,
-      ms: Date.now() - startedAt,
-    });
-    this.#applyEvent({
-      type: "ROUND_CONSOLIDATED",
-      round: roundNo,
-      from: plan.winner.sha,
-      lane: plan.winner.lane,
-      took: plan.takes,
-      ok: outcome.ok,
-      ...(outcome.ok && outcome.sha ? { sha: outcome.sha } : {}),
-      ...(outcome.note ? { note: outcome.note } : {}),
-      ...(outcome.added && outcome.added.length > 0 ? { added: outcome.added } : {}),
-      fixes: outcome.fixes,
-    });
-    return undefined;
-  }
-
-  /** tt 09 (change 3): the consolidator's prompt — the winner and the other
-   * lanes' commits, the exact items to take (id, text and the seats' evidence
-   * anchors), and 07's constraints on a consolidator. */
-  #consolidationPrompt(plan: ConsolidationPlan): string {
-    const record = (this.#state.phase.rounds ?? []).find((r) => r.round === plan.round);
-    const items = flatItems(this.#planItems());
-    const winner = candidateLabel(plan.round, plan.winner.lane);
-    const lines: string[] = [
-      `You are the CONSOLIDATOR of round ${plan.round} of phase ${this.#state.phase.phaseId}. Goal of the phase: ${this.#state.phase.contract.goal}`,
-      "",
-      `Round ${plan.round} ran ${record?.lanes.length ?? 2} lanes from one base. The seats picked lane ${plan.winner.lane} (${winner}, commit ${plan.winner.sha}), and its evaluation did not accept the phase. Another lane met plan items the winner did not (a strict majority of the seats said so). Your worktree holds the winner's commit ${plan.winner.sha}. Your one job: take the other lane's work for EXACTLY these items onto it, so the next round starts from both lanes' strengths.`,
-      "",
-    ];
-    for (const take of plan.takes) {
-      const candidate = record?.candidates.find((c) => c.lane === take.lane && c.sha === take.sha);
-      lines.push(`From lane ${take.lane} (${candidateLabel(plan.round, take.lane)}, commit ${take.sha}):`);
-      for (const id of take.items) {
-        const item = items.find((i) => i.id === id);
-        lines.push(`- ${id}${item ? ` ${oneLine(item.title)}: ${oneLine(item.text, 600)}` : ""}`);
-        const evidence = candidate ? itemEvidence(candidate, id, this.#laneSeats()) : [];
-        if (evidence.length > 0) lines.push(`  the seats' evidence it is met: ${evidence.map((e) => oneLine(e, 300)).join(" | ")}`);
-      }
-      lines.push("");
-    }
-    lines.push(
-      "How:",
-      `- Read the other lane's work with git (both commits are in this repository): \`git diff ${plan.winner.sha.slice(0, 12)} <lane commit>\`, \`git show <lane commit>:<path>\`, and \`git checkout <lane commit> -- <path>\` for a file only that lane changed.`,
-      "- Keep everything the winner already meets. Never rewrite the winner's work wholesale and never revert it; take the other lane's work only for the listed items.",
-      "- Do not weaken, skip, #[ignore] or delete a test, and do not drop a test either lane wrote for these items.",
-      "- Keep your own extra diff small: change only what integrating the two needs (a conflict, a call site, an import).",
-      "- Do not commit; tt commits your worktree when you submit. tt runs the round checks on your commit and sends any failure back to you, so run only a fast compile and the targeted tests of the items you took.",
-      "- Then call submit_phase with decisions [] and assumptions [], and in deviations one line per change you made beyond the taken work (path — why), or none.",
-      `- You have about ${Math.max(1, Math.floor(this.#deadlines.workerAttemptMs / 60_000))} minutes.`,
-    );
-    return lines.join("\n");
-  }
-
-  /** tt 09 (change 3): one consolidator run in its own worktree at the
-   * winner (or, for a fix, on its own red commit, continuing its session),
-   * frozen to a commit. Plan 07c (D4.3): generalized so a fixer uses the
-   * same machinery with its own worktree, agent id, session dir and base. */
-  async #buildConsolidation(plan: ConsolidationPlan, prompt: string, fix?: { of: string; timeoutMs: number }): Promise<LaneBuild> {
-    return this.#buildConsolidationAgent({
-      round: plan.round,
-      worktree: this.#consolidationWorktree(),
-      base: plan.winner.sha,
-      prompt,
-      sessionDir: path.join(this.#paths.sessions, `consolidator-${plan.round}`),
-      actionKind: `consolidate_${plan.round}`,
-      agentIdPrefix: `consolidate-${plan.round}`,
-      lane: "consolidator",
-      logPrefix: "consolidation",
-      roleWord: "consolidator",
-      changedNothingNote: "the consolidator changed nothing on the winner",
-      ...(fix ? { fix } : {}),
-    });
-  }
-
-  /** Plan 07c (D4.3): one mapper in consolidator mode — its own worktree at
-   * `base` (or, for a fix, on its own red commit, continuing its session),
-   * frozen to a commit. Mirrors `#buildLane` without the lane-only parts (no
-   * owner-note delivery, no saved unsubmitted work). */
-  async #buildConsolidationAgent(opts: {
+  /** Plan 07c (D4.3): one domain fixer mapper — its own worktree at `base`
+   * (or, for a fix, on its own red commit, continuing its session), frozen to
+   * a commit. Mirrors `#buildLane` without the lane-only parts (no owner-note
+   * delivery, no saved unsubmitted work). 07g1b (A4/C3): this is the only
+   * combining agent left — the consolidator step is gone. */
+  async #buildFixerAgent(opts: {
     round: number;
     worktree: string;
     base: string;
@@ -9144,14 +9442,10 @@ export class Conductor {
     lane: string;
     logPrefix: string;
     roleWord: string;
-    /** The note a first build whose tree equals the base records (the
-     * consolidator's own wording differs from a fixer's). */
-    changedNothingNote?: string;
     fix?: { of: string; timeoutMs: number };
-    /** A 07c fixer: runs on the worker model, not the consolidator's. */
-    fixer?: boolean;
   }): Promise<LaneBuild> {
     const { worktree, base, fix } = opts;
+    const startedAt = Date.now();
     try {
       if (fix && fs.existsSync(worktree) && headOf(worktree) === fix.of) {
         this.#log.append(`${opts.logPrefix}_worktree_reused`, { round: opts.round, reason: `fixing its red commit ${fix.of}` });
@@ -9174,7 +9468,7 @@ export class Conductor {
       sessionDir: opts.sessionDir,
       // It owes submit_phase only: no coverage turn (TT_ITEMS=0).
       env: { ...this.#laneEnv(worktree, this.#piEnvFor?.("worker", agentId) ?? {}), TT_ITEMS: "0" },
-      consolidation: { round: opts.round, worktree, ...(opts.fixer ? { fixer: true } : {}) },
+      mapper: { round: opts.round, worktree },
       // A fix continues the session that holds the work; a first build (or a
       // restart's re-run) starts fresh.
       ...(fix ? {} : { freshSession: true }),
@@ -9188,7 +9482,9 @@ export class Conductor {
         return { lane: opts.lane, note };
       }
       await handle.agent.prompt(opts.prompt);
-      const timeout = new PausableTimer<"timeout">(fix?.timeoutMs ?? this.#deadlines.workerAttemptMs, "timeout");
+      // Plan 07e (E1): a fixer's own attempt bound, not the worker's.
+      const attemptLimitMs = opts.actionKind === "fixer" ? this.#deadlines.fixerAttemptMs : this.#deadlines.workerAttemptMs;
+      const timeout = new PausableTimer<"timeout">(fix?.timeoutMs ?? attemptLimitMs, "timeout");
       const outcome = await Promise.race([
         handle.donePromise.then(() => "submitted" as const),
         handle.agent.waitSettled().then(() => "settled" as const),
@@ -9201,10 +9497,23 @@ export class Conductor {
       await handle.agent.terminate();
       // A settle with no submission also resolves `donePromise`
       // (`#onNoSubmission`); only a recorded submit_phase is a submission.
-      if (outcome !== "submitted" || handle.consolidationAdded === undefined) {
+      if (outcome !== "submitted" || handle.submissionAdded === undefined) {
+        // Plan 07e (E2/A2): every timed-out attempt names its bound — the
+        // fixer's own for a fixer, the worker attempt otherwise. The fixer's is
+        // also named in its task note, so a skipped fixer is never mistaken
+        // for a red one.
+        if (outcome === "timeout") {
+          if (opts.actionKind === "fixer") {
+            const limitMs = fix?.timeoutMs ?? this.#deadlines.fixerAttemptMs;
+            this.#recordBound("fixer-attempt", opts.lane, limitMs, Math.max(limitMs, Date.now() - startedAt));
+          } else {
+            const limitMs = fix?.timeoutMs ?? this.#deadlines.workerAttemptMs;
+            this.#recordBound("worker-attempt", opts.lane, limitMs, Math.max(limitMs, Date.now() - startedAt));
+          }
+        }
         const note =
           outcome === "timeout"
-            ? `the ${opts.roleWord} timed out before submitting`
+            ? `the ${opts.roleWord} timed out before submitting${opts.actionKind === "fixer" ? " (bound: fixer-attempt)" : ""}`
             : handle.agent.modelFailureReason
               ? `the ${opts.roleWord} ended without submitting: ${handle.agent.modelFailureReason}`
               : `the ${opts.roleWord} ended without submit_phase (${outcome})`;
@@ -9218,7 +9527,7 @@ export class Conductor {
       });
       this.#log.append("sweep", { ...sweepResult, fixer: opts.lane });
       const sha = freezeCommit(worktree, actionId, `phase ${this.#state.phase.phaseId} round ${opts.round} ${opts.roleWord}`);
-      const disclosures = handle.consolidationDisclosures ?? [];
+      const disclosures = handle.submissionDisclosures ?? [];
       // A commit with the base's own tree changed nothing: it is no work.
       if (!fix && treeOf(this.#plan.repo, sha) === treeOf(this.#plan.repo, base)) {
         this.#log.completion(actionId, { round: opts.round, outcome: "unchanged", sha });
@@ -9227,32 +9536,15 @@ export class Conductor {
         return {
           lane: opts.lane,
           unchanged: true,
-          note: opts.changedNothingNote ?? `the ${opts.roleWord} changed nothing on the base`,
-          ...(handle.consolidationAdded && handle.consolidationAdded.length > 0 ? { added: handle.consolidationAdded } : {}),
+          note: `the ${opts.roleWord} changed nothing on the base`,
+          ...(handle.submissionAdded && handle.submissionAdded.length > 0 ? { added: handle.submissionAdded } : {}),
           ...(disclosures.length > 0 ? { disclosures } : {}),
         };
       }
-      this.#log.completion(actionId, { round: opts.round, sha, added: handle.consolidationAdded });
-      return { lane: opts.lane, sha, added: handle.consolidationAdded, ...(disclosures.length > 0 ? { disclosures } : {}) };
+      this.#log.completion(actionId, { round: opts.round, sha, added: handle.submissionAdded });
+      return { lane: opts.lane, sha, added: handle.submissionAdded, ...(disclosures.length > 0 ? { disclosures } : {}) };
     } finally {
       this.#agents.delete(agentId);
-    }
-  }
-
-  /** tt 09 (change 3): the round checks on a consolidated commit, under the
-   * machine-wide lock, exactly as a lane candidate's (the winner is its base
-   * for the wide-path tier). */
-  async #checkConsolidation(plan: ConsolidationPlan, sha: string): Promise<LaneCheck> {
-    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
-    const window = openCheckWindow(this.#checkLockPath, this.#state.phase.runId);
-    try {
-      this.#log.append("consolidation_check_started", { round: plan.round, sha });
-      const result = await this.#runLaneChecks("consolidator", sha, plan.winner.sha);
-      this.#log.append("consolidation_check_finished", { round: plan.round, sha, passed: result.ok, ...(result.note ? { note: result.note } : {}) });
-      return result;
-    } finally {
-      window.release();
-      await lock.release();
     }
   }
 
@@ -9260,54 +9552,40 @@ export class Conductor {
   // Plan 07c (D4): fix rounds
   // -------------------------------------------------------------------------
 
-  /** Plan 07c (D4): the fix step after `roundNo`'s pick was evaluated and not
-   * accepted. Every open finding triaged `fix` with a domain becomes a task
-   * (`fixTasks`); one fixer per task runs in parallel from the same base B =
-   * the round's consolidated base or its pick. Each green fixer commit is
-   * merged into a fresh worktree at B in task order; a conflict or a red
-   * fixer skips that fixer with a note. ROUND_FIXED records the result either
-   * way. Returns "stopped" when the owner's stop or a recheck ended it before
-   * the record — the fix step then re-runs on resume. */
-  async #fixRound(roundNo: number): Promise<"stopped" | undefined> {
+  /** MAP and git integration for one lane-free loop. Points are grouped by
+   * domain on the loop's recorded base; each domain has its own sticky fixer
+   * and stateless review. ROUND_FIXED checkpoints the integrated head and
+   * domain outcomes before REDUCE checks, so resume never repeats this merge.
+   * A stop before the checkpoint resumes the bounded domain work. */
+  async #fixRound(roundNo: number): Promise<"stopped" | "parked" | undefined> {
     const record = (this.#state.phase.rounds ?? []).find((r) => r.round === roundNo);
-    if (!record?.picked || record.fixed || record.regressed) return undefined;
-    if (this.#state.phase.contract.fixRounds !== "domains") return undefined;
-    // Only a pick the phase adopted and evaluated is fixed (a round that was
-    // handed off and then not accepted).
-    if (this.#state.phase.candidate?.sha !== record.picked.sha) return undefined;
+    if (!record || record.lanes.length > 0 || record.fixed) return undefined;
     const domains = this.#state.phase.contract.domains ?? [];
     if (domains.length === 0) return undefined;
-    const findings: FixFinding[] = this.#state.phase.findings.map((f) => ({
-      ...f,
-      disposition: triageRecordFor(this.#state.phase.triage, f.id)?.disposition,
-    }));
-    // Fix packet Z: a decision of the pick the seats voted down or vetoed is
-    // fixer work too (the seats decided; the fixer applies their alternative).
-    const points: FixPoint[] = [...findings, ...this.#decisionFixPoints(record.picked.sha, domains)];
+    const findings: FixFinding[] = this.#state.phase.findings.map((f) => {
+      const path = f.where ? whereKey(f.where).split(" ")[0] : "";
+      const inferred = f.domain ? undefined : domainOf(path, domains);
+      return {
+        ...f,
+        ...(inferred ? { domain: inferred } : {}),
+        disposition: triageRecordFor(this.#state.phase.triage, f.id)?.disposition ??
+          (f.raisedBy === "conductor" ? { kind: "fix" as const, reason: "a final check failure is fixed in its file's domain" } : undefined),
+      };
+    });
+    // 07g1: only points are fixer work. A voted-down or vetoed decision goes
+    // to the seats (or the owner), never to a fixer.
+    const open = new Set(this.#openPointsOn(record.base));
+    const points: FixTask["findings"] = findings.filter((f) => open.has(f.id));
     const cap = this.#state.phase.contract.fixers ?? DEFAULT_FIXERS;
     const tasks = fixTasks(points, domains, cap);
     if (tasks.length === 0) return undefined;
-    const base = consolidatedBase(this.#state.phase.rounds, roundNo + 1) ?? record.picked.sha;
+    const base = record.base;
     const stopped = (): boolean => this.#stopRequested || this.#recheckCancelledLaneRound;
     this.#log.append("fix_round_started", { round: roundNo, base, tasks: tasks.map((t) => ({ domain: t.domain, findingIds: t.findingIds })) });
-    const results = await Promise.all(
-      tasks.map((task) =>
-        this.#runFixer(task, roundNo, base, tasks).catch((err): ConsolidationOutcome => ({
-          ok: false,
-          fixes: 0,
-          note: `the fixer failed: ${String((err as Error)?.message ?? err)}`,
-        })),
-      ),
-    );
-    if (stopped()) {
-      this.#log.append("fix_round_stopped", { round: roundNo, reason: this.#stopRequested ? "the owner stopped the run" : "a recheck stopped it" });
-      return "stopped";
-    }
-    // Merge the green fixer commits, in task order, into one fresh worktree at
-    // B. A conflict aborts that merge and skips the fixer; the sequence goes on.
-    const mergeWorktree = path.join(this.#runDir, "worktrees", `fix-merge-${roundNo}`);
     const taskRecords: FixTaskRecord[] = tasks.map((t) => ({ domain: t.domain, findingIds: [...t.findingIds] }));
-    const merges: { sha: string }[] = [];
+    const mergeWorktree = path.join(this.#runDir, "worktrees", `fix-merge-${roundNo}`);
+    const mergesByIndex = new Map<number, { sha: string }>();
+    const results: Array<LaneBuild & { ok: boolean; fixes: number; status?: string; reason?: string; domainRecords?: DomainLoopRecord[] }> = new Array(tasks.length);
     let candidate: string | undefined;
     let mergeWorktreeReady = false;
     try {
@@ -9318,26 +9596,78 @@ export class Conductor {
       const error = String((err as Error)?.message ?? err);
       this.#log.append("fix_merge_worktree_failed", { round: roundNo, error });
     }
+    // 07g2 (A1): every domain runs concurrently, but the merge does not:
+    // once every fixer has settled, their commits merge onto B in task order,
+    // so the candidate's history is deterministic instead of following the
+    // order the fixers happened to finish. A conflict starts the fenced
+    // integrate duty; a domain that cannot be integrated within
+    // `#+TT_INTEGRATE_MAX` is dropped and the retry continues without it.
+    const pending = new Map<number, Promise<{ index: number; result: (typeof results)[number] }>>();
+    for (let i = 0; i < tasks.length; i += 1) {
+      const task = tasks[i];
+      pending.set(
+        i,
+        this.#runFixer(task, roundNo, base)
+          .then((result) => ({ index: i, result }))
+          .catch((err): { index: number; result: (typeof results)[number] } => ({
+            index: i,
+            result: { lane: `fix-${task.domain}`, ok: false, fixes: 0, note: `the fixer failed: ${String((err as Error)?.message ?? err)}` },
+          })),
+      );
+    }
+    while (pending.size > 0) {
+      const settled = await Promise.race([...pending.values()]);
+      pending.delete(settled.index);
+      results[settled.index] = settled.result;
+    }
     for (let i = 0; i < tasks.length; i += 1) {
       const result = results[i];
+      if (!result) continue;
       if (typeof result.sha === "string" && result.sha.length > 0) taskRecords[i].sha = result.sha;
-      if (!mergeWorktreeReady) {
-        taskRecords[i].note = `the merge worktree could not be created`;
-        continue;
-      }
       if (!result.ok || typeof result.sha !== "string" || result.sha.length === 0) {
         taskRecords[i].note = result.note ?? "the fixer produced no commit";
-        continue;
       }
-      const merge = mergeFixer(mergeWorktree, result.sha);
-      if (!merge.ok) {
-        taskRecords[i].note = `its commit ${result.sha.slice(0, 7)} conflicted and was skipped`;
-        this.#log.append("fix_merge_conflict", { round: roundNo, domain: tasks[i].domain, sha: result.sha });
-        continue;
-      }
-      merges.push({ sha: result.sha });
     }
-    if (mergeWorktreeReady && merges.length > 0) candidate = headOf(mergeWorktree);
+    if (stopped()) {
+      this.#log.append("fix_round_stopped", { round: roundNo, reason: this.#stopRequested ? "the owner stopped the run" : "a recheck stopped it" });
+      return "stopped";
+    }
+    const commits = tasks.flatMap((task, i) => {
+      const result = results[i];
+      return result && result.ok && typeof result.sha === "string" && result.sha.length > 0
+        ? [{ domain: task.domain, sha: result.sha }]
+        : [];
+    });
+    if (commits.length > 0) {
+      if (!mergeWorktreeReady) {
+        for (const commit of commits) {
+          const index = tasks.findIndex((t) => t.domain === commit.domain);
+          if (index >= 0) taskRecords[index].note = "the merge worktree could not be created";
+        }
+      } else {
+        const integrateMax = this.#state.phase.contract.integrateMax ?? DEFAULT_INTEGRATE_MAX;
+        const integration = await this.#integrateDomains(mergeWorktree, base, commits, roundNo, integrateMax);
+        for (const landed of integration.integrated) {
+          const index = tasks.findIndex((t) => t.domain === landed.domain);
+          if (index >= 0) mergesByIndex.set(index, { sha: landed.sha });
+        }
+        for (const dropped of integration.dropped) {
+          const index = tasks.findIndex((t) => t.domain === dropped.domain);
+          if (index >= 0) taskRecords[index].note = dropped.reason;
+        }
+        if (integration.timedOut) {
+          const settledDomains = new Set([...integration.integrated, ...integration.dropped].map((c) => c.domain));
+          for (const commit of commits) {
+            if (settledDomains.has(commit.domain)) continue;
+            const index = tasks.findIndex((t) => t.domain === commit.domain);
+            if (index >= 0) taskRecords[index].note = `its commit ${commit.sha.slice(0, 7)} could not be merged within the merge bound (bound: merge)`;
+          }
+          this.#log.append("fix_merge_timed_out", { round: roundNo });
+        }
+        if (integration.head) candidate = integration.head;
+      }
+    }
+    const merges = tasks.flatMap((_, i) => (mergesByIndex.has(i) ? [mergesByIndex.get(i)!] : []));
     // Packet X: a merge whose tree is B's own changed nothing (e.g. a fixer
     // whose fix undid its own commit): there is no candidate, and the next
     // round is today's.
@@ -9355,9 +9685,8 @@ export class Conductor {
     const speaking = results.filter((r) => r.unchanged === true || (typeof r.sha === "string" && merged.has(r.sha)));
     const disclosures = speaking.flatMap((r) => r.disclosures ?? []);
     const added = speaking.flatMap((r) => r.added ?? []);
-    // The merged candidate is the next round's candidate: materialize its
-    // read-only checkout now, before the next round's lane reviews (which run
-    // in it) start.
+    const domainRecords = results.flatMap((r) => r.domainRecords ?? []);
+    // Materialize the integrated candidate for facts and acceptance.
     if (candidate) {
       const candidateDir = path.join(this.#paths.candidates, candidate);
       if (!fs.existsSync(candidateDir)) materializeCandidate(this.#plan.repo, candidate, candidateDir);
@@ -9370,6 +9699,7 @@ export class Conductor {
       ...(candidate ? { candidate } : {}),
       ...(disclosures.length > 0 ? { disclosures } : {}),
       ...(added.length > 0 ? { added } : {}),
+      ...(domainRecords.length > 0 ? { domains: domainRecords } : {}),
     });
     this.#applyEvent({
       type: "ROUND_FIXED",
@@ -9380,6 +9710,7 @@ export class Conductor {
       ...(candidate ? { candidate } : {}),
       ...(disclosures.length > 0 ? { disclosures } : {}),
       ...(added.length > 0 ? { added } : {}),
+      ...(domainRecords.length > 0 ? { domains: domainRecords } : {}),
     });
     // Packet X: once ROUND_FIXED records every fixer's outcome and the merged
     // candidate has its own checkout, the fix worktrees are spent. Only the
@@ -9399,100 +9730,857 @@ export class Conductor {
     return path.join(this.#runDir, "worktrees", `fix-${domain}`);
   }
 
-
-  /** Fix packet Z: the fixer points of the decisions bound to `sha` (the
-   * round's pick) — `decisionFixPoint` decides which (a non-reserved decision
-   * whose vote failed or that the leader vetoed) and their domain; this only
-   * gathers the facts it reads: the vote outcome, the item's `:DOMAIN:` and
-   * the evaluator's alternative. */
-  #decisionFixPoints(sha: string, domains: readonly Domain[]): DecisionFixPoint[] {
-    const phase = this.#state.phase;
-    const K = phase.contract.contractVersion;
-    const items = this.#planItems();
-    const itemDomain = (id: string | undefined): string | undefined =>
-      id ? [...items.requirements, ...items.architecture, ...items.constraints].find((i) => i.id === id)?.domain : undefined;
-    const points: DecisionFixPoint[] = [];
-    for (const decision of phase.decisions) {
-      if (decision.boundCandidateSha !== sha || !isLiveDecision(decision)) continue;
-      const point = decisionFixPoint(decision, {
-        ballots: phase.ballots ?? [],
-        seats: this.#laneSeats(),
-        leader: this.#laneLeader(),
-        settled: decisionSettled(decision, phase, sha, K),
-        itemDomain: itemDomain(decision.itemId),
-        domains,
-        evaluatorAlternative: (phase.itemChecks ?? []).find((c) => c.itemId === decision.id)?.alternative,
-      });
-      if (point) points.push(point);
-    }
-    return points;
+  /** 07g2 (A2/R3): the points still open on a merged candidate. A point with
+   * a proving fact closes for this gate when that fact passes on the candidate
+   * and does not pass on its base (a command that already passed before the
+   * fix proves nothing). A point a fact already closed on an earlier candidate
+   * stays closed (design G4): on this candidate its fact passes, and the base
+   * now carries the earlier fix, so `passesOnBase` no longer proves anything
+   * either way. Only a fact that FAILS on this candidate reopens it. */
+  #openPointsOn(candidateSha: string): string[] {
+    const facts = this.#factsFor(candidateSha);
+    const earlierFacts = this.#state.phase.doneWhenFacts ?? [];
+    return this.#state.phase.findings
+      .filter((f) => f.status === "open")
+      .filter((f) => {
+        const fact = facts.find((x) => x.findingId === f.id);
+        if (fact === undefined) return this.#approvedItemPointReview(f, candidateSha) === undefined;
+        // Its fact fails on this candidate: the point is open whatever closed
+        // it before.
+        if (fact.timedOut || fact.exitCode !== 0) return true;
+        // Proven on this candidate: it failed on this candidate's base.
+        if (fact.passesOnBase === false) return false;
+        // It passes here and also on the base — because an earlier loop's fix
+        // moved the base. Closed on an earlier candidate, it stays closed.
+        const closedEarlier = earlierFacts.some(
+          (x) => x.findingId === f.id && x.candidateSha !== candidateSha && !x.timedOut && x.exitCode === 0 && x.passesOnBase === false,
+        );
+        return !closedEarlier;
+      })
+      .map((f) => f.id);
   }
 
-  /** Plan 07c (D4.3): one fixer — its own worktree at B, its own session, and
-   * `runConsolidation` with `#+TT_FIX_CHECKS` as its gate. The fixer's handle
-   * is a consolidation handle: it owes `submit_phase` only. */
-  async #runFixer(task: FixTask, round: number, base: string, allTasks: readonly FixTask[]): Promise<ConsolidationOutcome> {
+  /** §7a.3: a mechanical item point without a command closes by an approved
+   * domain review with green fix checks. Read only replayed checkpoints and
+   * require that the reviewed head actually merged into this candidate. */
+  #approvedItemPointReview(finding: Finding, candidateSha: string): string | undefined {
+    if (finding.raisedBy !== "conductor" || !finding.itemId || finding.doneWhen || candidateSha === finding.boundCandidateSha) return undefined;
+    for (const round of this.#state.phase.rounds ?? []) {
+      for (const pass of round.fixed?.domains ?? []) {
+        if (!pass.sha || !pass.facts?.checkPassed || !pass.review?.quality.ok ||
+          !pass.review.points.some((p) => p.pointId === finding.id && p.fixed) ||
+          !round.fixed?.tasks.some((t) => t.domain === finding.domain && t.findingIds.includes(finding.id)) ||
+          !round.fixed.merges.some((m) => m.sha === pass.sha)) continue;
+        try {
+          execFileSync("git", ["-C", this.#plan.repo, "merge-base", "--is-ancestor", pass.sha, candidateSha], { stdio: "ignore" });
+          return `domain ${finding.domain} approved point ${finding.id} at ${pass.sha} with green fix checks (round ${round.round}, pass ${pass.iteration})`;
+        } catch {
+          // An approval of a head absent from this candidate proves nothing.
+        }
+      }
+    }
+    return undefined;
+  }
+
+  /** 07g2 (A2/R4): the merged candidate's red check with points still open on
+   * it parks the phase for the lead: no seat review starts on it. */
+  #parkOpenPoints(round: number, reason: string, points: readonly string[]): void {
+    this.#log.append("lead_called", { round, reason, points });
+    this.#applyEvent({ type: "BOUND_REACHED", kind: "rounds", scope: `round ${round} fix loop`, limitMs: 0, elapsedMs: 0, action: "the phase parks for the lead" });
+    this.#applyEvent({ type: "LEAD_CALLED", reasons: [reason] });
+    this.#applyEvent({ type: "LOOP_BOUND_REACHED", round, loops: this.#state.phase.contract.domainLoopMax ?? 3, reason });
+  }
+
+  /** 07g2 (A2/R3): a red merged candidate whose failing file no domain loop
+   * can take (design G3's "no path maps to a domain") parks the phase for the
+   * lead, exactly as the loop bound does: LEAD_CALLED, never a lane round. */
+  #parkMergedCheck(round: number, reason: string): void {
+    this.#log.append("lead_called", { round, reason, points: [] });
+    this.#applyEvent({ type: "LEAD_CALLED", reasons: [reason] });
+    this.#applyEvent({ type: "LOOP_BOUND_REACHED", round, loops: this.#state.phase.contract.domainLoopMax ?? 3, reason });
+  }
+
+  /** 07g2 (A1): one bounded git command in the merge worktree. Everything the
+   * merge step runs goes through the conductor's process-group machinery, so a
+   * hung git (a credential prompt, a wrapper, a huge tree) is killed instead
+   * of hanging the fix round. */
+  async #integrateGit(worktree: string, args: readonly string[], scope: string): Promise<{ ok: boolean; timedOut: boolean; output: string }> {
+    const startedAt = Date.now();
+    const result = await runCommand({
+      command: `git -C ${shellQuote(worktree)} -c user.name=tradeoffs-trace -c user.email=tradeoffs-trace@localhost -c core.hooksPath=/dev/null ${args.join(" ")}`,
+      cwd: worktree,
+      env: process.env,
+      deadlineMs: this.#deadlines.mergeMs,
+      termGraceMs: this.#deadlines.termGraceMs,
+      onIntent: ({ pgid }) => this.#onStageShIntent(pgid),
+    }).result;
+    if (result.timedOut) {
+      this.#recordBound("merge", scope, this.#deadlines.mergeMs, Math.max(this.#deadlines.mergeMs, Date.now() - startedAt));
+      return { ok: false, timedOut: true, output: result.output };
+    }
+    return { ok: result.exitCode === 0, timedOut: false, output: result.output };
+  }
+
+  /** 07g2 (A1/R1): git merges the approved domains onto `base` in task order,
+   * one `git merge --no-ff` per domain, and the CANDIDATE is one merge commit
+   * whose parents are `base` and every domain that landed, in task order — the
+   * commit git's octopus strategy builds for `git merge --no-ff <branch>...`.
+   * Merging one domain at a time is what lets each conflict go to the integrate
+   * duty; it is not the candidate's shape, so `#mergeCommitOntoBase` rebuilds
+   * that shape instead of chaining one merge commit per domain. A conflict
+   * starts the integrate duty: the one writer this phase allows, fenced to the
+   * files git left unmerged (C4), with `#+TT_INTEGRATE_MAX` attempts. When the
+   * attempts are spent that domain is dropped (its work never lands) and the
+   * next one is tried, so one unresolvable domain never holds the others. */
+  async #integrateDomains(
+    worktree: string,
+    base: string,
+    commits: ReadonlyArray<{ domain: string; sha: string }>,
+    round: number,
+    integrateMax: number,
+  ): Promise<{ head?: string; integrated: Array<{ domain: string; sha: string }>; dropped: Array<{ domain: string; sha: string; reason: string }>; timedOut: boolean }> {
+    const integrated: Array<{ domain: string; sha: string }> = [];
+    const dropped: Array<{ domain: string; sha: string; reason: string }> = [];
+    let current = base;
+    let timedOut = false;
+    const remaining = [...commits];
+    while (remaining.length > 0 && !timedOut) {
+      const commit = remaining[0];
+      let landed: string | undefined;
+      for (let attempt = 1; attempt <= integrateMax && !timedOut; attempt += 1) {
+        // Every attempt starts from the head merged so far, so a refused or
+        // unresolved attempt leaves nothing behind.
+        const reset = await this.#integrateGit(worktree, ["reset", "--hard", shellQuote(current)], `round ${round} integrate reset`);
+        if (reset.timedOut) {
+          timedOut = true;
+          break;
+        }
+        // A refused attempt may have left an untracked file outside the fence;
+        // every attempt starts from the same clean head.
+        const clean = await this.#integrateGit(worktree, ["clean", "-fd"], `round ${round} integrate clean`);
+        if (clean.timedOut) {
+          timedOut = true;
+          break;
+        }
+        const merge = await this.#mergeFixerBounded(worktree, commit.sha, commit.domain, round);
+        if (merge.timedOut) {
+          this.#log.append("fix_merge_timed_out", { round, domain: commit.domain, sha: commit.sha });
+          timedOut = true;
+          break;
+        }
+        if (merge.ok) {
+          landed = headOf(worktree);
+          break;
+        }
+        // 07g2 (R2/C4): the conflicted paths are what the fence allows.
+        const status = await this.#integrateGit(worktree, ["status", "--porcelain", "-z"], `round ${round} integrate status`);
+        const conflicted = unmergedPaths(status.output);
+        if (conflicted.length === 0) {
+          this.#log.append("integrate_merge_failed", { round, attempt, domains: [commit.domain], output: merge.output });
+          continue;
+        }
+        this.#log.append("integrate_conflict", { round, attempt, conflicted, domains: [commit.domain], output: merge.output });
+        // A merge may leave a conflicted path holding only one side (git's merge
+        // driver can fail on an absent empty blob). Re-create the conflict
+        // markers from the index so the integrate duty sees BOTH sides.
+        await this.#integrateGit(
+          worktree,
+          ["checkout", "--merge", "--", ...conflicted.map((p) => shellQuote(p))],
+          `round ${round} integrate checkout --merge`,
+        );
+        const duty = await this.#runIntegrateDuty(worktree, {
+          round,
+          base: merge.before ?? current,
+          commits: [commit],
+          conflicted,
+          mergeOutput: merge.output,
+          attempt,
+          maxAttempts: integrateMax,
+        });
+        if (!duty.ok) {
+          this.#log.append("integrate_attempt_failed", { round, attempt, conflicted, reason: duty.reason });
+          continue;
+        }
+        const committed = await this.#commitIntegrated(worktree, current, [commit], round, conflicted);
+        if (committed) {
+          landed = committed;
+          break;
+        }
+      }
+      if (timedOut) break;
+      remaining.shift();
+      if (landed) {
+        integrated.push(commit);
+        current = landed;
+        continue;
+      }
+      dropped.push({
+        domain: commit.domain,
+        sha: commit.sha,
+        reason: `its commit ${commit.sha.slice(0, 7)} conflicted and was dropped: it could not be integrated within ${integrateMax} attempt(s) (bound: integrate)`,
+      });
+    }
+    // 07g2 (A1): the candidate is ONE merge commit over the tree the per-domain
+    // merges produced, with `base` and every landed domain commit as its direct
+    // parents. A chain of per-domain merge commits would leave the pick and the
+    // domains on opposite sides of intermediate commits instead.
+    let head = integrated.length > 0 ? current : undefined;
+    if (head !== undefined && integrated.length > 1) {
+      const candidate = await this.#mergeCommitOntoBase(worktree, base, integrated, head, round);
+      if (candidate !== undefined) head = candidate;
+    }
+    return { head, integrated, dropped, timedOut };
+  }
+
+  /** 07g2 (A1): the candidate's shape — one merge commit whose parents are
+   * `base` and every domain commit that landed, in task order, over the tree
+   * `head` holds (the tree the merges produced, conflicts resolved). This is
+   * the commit `git merge --no-ff <branch>...` makes; when a conflict forced
+   * the merges to run one at a time, this is what keeps the candidate's history
+   * `base` plus every domain head instead of a chain of merge commits. Each
+   * tree, commit and reset is a bounded git command like every other step here. */
+  async #mergeCommitOntoBase(
+    worktree: string,
+    base: string,
+    landed: ReadonlyArray<{ domain: string; sha: string }>,
+    head: string,
+    round: number,
+  ): Promise<string | undefined> {
+    const tree = await this.#integrateGit(worktree, ["rev-parse", `${shellQuote(head)}^{tree}`], `round ${round} integrate tree`);
+    const treeSha = tree.output.trim().split("\n")[0];
+    if (!tree.ok || !/^[0-9a-f]{40,64}$/.test(treeSha)) {
+      this.#log.append("integrate_merge_shape_failed", { round, head, step: "rev-parse", output: tree.output });
+      return undefined;
+    }
+    const message = `merge domains ${landed.map((c) => c.domain).join(", ")}\n\nTT-Action: fix-merge-${round}`;
+    const committed = await this.#integrateGit(
+      worktree,
+      ["commit-tree", shellQuote(treeSha), "-p", shellQuote(base), ...landed.flatMap((c) => ["-p", shellQuote(c.sha)]), "-m", shellQuote(message)],
+      `round ${round} integrate commit-candidate`,
+    );
+    const sha = committed.output.trim().split("\n")[0];
+    if (!committed.ok || !/^[0-9a-f]{40,64}$/.test(sha)) {
+      this.#log.append("integrate_merge_shape_failed", { round, head, step: "commit-tree", output: committed.output });
+      return undefined;
+    }
+    const reset = await this.#integrateGit(worktree, ["reset", "--hard", shellQuote(sha)], `round ${round} integrate reset-candidate`);
+    if (!reset.ok) {
+      this.#log.append("integrate_merge_shape_failed", { round, head, step: "reset", output: reset.output });
+      return undefined;
+    }
+    this.#log.append("integrate_candidate", {
+      round,
+      base,
+      head: sha,
+      from: head,
+      parents: [base, ...landed.map((c) => c.sha)],
+      domains: landed.map((c) => ({ domain: c.domain, sha: c.sha })),
+    });
+    return sha;
+  }
+
+  /** 07g2 (A1/C4): the conductor's own merge commit. The index it commits is
+   * the merge's own index — git staged every cleanly merged path before the
+   * integrate duty ran — plus the duty's resolution of the conflicted files,
+   * and nothing else: the fence (`#integrateChangedPaths`) refuses an attempt
+   * whose staged or worktree change falls outside that set, so the tree here
+   * is exactly the merge's tree with the fenced resolution. */
+  async #commitIntegrated(
+    worktree: string,
+    base: string,
+    commits: ReadonlyArray<{ domain: string; sha: string }>,
+    round: number,
+    conflicted?: readonly string[],
+  ): Promise<string | undefined> {
+    if (conflicted && conflicted.length > 0) {
+      const add = await this.#integrateGit(worktree, ["add", "--", ...conflicted.map((p) => shellQuote(p))], `round ${round} integrate add`);
+      if (!add.ok) {
+        this.#log.append("integrate_stage_failed", { round, conflicted, output: add.output });
+        return undefined;
+      }
+    }
+    const tree = await this.#integrateGit(worktree, ["write-tree"], `round ${round} integrate write-tree`);
+    if (!tree.ok) {
+      this.#log.append("integrate_write_tree_failed", { round, output: tree.output });
+      return undefined;
+    }
+    const treeSha = tree.output.trim().split("\n")[0];
+    if (!/^[0-9a-f]{40,64}$/.test(treeSha)) return undefined;
+    const message = `merge domains ${commits.map((c) => c.domain).join(", ")}\n\nTT-Action: fix-merge-${round}`;
+    const committed = await this.#integrateGit(
+      worktree,
+      ["commit-tree", shellQuote(treeSha), "-p", shellQuote(base), ...commits.flatMap((c) => ["-p", shellQuote(c.sha)]), "-m", shellQuote(message)],
+      `round ${round} integrate commit`,
+    );
+    if (!committed.ok) {
+      this.#log.append("integrate_commit_failed", { round, output: committed.output });
+      return undefined;
+    }
+    const head = committed.output.trim().split("\n")[0];
+    if (!/^[0-9a-f]{40,64}$/.test(head)) return undefined;
+    const reset = await this.#integrateGit(worktree, ["reset", "--hard", shellQuote(head)], `round ${round} integrate reset-head`);
+    if (!reset.ok) return undefined;
+    this.#log.append("integrate_committed", {
+      round,
+      base,
+      domains: commits.map((c) => ({ domain: c.domain, sha: c.sha })),
+      head,
+      ...(conflicted ? { conflicted } : {}),
+    });
+    return head;
+  }
+
+  /** 07g2 (A1/C4): the integrate duty. One writer, fenced by file: after the
+   * session ends, the conductor refuses a resolution whose diff touches a path
+   * git did not leave unmerged, refuses a session that committed or left
+   * conflict markers behind, and only then stages the conflicted files and
+   * commits the merge itself. Hunks inside a conflicted file are never judged. */
+  async #runIntegrateDuty(
+    worktree: string,
+    opts: {
+      round: number;
+      base: string;
+      commits: ReadonlyArray<{ domain: string; sha: string }>;
+      conflicted: readonly string[];
+      mergeOutput: string;
+      attempt: number;
+      maxAttempts: number;
+    },
+  ): Promise<{ ok: boolean; reason?: string }> {
+    const startedAt = Date.now();
+    const actionId = this.#log.actionId("integrate");
+    const agentId = `integrate-${opts.round}-${opts.attempt}-${actionId}`;
+    this.#log.intent(actionId, { round: opts.round, attempt: opts.attempt, conflicted: opts.conflicted });
+    // 07g2 (C4): the fence compares the index the merge left with the index
+    // after the duty, so a resolution that STAGES an out-of-fence path
+    // (`git add`, `git rm`, a new file) is caught too, not only a worktree
+    // edit. The snapshot is taken before the session exists.
+    const before = await this.#integrateIndexSnapshot(worktree, opts.round);
+    if (!before.ok) {
+      this.#log.append("integrate_index_failed", { round: opts.round, attempt: opts.attempt, output: before.output });
+      return { ok: false, reason: "the conductor could not read the merge index" };
+    }
+    const handle = this.#spawnLaneAgent({
+      role: "worker",
+      // 07g2 (G3): the integrate duty writes, so it keeps the worker role's
+      // tools but runs on the evaluator's model.
+      modelRole: "evaluator",
+      agentId,
+      cwd: worktree,
+      sessionDir: path.join(this.#paths.sessions, `integrate-${opts.round}-${opts.attempt}`),
+      env: { ...this.#laneEnv(worktree, this.#piEnvFor?.("worker", agentId) ?? {}), TT_ITEMS: "0" },
+      mapper: { round: opts.round, worktree },
+      freshSession: true,
+    });
+    try {
+      const hello = await raceTimeout(handle.helloPromise, this.#deadlines.helloTimeoutMs, "hello");
+      if (hello === "timeout" || !hello.ok) {
+        await handle.agent.terminate();
+        this.#log.completion(actionId, { round: opts.round, outcome: "no-commit", reason: "the integrate duty did not start" });
+        return { ok: false, reason: "the integrate duty did not start" };
+      }
+      await handle.agent.prompt(
+        this.#agentPrompt(
+          integrateBrief({
+            round: opts.round,
+            base: opts.base,
+            commits: opts.commits,
+            conflicted: opts.conflicted,
+            mergeOutput: opts.mergeOutput,
+            attempt: opts.attempt,
+            maxAttempts: opts.maxAttempts,
+          }),
+        ),
+      );
+      const timeout = new PausableTimer<"timeout">(this.#deadlines.workerAttemptMs, "timeout");
+      const outcome = await Promise.race([
+        handle.donePromise.then(() => "submitted" as const),
+        handle.agent.waitSettled().then(() => "settled" as const),
+        handle.agent.waitExit().then(() => "exited" as const),
+        timeout.promise,
+      ]);
+      timeout.cancel();
+      await handle.agent.terminate();
+      if (outcome !== "submitted") {
+        if (outcome === "timeout") {
+          this.#recordBound("merge", `round ${opts.round} integrate attempt ${opts.attempt}`, this.#deadlines.workerAttemptMs, Math.max(this.#deadlines.workerAttemptMs, Date.now() - startedAt));
+        }
+        this.#log.completion(actionId, { round: opts.round, outcome: "no-commit", reason: `the integrate duty ${outcome}` });
+        return { ok: false, reason: `the integrate duty ${outcome} without a resolution` };
+      }
+      // The duty never commits: a moved HEAD is a refused attempt.
+      if (headOf(worktree) !== opts.base) {
+        this.#log.append("integrate_refused", { round: opts.round, attempt: opts.attempt, reason: "the duty committed", head: headOf(worktree) });
+        return { ok: false, reason: "the integrate duty committed; the conductor commits the merge" };
+      }
+      const changed = await this.#integrateChangedPaths(worktree, opts.round, before.entries);
+      const outside = resolutionOutsideConflicted(changed, opts.conflicted);
+      if (outside.length > 0) {
+        this.#log.append("integrate_refused", { round: opts.round, attempt: opts.attempt, outside, conflicted: opts.conflicted });
+        return { ok: false, reason: `the resolution changed files outside the conflicted set: ${outside.join(", ")}` };
+      }
+      const unresolved = opts.conflicted.filter((p) => {
+        try {
+          return /^(?:<{7}|>{7})(?: |$)/m.test(fs.readFileSync(path.join(worktree, p), "utf8"));
+        } catch {
+          return false;
+        }
+      });
+      if (unresolved.length > 0) {
+        this.#log.append("integrate_unresolved", { round: opts.round, attempt: opts.attempt, unresolved });
+        return { ok: false, reason: `the resolution left conflict markers in ${unresolved.join(", ")}` };
+      }
+      this.#log.completion(actionId, { round: opts.round, outcome: "resolved", changed });
+      return { ok: true };
+    } finally {
+      this.#agents.delete(agentId);
+    }
+  }
+
+  /** 07g2 (C4): the merge's index, keyed by path — every stage entry of a
+   * conflicted path, in git's order. Taken just before the integrate duty
+   * runs, so the fence can tell the duty's staged edits from the merge's own. */
+  async #integrateIndexSnapshot(
+    worktree: string,
+    round: number,
+  ): Promise<{ ok: boolean; entries: Map<string, string[]>; output: string }> {
+    const listed = await this.#integrateGit(worktree, ["ls-files", "-s", "-z"], `round ${round} integrate ls-files`);
+    const entries = new Map<string, string[]>();
+    for (const entry of listed.output.split("\u0000")) {
+      const tab = entry.indexOf("\t");
+      if (tab < 0) continue;
+      const path = entry.slice(tab + 1);
+      const meta = entry.slice(0, tab);
+      const stages = entries.get(path);
+      if (stages) stages.push(meta);
+      else entries.set(path, [meta]);
+    }
+    return { ok: listed.ok, entries, output: listed.output };
+  }
+
+  /** 07g2 (C4): every path the integrate duty changed — its worktree edits
+   * (worktree-vs-index diff), its untracked files, AND anything it staged
+   * (`git add`, `git rm`, a new path): the index is compared with the snapshot
+   * taken before the duty. The merge itself staged its own clean paths before
+   * that snapshot, so they are not "changed" here; only the duty's edits are. */
+  async #integrateChangedPaths(
+    worktree: string,
+    round: number,
+    before: ReadonlyMap<string, readonly string[]>,
+  ): Promise<string[]> {
+    const after = await this.#integrateIndexSnapshot(worktree, round);
+    const staged: string[] = [];
+    for (const [path, stages] of after.entries) {
+      const previous = before.get(path);
+      if (!previous || previous.join("\n") !== stages.join("\n")) staged.push(path);
+    }
+    for (const path of before.keys()) if (!after.entries.has(path)) staged.push(path);
+    const diff = await this.#integrateGit(worktree, ["diff", "--name-only"], `round ${round} integrate diff`);
+    const untracked = await this.#integrateGit(worktree, ["ls-files", "--others", "--exclude-standard"], `round ${round} integrate untracked`);
+    const lines = (text: string) => text.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+    return [...new Set([...staged, ...lines(diff.output), ...lines(untracked.output)])];
+  }
+
+  /** Plan 07e (E2): merge one fixer commit under the merge bound. The same
+   * git command runs through the conductor's process-group machinery, so a
+   * hung merge (a credential prompt, a wrapper, a huge tree) is killed and
+   * skipped instead of hanging the fix round. R5: the worktree's HEAD before
+   * the merge is the only state that may survive, so a merge wrapper that
+   * commits and only then hangs cannot leave its commit in the candidate. */
+  async #mergeFixerBounded(worktree: string, sha: string, domain: string, round: number): Promise<{ ok: boolean; timedOut: boolean; conflict: boolean; before?: string; output: string }> {
+    const startedAt = Date.now();
+    const before = headOf(worktree);
+    const scope = `round ${round} fixer ${domain}`;
+    const gitArgs = [
+      "-C",
+      shellQuote(worktree),
+      "-c",
+      "user.name=tradeoffs-trace",
+      "-c",
+      "user.email=tradeoffs-trace@localhost",
+      "-c",
+      "core.hooksPath=/dev/null",
+      "merge",
+      "--no-ff",
+      "--no-verify",
+      "-m",
+      shellQuote(`merge fixer commit ${sha}\n\nTT-Action: fix-merge-${sha}`),
+      shellQuote(sha),
+    ].join(" ");
+    const result = await runCommand({
+      command: `git ${gitArgs}`,
+      cwd: worktree,
+      env: process.env,
+      deadlineMs: this.#deadlines.mergeMs,
+      termGraceMs: this.#deadlines.termGraceMs,
+      onIntent: ({ pgid }) => {
+        this.#onStageShIntent(pgid);
+        this.#log.intent(`fixer-merge-${domain}-${pgid}`, { pgid, domain, sha });
+      },
+    }).result;
+    if (result.timedOut) {
+      this.#recordBound("merge", scope, this.#deadlines.mergeMs, Math.max(this.#deadlines.mergeMs, Date.now() - startedAt));
+      await this.#restoreMergeState(worktree, before, `${scope} merge --abort`);
+      return { ok: false, timedOut: true, conflict: false, before, output: result.output };
+    }
+    if (result.exitCode !== 0) {
+      // Plan 07g2 (R2): a genuine conflict is left in the worktree for the
+      // integrate duty; the caller aborts it if every try fails. A non-
+      // conflict failure keeps the old skip-and-abort path.
+      let conflict = false;
+      try {
+        conflict = execFileSync("git", ["-C", worktree, "diff", "--name-only", "--diff-filter=U"], { encoding: "utf8" }).trim().length > 0;
+      } catch {
+        conflict = false;
+      }
+      if (!conflict) await this.#restoreMergeState(worktree, before, `${scope} merge --abort`);
+      return { ok: false, timedOut: false, conflict, before, output: result.output };
+    }
+    return { ok: true, timedOut: false, conflict: false, before, output: result.output };
+  }
+
+  /** Plan 07e (E2/A2): undo a failed or killed merge, bounded like the merge
+   * itself. R5: `git merge --abort` only undoes an in-progress merge, so a
+   * wrapper that committed before it hung (or failed) leaves HEAD moved; the
+   * pre-merge HEAD is restored in that case, so the timed-out merge's own
+   * commit never becomes the fix round's candidate. Both git commands are
+   * bounded, and a bound reached here is recorded too. */
+  async #restoreMergeState(worktree: string, before: string | undefined, scope: string): Promise<void> {
+    const startedAt = Date.now();
+    const abort = await runCommand({
+      command: `git -C ${shellQuote(worktree)} merge --abort`,
+      cwd: worktree,
+      env: process.env,
+      deadlineMs: this.#deadlines.mergeMs,
+      termGraceMs: this.#deadlines.termGraceMs,
+      onIntent: () => undefined,
+    }).result.catch(() => undefined);
+    if (abort?.timedOut) {
+      this.#recordBound("merge", scope, this.#deadlines.mergeMs, Math.max(this.#deadlines.mergeMs, Date.now() - startedAt));
+    }
+    if (before === undefined || headOf(worktree) === before) return;
+    const resetStartedAt = Date.now();
+    const reset = await runCommand({
+      command: `git -C ${shellQuote(worktree)} reset --hard ${shellQuote(before)}`,
+      cwd: worktree,
+      env: process.env,
+      deadlineMs: this.#deadlines.mergeMs,
+      termGraceMs: this.#deadlines.termGraceMs,
+      onIntent: () => undefined,
+    }).result.catch(() => undefined);
+    this.#log.append("fix_merge_restored", { scope, before, head: headOf(worktree), resetExitCode: reset?.exitCode ?? null });
+    if (reset?.timedOut) {
+      this.#recordBound("merge", `${scope} reset --hard`, this.#deadlines.mergeMs, Math.max(this.#deadlines.mergeMs, Date.now() - resetStartedAt));
+    }
+  }
+
+
+  /** 07g1: one domain's loop. The domain gets its own worktree at B and its
+   * own fixer session; every red check, failing doneWhen or unfixed review
+   * verdict goes back to that same session. A fresh stateless domain review
+   * judges the points only after every fact is green; a domain that spends its
+   * review bound is dropped and never holds another domain. */
+  async #runFixer(task: FixTask, round: number, base: string): Promise<LaneBuild & { ok: boolean; fixes: number; domainRecords?: DomainLoopRecord[] }> {
     const worktree = this.#fixerWorktree(task.domain);
     const sessionDir = path.join(this.#paths.sessions, `fix-${round}-${task.domain}`);
-    const prompt = this.#fixerPrompt(task, round, base, allTasks);
-    const startedAt = Date.now();
     const lane = `fix-${task.domain}`;
-    return runConsolidation({
-      build: () =>
-        this.#buildConsolidationAgent({
-          round,
-          worktree,
-          base,
-          prompt,
-          sessionDir,
-          actionKind: "fixer",
-          agentIdPrefix: `fix-${round}-${task.domain}`,
-          lane,
-          logPrefix: "fixer",
-          roleWord: `fixer ${task.domain}`,
-          fixer: true,
-        }),
-      check: (sha) => this.#checkFixer(task, round, sha),
+    const startedAt = Date.now();
+    const records: DomainLoopRecord[] = [];
+    const allDisclosures: DecisionDisclosure[] = [];
+    const allAdded: string[] = [];
+    const remaining = (): number => this.#deadlines.fixerAttemptMs - (Date.now() - startedAt);
+    const buildFixer = async (fix?: { of: string; feedback: string }): Promise<LaneBuild> => {
+      const prompt = fix
+        ? this.#fixerFixPrompt(task, round, fix.of, fix.feedback, remaining())
+        : this.#fixerPrompt(task, round, base);
+      const built = await this.#buildFixerAgent({
+        round,
+        worktree,
+        base,
+        prompt,
+        sessionDir,
+        actionKind: "fixer",
+        agentIdPrefix: `fix-${round}-${task.domain}`,
+        lane,
+        logPrefix: "fixer",
+        roleWord: `fixer ${task.domain}`,
+        fixer: true,
+        ...(fix ? { fix: { of: fix.of, timeoutMs: Math.max(1, remaining()) } } : {}),
+      });
+      if (built.sha && fix && treeOf(this.#plan.repo, built.sha) === treeOf(this.#plan.repo, fix.of)) {
+        this.#log.append("fixer_fix_unchanged", { round, domain: task.domain, sha: fix.of, fixedSha: built.sha });
+        return { lane, unchanged: true, note: `its fix of ${fix.of.slice(0, 7)} changed nothing`, ...(built.disclosures ? { disclosures: built.disclosures } : {}) };
+      }
+      if (built.disclosures) allDisclosures.push(...built.disclosures);
+      if (built.added) allAdded.push(...built.added);
+      return built;
+    };
+    const host: DomainLoopHost = {
+      maxReviews: this.#state.phase.contract.domainLoopMax ?? 3,
+      // 07g1b (A2): a quality problem blocks only when it names a plan item or
+      // a design line; the plan's own item ids are what the review may cite.
+      itemIds: flatItems(this.#planItems()).map((i) => i.id),
+      // The bound is total for the round and domain: a resumed loop counts
+      // the reviews its log already recorded instead of starting again at 0.
+      startReviews: this.#domainLoopReviewsSpent(task, round),
+      // A resumed fix round continues the pass numbers its log recorded, so
+      // its stateless brief keeps every earlier pass instead of overwriting
+      // iteration 1 with a fresh one.
+      startIteration: this.#domainLoopResumeIteration(task, round),
+      build: () => buildFixer(),
+      facts: (sha, iteration) => this.#domainFacts(task, round, base, sha, iteration),
+      review: (sha, iteration, facts) => this.#runDomainReview(task, round, base, sha, iteration, facts, records),
       fix: async (sha, failure) => {
-        const remainingMs = this.#deadlines.workerAttemptMs - (Date.now() - startedAt);
-        if (remainingMs < Math.min(60_000, this.#deadlines.workerAttemptMs / 10)) {
+        const ms = remaining();
+        if (ms < Math.min(60_000, this.#deadlines.fixerAttemptMs / 10)) {
           this.#log.append("fixer_fix_skipped", { round, domain: task.domain, sha, reason: "no attempt time left" });
-          return { lane, note: "its attempt time is spent" };
+          // No fix ran: the unchanged head remains open on its domain branch,
+          // never approved for integration merely because its check is green.
+          return { lane, unchanged: true, note: "its attempt time is spent" };
         }
-        this.#log.append("fixer_fix_started", { round, domain: task.domain, sha, remainingMs });
-        const digest = this.#laneCheckFailureDigest(sha);
-        const fixPrompt = [
-          `Your fixer commit ${sha.slice(0, 7)} FAILED the fix check (${this.#state.phase.contract.fixChecks ?? "none"}), so it cannot be merged.`,
-          "",
-          "Fix exactly what fails, in this worktree (it holds your commit). Change only what your findings need; do not delete, skip or #[ignore] a test to make the check pass.",
-          `Run \`${this.#state.phase.contract.fixChecks ?? "none"}\` until it passes, then call submit_phase again with all your disclosures: in decisions every trade-off you met beyond your findings (reported, not decided), in assumptions what you assumed, and in deviations anything you changed beyond your findings.`,
-          `You have about ${Math.max(1, Math.floor(remainingMs / 60_000))} minutes left.`,
-          "",
-          `The failure: ${failure}`,
-          ...(digest ? ["", "Its output (errors first):", "```", digest, "```"] : []),
-        ].join("\n");
-        const fixed = await this.#buildConsolidationAgent({
-          round,
-          worktree,
-          base,
-          prompt: fixPrompt,
-          sessionDir,
-          actionKind: "fixer",
-          agentIdPrefix: `fix-${round}-${task.domain}`,
-          lane,
-          logPrefix: "fixer",
-          roleWord: `fixer ${task.domain}`,
-          fix: { of: sha, timeoutMs: remainingMs },
-        });
-        if (fixed.sha && treeOf(this.#plan.repo, fixed.sha) === treeOf(this.#plan.repo, sha)) {
-          this.#log.append("fixer_fix_unchanged", { round, domain: task.domain, sha, fixedSha: fixed.sha });
-          // Plan 07c (C3): the fix's own submission is kept with the note.
-          return { lane, note: `its fix of ${sha.slice(0, 7)} changed nothing`, ...(fixed.disclosures ? { disclosures: fixed.disclosures } : {}) };
-        }
-        return fixed;
+        this.#log.append("fixer_fix_started", { round, domain: task.domain, sha, remainingMs: ms });
+        const fixedBuild = await buildFixer({ of: sha, feedback: failure });
+        // 07g1b (R14): a fix that changed nothing still made its disclosures;
+        // an approved domain keeps them like any other fix.
+        if (fixedBuild.unchanged && fixedBuild.disclosures) allDisclosures.push(...fixedBuild.disclosures);
+        return fixedBuild;
       },
       stopRequested: () => this.#stopRequested || this.#recheckCancelledLaneRound,
+      record: (r) => {
+        records.push(r);
+        this.#log.append("domain_loop_pass", { round, domain: task.domain, ...r });
+      },
+    };
+    const outcome = await runDomainLoop(task, host);
+    const outcomeSha = outcome.sha;
+    // Only an approved domain may merge (§5). An unchanged fixer with a red
+    // point remains open on its domain branch; it is not an integration vote.
+    const approved = outcome.status === "approved";
+    // 07g1 (A2): a quality problem already sent the work back to the same
+    // fixer, so an approved domain's review is quality-ok. Keep its notes for
+    // the next fixer on DOMAIN_APPROVED so the record still carries them.
+    const lastReview = approved ? [...outcome.records].reverse().find((r) => r.review)?.review : undefined;
+    const approvalNotes = lastReview?.notes ?? [];
+    this.#applyEvent({
+      type: approved ? "DOMAIN_APPROVED" : "DOMAIN_DROPPED",
+      round,
+      domain: task.domain,
+      ...(approved ? { sha: outcomeSha!, ...(approvalNotes.length > 0 ? { notes: approvalNotes } : {}) } : { reason: outcome.reason ?? "the domain loop ended" }),
+      reviews: outcome.reviews,
+    } as Event);
+    this.#log.append("domain_loop_finished", {
+      round,
+      domain: task.domain,
+      status: outcome.status,
+      ...(outcomeSha ? { sha: outcomeSha } : {}),
+      ...(outcome.reason ? { reason: outcome.reason } : {}),
+      reviews: outcome.reviews,
+      fixes: outcome.fixes,
     });
+    if (approved && outcomeSha) return { lane, ok: true, sha: outcomeSha, fixes: outcome.fixes, status: outcome.status, domainRecords: outcome.records, ...(allDisclosures.length > 0 ? { disclosures: allDisclosures } : {}), ...(allAdded.length > 0 ? { added: allAdded } : {}) };
+    return {
+      lane,
+      ok: false,
+      fixes: outcome.fixes,
+      status: outcome.status,
+      reason: outcome.reason,
+      note: outcome.status === "stopped" ? "the run was stopped" : (outcome.reason ?? "the domain was dropped"),
+      ...(outcomeSha ? { sha: outcomeSha } : {}),
+      domainRecords: outcome.records,
+      ...(allDisclosures.length > 0 ? { disclosures: allDisclosures } : {}),
+      ...(allAdded.length > 0 ? { added: allAdded } : {}),
+    };
+  }
+
+  /** 07g1: the failure text sent to the SAME fixer session after a red fact
+   * or a review that did not fix every point or reported a quality problem. */
+  #fixerFixPrompt(task: FixTask, round: number, sha: string, failure: string, remainingMs: number): string {
+    return [
+      `Your fixer commit ${sha.slice(0, 7)} is not accepted in domain ${task.domain}, so it cannot be merged yet.`,
+      "",
+      "Fix exactly what fails, in this worktree (it holds your commit). Change only what your points need; do not delete, skip or #[ignore] a test to make a check pass.",
+      "Run every failing command until it passes, then call submit_phase again with all your disclosures: in decisions every trade-off you met beyond your findings (reported, not decided), in assumptions what you assumed, and in deviations anything you changed beyond your findings.",
+      `You have about ${Math.max(1, Math.floor(remainingMs / 60_000))} minutes left.`,
+      "",
+      "The failure:",
+      failure,
+      "",
+      `Points of domain ${task.domain}: ${task.findingIds.join(", ")}.`,
+      `Round ${round}; fix check: ${this.#state.phase.contract.fixChecks ?? "(none)"}.`,
+    ].join("\n");
+  }
+
+  /** 07g1: establish every fact a domain review needs before it may start:
+   * the fast fix check, each point's doneWhen on the head (and on B, so a
+   * command that already passed before the fix proves nothing), and the test
+   * removal rule. Emits DOMAIN_CHECKED for the pass. */
+  async #domainFacts(task: FixTask, round: number, base: string, sha: string, iteration: number): Promise<DomainFacts> {
+    let testRemovals: string[] = [];
+    try {
+      testRemovals = testRemovalViolationsBetween(this.#plan.repo, base, sha, this.#state.phase.contract.testRemovals ?? []);
+    } catch (err) {
+      testRemovals = [`the test removal check could not run: ${String((err as Error)?.message ?? err)}`];
+    }
+    const check = await this.#checkFixer(task, round, sha);
+    let facts: FindingFact[] = [];
+    let checkout: DisposableCheckout | undefined;
+    try {
+      checkout = disposableCheckout(this.#plan.repo, sha);
+      facts = task.findings.some((f) => typeof f.doneWhen === "string" && f.doneWhen.trim().length > 0)
+        ? await this.#runDoneWhenFacts(`fix-${task.domain}`, sha, checkout.dir, base)
+        : [];
+    } catch (err) {
+      this.#log.append("domain_fact_failed", { round, domain: task.domain, sha, error: String((err as Error)?.message ?? err) });
+    } finally {
+      checkout?.dispose();
+    }
+    const points = task.findingIds.map((id) => {
+      const f = task.findings.find((x) => x.id === id);
+      const fact = facts.find((x) => x.findingId === id);
+      const hasDoneWhen = typeof f?.doneWhen === "string" && f.doneWhen.trim().length > 0;
+      return {
+        id,
+        onBase: fact?.passesOnBase === true,
+        // R1: a point with a doneWhen whose fact is missing did not pass. An
+        // absent fact must never be read as green.
+        onHead: hasDoneWhen ? fact !== undefined && !fact.timedOut && fact.exitCode === 0 : true,
+        ...(f?.doneWhen ? { doneWhen: f.doneWhen } : {}),
+        ...(fact?.outputTail ? { outputTail: fact.outputTail } : {}),
+      };
+    });
+    const domainFacts: DomainFacts = {
+      checkPassed: check.ok,
+      ...(check.note ? { checkNote: check.note } : {}),
+      points,
+      ...(testRemovals.length > 0 ? { testRemovals } : {}),
+    };
+    this.#applyEvent({ type: "DOMAIN_CHECKED", round, domain: task.domain, iteration, sha, base, facts: domainFacts });
+    return domainFacts;
+  }
+
+  /** 07g1: one fresh, stateless domain review. Its brief is built from the
+   * recorded loop history (never live memory), its tools are read-only, and
+   * it never commits. */
+  async #runDomainReview(task: FixTask, round: number, base: string, sha: string, iteration: number, facts: DomainFacts, records: readonly DomainLoopRecord[]): Promise<DomainReview | undefined> {
+    if (this.#stopRequested) return undefined;
+    const candidateDir = path.join(this.#paths.candidates, sha);
+    if (!fs.existsSync(candidateDir)) {
+      try {
+        materializeCandidate(this.#plan.repo, sha, candidateDir);
+      } catch (err) {
+        this.#log.append("domain_review_checkout_failed", { round, domain: task.domain, sha, error: String((err as Error)?.message ?? err) });
+        return undefined;
+      }
+    }
+    const brief = domainReviewBrief(task, this.#domainLoopHistory(task, round, records));
+    let change = "";
+    try {
+      change = execFileSync("git", ["-C", this.#plan.repo, "diff", `${base}..${sha}`], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 }).trim();
+    } catch {
+      // A diff that cannot be produced is not a fact; the reviewer still sees
+      // the recorded loop history and the facts below.
+    }
+    const actionId = this.#log.actionId(`domain_review_${round}_${task.domain}_${iteration}`);
+    this.#log.intent(actionId, { round, domain: task.domain, candidateSha: sha, iteration });
+    const agentId = `domain-review-${round}-${task.domain}-${iteration}-${actionId}`;
+    const handle = this.#spawnLaneAgent({
+      role: "domain-review",
+      agentId,
+      cwd: candidateDir,
+      sessionDir: path.join(this.#paths.sessions, `domain-review-${round}-${task.domain}-${iteration}-${sha.slice(0, 12)}`),
+      env: this.#laneEnv(candidateDir, { ...(this.#piEnvFor?.("domain-review", agentId) ?? {}), TT_CANDIDATE_SHA: sha }),
+      domainReview: { round, domain: task.domain, sha, iteration, pointIds: [...task.findingIds] },
+    });
+    try {
+      const hello = await raceTimeout(handle.helloPromise, this.#deadlines.helloTimeoutMs, "hello");
+      if (hello === "timeout" || !hello.ok) {
+        await handle.agent.terminate();
+        this.#log.completion(actionId, { round, domain: task.domain, ok: false, reason: "the domain reviewer did not start" });
+        return undefined;
+      }
+      await handle.agent.prompt(this.#agentPrompt(`${brief}\n\nThe commit under review is ${sha}, on base ${base}. Its change from that base:\n${change || "(no diff could be produced)"}\n\nFacts recorded for this pass:\n${JSON.stringify(facts, null, 2)}`));
+      const timeout = cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const);
+      const raced = await Promise.race([
+        handle.domainReviewPromise!.then((r) => ({ kind: "reviewed" as const, review: r })),
+        handle.agent.waitSettled().then(() => ({ kind: "settled" as const })),
+        handle.agent.waitExit().then(() => ({ kind: "exited" as const })),
+        handle.agent.waitModelFailed().then(() => ({ kind: "failed" as const })),
+        timeout.promise.then(() => ({ kind: "timeout" as const })),
+      ]);
+      timeout.cancel();
+      await handle.agent.terminate();
+      if (raced.kind === "reviewed") {
+        this.#applyEvent({ type: "DOMAIN_REVIEWED", round, domain: task.domain, iteration, sha, brief, review: raced.review });
+        this.#log.completion(actionId, { round, domain: task.domain, ok: true, sha });
+        return raced.review;
+      }
+      if (raced.kind === "timeout") this.#recordBound("review", `${round}:${task.domain}`, this.#deadlines.reviewMs, this.#deadlines.reviewMs);
+      this.#log.completion(actionId, { round, domain: task.domain, ok: false, reason: `the domain review ended without submit_domain_review (${raced.kind})` });
+      return undefined;
+    } finally {
+      this.#agents.delete(agentId);
+    }
+  }
+
+  /** 07g1: the pass number a resumed domain loop continues at: one after the
+   * last pass the event log recorded for this round and domain. A first run
+   * (nothing logged) starts at 1. */
+  #domainLoopResumeIteration(task: FixTask, round: number): number {
+    let last = 0;
+    try {
+      for (const rec of readLog(this.#paths.events).records) {
+        if (rec.kind !== "domain_loop_pass") continue;
+        const e = rec.event as { round?: unknown; domain?: unknown; iteration?: unknown };
+        if (e.round !== round || e.domain !== task.domain) continue;
+        if (typeof e.iteration === "number" && e.iteration > last) last = e.iteration;
+      }
+    } catch {
+      // an unreadable log: this loop starts at pass 1
+    }
+    return last + 1;
+  }
+
+  /** 07g1: the domain reviews a resumed loop already spent, read from the
+   * event log. `TT_DOMAIN_LOOP_MAX` bounds the round's whole domain loop, so
+   * a restart must not hand the domain a fresh review budget. A review is
+   * counted from its recorded pass or its `DOMAIN_REVIEWED` event, whichever
+   * landed before the stop. */
+  #domainLoopReviewsSpent(task: FixTask, round: number): number {
+    const reviewed = new Set<number>();
+    try {
+      for (const rec of readLog(this.#paths.events).records) {
+        const e = rec.event as { type?: unknown; round?: unknown; domain?: unknown; iteration?: unknown; review?: unknown };
+        const scoped = e.round === round && e.domain === task.domain && typeof e.iteration === "number";
+        if (!scoped) continue;
+        if (rec.kind === "domain_loop_pass") {
+          if (e.review !== undefined) reviewed.add(e.iteration as number);
+        } else if (rec.kind === "event" && e.type === "DOMAIN_REVIEWED") {
+          reviewed.add(e.iteration as number);
+        }
+      }
+    } catch {
+      // an unreadable log: this loop starts with no spent reviews
+    }
+    return reviewed.size;
+  }
+
+  /** 07g1: the recorded in-memory loop history, reconciled with the event
+   * log so a restarted conductor gives the stateless reviewer the same
+   * history. A live record for an iteration wins over the logged one. */
+  #domainLoopHistory(task: FixTask, round: number, records: readonly DomainLoopRecord[]): DomainLoopRecord[] {
+    const byIteration = new Map();
+    try {
+      for (const rec of readLog(this.#paths.events).records) {
+        if (rec.kind !== "domain_loop_pass") continue;
+        const e = rec.event as { round?: unknown; domain?: unknown; iteration?: unknown };
+        if (e.round !== round || e.domain !== task.domain || typeof e.iteration !== "number") continue;
+        byIteration.set(e.iteration, rec.event as DomainLoopRecord);
+      }
+    } catch {
+      // an unreadable log: the live records below are still the best history
+    }
+    for (const r of records) byIteration.set(r.iteration, r);
+    return [...byIteration.values()].sort((a, b) => a.iteration - b.iteration);
   }
 
   /** Plan 07c (D4.3): run one fixer's own `#+TT_FIX_CHECKS` command in a
@@ -9500,7 +10588,7 @@ export class Conductor {
    * command means nothing to gate on, so the fixer is green. */
   async #checkFixer(task: FixTask, round: number, sha: string): Promise<LaneCheck> {
     const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
-    const window = openCheckWindow(this.#checkLockPath, this.#state.phase.runId);
+    const window = this.#openCheckWindow();
     try {
       const command = this.#state.phase.contract.fixChecks;
       this.#log.append("fixer_check_started", { round, domain: task.domain, sha });
@@ -9516,6 +10604,8 @@ export class Conductor {
           env: this.#checkEnv(),
           deadlineMs: this.#deadlines.checkMs,
           termGraceMs: this.#deadlines.termGraceMs,
+          // 07g2 (A4/R9): a red fix check names its failing step.
+          traceSteps: true,
           onIntent: ({ pgid }) => {
             this.#onStageShIntent(pgid);
             this.#log.intent(`fixer-check-sh-${task.domain}-${pgid}`, { pgid, domain: task.domain, candidateSha: sha });
@@ -9524,10 +10614,18 @@ export class Conductor {
         // Packet X: the fixer check's output is kept under checks/<sha>/, as a
         // lane check's is, so a red fixer's fix prompt carries the failure
         // (`#laneCheckFailureDigest`).
+        if (result.timedOut) this.#recordBound("check", `fixer:${sha}`, this.#deadlines.checkMs, this.#deadlines.checkMs);
         this.#recordCheck(path.join(this.#paths.checks, sha), this.#withValues(command), result);
         const ok = result.exitCode === 0 && !result.timedOut;
         this.#log.append("fixer_check_finished", { round, domain: task.domain, sha, passed: ok, exitCode: result.exitCode, timedOut: result.timedOut });
-        return ok ? { ok: true } : { ok: false, note: `the fixer check \`${command}\` ${result.timedOut ? "timed out" : `exited ${result.exitCode}`}` };
+        if (ok) return { ok: true };
+        // R1: the failure goes back to the same fixer with the check's own
+        // output, exactly as a lane's red check does.
+        const output = this.#laneCheckFailureDigest(sha);
+        return {
+          ok: false,
+          note: `the fixer check \`${command}\` ${result.timedOut ? "timed out" : `exited ${result.exitCode}`}${output ? `:\n${output}` : ""}`,
+        };
       } finally {
         checkout.dispose();
       }
@@ -9540,7 +10638,7 @@ export class Conductor {
   /** Plan 07c (D4.4): the fixer's brief, in the fixed order: the duty
    * paragraph, the phase goal, `TT_REFS`, its own findings with every field
    * (and each `from`'s `git show`), and a one-line index of the other tasks. */
-  #fixerPrompt(task: FixTask, round: number, base: string, allTasks: readonly FixTask[]): string {
+  #fixerPrompt(task: FixTask, round: number, base: string): string {
     const lines: string[] = [
       FIXER_DUTY,
       "",
@@ -9565,26 +10663,6 @@ export class Conductor {
         if (show) lines.push("  ```", ...show.split("\n").map((l) => `  ${l}`), "  ```");
       }
     }
-    // Fix packet Z: the decisions the seats voted down or vetoed. The seats
-    // decided; the fixer applies their alternative or removes the change.
-    if (task.decisions.length > 0) {
-      lines.push(
-        "",
-        `Your decision points (domain ${task.domain}) — the seats did not approve these choices; apply the alternative they recommend, or remove the vetoed change:`,
-      );
-      for (const point of task.decisions) {
-        lines.push(
-          `- ${point.id} [decision/${point.outcome}] item ${point.item ?? "?"} where ${point.where ?? "?"}`,
-          `  choice: ${point.choice}`,
-          `  expected: ${point.expected}`,
-          "  doneWhen: (none — the seats re-vote on the next candidate)",
-        );
-      }
-    }
-    const others = otherTaskIndexLines(allTasks, task);
-    if (others.length > 0) {
-      lines.push("", "The other fixers' tasks (their findings are not yours; do not fix them):", ...others);
-    }
     lines.push(
       "",
       "How:",
@@ -9592,7 +10670,7 @@ export class Conductor {
       "- Run each finding's doneWhen command yourself until it passes.",
       "- Do not commit; tt commits your worktree when you submit. tt runs the fix check on your commit and sends a failure back to you.",
       "- Call submit_phase when done, reporting anything beyond these findings as a disclosure: in decisions every trade-off you met (reported, not decided), in assumptions what you assumed, and in deviations anything you changed beyond these findings.",
-      `- You have about ${Math.max(1, Math.floor(this.#deadlines.workerAttemptMs / 60_000))} minutes.`,
+      `- You have about ${Math.max(1, Math.floor(this.#deadlines.fixerAttemptMs / 60_000))} minutes.`,
     );
     return lines.join("\n");
   }
@@ -9614,6 +10692,38 @@ export class Conductor {
    * check record on disk when it was checked before the stop. The resumed
    * round's checks, reviews and hand-off then see what the live build would
    * have given them. */
+  /** The check record of one candidate, read from disk: the parsed record and
+   * the combined per-command logs. Undefined when the candidate was never
+   * checked (or its record is unreadable). */
+  #readCheckRecord(sha: string): { record: CheckRecord; output: string } | undefined {
+    const outDir = path.join(this.#paths.checks, sha);
+    try {
+      const record = parseCheckRecord(JSON.parse(fs.readFileSync(path.join(outDir, "record.json"), "utf8")));
+      if (!record) return undefined;
+      const output = record.commands
+        .map((c) => {
+          try {
+            return fs.readFileSync(path.join(outDir, c.log ?? this.#checkLogName(c.command)), "utf8");
+          } catch {
+            return "";
+          }
+        })
+        .join("\n");
+      return { record, output };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The check output of one candidate: the live map first (the common case),
+   * the recorded check second (an earlier round's candidate, or one checked by
+   * the process that stopped). Empty string when it was never checked. */
+  #checkOutputFor(sha: string): string {
+    const live = this.#laneCheckOutputs.get(sha);
+    if (live !== undefined) return live;
+    return this.#readCheckRecord(sha)?.output ?? "";
+  }
+
   #resumedLaneBuild(round: number, lane: string, sha: string): LaneBuild {
     const key = `${round}-${lane}`;
     const live = this.#laneBuilds.get(key);
@@ -9630,47 +10740,16 @@ export class Conductor {
       build = { ...(done.build ?? {}), lane, sha, ...(done.tainted !== undefined ? { tainted: done.tainted } : {}) };
       break;
     }
-    // Plan 07c (D4.7): a resumed fix round's synthetic lane has no worker
-    // completion to restore from, so its check base, start time and
-    // disclosures come from the previous round's recorded ROUND_FIXED, exactly
-    // as the fresh path sets them. The base is B even for a lane-fix commit of
-    // the merged candidate (whose own intent names the round base C), so a
-    // resumed check never diffs against the wrong base (or misses the final
-    // tier a wide path selects).
-    const fix = lane === "a" ? fixRoundCandidate(this.#state.phase.rounds, round) : undefined;
-    const fixRecord = fix ? (this.#state.phase.rounds ?? []).find((r) => r.fixed?.candidate === fix.candidate)?.fixed : undefined;
-    if (fix && fixRecord) {
-      this.#laneCheckBases.set(key, fix.base);
-      if (!this.#laneStartedAt.has(key)) this.#laneStartedAt.set(key, Date.now());
-      if (build.disclosures === undefined && fixRecord.disclosures) build = { ...build, disclosures: fixRecord.disclosures };
-      if (build.added === undefined && fixRecord.added) build = { ...build, added: fixRecord.added };
-    }
     this.#laneBuilds.set(key, build);
     // A candidate checked before the stop: its output (for the hand-off's
     // test-verify resolution) is the check's own per-command logs.
-    if (!this.#laneCheckOutputs.has(sha)) {
-      const outDir = path.join(this.#paths.checks, sha);
-      try {
-        const record = parseCheckRecord(JSON.parse(fs.readFileSync(path.join(outDir, "record.json"), "utf8")));
-        if (record) {
-          const output = record.commands
-            .map((c) => {
-              try {
-                return fs.readFileSync(path.join(outDir, c.log ?? this.#checkLogName(c.command)), "utf8");
-              } catch {
-                return "";
-              }
-            })
-            .join("\n");
-          this.#laneCheckOutputs.set(sha, output);
-          if (this.#itemsEnforced()) this.#laneCheckResolutions.set(sha, this.#resolveVerifies(output));
-          // Plan 07b (D3): the doneWhen facts the pre-stop check ran are read
-          // back, so the resumed hand-off records them without running again.
-          if (record.facts) this.#laneFacts.set(sha, record.facts.map((f) => ({ ...f, candidateSha: sha })));
-        }
-      } catch {
-        // Not checked before the stop: the resumed round checks it now.
-      }
+    const recorded = this.#readCheckRecord(sha);
+    if (recorded !== undefined) {
+      this.#laneCheckOutputs.set(sha, recorded.output);
+      if (this.#itemsEnforced()) this.#laneCheckResolutions.set(sha, this.#resolveVerifies(recorded.output));
+      // Plan 07b (D3): the doneWhen facts the pre-stop check ran are read
+      // back, so the resumed hand-off records them without running again.
+      if (recorded.record.facts) this.#laneFacts.set(sha, recorded.record.facts.map((f) => ({ ...f, candidateSha: sha })));
     }
     this.#log.append("lane_build_resumed", { round, lane, candidateSha: sha, payload: build.disclosures !== undefined });
     return build;
@@ -9681,7 +10760,7 @@ export class Conductor {
     const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
     // Plan 06k1 (A4): the check holds the host-wide window for its duration,
     // so every other run's workers are paused while it runs.
-    const window = openCheckWindow(this.#checkLockPath, this.#state.phase.runId);
+    const window = this.#openCheckWindow();
     try {
       const laneBase = this.#laneCheckBases.get(`${round}-${lane}`);
       this.#log.append("lane_check_started", { round, lane, candidateSha: sha, ...(laneBase ? { base: laneBase } : {}) });
@@ -9702,7 +10781,6 @@ export class Conductor {
   async #runLaneChecks(lane: string, candidateSha: string, laneBase?: string): Promise<LaneCheck> {
     const checkoutDir = disposableCheckout(this.#plan.repo, candidateSha);
     const outDir = path.join(this.#paths.checks, candidateSha);
-    fs.mkdirSync(outDir, { recursive: true });
     // Plan 06n (A5): a candidate whose diff against its lane's start touches a
     // wide path runs the final checks in this round; one that touches none
     // runs the round checks, exactly as before.
@@ -9726,6 +10804,17 @@ export class Conductor {
     let combinedOutput = "";
     let firstFailure: string | undefined;
     try {
+      // Plan 07e (A4/E4): creating the check directory is part of the check, so
+      // a full disk here is `disk full`, never an uncaught ENOSPC.
+      try {
+        fs.mkdirSync(outDir, { recursive: true });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === "ENOSPC") {
+          this.#noteDiskFull(err, "check directory");
+          return { ok: false, note: "disk full" };
+        }
+        throw err;
+      }
       if (!verifyIntegrity(this.#plan.repo, checkoutDir.dir, candidateSha)) {
         passed = false;
         firstFailure = "the checkout no longer matches the candidate commit";
@@ -9734,31 +10823,38 @@ export class Conductor {
         if (!passed) break;
         const command = this.#withValues(rawCommand);
         const startedAt = Date.now();
+        // Plan 07e (E1): a final-tier command uses the final-check bound; a
+        // round-tier command keeps today's check bound.
+        const checkLimitMs = tier === "final" ? this.#deadlines.finalCheckMs : this.#deadlines.checkMs;
         // Plan 06l (A4): a re-run alone must finish inside this same
         // per-command deadline.
-        const deadlineAt = startedAt + this.#deadlines.checkMs;
+        const deadlineAt = startedAt + checkLimitMs;
         const result = await runCommand({
           command,
           cwd: checkoutDir.dir,
           env: this.#checkEnv(),
-          deadlineMs: this.#deadlines.checkMs,
+          deadlineMs: checkLimitMs,
           termGraceMs: this.#deadlines.termGraceMs,
+          // 07g2 (A4/R9): the chain runs in one shell; its trace names the
+          // failing step and that step's own output.
+          traceSteps: true,
           onIntent: ({ pgid }) => {
             this.#onStageShIntent(pgid);
             this.#log.intent(`lane-check-sh-${lane}-${pgid}`, { pgid });
           },
         }).result;
         combinedOutput += `${result.output}\n`;
-        this.#recordCheck(outDir, command, result);
-        recordCommands.push({
-          command,
-          exitCode: result.exitCode,
-          signal: result.signal,
-          timedOut: result.timedOut,
-          durationMs: Date.now() - startedAt,
-          passed: result.exitCode === 0 && !result.timedOut,
-          log: this.#checkLogName(command),
-        });
+        // Plan 07e (E2): every timed-out check names its bound.
+        if (result.timedOut) this.#recordBound(tier === "final" ? "final-check" : "check", `${lane}:${candidateSha}`, checkLimitMs, Date.now() - startedAt);
+        const recordFailure = this.#recordCheck(outDir, command, result);
+        recordCommands.push(this.#checkRecordCommand(command, result, startedAt, recordFailure));
+        // Plan 07e (A4/E4): a check whose own log the disk refused fails with
+        // `disk full`, never as a pass.
+        if (recordFailure === "disk-full") {
+          passed = false;
+          firstFailure = "disk full";
+          break;
+        }
         if (!verifyIntegrity(this.#plan.repo, checkoutDir.dir, candidateSha)) {
           passed = false;
           firstFailure = "the checkout no longer matches the candidate commit";
@@ -9826,23 +10922,22 @@ export class Conductor {
         if (!firstFailure) firstFailure = `the check \`${command}\` ${result.timedOut ? "timed out" : `exited ${result.exitCode}`}`;
         passed = false;
       }
-      // Plan 07b (D3): after a candidate's checks pass, run each open
-      // domain-mode finding's doneWhen in THIS checkout with the check
-      // environment, one at a time, bounded by the reproduction deadline. The
+      // Every open point gets its own fact, even when another file's round
+      // check is red. That failure goes only to its owning domain; it must
+      // not erase the proving facts of unrelated approved domains. The
       // results stay with the candidate (persisted in its record) so a resumed
       // round reads them; only the picked candidate's become events.
       // Packet X: each doneWhen that passes here also runs on the round's base
       // (the lane's start), so a command that passes there too repairs
-      // nothing. The consolidator's commit gets no facts: its facts are never
-      // used (the next round's candidates are checked on their own).
+      // nothing.
       const facts =
-        passed && lane !== "consolidator" && (this.#state.phase.contract.domains?.length ?? 0) > 0
+        (this.#state.phase.contract.domains?.length ?? 0) > 0 && !this.#stopRequested
           ? await this.#runDoneWhenFacts(lane, candidateSha, checkoutDir.dir, laneBase ?? this.#baselineBaseSha())
           : [];
       this.#laneFacts.set(candidateSha, facts);
-      this.#writeCheckRecord(outDir, {
+      const recordWritten = this.#writeCheckRecord(outDir, {
         candidateSha,
-        ...(this.#baselineBaseSha() ? { baseSha: this.#baselineBaseSha() } : {}),
+        ...((laneBase ?? this.#baselineBaseSha()) ? { baseSha: laneBase ?? this.#baselineBaseSha() } : {}),
         tier,
         passed,
         commands: recordCommands,
@@ -9862,6 +10957,8 @@ export class Conductor {
         freeMemMB: recordFreeMemMB,
         at: new Date().toISOString(),
       });
+      // Plan 07e (A4/E4): a record the disk refused fails the lane's check.
+      if (!recordWritten) return { ok: false, note: "disk full" };
       // The item test-verifies are resolved for the winner only (the hand-off
       // applies them); a loser's output must not touch the phase's item state.
       this.#laneCheckOutputs.set(candidateSha, combinedOutput);
@@ -9917,6 +11014,9 @@ export class Conductor {
             this.#log.intent(`done-when-${lane}-${finding.id}-${pgid}`, { pgid, findingId: finding.id, candidateSha });
           },
         }).result;
+        // Plan 07e (E2): a doneWhen fact's own bound. It is recorded and the
+        // fact keeps `timedOut: true`; it is never retried.
+        if (result.timedOut) this.#recordBound("fact", `lane ${lane} finding ${finding.id}`, this.#deadlines.reproductionMs, Date.now() - startedAt);
         let passesOnBase: boolean | undefined;
         if (result.exitCode === 0 && !result.timedOut) {
           const key = `${baseSha}\0${finding.id}`;
@@ -9941,6 +11041,7 @@ export class Conductor {
                   this.#log.intent(`done-when-base-${lane}-${finding.id}-${pgid}`, { pgid, findingId: finding.id, baseSha });
                 },
               }).result;
+              if (run.timedOut) this.#recordBound("fact", `${lane}:${finding.id}:base`, this.#deadlines.reproductionMs, this.#deadlines.reproductionMs);
               onBase = { exitCode: run.exitCode, timedOut: run.timedOut };
               this.#doneWhenBaseRuns.set(key, onBase);
               this.#log.append("done_when_base", { lane, findingId: finding.id, baseSha, command, exitCode: run.exitCode, timedOut: run.timedOut });
@@ -10297,6 +11398,9 @@ export class Conductor {
       if (turn1 !== "discovered") {
         timeout.cancel();
         await handle.agent.terminate();
+        if (turn1 === "timeout") {
+          this.#recordBound("review", `${round}:${lane}:${seat}`, this.#discoveryDeadlineMs(), this.#discoveryDeadlineMs());
+        }
         const why =
           turn1 === "settled"
             ? "settled without submit_discovery (turn 1)"
@@ -10316,6 +11420,7 @@ export class Conductor {
       if (turn1Settled === "timeout") {
         timeout.cancel();
         await handle.agent.terminate();
+        this.#recordBound("review", `${round}:${lane}:${seat}`, this.#discoveryDeadlineMs(), this.#discoveryDeadlineMs());
         this.#log.completion(actionId, { round, lane, seat, ok: false, reason: "timeout (turn 1 did not settle)" });
         throw new Error("timeout (turn 1 did not settle)");
       }
@@ -10337,6 +11442,7 @@ export class Conductor {
       if (barrier === "timeout") {
         timeout.cancel();
         await handle.agent.terminate();
+        this.#recordBound("review", `${round}:${lane}:${seat}`, this.#deadlines.reviewMs, this.#deadlines.reviewMs);
         this.#log.completion(actionId, { round, lane, seat, ok: false, reason: "timeout (waiting for the other seats' discovery)" });
         throw new Error("timeout (waiting for the other seats' discovery)");
       }
@@ -10404,6 +11510,7 @@ export class Conductor {
       const ok = turn2 === "submitted";
       this.#log.completion(actionId, { round, lane, seat, ok, ...(ok ? {} : { reason: turn2 }) });
       if (!ok) {
+        if (turn2 === "timeout") this.#recordBound("review", `${round}:${lane}:${seat}`, this.#deadlines.reviewMs, this.#deadlines.reviewMs);
         throw new Error(
           turn2 === "settled"
             ? "settled without submit_review (turn 2, after one re-prompt)"
@@ -10630,7 +11737,10 @@ export class Conductor {
       this.#log.completion(actionId, { round, seat, ok, ...(ok ? {} : { reason: outcome }) });
       // Plan 06g2: a missing vote fails the round (it repeats); the pick is
       // never taken with fewer than all seats' votes.
-      if (!ok) throw new Error(`the pick turn ${outcome} without a vote`);
+      if (!ok) {
+        if (outcome === "timeout") this.#recordBound("review", `${round}:pick:${seat}`, this.#deadlines.reviewMs, this.#deadlines.reviewMs);
+        throw new Error(`the pick turn ${outcome} without a vote`);
+      }
     } finally {
       this.#agents.delete(agentId);
     }
@@ -10673,18 +11783,187 @@ export class Conductor {
       .map((r) => {
         const votes = r.votes.map((v) => `${v.seat}→${v.lane}`).join(" ");
         const picked = r.picked ? `${candidateLabel(r.round, r.picked.lane)} won (${r.picked.votes} vote(s))` : "no winner";
-        // tt 09 (change 3): the round's combine step, when it ran.
-        const consolidated = consolidationLine(r);
-        return `round ${r.round} from ${r.base.slice(0, 7)}: ${r.lanes.map((l) => candidateLabel(r.round, l)).join(", ")}${votes ? ` — votes ${votes}` : ""} — ${picked}${consolidated ? ` — ${consolidated}` : ""}`;
+        return `round ${r.round} from ${r.base.slice(0, 7)}: ${r.lanes.map((l) => candidateLabel(r.round, l)).join(", ")}${votes ? ` — votes ${votes}` : ""} — ${picked}`;
       });
   }
 
-  /** The round's own orchestration: `runRound` (core/lanes.ts) is the only
-   * module that decides the sequence; this implements its host callbacks. */
+  /** After the pick there are no lanes: domain MAP, git/facts REDUCE, then
+   * ordinary candidate seats only when every point is closed. Empty-lane
+   * RoundRecords are durable loop checkpoints, never candidates to pick. */
+  async #runDomainRounds(actionId: string): Promise<void> {
+    this.#resumeStoppedRound = false;
+    let last = this.#state.phase.rounds?.at(-1);
+    if (!last) return;
+    if (last.lanes.length > 0) this.#recordRegression(last);
+    const limit = this.#state.phase.contract.roundsAllowed ?? this.#plan.rounds ?? boundDefinition("rounds").defaultValue;
+    // A completed acceptance hand-off that was rejected starts another loop.
+    // A stopped REDUCE reuses the existing fixed checkpoint and its base.
+    let resume = last.lanes.length === 0 &&
+      !(last.fixed?.candidate && last.fixed.candidate === this.#state.phase.candidate?.sha);
+    let base = last.picked?.sha ?? last.fixed?.candidate ?? last.base;
+    for (;;) {
+      const round = resume ? last.round : last.round + 1;
+      if (round > limit) {
+        this.#parkOpenPoints(last.round, "the fix loop's round bound was reached", this.#openPointsOn(base));
+        return;
+      }
+      if (!resume) this.#applyEvent({ type: "ROUND_STARTED", round, base, lanes: [] });
+      this.#log.intent(actionId, { round, base, domains: true });
+      const status = await this.#fixRound(round);
+      if (status === "stopped" || this.#stopRequested || this.#recheckCancelledLaneRound) return;
+      if (status === "parked") return;
+      const record = this.#state.phase.rounds!.find((r) => r.round === round)!;
+      const candidate = record.fixed?.candidate ?? record.base;
+      const kept = resume ? this.#readCheckRecord(candidate)?.record : undefined;
+      const expected = kept ? checkCommands(this.#plan.checks, this.#state.phase.contract.checks, this.#state.phase.contract.finalChecks, kept.tier).map((c) => this.#withValues(c)) : [];
+      const factIds = new Set(kept?.facts?.map((f) => f.findingId));
+      const coversPoints = this.#state.phase.findings.filter((f) => f.status === "open" && f.domain && f.doneWhen).every((f) => factIds.has(f.id));
+      let check: LaneCheck;
+      if (kept?.passed && kept.baseSha === record.base && coversPoints && expected.length === kept.commands.length && expected.every((c, i) => c === kept.commands[i].command)) {
+        check = { ok: true };
+        this.#log.append("integrated_check_reused", { round, candidateSha: candidate, base: record.base });
+      } else {
+        const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
+        const window = this.#openCheckWindow();
+        try {
+          this.#log.append("integrated_check_started", { round, candidateSha: candidate, base: record.base });
+          check = await this.#runLaneChecks("integrated", candidate, record.base);
+          this.#log.append("integrated_check_finished", { round, candidateSha: candidate, passed: check.ok });
+        } finally {
+          window.release();
+          await lock.release();
+        }
+      }
+      if (this.#stopRequested || this.#recheckCancelledLaneRound) return;
+      if (!check.ok) {
+        const result = this.#readCheckRecord(candidate);
+        const output = result?.output ?? check.note ?? "";
+        const owner = failingDomainOf(output, this.#state.phase.contract.domains ?? []);
+        if (!owner) {
+          const reason = `the merged candidate ${candidate.slice(0, 7)} is red and its check output names no file of a declared domain`;
+          this.#log.append("merged_check_no_loop", { round, sha: candidate, reason });
+          this.#parkMergedCheck(round, reason);
+          return;
+        }
+        const command = result?.record.commands.find((c) => !c.passed)?.command;
+        if (!command) {
+          this.#parkMergedCheck(round, "the merged check has no reproducible command for its owning domain");
+          return;
+        }
+        // Even a domain with no existing task gets the failing fact as a
+        // point. The next MAP uses precisely that domain, never a lane repair.
+        const existing = this.#state.phase.findings.find((f) => f.status === "open" && f.domain === owner.domain && f.doneWhen === command);
+        if (!existing) this.#applyEvent({
+          type: "FINDING_RAISED",
+          finding: {
+            id: `F-${this.#state.phase.phaseId}-round-check-${round}`,
+            version: 1, phaseId: this.#state.phase.phaseId, kind: "defect", severity: "blocking",
+            raisedBy: "conductor", status: "open", boundCandidateSha: candidate,
+            domain: owner.domain, where: `${owner.path}:1`, doneWhen: command,
+            expected: "the round check passes (conceptual integrity §5)", evidence: output,
+          },
+        });
+        this.#log.append("merged_check_reentered", { round, sha: candidate, domain: owner.domain, path: owner.path });
+      }
+      this.#recordIntegratedRegressions(round, candidate);
+      for (const fact of this.#factsFor(candidate)) this.#applyEvent({ type: "FINDING_FACT", ...fact });
+      const openPoints = this.#openPointsOn(candidate);
+      if (check.ok && openPoints.length === 0) {
+        this.#log.completion(actionId, { round, base: record.base, candidate });
+        await this.#handOffIntegratedCandidate(record, candidate);
+        return;
+      }
+      if (!record.fixed && check.ok) {
+        this.#parkMergedCheck(round, "open points have no declared domain task; the lead must rewrite the points");
+        return;
+      }
+      this.#log.append("fix_loop_chained", { round, candidate, openPoints });
+      if (round >= limit) {
+        this.#parkOpenPoints(round, `the fix loop's bound was reached with points still open: ${openPoints.join(", ")}`, openPoints);
+        return;
+      }
+      base = candidate;
+      last = record;
+      resume = false;
+    }
+  }
+
+  /** Losing a required test is a point, never a lane restart. Review-only
+   * votes are not facts and cannot create regression work inside a fix loop. */
+  #recordIntegratedRegressions(round: number, candidate: string): void {
+    const best = this.#pickGuard(round)?.best;
+    if (!best || best.sha === candidate) return;
+    const before = this.#checkOutputFor(best.sha);
+    const after = this.#checkOutputFor(candidate);
+    const declared = this.#declaredTestCommands();
+    for (const item of flatItems(this.#planItems())) {
+      const lost = itemTestVerifies(item).filter((v) => testOutcomeIn(before, v.name) === "passed" && testOutcomeIn(after, v.name) !== "passed");
+      if (lost.length === 0) continue;
+      const doneWhen = this.#lostTestsDoneWhen(item, lost, declared);
+      this.#raiseLostItemPoint({ item, sha: best.sha, paths: this.#changedPaths(best.sha, candidate), pickSha: candidate,
+        evidence: `${item.id}: ${lost.map((v) => `test "${v.name}"`).join(", ")} passed on ${best.sha.slice(0, 7)} and does not pass on integrated candidate ${candidate.slice(0, 7)}`,
+        ...(doneWhen ? { doneWhen } : {}),
+      });
+    }
+  }
+
+  /** Adopt REDUCE's checked candidate. No lane candidate, lane review, pick,
+   * or pending-lane winner is created: PROBING leads to the ordinary ACCEPT
+   * reviewers, each receiving the recorded domain commits and verdicts. */
+  async #handOffIntegratedCandidate(record: RoundRecord, sha: string): Promise<void> {
+    if (fs.existsSync(this.#paths.worktree)) removeWorktree(this.#plan.repo, this.#paths.worktree);
+    createWorktree(this.#plan.repo, this.#paths.worktree, sha);
+    const dir = path.join(this.#paths.candidates, sha);
+    if (!fs.existsSync(dir)) materializeCandidate(this.#plan.repo, sha, dir);
+    fs.writeFileSync(path.join(this.#runDir, "candidate-sha.txt"), sha);
+    let decisions: Decision[] = [];
+    this.#driveSuspended = true;
+    try {
+      // Every lane-free loop since the previous hand-off speaks for this
+      // candidate, not just the last one. The last disclosure of a choice
+      // wins deterministically if a later fixer reports it again.
+      const rounds = this.#state.phase.rounds ?? [];
+      const previous = rounds.findLastIndex((r) => r.fixed?.candidate === this.#state.phase.candidate?.sha);
+      const disclosures = [...new Map(rounds.slice(previous + 1)
+        .filter((r) => r.lanes.length === 0 && r.round <= record.round)
+        .flatMap((r) => r.fixed?.disclosures ?? [])
+        .map((d) => [d.choice, d] as const)).values()];
+      // FREEZE_COMPLETED historically supersedes conductor item findings.
+      // Keep their actual closure evidence so the hand-off records repair,
+      // not merely supersession by a new candidate.
+      const openPoints = this.#state.phase.findings.filter((f) => f.status === "open");
+      this.#applyEvent({ type: "SUBMIT_PHASE", disclosures });
+      decisions = this.#assembleDecisions(sha);
+      this.#applyEvent({ type: "FREEZE_COMPLETED", candidateSha: sha, decisions, tainted: false });
+      this.#applyEvent({ type: "CHECKS_PASSED" });
+      for (const finding of openPoints) {
+        const evidence = this.#approvedItemPointReview(finding, sha);
+        if (evidence) this.#applyEvent({ type: "FINDING_EVALUATOR_REPAIRED", findingId: finding.id, candidateSha: sha, evidence });
+      }
+      for (const fact of this.#factsFor(sha)) {
+        if (fact.timedOut || fact.exitCode !== 0) continue;
+        const proven = fact.passesOnBase === false || (this.#state.phase.doneWhenFacts ?? []).some(
+          (f) => f.findingId === fact.findingId && f.passesOnBase === false && f.exitCode === 0 && !f.timedOut,
+        );
+        const finding = openPoints.find((f) => f.id === fact.findingId);
+        if (finding && proven) this.#applyEvent({ type: "FINDING_CONFIRMED_REPAIRED", findingId: finding.id, byReviewer: finding.raisedBy, candidateSha: sha });
+      }
+      if (this.#itemsEnforced()) {
+        this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: this.#resolveVerifies(this.#checkOutputFor(sha)) });
+        this.#applyTestVerifyFindings(sha);
+      }
+    } finally {
+      this.#driveSuspended = false;
+    }
+    this.#carryMessages(sha);
+    for (const decision of decisions) this.#raiseMessage("tradeoff", decision.id, this.#decisionContent(decision), sha);
+    this.#recordBoundaryDataAndSample(sha);
+    this.drive();
+  }
+
+  /** Loop 1's BUILD and REVIEW only. */
   async #runLaneRound(actionId: string): Promise<void> {
-    // Plan 07c (D4.7): a fix round's next round runs one lane on the merged
-    // candidate, so `lanes` is recomputed per round, not fixed at the top.
-    let lanes = this.#lanes();
+    const lanes = this.#lanes();
     let loggedIntent = false;
     // Plan 06k3 (A1): a round that fails only because a lane review or pick
     // vote is still missing after its retry is repeated in place WITHOUT
@@ -10719,72 +11998,29 @@ export class Conductor {
       // pick is adopted as the base or, when it lost a met item in code it
       // changed, recorded as a regression (ITEMS_REGRESSED).
       if (!unfinished) this.#recordRegression(last);
-      // tt 09 (change 3): a pick the phase did not accept is combined with
-      // the plan items another lane met and it did not, before the next
-      // round starts; a green consolidation is that round's base for every
-      // lane. Recorded as ROUND_CONSOLIDATED, so a restart never redoes it.
-      if (!unfinished && last?.picked) {
-        const consolidated = await this.#consolidateRound(last.round);
-        if (consolidated === "stopped") {
-          // A recheck stopped the consolidator (the phase is CHECKING again),
-          // or the owner stopped the run: nothing was recorded, and the next
-          // start consolidates again.
-          this.#recheckCancelledLaneRound = false;
-          return;
-        }
-      }
-      // Plan 07c (D4): the fix step for a pick the phase did not accept. One
-      // fixer per domain runs from the same base; a merged candidate makes
-      // this round a single-lane round on it. Recorded as ROUND_FIXED, so a
-      // restart never redoes it.
-      if (!unfinished && last?.picked) {
-        const fixed = await this.#fixRound(last.round);
-        if (fixed === "stopped") {
-          // The owner stopped the run or a recheck stopped it: nothing was
-          // recorded, and the next start fixes again.
-          this.#recheckCancelledLaneRound = false;
-          return;
-        }
-      }
-      // Plan 07c (D4.7): the fix candidate is read for an unfinished round
-      // too, so a resumed synthetic lane still knows its base and disclosures.
-      const fix = fixRoundCandidate(this.#state.phase.rounds, round);
-      lanes = unfinished ? last!.lanes : fix ? ["a"] : this.#lanes();
       const previous = last ? (this.#state.phase.rounds ?? []).find((r) => r.round === last.round) : undefined;
-      const previousGuard = previous ? this.#pickGuard(previous.round) : undefined;
-      const restartGuard = this.#pickGuard(round);
       // An unfinished round resumes from its own base. A new round starts from
-      // the phase's candidate (the last adopted pick) — or, when that pick
-      // regressed, from the best candidate; tt 09 (change 3): or, when that
-      // pick was consolidated, from the consolidated commit.
-      const base = unfinished
-        ? last!.base
-        : fix
-          ? fix.candidate
-          : previous?.regressed && restartGuard
-            ? restartGuard.best.sha
-            : round === 1
-              ? this.#state.phase.integrationHead
-              : (consolidatedBase(this.#state.phase.rounds, round) ?? this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
+      // the phase's candidate — the last adopted pick. 07g1b (A4): a lost item
+      // is a point, never a restart from an older candidate, so no round picks
+      // a base other than the pick.
+      // 07g1b (A4/R12): a ruling that named a candidate replaces that round's
+      // pick, so the next repair builds on the named candidate even though the
+      // adopted candidate (phase.candidate) is another one.
+      const ruled = previous?.picked?.ruling ? previous.picked.sha : undefined;
+      const base = unfinished ? last!.base : (ruled ?? this.#state.phase.integrationHead);
       // 02k: a repeat of a round that failed only for a missing review or vote
       // restarts each lane that passed its checks from its own candidate.
-      // Plan 06n (A7/R9b): a round where every lane lost an item restarts
-      // every lane from the best candidate.
-      const passingBases = previous && previous.round === round - 1 ? repeatLaneBases(previous, previousGuard) : undefined;
-      this.#laneRoundRestartFromBest =
-        !unfinished && previous && ((previous.regressed && restartGuard) || everyLaneLost(previous, previousGuard))
-          ? (restartGuard ?? previousGuard)!.best.sha
-          : undefined;
+      const continuedStarts = previous && previous.round === round - 1 ? this.#continuedLaneStarts(previous) : undefined;
       // Plan 06k3 (A2): a lane that produced no passing candidate starts from
       // its own saved unsubmitted work (never discarded at its deadline).
       const saved = this.#savedLaneWork();
       const prevCandidate = new Map((last?.candidates ?? []).map((c) => [c.lane, c.sha]));
-      const mergedLaneBases: Record<string, string> = {};
+      const savedStarts: Record<string, string> = {};
       const usedSaved: Array<{ lane: string; ref: string; sha: string }> = [];
       for (const lane of lanes) {
-        const passing = passingBases?.[lane];
-        if (passing) {
-          mergedLaneBases[lane] = passing;
+        const continued = continuedStarts?.[lane];
+        if (continued) {
+          savedStarts[lane] = continued;
           continue;
         }
         // Plan 06k3 (A2, finding A-2): only a lane that produced NO candidate
@@ -10794,12 +12030,12 @@ export class Conductor {
         if (last && prevCandidate.get(lane)) continue;
         const work = saved.get(lane);
         if (work) {
-          mergedLaneBases[lane] = work.sha;
+          savedStarts[lane] = work.sha;
           usedSaved.push({ lane, ref: work.ref, sha: work.sha });
         }
       }
       this.#laneSavedWorkForRound = usedSaved;
-      const laneBases = Object.keys(mergedLaneBases).length > 0 ? mergedLaneBases : undefined;
+      const laneBases = Object.keys(savedStarts).length > 0 ? savedStarts : undefined;
       if (!loggedIntent) {
         this.#log.intent(actionId, { round, base, lanes, ...(laneBases ? { laneBases } : {}) });
         loggedIntent = true;
@@ -10820,21 +12056,6 @@ export class Conductor {
         },
         lanePrompt: (r, at) => this.#laneWorkerPrompt(r, at),
         buildLane: async (lane, r, at, prompt) => {
-          // Plan 07c (D4.7): a fix round's lane is its merged candidate; no
-          // worker runs. Its check base is the fix round's base B.
-          if (fix && r === round && lane === "a") {
-            this.#laneCheckBases.set(`${r}-${lane}`, fix.base);
-            this.#laneStartedAt.set(`${r}-${lane}`, Date.now());
-            const fixRecord = (this.#state.phase.rounds ?? []).find((x) => x.fixed?.candidate === fix.candidate)?.fixed;
-            const built: LaneBuild = {
-              lane,
-              sha: fix.candidate,
-              ...(fixRecord?.disclosures && fixRecord.disclosures.length > 0 ? { disclosures: fixRecord.disclosures } : {}),
-              ...(fixRecord?.added && fixRecord.added.length > 0 ? { added: fixRecord.added } : {}),
-            };
-            this.#laneBuilds.set(`${r}-${lane}`, built);
-            return built;
-          }
           const built = await this.#buildLane(lane, r, at, prompt);
           // Kept for the lane review prompts, which need the lane's own
           // disclosures before the winner's hand-off assembles them.
@@ -10857,9 +12078,9 @@ export class Conductor {
         cancelReviews: (r, lane, sha) => this.#cancelLaneReviews(r, lane, sha),
         pickTurn: (r, at, seat, passing, revote) => this.#runPickTurn(r, at, seat, passing, revote),
         emit: (event) => this.#applyEvent(event),
-        // Plan 06n (A7): the pick compares each lane's item reviews against
-        // the phase's best candidate from the earlier rounds.
-        pickGuard: () => this.#pickGuard(round),
+        // 07g1b (R11): a lane the round stops waiting for is terminated here;
+        // the round itself never waits out a red lane's fix.
+        stopLane: (r, lane) => this.#stopLane(r, lane),
         // Plan 06n (A3): the round records nothing after a requested stop.
         stopRequested: () => this.#stopRequested,
       };
@@ -10909,15 +12130,6 @@ export class Conductor {
         // is). ATTEMPT_NO_SUBMISSION is the ordinary "this attempt produced no
         // acceptable candidate" event; REPAIRING then starts the next round.
         if (outcome.failure) this.#log.append("round_incomplete", { round, reason: outcome.failure });
-        // Plan 06n (A7/R9b): every passing lane lost an item the best
-        // candidate met, so no lane was picked; the next round restarts every
-        // lane from the best candidate.
-        {
-          const record = (this.#state.phase.rounds ?? []).find((r) => r.round === round);
-          const guard = this.#pickGuard(round);
-          const lost = record ? everyLaneLost(record, guard) : undefined;
-          if (lost) this.#log.append("round_no_pick_items_lost", { round, best: guard!.best.sha, lost });
-        }
         this.#applyEvent({ type: "ATTEMPT_NO_SUBMISSION" });
         this.#clearLaneRound(round);
         return;
@@ -10929,11 +12141,32 @@ export class Conductor {
         this.#clearLaneRound(round);
         return;
       }
-      const build = outcome.builds.find((b) => b.lane === outcome.winner!.lane);
-      await this.#handOffLaneWinner(round, outcome.winner, build);
+      // 07g1b (R12): a ruling that named a candidate while the round was still
+      // running is honoured now — its pick replaced the seats' own when the
+      // round's CANDIDATE_PICKED was recorded. The ruling's candidate is what
+      // is handed off and what the next repair builds on.
+      for (const ruling of this.#state.phase.rulings ?? []) this.#adoptRulingPick(ruling);
+      const adopted = (this.#state.phase.rounds ?? []).find((r) => r.round === round)?.picked;
+      const winner = adopted ? { lane: adopted.lane, sha: adopted.sha, votes: adopted.votes } : outcome.winner!;
+      const build = outcome.builds.find((b) => b.lane === winner.lane) ?? outcome.builds.find((b) => b.sha === winner.sha);
+      await this.#handOffLaneWinner(round, winner, build);
       this.#clearLaneRound(round);
       return;
     }
+  }
+
+  /** 07g1b (R12): a lead ruling that names a candidate replaces that round's
+   * pick through CANDIDATE_PICKED, not a special reducer state branch. */
+  #adoptRulingPick(ruling: Ruling): void {
+    // 07g1b (R12, check 3): the ruling names its candidate through its
+    // structured `candidate` field only — never a SHA found in its text, and
+    // never a record id it settles.
+    const named = ruling.candidate ? namedCandidate(this.#state.phase, ruling.candidate) : undefined;
+    if (!named) return;
+    const round = (this.#state.phase.rounds ?? []).find((r) => r.round === named.round);
+    if (!round || (round.picked?.sha === named.sha && round.picked.ruling === ruling.id)) return;
+    this.#log.append("ruling_pick_adopted", { round: named.round, lane: named.lane, sha: named.sha, ruling: ruling.id, was: round.picked?.sha });
+    this.#applyEvent({ type: "CANDIDATE_PICKED", round: named.round, lane: named.lane, sha: named.sha, votes: 0, ruling: ruling.id });
   }
 
   /** Plan 06n (A7): what a round's pick compares each lane against — the
@@ -10947,14 +12180,15 @@ export class Conductor {
     return best ? { best, itemIds, seatCount } : undefined;
   }
 
-  /** Plan 06n (A7/R9c-d): once the phase has evaluated `last`'s pick and not
-   * accepted it, compare its evaluated items with the best candidate. An item
-   * the best candidate met that the pick does not meet, with its not-met
-   * evidence in a file the pick changed against the best candidate, is a
-   * regression: ITEMS_REGRESSED is recorded, and the next round restarts from
-   * the best candidate instead of the pick. An item whose evidence anchors
-   * only in unchanged files is a newly found defect: the pick is adopted as
-   * today. This chooses a base only; it never accepts a candidate. */
+  /** 07g1b (R13/A4): once the phase has evaluated `last`'s pick and not
+   * accepted it, compare its evaluated items with the best candidate. Only a
+   * TEST-VERIFIED item can regress: one whose `:VERIFY:` test passed on the
+   * best candidate and does not pass on the pick (any of an item's tests, not
+   * just the first). It becomes a point in its domain with the lost tests as
+   * doneWhen, never a restart — the pick stays the next base (the fix round
+   * repairs the point on it). A review-only item whose seat votes flip between
+   * candidates is not a regression and makes no point at all (07f1b let C2
+   * "regress" nine times on votes alone). */
   #recordRegression(last: RoundRecord | undefined): void {
     if (!last?.picked || last.regressed || !this.#itemsEnforced()) return;
     const picked = last.picked.sha;
@@ -10964,23 +12198,227 @@ export class Conductor {
     if (!seatsOf(phase.contract).some((w) => phase.reviews[w]?.review?.candidateSha === picked)) return;
     const guard = this.#pickGuard(last.round);
     if (!guard || guard.best.sha === picked) return;
-    let changed: string[];
+    const items = new Map(flatItems(this.#planItems()).map((item) => [item.id, item]));
+    const outcomes = new Map(this.#itemOutcomes().map((o) => [o.item.id, o]));
+    const bestOutput = this.#checkOutputFor(guard.best.sha);
+    const pickOutput = this.#checkOutputFor(picked);
+    const declared = this.#declaredTestCommands();
+    const lostTests: Array<{ id: string; test: string; doneWhen?: string }> = [];
+    for (const item of items.values()) {
+      const verifies = itemTestVerifies(item);
+      // A review-only item cannot regress: the seats' votes are not evidence.
+      if (verifies.length === 0) continue;
+      // R13/A4: for a test-verified item the TEST evidence decides, whatever
+      // the seats voted on either candidate (D-B-44, rejected: a seat "met" on
+      // the pick never hides a lost test). EVERY test verify counts, not just
+      // the first — the pick can lose the item's second test while its first
+      // still passes.
+      const lost = verifies.filter(
+        (v) => testOutcomeIn(bestOutput, v.name) === "passed" && testOutcomeIn(pickOutput, v.name) !== "passed",
+      );
+      if (lost.length === 0) continue;
+      const doneWhen = this.#lostTestsDoneWhen(item, lost, declared);
+      this.#raiseLostItemPoint({
+        item,
+        sha: guard.best.sha,
+        paths: this.#changedPaths(guard.best.sha, picked),
+        pickSha: picked,
+        evidence: `${item.id}${item.title ? ` (${item.title})` : ""}: ${lost.map((v) => `test "${v.name}"`).join(", ")} passed on ${guard.best.sha.slice(0, 7)} (round ${guard.best.round}'s pick) and does not pass on ${picked.slice(0, 7)}`,
+        ...(doneWhen ? { doneWhen } : {}),
+      });
+      for (const v of lost) lostTests.push({ id: item.id, test: v.name, ...(doneWhen ? { doneWhen } : {}) });
+    }
+    this.#log.append("regression_points", {
+      round: last.round,
+      sha: picked,
+      best: guard.best.sha,
+      lostTests,
+      lostReviewOnly: guard.best.met.filter((id) => {
+        const o = outcomes.get(id);
+        const item = items.get(id);
+        return o && o.outcome !== "met" && o.outcome !== "fits" && item && itemTestVerifies(item).length === 0;
+      }),
+    });
+  }
+
+  /** 07g1b (A4): raise one point for an item another candidate met and the
+   * pick does not. Skipped when the item already has an open blocking point
+   * (a second round must not stack duplicates), and refused silently when the
+   * item has no domain while the phase declares domains (the conductor's own
+   * points name one, as §3.2 requires). */
+  #raiseLostItemPoint(opts: {
+    item: FlatItem;
+    sha: string;
+    paths: string[];
+    pickSha: string;
+    evidence: string;
+    doneWhen?: string;
+  }): void {
+    const phase = this.#state.phase;
+    // Dedupe per source candidate: the pick's own test-verify point for the
+    // same item (no `from`) is a different record and stays.
+    if (
+      phase.findings.some(
+        (f) => f.status === "open" && f.severity === "blocking" && f.itemId === opts.item.id && f.from?.sha === opts.sha,
+      )
+    ) {
+      return;
+    }
+    const finding: Finding = {
+      id: `F-${phase.phaseId}-from-${opts.item.id}-${phase.findings.length + 1}`,
+      version: 1,
+      phaseId: phase.phaseId,
+      kind: "defect",
+      severity: "blocking",
+      evidence: opts.evidence,
+      raisedBy: "conductor",
+      status: "open",
+      boundCandidateSha: opts.pickSha,
+      itemId: opts.item.id,
+      item: opts.item.id,
+      ...(opts.item.domain ? { domain: opts.item.domain } : {}),
+      ...(opts.item.where ? { where: opts.item.where } : {}),
+      ...(opts.item.text ? { expected: opts.item.text } : {}),
+      ...(opts.doneWhen ? { doneWhen: opts.doneWhen } : {}),
+      from: { sha: opts.sha, paths: opts.paths },
+    };
+    this.#applyEvent({ type: "FINDING_RAISED", finding });
+  }
+
+  /** The files one commit changed against another, or [] when git cannot say. */
+  #changedPaths(from: string, to: string): string[] {
     try {
-      changed = diffNameOnly(this.#plan.repo, guard.best.sha, picked);
+      return from === to ? [] : diffNameOnly(this.#plan.repo, from, to);
     } catch (err) {
-      this.#log.append("error", { where: "regression_diff", error: String((err as Error)?.message ?? err) });
-      return;
+      this.#log.append("error", { where: "lane_point_paths", error: String((err as Error)?.message ?? err) });
+      return [];
     }
-    const items = regressedItems(guard.best, this.#itemOutcomes(), changed);
+  }
+
+  /** 07g1b (A4/R7/R13): the commands the plan declares for running its
+   * tests — the `#+TT_RERUN:` template and the phase's round (and final)
+   * checks. A lost-test point's doneWhen is only ever taken from these. */
+  #declaredTestCommands(): DeclaredTestCommands {
+    const contract = this.#state.phase.contract;
+    return {
+      ...(this.#plan.rerun ? { rerun: this.#plan.rerun } : {}),
+      checks: checkCommands(this.#plan.checks, contract.checks, contract.finalChecks, "round"),
+      ...(contract.finalChecks ? { finalChecks: contract.finalChecks } : {}),
+    };
+  }
+
+  /** 07g1b (A4/R7/R13): the doneWhen of a point made from `tests` of `item`:
+   * each test's declared command (`lostTestsDoneWhen`). A plan that declares
+   * none is refused by `tt lint` (item-verify); should one reach a run anyway,
+   * the gap is logged as an error, never left as a silently empty doneWhen. */
+  #lostTestsDoneWhen(item: FlatItem, tests: readonly TestVerify[], declared: DeclaredTestCommands): string | undefined {
+    const doneWhen = lostTestsDoneWhen(tests, declared);
+    if (doneWhen === undefined && tests.length > 0) {
+      this.#log.append("error", {
+        where: "lost_test_done_when",
+        item: item.id,
+        tests: tests.map((t) => t.name),
+        error: "the plan declares no command for this test verify (no #+TT_RERUN it fills and no check); tt lint refuses such a plan",
+      });
+    }
+    return doneWhen;
+  }
+
+  /** 07g1b (A4/R7/R11): the work another lane landed that the pick does not
+   * carry arrives as points, never as a consolidation step and never as a
+   * restart. For every other lane's candidate in the round, an item becomes a
+   * point when
+   * - that lane's own seats met it and the pick's seats did not (R7), or
+   * - its `:VERIFY:` test passes in that lane's check output and not in the
+   *   pick's (R11: a lane stopped while still fixing landed work green even
+   *   though its tree as a whole was red).
+   * For a test-verified item the test outputs overrule the seats: a seat
+   * "met" makes no point when the pick passes every one of the item's tests
+   * or the lane fails one; it counts only where the outputs show neither.
+   * The point names the lane's commit and paths in `from` and, when the pick
+   * lost the item's `:VERIFY:` tests (any of them), those tests as doneWhen;
+   * otherwise it carries none and is closed by its domain review (CI §3.2). */
+  #raiseLostLanePoints(round: number, winner: { lane: string; sha: string }): void {
+    if (!this.#itemsEnforced()) return;
+    const roundRecord = (this.#state.phase.rounds ?? []).find((r) => r.round === round);
+    const pick = roundRecord?.candidates.find((c) => c.lane === winner.lane && c.sha === winner.sha);
+    if (!roundRecord || !pick) return;
+    const items = flatItems(this.#planItems());
     if (items.length === 0) return;
-    // 07 (G2): a fix round's pick is never undone; the items it lost stay open
-    // as points (the conductor's item findings), so the next fix round gets them.
-    if (isFixRound(this.#state.phase.rounds, last.round)) {
-      this.#log.append("regression_skipped_fix_round", { round: last.round, items, sha: picked, best: guard.best.sha });
-      return;
+    const itemIds = items.map((item) => item.id);
+    const seatCount = this.#laneSeats().length;
+    const pickMet = laneMetItems(pick, itemIds, seatCount);
+    const pickOutput = this.#checkOutputFor(winner.sha);
+    const declared = this.#declaredTestCommands();
+    for (const other of roundRecord.candidates) {
+      if (other.lane === winner.lane || typeof other.sha !== "string" || other.sha.length === 0) continue;
+      if (other.sha === winner.sha) continue;
+      const laneMet = laneMetItems(other, itemIds, seatCount);
+      const laneOutput = this.#checkOutputFor(other.sha);
+      const paths = this.#changedPaths(roundRecord.base, other.sha);
+      for (const item of items) {
+        const verifies = itemTestVerifies(item);
+        // A4/R7: EVERY test verify counts, not just the first. A test that
+        // passes in the lane's output and not in the pick's is lost work,
+        // whatever the pick's seats voted (test evidence decides, as in R13).
+        const lost = verifies.filter(
+          (v) => testOutcomeIn(laneOutput, v.name) === "passed" && testOutcomeIn(pickOutput, v.name) !== "passed",
+        );
+        // R7, read literally: "lane b met an item lane a missed" is a point —
+        // a test-verified one too, even when no test loss shows in the two
+        // check outputs (the lane's seats met it; the pick's did not).
+        const metBySeats = laneMet.has(item.id) && !pickMet.has(item.id);
+        if (!metBySeats && lost.length === 0) continue;
+        // Test evidence wins over the seats for a test-verified item, both
+        // ways: when the pick's own check output passes every test the item
+        // names, the pick carries it whatever its seats voted; when the lane's
+        // output fails one of them, its seats' "met" is not lost work.
+        if (lost.length === 0 && verifies.length > 0) {
+          if (verifies.every((v) => testOutcomeIn(pickOutput, v.name) === "passed")) continue;
+          if (verifies.some((v) => testOutcomeIn(laneOutput, v.name) === "failed")) continue;
+        }
+        // "The point's doneWhen is the item's :VERIFY: test when it has one":
+        // the lost tests, else every test the item names, each by the plan's
+        // declared command. A review-only item's point carries none and is
+        // closed by its domain review (CI §3.2).
+        const doneWhen = verifies.length > 0 ? this.#lostTestsDoneWhen(item, lost.length > 0 ? lost : verifies, declared) : undefined;
+        const how = lost.length > 0 ? `its check output passes the item's test "${lost[0].name}"` : "its seats met it";
+        this.#raiseLostItemPoint({
+          item,
+          sha: other.sha,
+          paths,
+          pickSha: winner.sha,
+          evidence: `${item.id}${item.title ? ` (${item.title})` : ""}: lane ${other.lane}'s candidate ${other.sha.slice(0, 7)} has the work (${how}); the pick ${winner.sha.slice(0, 7)} (lane ${winner.lane}) does not`,
+          ...(doneWhen ? { doneWhen } : {}),
+        });
+        this.#log.append("lost_lane_point", {
+          round,
+          item: item.id,
+          from: other.sha,
+          lane: other.lane,
+          pick: winner.sha,
+          via: lost.length > 0 ? "test" : "seats",
+          ...(doneWhen ? { doneWhen } : {}),
+        });
+      }
     }
-    this.#log.append("items_regressed", { round: last.round, items, sha: picked, best: guard.best.sha, changed });
-    this.#applyEvent({ type: "ITEMS_REGRESSED", round: last.round, items, sha: picked });
+  }
+
+  /** 07g1b (R11): stop a lane the round no longer reads. Its agent is
+   * terminated (the work it already committed is saved to its own ref by the
+   * lane's own bookkeeping), so a red lane's long fix never holds the phase. */
+  #stopLane(round: number, lane: string): void {
+    const prefix = `lane-${round}-${lane}-`;
+    let agents = 0;
+    for (const [agentId, handle] of [...this.#agents]) {
+      if (!agentId.startsWith(prefix)) continue;
+      agents += 1;
+      for (const pgid of handle.shGroups) {
+        setImmediate(() => void killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined));
+      }
+      void handle.agent.terminate().catch(() => undefined);
+    }
+    this.#log.append("lane_stopped", { round, lane, agents, reason: "the pick was adopted before this lane settled" });
   }
 
   /** Drops one round's per-lane scratch state (its builds, discoveries and
@@ -11133,6 +12571,9 @@ export class Conductor {
       this.#raiseMessage("tradeoff", decision.id, this.#decisionContent(decision), winner.sha);
     }
     if (this.#itemsEnforced() && build?.coverage) this.#applyCoverageNotes(build.coverage as Coverage, winner.sha);
+    // 07g1b (A4/R7): the other lanes' work this pick does not carry arrives
+    // as points with `from` — never as a consolidation step, never a restart.
+    this.#raiseLostLanePoints(round, winner);
     this.#recordBoundaryDataAndSample(winner.sha, { lane: { round, lane: winner.lane } });
     this.drive();
   }
@@ -11716,17 +13157,106 @@ export class Conductor {
    * always used. Called for every executed command in both gates, so the
    * candidate C and the probed integration I each get one file per
    * command. */
-  #recordCheck(outDir: string, command: string, result: RunCommandResult): void {
-    fs.mkdirSync(outDir, { recursive: true });
+  /** Plan 07e (E3): a failed check that says nothing is recorded as silent;
+   * one a stop cut off is interrupted (or `disk-full` when the stop was the
+   * full disk's own), never an ordinary failure. A timeout keeps its own
+   * `timedOut` marker. */
+  #checkFailureClass(result: RunCommandResult): "silent" | "interrupted" | "disk-full" | undefined {
+    if (result.cancelled) return this.#stopCause === "disk full" ? "disk-full" : "interrupted";
+    if (result.timedOut || (result.exitCode === 0 && !result.signal)) return undefined;
+    if (this.#stopRequested) return this.#stopCause === "disk full" ? "disk-full" : "interrupted";
+    if (result.exitCode !== null && result.exitCode !== 0 && result.output.trim().length === 0) return "silent";
+    return undefined;
+  }
+
+  /** Plan 07e (E4): the honest sentence for a check a stop cut off. Only an
+   * owner's own stop is named as the owner's; a conductor self-stop (a full
+   * disk, an env block, a terminal phase) says so instead. */
+  #interruptedNote(): string {
+    switch (this.#stopCause) {
+      case "owner":
+        return "check interrupted (the owner stopped the run)";
+      case "disk full":
+        return "check interrupted (disk full)";
+      default:
+        return "check interrupted (the conductor stopped the run)";
+    }
+  }
+
+  /** 07e (A4): record how a command ended while preserving the existing
+   * disk-full classification and failureClass readers. 07g2 (A4/R9): a failed
+   * traced check also records the simple command the shell ran last before the
+   * non-zero exit, and that step's own output. */
+  #checkRecordCommand(command: string, result: RunCommandResult, startedAt: number, recordFailure?: "disk-full"): CheckRecordCommand {
+    const failureClass = recordFailure ?? this.#checkFailureClass(result);
+    const passed = !failureClass && result.exitCode === 0 && !result.timedOut;
+    const note = failureClass === "interrupted"
+      ? this.#interruptedNote()
+      : failureClass === "silent"
+        ? `check exited ${result.exitCode} with no output`
+        : failureClass === "disk-full"
+          ? "disk full"
+          : undefined;
+    const step = !passed ? lastStep(result) : undefined;
+    return {
+      command,
+      exitCode: result.exitCode,
+      signal: result.signal,
+      timedOut: result.timedOut,
+      durationMs: Date.now() - startedAt,
+      passed,
+      class: failureClass ?? (passed ? "passed" : "failed"),
+      ...(failureClass ? { failureClass } : {}),
+      ...(note ? { note } : {}),
+      ...(step ? { failingStep: step.command } : {}),
+      ...(step ? { failingStepOutput: step.output.trim() } : {}),
+      ...(step ? { failingStepSilent: step.output.trim().length === 0 } : {}),
+      log: this.#checkLogName(command),
+    };
+  }
+
+  #recordCheck(outDir: string, command: string, result: RunCommandResult): "disk-full" | undefined {
+    try {
+      fs.mkdirSync(outDir, { recursive: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOSPC") {
+        this.#noteDiskFull(err, "check directory");
+        return "disk-full";
+      }
+      this.#log.append("error", { where: "check_log", error: String((err as Error)?.message ?? err) });
+      return undefined;
+    }
     // Plan 01a: a check or probe command (and its output) may carry a secret
     // value — a vendor key a command echoes, or the plan's own check line.
-    fs.writeFileSync(
-      path.join(outDir, this.#checkLogName(command)),
-      redactText(
-        `$ ${command}\n${result.output}\nexit ${result.exitCode} signal ${result.signal}${result.timedOut ? " (timed out)" : ""}\n`,
-        this.#secretMaskable,
-      ),
-    );
+    const failureClass = this.#checkFailureClass(result);
+    const failingStep = !(result.exitCode === 0 && !result.timedOut) ? lastStep(result) : undefined;
+    const stepLine = failingStep
+      ? `failing step: ${failingStep.command}${failingStep.output.trim().length === 0 ? " (no output)" : `\n${failingStep.output}`}\n`
+      : "";
+    const failureLine =
+      failureClass === "silent"
+        ? `check exited ${result.exitCode} with no output\n`
+        : failureClass === "interrupted"
+          ? `${this.#interruptedNote()}\n`
+          : failureClass === "disk-full"
+            ? "disk full\n"
+            : "";
+    try {
+      fs.writeFileSync(
+        path.join(outDir, this.#checkLogName(command)),
+        redactText(
+          `$ ${command}\n${result.output}\nexit ${result.exitCode} signal ${result.signal}${result.timedOut ? " (timed out)" : ""}\n${stepLine}${failureLine}`,
+          this.#secretMaskable,
+        ),
+      );
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOSPC") {
+        this.#noteDiskFull(err, "check output");
+        return "disk-full";
+      }
+      this.#log.append("error", { where: "check_log", error: String((err as Error)?.message ?? err) });
+    }
+    return undefined;
   }
 
   /** Plan 06c: write `checks/<sha>/record.json` — the candidate's check
@@ -11734,7 +13264,7 @@ export class Conductor {
    * there was one, and the machine's load at the run. A `final` run
    * overwrites the candidate's `round` record, so the accepted candidate's
    * record is the one that ran the final check. */
-  #writeCheckRecord(outDir: string, record: CheckRecord): void {
+  #writeCheckRecord(outDir: string, record: CheckRecord): boolean {
     try {
       // The commands ran with plan secrets resolved; on disk they keep the
       // mask every other run file keeps.
@@ -11747,8 +13277,16 @@ export class Conductor {
           : {}),
       };
       fs.writeFileSync(path.join(outDir, "record.json"), `${JSON.stringify(masked, null, 2)}\n`);
+      return true;
     } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOSPC") {
+        this.#noteDiskFull(err, "check record");
+        // Plan 07e (A4/E4): the disk refused the record, so the check did not
+        // pass; the caller fails its action with `disk full`.
+        return false;
+      }
       this.#log.append("error", { where: "check_record", error: String((err as Error)?.message ?? err) });
+      return true;
     }
   }
 
@@ -12181,6 +13719,7 @@ export class Conductor {
       // baseline-sh-<actionId>-<pgid>) and mark the stage timed out, so a
       // slow suite cannot keep running and its late record is ignored.
       this.#baselineTimedOut = true;
+      this.#recordBound("check", "baseline", this.#deadlines.checkMs, this.#deadlines.checkMs);
       for (const rec of readLog(this.#paths.events).records) {
         if (rec.kind !== "intent" || typeof rec.actionId !== "string") continue;
         if (!rec.actionId.startsWith(`baseline-sh-${actionId}-`)) continue;
@@ -12529,18 +14068,79 @@ export class Conductor {
     }
   }
 
+  /** 07g1: a red FINAL check is a point, not just a record. Anchor it to
+   * the first failing file the output names and put it in that file's domain.
+   * A failure that names no file of a declared domain is not a point: the
+   * conductor cannot choose a domain for it, so it records LEAD_CALLED. */
+  #raiseFinalCheckPoint(candidateSha: string, evidence: string, failingCommands: readonly string[]): void {
+    const domains = this.#state.phase.contract.domains ?? [];
+    if (domains.length === 0) return;
+    const seen = new Set<string>();
+    const paths: string[] = [];
+    for (const m of evidence.matchAll(/(?:^|[\s(`'"])((?:[\w.@+-]+\/)+[\w.@+-]+\.[A-Za-z0-9]+)(?::\d+)?/gm)) {
+      const p = m[1];
+      const domain = domainOf(p, domains);
+      if (!domain || seen.has(`${domain}:${p}`)) continue;
+      seen.add(`${domain}:${p}`);
+      paths.push(p);
+    }
+    const path = paths[0];
+    if (!path) {
+      const reason = `the final check failed but its output named no file of a declared domain: ${evidence.split("\n")[0]}`;
+      this.#applyEvent({ type: "LEAD_CALLED", reasons: [reason] });
+      this.#log.append("final_check_point_skipped", { candidateSha, reason });
+      return;
+    }
+    const domain = domainOf(path, domains);
+    if (!domain) return;
+    const existing = (this.#state.phase.findings ?? []).find(
+      (f) => f.raisedBy === "conductor" && f.status === "open" && f.domain === domain && f.where === `${path}:1`,
+    );
+    if (existing) return;
+    const phase = this.#state.phase;
+    const n = (phase.findings ?? []).filter((f) => f.raisedBy === "conductor").length + 1;
+    const doneWhen = failingCommands[0] ?? phase.contract.finalChecks ?? phase.contract.fixChecks;
+    this.#applyEvent({
+      type: "FINDING_RAISED",
+      finding: {
+        id: `F-${phase.phaseId}-final-${n}`,
+        version: 1,
+        phaseId: phase.phaseId,
+        kind: "defect",
+        severity: "blocking",
+        evidence: evidence.slice(0, 4000),
+        raisedBy: "conductor",
+        status: "open",
+        boundCandidateSha: candidateSha,
+        domain,
+        where: `${path}:1`,
+        expected: "the final check passes",
+        ...(doneWhen ? { doneWhen } : {}),
+      },
+    });
+    this.#log.append("final_check_point_raised", { candidateSha, domain, where: `${path}:1`, doneWhen });
+  }
+
+  /** 07g1: when the final check passes on a later candidate, the conductor's
+   * own final-check points no longer hold. */
+  #closeFinalCheckPoints(candidateSha: string): void {
+    for (const finding of this.#state.phase.findings ?? []) {
+      if (finding.raisedBy !== "conductor" || finding.status !== "open" || !finding.id.includes("-final-")) continue;
+      this.#applyEvent({ type: "FINDING_DISPROVED", findingId: finding.id, byReviewer: "conductor", evidence: `the final check passed on candidate ${candidateSha}` });
+    }
+  }
+
   async #runChecks(actionId: string, candidateSha: string): Promise<void> {
     // Plan 06k1 (A4): every check run on the host — phase or final tier —
     // holds one of the machine-wide check slots (at most `#checkSlots` checks
     // at once) and the host-wide check window, so every other run's workers
     // pause while this one runs.
     const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
-    const window = openCheckWindow(this.#checkLockPath, this.#state.phase.runId);
+    const window = this.#openCheckWindow();
     this.#log.intent(actionId, { candidateSha });
     crashAt("before_run_checks");
     const checkoutDir = disposableCheckout(this.#plan.repo, candidateSha);
     const outDir = path.join(this.#paths.checks, candidateSha);
-    fs.mkdirSync(outDir, { recursive: true });
     // Plan 06c: `checkTier` decides which commands this candidate runs. From
     // CHECKING the candidate has not been reviewed yet, so the tier is
     // `round`; from FINAL_CHECKING it has passed review with no open blocker,
@@ -12565,6 +14165,20 @@ export class Conductor {
     const recordLoad1 = Math.round(loadavg()[0] * 100) / 100;
     const recordFreeMemMB = Math.round(os.freemem() / (1024 * 1024));
     try {
+      // Plan 07e (A4/E4): creating the check directory is part of the check,
+      // so a full disk here is recorded as `disk full` and fails the action —
+      // never an uncaught ENOSPC outside the honest-check cleanup. The
+      // `finally` below still disposes the checkout and releases the slot.
+      try {
+        fs.mkdirSync(outDir, { recursive: true });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === "ENOSPC") {
+          this.#noteDiskFull(err, "check directory");
+          this.#log.completion(actionId, { candidateSha, passed: false, reason: "disk full" });
+          return;
+        }
+        throw err;
+      }
       const before = verifyIntegrity(this.#plan.repo, checkoutDir.dir, candidateSha);
       let passed = before;
       let integrityViolated = !before;
@@ -12603,20 +14217,24 @@ export class Conductor {
           // kills the command's process group on expiry (shell.ts); this
           // just records *why* the check failed.
           const startedAt = Date.now();
+          // Plan 07e (E1): the final tier's own bound.
+          const checkLimitMs = tier === "final" ? this.#deadlines.finalCheckMs : this.#deadlines.checkMs;
           // Plan 05d: a re-run alone must finish inside this same per-command
           // deadline (design §8.1). `deadlineAt` is that deadline's wall time.
-          const deadlineAt = startedAt + this.#deadlines.checkMs;
+          const deadlineAt = startedAt + checkLimitMs;
           // ODP-3: the check's own process group, tracked live so `stop()`
           // signals it like every other stage's.
           let checkPgid: number | undefined;
           const running = runCommand({
             command,
             cwd: checkoutDir.dir,
+            // 07g2 (A4/R9): a red round check names its failing step.
+            traceSteps: true,
             // F13: isolate the child from the Node test runner's own
             // recursion markers so a check that runs `node --test` actually
             // runs (and can fail) instead of silently skipping.
             env: this.#checkEnv(),
-            deadlineMs: this.#deadlines.checkMs,
+            deadlineMs: checkLimitMs,
             termGraceMs: this.#deadlines.termGraceMs,
             // Plan 06c: record the command's process group so a crash/stop
             // during CHECKING can kill the orphan and re-run the check.
@@ -12634,17 +14252,37 @@ export class Conductor {
           // Plan 05d: the machine's load average at the failing run is part
           // of the flake evidence (findings #10, #31).
           const machineLoad = Math.round(loadavg()[0] * 100) / 100;
-          if (result.timedOut) timedOut = true;
-          this.#recordCheck(outDir, command, result);
-          recordCommands.push({
-            command,
-            exitCode: result.exitCode,
-            signal: result.signal,
-            timedOut: result.timedOut,
-            durationMs: Date.now() - startedAt,
-            passed: result.exitCode === 0 && !result.timedOut,
-            log: this.#checkLogName(command),
-          });
+          if (result.timedOut) {
+            timedOut = true;
+            // Plan 07e (E2): the final tier names its own bound; every other
+            // check names the check bound.
+            this.#recordBound(tier === "final" ? "final-check" : "check", `check \`${command}\``, checkLimitMs, Date.now() - startedAt);
+          }
+          const recordFailure = this.#recordCheck(outDir, command, result);
+          // 07e (E4), the seats' alternative to the vetoed output-text
+          // environment block: a check that exits non-zero and whose output
+          // reports ENOSPC is RECORDED as class `disk-full`, and still fails
+          // as an ordinary check — the round continues and spends its repair
+          // round. Output text alone is never proof that the machine failed,
+          // so it can neither block the run nor change a plan without the new
+          // keywords.
+          const diskFullOutput =
+            recordFailure === undefined &&
+            !result.timedOut &&
+            result.exitCode !== 0 &&
+            /ENOSPC|No space left on device/i.test(result.output);
+          if (diskFullOutput) {
+            this.#log.append("disk_full", { stage: "checks", command, exitCode: result.exitCode, action: "ordinary failure" });
+          }
+          recordCommands.push(this.#checkRecordCommand(command, result, startedAt, recordFailure ?? (diskFullOutput ? "disk-full" : undefined)));
+          // Plan 07e (A4/E4): a check whose own log the disk refused fails its
+          // action with `disk full`, never as a pass (`#noteDiskFull` stops the
+          // run cleanly, exactly as for a command that reported ENOSPC).
+          if (recordFailure === "disk-full") {
+            passed = false;
+            this.#log.completion(actionId, { candidateSha, passed: false, reason: "disk full", command, exitCode: result.exitCode });
+            return;
+          }
           // Plan 05i: 126/127 means the shell could not execute the command
           // (`command not found` / `not executable`). That is the machine, not
           // the code: stop the run in ENV_BLOCKED instead of recording a
@@ -12654,6 +14292,7 @@ export class Conductor {
             this.#applyEnvFailure("checks", command, result);
             return;
           }
+          // 07e (A4): a full disk is the machine, not the candidate.
           const after = verifyIntegrity(this.#plan.repo, checkoutDir.dir, candidateSha);
           if (!after) integrityViolated = true;
           const failed = result.exitCode !== 0 || result.timedOut || !after;
@@ -12740,6 +14379,26 @@ export class Conductor {
           }
         }
       }
+      // Plan 07e (A4): write the record before events that a stop can refuse,
+      // so an interrupted command keeps its own class even after log closure.
+      const recordWritten = this.#writeCheckRecord(outDir, {
+        candidateSha,
+        ...(this.#baselineBaseSha() ? { baseSha: this.#baselineBaseSha() } : {}),
+        tier,
+        passed,
+        commands: recordCommands,
+        finalCommands,
+        load1: recordLoad1,
+        freeMemMB: recordFreeMemMB,
+        at: new Date().toISOString(),
+      });
+      // Plan 07e (A4/E4): a record the disk refused fails the check, never a
+      // pass; the run is already stopping cleanly.
+      if (!recordWritten) {
+        this.#log.completion(actionId, { candidateSha, passed: false, reason: "disk full" });
+        return;
+      }
+      if (this.#closed) return;
       // design §2.2: a checkout that no longer matches its candidate commit
       // invalidates that gate's result (never counted as passed — `passed`
       // above is already forced `false` by the `!after` check) and marks
@@ -12763,19 +14422,7 @@ export class Conductor {
         ...(checkFailures.length > 0 ? { checkFailures } : {}),
         reason: !passed && timedOut ? "timeout" : undefined,
       });
-      // Plan 06c: the record names the tier, the final command when there was
-      // one, and the machine's load at the run.
-      this.#writeCheckRecord(outDir, {
-        candidateSha,
-        ...(this.#baselineBaseSha() ? { baseSha: this.#baselineBaseSha() } : {}),
-        tier,
-        passed,
-        commands: recordCommands,
-        finalCommands,
-        load1: recordLoad1,
-        freeMemMB: recordFreeMemMB,
-        at: new Date().toISOString(),
-      });
+      // The check record is already written above, before events a stop can refuse.
       // Plan 06b: resolve every item's `test` verify against the candidate's
       // own (round) check run. A named test that is missing from or failed in
       // the output is a blocking finding anchored to its item, except a
@@ -12803,13 +14450,18 @@ export class Conductor {
             );
             this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: [...kept, ...finalVerifies] });
           }
+          this.#closeFinalCheckPoints(candidateSha);
           this.#applyEvent({ type: "FINAL_CHECKS_PASSED", candidateSha });
         } else if (passed) {
           // Every command exited 0, but a final-only test did not pass in the
           // output: the repair prompt names each one as a failure to fix.
+          // 07g1: the missing final-only test is a point in the failing
+          // file's domain (or the first domain when no file is named).
+          const finalOnlyEvidence = `the final check on candidate ${candidateSha.slice(0, 9)} did not pass every final-only test: ${finalVerifyLines.join("; ")}`;
+          this.#raiseFinalCheckPoint(candidateSha, finalOnlyEvidence, [this.#state.phase.contract.finalChecks ?? this.#state.phase.contract.fixChecks ?? ""]);
           this.#applyEvent({
             type: "FINAL_CHECKS_FAILED",
-            evidence: `the final check on candidate ${candidateSha.slice(0, 9)} did not pass every final-only test: ${finalVerifyLines.join("; ")}`,
+            evidence: finalOnlyEvidence,
             failures: finalVerifies
               .filter((r) => r.outcome !== "passed")
               .map((r) => ({ name: r.name, reproducesAlone: true, loadOnly: false, failingExitCode: null, rerunExitCodes: [] })),
@@ -12833,16 +14485,29 @@ export class Conductor {
                   failingExitCode,
                   rerunExitCodes: [],
                 }));
+          const finalEvidence = `the final check failed on candidate ${candidateSha.slice(0, 9)}: ${failing.join(", ") || "(a check command exited non-zero)"}${finalVerifyLines.length > 0 ? `; ${finalVerifyLines.join("; ")}` : ""}${tail ? `\n${tail}` : ""}`;
+          this.#raiseFinalCheckPoint(candidateSha, finalEvidence, failing);
           this.#applyEvent({
             type: "FINAL_CHECKS_FAILED",
-            evidence: `the final check failed on candidate ${candidateSha.slice(0, 9)}: ${failing.join(", ") || "(a check command exited non-zero)"}${finalVerifyLines.length > 0 ? `; ${finalVerifyLines.join("; ")}` : ""}${tail ? `\n${tail}` : ""}`,
+            evidence: finalEvidence,
             ...(finalFailures.length > 0 ? { failures: finalFailures } : {}),
           });
         }
       } else if (passed) {
         this.#applyEvent({ type: "CHECKS_PASSED" });
       } else {
-        this.#applyEvent({ type: "CHECKS_FAILED", ...(checkFailures.length > 0 ? { failures: checkFailures } : {}) });
+        // Compatibility summary for event-log readers. Per-command step and
+        // output live in recordCommands; blocker lines read those records,
+        // never this summary. Earlier failures may have been base-excused;
+        // stop-at-first means the last executed command stopped this run
+        // (also when a green command violated checkout integrity).
+        const failedCommand = recordCommands.at(-1);
+        this.#applyEvent({
+          type: "CHECKS_FAILED",
+          ...(checkFailures.length > 0 ? { failures: checkFailures } : {}),
+          ...(failedCommand?.failingStep ? { failingStep: failedCommand.failingStep } : {}),
+          ...(failedCommand?.failingStepSilent ? { failingStepSilent: true } : {}),
+        });
         // Plan 06g (A4): a test that PASSED at this round's base (the previous
         // candidate in a repair, the phase base in round 1) and fails now is a
         // true regression — recorded so the reason is observable, and distinct
@@ -12891,6 +14556,9 @@ export class Conductor {
             termGraceMs: this.#deadlines.termGraceMs,
           });
           const result = await running.result;
+          // Plan 07e (E2): an isolated re-run spends what is left of the
+          // check bound; timing out is that bound reached.
+          if (result.timedOut) this.#recordBound("check", `rerun:${plan.name}`, budget, budget);
           // Review finding M-1: exit 0 alone is not proof — a filter that
           // matched no test exits 0. Keep the output so the classification can
           // require evidence that the test ran.
@@ -12956,6 +14624,8 @@ export class Conductor {
       });
       const commandResult = await running.result;
       this.#recordCheck(outDir, command, commandResult);
+      // Plan 07e (E2): the probe's checks share the check bound.
+      if (commandResult.timedOut) this.#recordBound("check", `probe:${result.I}`, this.#deadlines.probeMs, this.#deadlines.probeMs);
       // Plan 05i: 126/127 is the machine, not the code — discard the probe
       // branch and block on the environment instead of raising an
       // `integration` finding.
@@ -13330,6 +15000,8 @@ export class Conductor {
           });
           const gateResult = await running.result;
           if (gatePgid !== undefined) this.#onStageShExit(gatePgid);
+          // Plan 07e (E2): the gate command's own bound.
+          if (gateResult.timedOut) this.#recordBound("gate", candidateSha, this.#deadlines.gateMs, Date.now() - startedMs);
           // Plan 05i: 126/127 is the shell failing to execute the command, not
           // the gate failing. Record it (the record carries the exit, and a
           // non-passing record is never reused) but block on the environment
@@ -13366,6 +15038,7 @@ export class Conductor {
             });
             cleanupResult = await cleanup.result;
             if (cleanupPgid !== undefined) this.#onStageShExit(cleanupPgid);
+            if (cleanupResult.timedOut) this.#recordBound("gate", `${candidateSha}:cleanup`, this.#deadlines.gateMs, Date.now() - cleanupStartedMs);
             cleanupMs = Date.now() - cleanupStartedMs;
           }
           const passed = !gateResult.timedOut && gateResult.exitCode === 0;
@@ -13669,7 +15342,7 @@ export class Conductor {
 
       if (this.#stubReviews) {
         await agent.prompt(
-          this.#agentPrompt(buildReviewerPrompt(this.#state.phase, reviewer, this.#secretNames, this.#state.phase.ownerDirectives)),
+          this.#agentPrompt([buildReviewerPrompt(this.#state.phase, reviewer, this.#secretNames, this.#state.phase.ownerDirectives), ...this.#acceptanceDomainLines()].join("\n")),
         );
         const outcome = await Promise.race([donePromise.then(() => "submitted" as const), reviewTimeout.promise]);
         reviewTimeout.cancel();
@@ -13679,6 +15352,7 @@ export class Conductor {
           return;
         }
         await agent.terminate();
+        this.#recordBound("review", `${this.#state.phase.phaseId}:${reviewer}`, this.#deadlines.reviewMs, this.#deadlines.reviewMs);
         this.#log.completion(actionId, { reviewer, ok: false, reason: "timeout" });
         this.#reviewTimedOut(reviewer, dispatchCandidate);
         return;
@@ -13700,6 +15374,7 @@ export class Conductor {
       if (turn1 !== "discovered") {
         reviewTimeout.cancel();
         await agent.terminate();
+        if (turn1 === "timeout") this.#recordBound("review", `${this.#state.phase.phaseId}:${reviewer}`, this.#deadlines.reviewMs, this.#deadlines.reviewMs);
         const why = turn1 === "settled" ? "settled without submit_discovery (turn 1)" : "timeout (turn 1: submit_discovery)";
         this.#log.completion(actionId, { reviewer, ok: false, reason: why });
         this.#reviewTimedOut(reviewer, dispatchCandidate);
@@ -13714,6 +15389,7 @@ export class Conductor {
       if (turn1Settled === "timeout") {
         reviewTimeout.cancel();
         await agent.terminate();
+        this.#recordBound("review", `${this.#state.phase.phaseId}:${reviewer}`, this.#deadlines.reviewMs, this.#deadlines.reviewMs);
         this.#log.completion(actionId, { reviewer, ok: false, reason: "timeout (turn 1 did not settle)" });
         this.#reviewTimedOut(reviewer, dispatchCandidate);
         return;
@@ -13735,6 +15411,7 @@ export class Conductor {
       if (barrier === "timeout") {
         reviewTimeout.cancel();
         await agent.terminate();
+        this.#recordBound("review", `${this.#state.phase.phaseId}:${reviewer}`, this.#deadlines.reviewMs, this.#deadlines.reviewMs);
         this.#log.completion(actionId, { reviewer, ok: false, reason: "timeout (waiting for the other reviewers' discovery)" });
         this.#reviewTimedOut(reviewer, dispatchCandidate);
         return;
@@ -13766,6 +15443,7 @@ export class Conductor {
         return;
       }
       await agent.terminate();
+      if (turn2 === "timeout") this.#recordBound("review", `${this.#state.phase.phaseId}:${reviewer}`, this.#deadlines.reviewMs, this.#deadlines.reviewMs);
       const why2 = turn2 === "settled" ? "settled without submit_review (turn 2, after one re-prompt)" : "timeout (turn 2: submit_review)";
       this.#log.completion(actionId, { reviewer, ok: false, reason: why2 });
       this.#reviewTimedOut(reviewer, dispatchCandidate);
@@ -13884,6 +15562,7 @@ export class Conductor {
         timeout.cancel();
       }
       await agent.terminate();
+      if (outcome === "timeout") this.#recordBound("evaluate", this.#state.phase.phaseId, this.#deadlines.evaluateMs, this.#deadlines.evaluateMs);
       this.#log.completion(actionId, {
         candidateSha,
         ok: outcome === "submitted",
@@ -14452,6 +16131,7 @@ export class Conductor {
         agent.waitExit().then(() => "exited" as const),
       ]);
       evaluatorTimeout.cancel();
+      if (outcome === "timeout") this.#recordBound("evaluate", `${this.#state.phase.phaseId}:${messageType}`, this.#deadlines.evaluateMs, this.#deadlines.evaluateMs);
       if (outcome === "submitted") {
         await agent.terminate();
         this.#log.completion(actionId, { messageType, ok: true });
@@ -14496,6 +16176,7 @@ export class Conductor {
       ...(phase.contract.golden ? ["", "Golden note (the current source a choice must be re-checked against; a `contract` classification must cite it):", phase.contract.golden] : []),
       ...secretPromptLines(this.#secretNames),
       ...directiveLines(phase.ownerDirectives),
+      ...rulingLines(phase.rulings),
       ...ledgerPromptLines(phase.messages),
       // Plan 05j: the evaluator sees the entries its messages belong to, so a
       // topic raised as another type is visible to it (plan item 3's
@@ -14532,9 +16213,8 @@ export class Conductor {
         ...refused.map((m) => `- ${m.id} "${m.title}" — refused: ${m.settlement?.reason ?? "no reason given"}`),
       );
     }
-    // Plan 06b (OD-1 R3b): a majority unmet/deviates item needs the
-    // evaluator's substantive re-check against the candidate before it
-    // blocks. The check is recorded with what was checked.
+    // §7a: brief and submission share the same exception-only duty.
+    const exceptionIds = new Set(evaluationExceptions(phase).map((e) => e.id));
     const owedIds = this.#owedItemCheckIds("finding");
     const reverifyItems = itemsNeedingEvaluatorReverify(phase)
       ? phaseItemOutcomes(phase).filter((o) => owedIds.includes(o.item.id))
@@ -14545,7 +16225,13 @@ export class Conductor {
         "Plan-item re-check: each item below owes an evaluator check. Re-check it against the candidate's code and record exactly what you checked:",
         ...reverifyItems.map(
           (o) =>
-            `- ${o.item.id} ${o.item.title}: ${o.outcome}${o.outcome === "met" || o.outcome === "fits" ? " (thin unanimous evidence — audit it)" : " (a majority judged it unmet or deviating)"}; seats: ${o.evidence.join(" | ")}`,
+            `- ${o.item.id} ${o.item.title}: ${o.outcome}${
+              itemIsSplit(o)
+                ? " (the seats split on it)"
+                : o.outcome === "met" || o.outcome === "fits"
+                  ? " (thin unanimous evidence — audit it)"
+                  : " (a majority judged it unmet or deviating)"
+            }; seats: ${o.evidence.join(" | ")}`,
         ),
         "Add one `itemChecks[]` entry = { id, verdict: confirmed|contradicted, evidence } for each item above. `evidence` must cite a file:line in the candidate. Use `contradicted` only when the candidate's code proves the verdict wrong; otherwise `confirmed`.",
       );
@@ -14560,9 +16246,13 @@ export class Conductor {
     {
       const rows =
         messageType === "finding"
-          ? openFindings(phase).map((f) => `- ${f.id} (finding, raised ${f.raisedBy}, severity ${f.severity}): ${f.evidence}`)
+          ? openFindings(phase)
+              .filter((f) => exceptionIds.has(f.id))
+              .map((f) => `- ${f.id} (finding, raised ${f.raisedBy}, severity ${f.severity}): ${f.evidence}`)
           : messageType === "tradeoff"
-            ? discoveredDecisions(phase).map((d) => `- ${d.id} (discovered decision): ${d.choice} — ${d.whyItMatters}`)
+            ? discoveredDecisions(phase)
+                .filter((d) => exceptionIds.has(d.id))
+                .map((d) => `- ${d.id} (discovered decision): ${d.choice} — ${d.whyItMatters}`)
             : [];
       if (rows.length > 0) {
         lines.push(
@@ -14777,6 +16467,7 @@ export class Conductor {
       ...phase.contract.acceptance.map((a) => `- ${a}`),
       ...secretPromptLines(this.#secretNames),
       ...directiveLines(phase.ownerDirectives),
+      ...rulingLines(phase.rulings),
       ...ledgerPromptLines(phase.messages),
       "",
       "Your read-only checkout of the candidate is the working directory. This is the diff against the base:",
@@ -15124,9 +16815,11 @@ export class Conductor {
       // turn 1 too, so a reviewer discovers against the same point shape it
       // will submit in turn 2; empty outside domain mode.
       ...domainPromptLines(phase.contract.domains),
+      ...this.#acceptanceDomainLines(),
       `Candidate checkout (read-only): ${candidateDir}`,
       ...referenceLines(runReferences(this.#runDir)),
       ...directiveLines(phase.ownerDirectives),
+      ...rulingLines(phase.rulings),
       // Plan 04a: the settled ledger, so a fresh reviewer never re-raises
       // what is already settled.
       ...ledgerPromptLines(phase.messages),
@@ -15154,6 +16847,16 @@ export class Conductor {
       ...directiveAnswerLines(phase),
       "Call submit_discovery with at most 5 choices that change behaviour, interfaces, guarantees or cost where the plan left room. Each choice is one plain sentence of at most 20 words. Do not list implementation details (helper structure, naming, file layout) and do not give review advice here — correctness problems are findings, which you raise in turn 2. An empty list is fine.",
     ].join("\n");
+  }
+
+  /** §5: acceptance seats receive the integrated domains' recorded commits,
+   * points, facts and verdicts across the lane-free fix loops. */
+  #acceptanceDomainLines(): string[] {
+    const loops = (this.#state.phase.rounds ?? []).filter((r) => r.lanes.length === 0);
+    if (loops.length === 0) return [];
+    return ["Acceptance review: the integrated domains, their points and verdicts:",
+      ...loops.map((r) => JSON.stringify({ round: r.round, base: r.base, ...r.fixed })),
+      "A fact-closed point stays closed unless its fact fails on this candidate (conceptual integrity §5)."];
   }
 
   /** Turn 2 (design §6.1): every live record on this candidate (the worker's
@@ -15232,6 +16935,7 @@ export class Conductor {
       // Plan 01i: the directives in force, and the contract rule that binds
       // them — always stated, whether or not one is in force right now.
       ...reviewerTurn2DirectiveSection(phase.ownerDirectives),
+      ...rulingLines(phase.rulings),
       // Plan 01e: the base's own failing tests, so a reviewer does not raise
       // them as this candidate's defect (runtime doc §8: reviewers kept
       // flagging the 14 pre-existing exchange-state-machine failures).
@@ -15723,6 +17427,15 @@ export function directiveItemsOwed(directives: readonly OwnerDirective[] | undef
  * directive with a numbered list is shown as its items `OD-n.k`, so the
  * worker can answer each one. Empty when none is in force, so a prompt with
  * no directive gains no section. */
+export function rulingLines(rulings: readonly Ruling[] | undefined): string[] {
+  if (!rulings || rulings.length === 0) return [];
+  return [
+    "",
+    "Owner rulings (final when recorded; binding, never voted on):",
+    ...rulings.map((r) => `- ${r.text} [settles ${r.recordIds.join(", ")}]`),
+  ];
+}
+
 export function directiveLines(directives: readonly OwnerDirective[] | undefined): string[] {
   const inForce = (directives ?? []).filter((d) => d.status === "in-force");
   if (inForce.length === 0) return [];
