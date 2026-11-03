@@ -63,6 +63,28 @@
     (should (equal (alist-get 'reserved p1) ["public API types" "persistence format"]))
     (should (eq (alist-get 'provisional (aref (alist-get 'phases plan) 1)) t))))
 
+(ert-deftest tradeoffs-trace-plan-test-removals-round-trip ()
+  "Org export keeps the removal allowances on the plan and every phase."
+  (let* ((text (concat "#+TT_TEST_REMOVALS: test/old.test.ts::old case; test/deleted.test.ts\n"
+                       +tt-test--valid-plan))
+         (plan (plist-get (+tt-test--parse text) :plan))
+         (json-object-type 'alist)
+         (json-array-type 'vector)
+         (exported (json-read-from-string (json-encode plan))))
+    (should (equal (alist-get 'testRemovals exported)
+                   ["test/old.test.ts::old case" "test/deleted.test.ts"]))
+    (should (equal (alist-get 'testRemovals (aref (alist-get 'phases exported) 0))
+                   ["test/old.test.ts::old case" "test/deleted.test.ts"]))
+    (should (equal (alist-get 'testRemovals (aref (alist-get 'phases exported) 1))
+                   ["test/old.test.ts::old case" "test/deleted.test.ts"]))))
+
+(ert-deftest tradeoffs-trace-plan-preflight-export ()
+  "The plan-wide preflight exports shell chains verbatim."
+  (let* ((command "cargo --version && cmake --version")
+         (plan (plist-get (+tt-test--parse
+                          (concat "#+TT_PREFLIGHT: " command "\n" +tt-test--valid-plan)) :plan)))
+    (should (equal (alist-get 'preflight plan) (vector command)))))
+
 (defconst +tt-test--structured-plan
   (concat "#+TITLE: structured\n"
           "#+TT_REPO: /tmp/tt-ert-repo\n"

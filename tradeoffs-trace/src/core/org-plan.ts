@@ -455,6 +455,7 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   return {
     ...(sourceFile ? { sourceFile } : {}),
     ...(globalChecks ? { checks: [globalChecks] } : {}),
+    ...(first("TT_PREFLIGHT") ? { preflight: [first("TT_PREFLIGHT")!.value] } : {}),
     ...(repo && repo.trim().length > 0 ? { repo: repo.trim() } : {}),
     ...(envFile && envFile.trim().length > 0 ? { envFile: envFile.trim() } : {}),
     ...(labels ? { labels: splitList(labels.value) } : {}),

@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { accept, acceptanceBlockers } from "../../src/core/predicate.ts";
 import { CV, basePhase, makeDecision } from "./helpers.ts";
+import { resolveRoundTestVerifies } from "../../src/core/items.ts";
 
 const C = "C1";
 const K = CV();
@@ -43,6 +44,36 @@ const POINT = (id: string) => ({
   boundCandidateSha: C,
   domain: "booking",
   doneWhen: "test -f done",
+});
+
+test("a guard that stops before 25 named tests is one check blocker and cannot be accepted", () => {
+  const requirements = Array.from({ length: 25 }, (_, n) => ({
+    id: `P${n + 1}`, title: "named test", text: "named test", arch: [], verify: [`test \"tt07_p1_p${n + 1}\"`],
+  }));
+  const contract = { ...CONTRACT, requirements };
+  const command = "./check-phase";
+  const output = "cargo: not found";
+  const phase = basePhase({
+    contract, phase: "RESOLVING", candidate: { sha: C, contractVersion: K }, integrationHead: "H0",
+    checks: { candidateSha: C, passed: false },
+    probe: { candidateSha: C, head: "H0", probedI: "I1", passed: true },
+    checkResolution: resolveRoundTestVerifies({ goal: "g", architecture: [], constraints: [], requirements }, output, [{ command, output, exitCode: 127 }]),
+    reviews: Object.fromEntries(["M", "A", "B"].map((seat) => [seat, { review: {
+      ...REVIEW(seat, "unmet"), items: requirements.map((r) => ({ id: r.id, verdict: "unmet", evidence: "tests never ran" })),
+    } }])),
+  });
+  const blockers = acceptanceBlockers(phase, [command]);
+  assert.equal(blockers.length, 1, JSON.stringify(blockers));
+  assert.equal(blockers[0].kind, "check");
+  assert.equal(blockers[0].command, command);
+  assert.match(blockers[0].detail, /failed before its named tests ran: cargo: not found/);
+  const withFinding: typeof phase = { ...phase, findings: [{
+    id: "F-p1-named-check-1", version: 1, phaseId: "p1", kind: "defect", severity: "blocking",
+    evidence: blockers[0].detail, raisedBy: "conductor", status: "open", boundCandidateSha: C,
+  }] };
+  assert.equal(acceptanceBlockers(withFinding, [command]).length, 1, "the recorded check finding is the same cause, not an owner ruling");
+  assert.equal(accept(phase, C, K), false);
+  assert.equal(accept({ ...phase, checks: { candidateSha: C, passed: true } }, C, K), false, "a base-excused failure cannot waive missing named tests");
 });
 
 test("acceptanceBlockers lists failed checks missing test verifies open points flagged decisions and open owner requests each with its command", () => {

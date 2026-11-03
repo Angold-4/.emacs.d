@@ -843,6 +843,13 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
       record({ type: "NODE_BLOCKED", node: id, reason: String((err as Error).message ?? err) });
       continue;
     }
+    // The node's checks keep the same environment its plan-wide preflight
+    // used at program start, even after a scheduler restart.
+    const envFile = path.join(dir, "check-env.json");
+    if (fs.existsSync(envFile)) {
+      const env = JSON.parse(fs.readFileSync(envFile, "utf8"))[node.entry];
+      if (env) fs.writeFileSync(path.join(runDir, "check-env.json"), JSON.stringify(env, null, 2));
+    }
     // Plan 06c (A3): the scheduler is the only owner of the baseline-reuse
     // choice. A node with exactly one dependency whose accepted candidate IS
     // this node's base reuses that candidate's check record; the path is

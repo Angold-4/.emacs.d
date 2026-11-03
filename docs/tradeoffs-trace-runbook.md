@@ -310,6 +310,16 @@ conductor itself (06a–06e), not something a worker runs on every attempt.
 
 ### `TT_CHECKS` versus `TT_FINAL_CHECKS`
 
+`#+TT_PREFLIGHT:` declares plan-wide toolchain guards, for example
+`cargo --version && cmake --version`. Like `TT_FINAL_CHECKS`, its value is a
+shell command (a JSON plan may supply several commands in `preflight`).
+`tt start` and `tt program start` run each command once, before any round or
+node starts, in a fresh checkout of the plan repository at the program base
+(`TT_BASE`, or the plan's integration branch). They use the recorded check
+environment, including PATH; that same record is passed to the node's checks.
+A non-zero exit refuses the start with `X:ENV_FAULT`, the command, exit code
+and last output lines. No `TT_PREFLIGHT` means the existing start behavior.
+
 `#+TT_CHECKS` (and a phase's `:CHECKS:`) is the **round check**: every
 candidate runs it, before the reviews. `#+TT_FINAL_CHECKS` (or a phase's
 `:FINAL_CHECKS:`, which overrides the plan-level one) is the **final check**:

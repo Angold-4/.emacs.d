@@ -31,6 +31,8 @@ import {
   tallyItems,
   testOutcomeIn,
   testResultLines,
+  testVerifyProblems,
+  checkResolutionLines,
   verdictIssues,
   verifyKindIssue,
   verifyLabel,
@@ -61,6 +63,34 @@ const structured: PlanItems = {
     { id: "C2", title: "No API change", text: "public API stays", verify: ["review"] },
   ],
 };
+
+test("failed checks report one cause for named tests they never reached, while passing checks still report missing names", () => {
+  const items: PlanItems = {
+    goal: "guard before tests", architecture: [], constraints: [],
+    requirements: Array.from({ length: 25 }, (_, n) => ({
+      id: `P${n + 1}`, title: "named test", text: "named test", arch: [], verify: [`test \"tt07_p1_p${n + 1}\"`],
+    })),
+  };
+  const command = "./check-phase";
+  const output = "CMake 3.30 or higher is required\n";
+  const checks = [{ command, exitCode: 1, output, failingStep: "cmake --build build" }];
+  const resolutions = resolveRoundTestVerifies(items, output, checks);
+  assert.equal(resolutions.length, 25, "all test outcomes remain non-passing");
+  assert.ok(resolutions.every((r) => r.outcome === "missing"));
+  assert.deepEqual(testVerifyProblems(resolutions), [
+    "check `./check-phase` failed before its named tests ran: cmake --build build: CMake 3.30 or higher is required",
+  ]);
+  assert.equal(testVerifyProblems(resolveRoundTestVerifies(items, output, [{ ...checks[0], exitCode: 0 }])).length, 25);
+  const ran = resolveRoundTestVerifies(items, "test tt07_p1_p1 ... FAILED\n" + output, checks);
+  assert.match(testVerifyProblems(ran)[0], /P1.*failed/);
+  assert.equal(testVerifyProblems(ran).length, 2, "a reported failing test remains its own defect");
+  assert.equal(checkResolutionLines(resolutions).filter((line) => line.startsWith("- ")).length, 1, "reviewers see one check failure");
+  const located = { ...items, requirements: [{ ...items.requirements[0], verify: ["test test/a.test.ts::absent"] }] };
+  const separate = resolveRoundTestVerifies(located, output, [
+    { command: "node --test test/a.test.ts", exitCode: 0, output: "" }, checks[0],
+  ]);
+  assert.match(testVerifyProblems(separate)[0], /is missing from the check output/, "a successful producer still owes its named test even if a different command failed");
+});
 
 test("items: parseVerify reads test, review and evidence, with a file::name and several kinds", () => {
   assert.deepEqual(parseVerify(undefined), [{ kind: "review" }]);

@@ -436,6 +436,17 @@ export interface VerifyResolution {
   /** A `test final` verify: the final checks resolve it. */
   final?: true;
   outcome: TestOutcome;
+  /** The check that stopped before this absent name could run. The outcome
+   * stays non-passing, but this is one check failure, not an item defect. */
+  blockedBy?: { command: string; detail: string };
+}
+
+export interface VerifyCheck {
+  command: string;
+  exitCode: number | null;
+  output?: string;
+  failingStep?: string;
+  failingStepOutput?: string;
 }
 
 
@@ -502,16 +513,27 @@ export function testResultLines(output: string): string[] {
 
 /** Resolve every `test` verify of every R, C (and A) item against the check
  * run's output. An item with no test verify produces no rows. */
-export function resolveTestVerifies(items: PlanItems, checkOutput: string): VerifyResolution[] {
+export function resolveTestVerifies(items: PlanItems, checkOutput: string, checks: readonly VerifyCheck[] = []): VerifyResolution[] {
   const out: VerifyResolution[] = [];
   for (const item of flatItems(items)) {
     for (const v of itemTestVerifies(item)) {
+      const outcome = testOutcomeIn(checkOutput, v.name);
+      // An explicit file can identify a successful producer even when a
+      // different check failed. Wrapper scripts and bare names use the
+      // failing check (the conductor stops at its first unexcused failure).
+      const producer = v.file ? checks.find((c) => c.command.includes(v.file!)) : undefined;
+      const failed = producer ?? checks.findLast((c) => c.exitCode !== 0);
+      const tail = (failed?.failingStepOutput ?? failed?.output ?? checkOutput)
+        .split("\n").filter((line) => line.trim()).slice(-10).join("\n");
       out.push({
         id: item.id,
         name: v.name,
         ...(v.file ? { file: v.file } : {}),
         ...(v.final ? { final: true as const } : {}),
-        outcome: testOutcomeIn(checkOutput, v.name),
+        outcome,
+        ...(outcome === "missing" && failed && failed.exitCode !== 0
+          ? { blockedBy: { command: failed.command, detail: [failed.failingStep, tail].filter(Boolean).join(": ") || `exited ${failed.exitCode ?? "without an exit code"}` } }
+          : {}),
       });
     }
   }
@@ -523,22 +545,31 @@ export function resolveTestVerifies(items: PlanItems, checkOutput: string): Veri
  * from it — the plan runs that test only in `#+TT_FINAL_CHECKS`, so it
  * neither raises a finding nor holds acceptance here. A final-only test that
  * ran and failed is kept, and every other missing test is kept. */
-export function resolveRoundTestVerifies(items: PlanItems, checkOutput: string): VerifyResolution[] {
-  return resolveTestVerifies(items, checkOutput).filter((r) => !(r.final && r.outcome === "missing"));
+export function resolveRoundTestVerifies(items: PlanItems, checkOutput: string, checks: readonly VerifyCheck[] = []): VerifyResolution[] {
+  return resolveTestVerifies(items, checkOutput, checks).filter((r) => !(r.final && r.outcome === "missing"));
 }
 
 /** The final tier's outcomes: only the `test final` verifies, resolved
  * against the final checks' output (the round checks plus the final ones). */
-export function resolveFinalTestVerifies(items: PlanItems, checkOutput: string): VerifyResolution[] {
-  return resolveTestVerifies(items, checkOutput).filter((r) => r.final === true);
+export function resolveFinalTestVerifies(items: PlanItems, checkOutput: string, checks: readonly VerifyCheck[] = []): VerifyResolution[] {
+  return resolveTestVerifies(items, checkOutput, checks).filter((r) => r.final === true);
 }
 
 /** The failing/missing test verifies that block acceptance: `id — test
  * "name" (missing|failed)`. Empty when every named test passed. */
 export function testVerifyProblems(resolutions: readonly VerifyResolution[]): string[] {
-  return resolutions
+  return [...new Set(resolutions
     .filter((r) => r.outcome !== "passed")
-    .map((r) => `${r.id} — test "${r.name}" ${r.outcome === "missing" ? "is missing from the check output" : "failed"}`);
+    .map((r) => r.blockedBy
+      ? `check \`${r.blockedBy.command}\` failed before its named tests ran: ${r.blockedBy.detail}`
+      : `${r.id} — test "${r.name}" ${r.outcome === "missing" ? "is missing from the check output" : "failed"}`))];
+}
+
+/** Items held up by a check, without a separate reported test failure. */
+export function testVerifyBlockedItemIds(resolutions: readonly VerifyResolution[]): Set<string> {
+  return new Set(resolutions.filter((r) => r.blockedBy && !resolutions.some((other) =>
+    other.id === r.id && other.outcome !== "passed" && !other.blockedBy,
+  )).map((r) => r.id));
 }
 
 /** The ids whose `test` verify is a problem, for anchoring a finding. */
@@ -1089,7 +1120,7 @@ export function itemEvidenceFiles(phase: ItemLoopState): Array<{ id: string; con
     const tests = (phase.checkResolution ?? []).filter((r) => r.id === item.id);
     if (tests.length > 0) {
       lines.push("", "* Check");
-      for (const t of tests) lines.push(`  - test "${t.name}": ${t.outcome}`);
+      for (const t of tests) lines.push(`  - test "${t.name}": ${t.blockedBy ? `not run (check \`${t.blockedBy.command}\` failed)` : t.outcome}`);
     }
     const o = outcomes.get(item.id);
     lines.push("", `* Verdict: ${o?.outcome ?? "incomplete"}`);
@@ -1159,7 +1190,7 @@ export function itemMatrix(
     const tests = resolutions.filter((r) => r.id === item.id);
     cells.push({
       by: "check",
-      text: tests.length === 0 ? "—" : tests.every((t) => t.outcome === "passed") ? "pass" : tests.map((t) => `${t.name}: ${t.outcome}`).join("; "),
+      text: tests.length === 0 ? "—" : tests.every((t) => t.outcome === "passed") ? "pass" : tests.map((t) => `${t.name}: ${t.blockedBy ? "not run (check failed)" : t.outcome}`).join("; "),
     });
     for (const seat of seats) {
       const v = outcome?.seats.find((s) => s.seat === seat);
@@ -1256,7 +1287,9 @@ export function coverageLines(coverage: Coverage | undefined, items: PlanItems):
 /** The check-resolution section in the reviewer prompt. */
 export function checkResolutionLines(resolutions: readonly VerifyResolution[]): string[] {
   if (resolutions.length === 0) return [];
-  return ["", "Test verifies, resolved against the candidate's check run:", ...resolutions.map((r) => `- ${r.id} test "${r.name}": ${r.outcome}`)];
+  return ["", "Test verifies, resolved against the candidate's check run:",
+    ...testVerifyProblems(resolutions.filter((r) => r.blockedBy)).map((reason) => `- ${reason}`),
+    ...resolutions.filter((r) => !r.blockedBy).map((r) => `- ${r.id} test "${r.name}": ${r.outcome}`)];
 }
 
 /** The item verdicts a reviewer must submit, rendered as a checklist. */
