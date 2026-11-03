@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import { groupAlive, groupHasRecordedMember, groupMemberIdentities, groupStartedBefore, isUnder, killGroup, sweep, sweepDecision } from "../../src/effects/sweep.ts";
+import { LSOF_COMMAND, groupAlive, groupHasRecordedMember, groupMemberIdentities, groupStartedBefore, isUnder, killGroup, sweep, sweepDecision } from "../../src/effects/sweep.ts";
 
 let dir: string;
 
@@ -66,7 +66,7 @@ test("a process outside the run's recorded process groups is reported held, neve
   try {
     await waitFor(() => {
       try {
-        const out = execFileSync("/usr/sbin/lsof", ["+D", dir, "-F", "p"], { encoding: "utf8" });
+        const out = execFileSync(LSOF_COMMAND, ["+D", dir, "-F", "p"], { encoding: "utf8" });
         return out.includes(`p${escapee.pid}`);
       } catch {
         return false;
@@ -93,7 +93,7 @@ test("kills a process in one of the run's own recorded process groups (A2)", asy
   );
   await waitFor(() => {
     try {
-      const out = execFileSync("/usr/sbin/lsof", ["+D", dir, "-F", "p"], { encoding: "utf8" });
+      const out = execFileSync(LSOF_COMMAND, ["+D", dir, "-F", "p"], { encoding: "utf8" });
       return out.includes(`p${own.pid}`);
     } catch {
       return false;
@@ -122,7 +122,7 @@ test("exceptPids protects an intentionally-running process", async () => {
   try {
     await waitFor(() => {
       try {
-        const out = execFileSync("/usr/sbin/lsof", ["+D", dir, "-F", "p"], { encoding: "utf8" });
+        const out = execFileSync(LSOF_COMMAND, ["+D", dir, "-F", "p"], { encoding: "utf8" });
         return out.includes(`p${survivor.pid}`);
       } catch {
         return false;
@@ -153,7 +153,7 @@ test("a process that only holds a file under the worktree (a bind mount's file s
     await waitFor(() => {
       let out = "";
       try {
-        out = execFileSync("/usr/sbin/lsof", ["+D", dir, "-F", "p"], { encoding: "utf8" });
+        out = execFileSync(LSOF_COMMAND, ["+D", dir, "-F", "p"], { encoding: "utf8" });
       } catch (err) {
         out = String((err as { stdout?: string }).stdout ?? "");
       }
@@ -182,7 +182,7 @@ test("plan 06e: a recorded group is signalled, a recycled pgid is not", async ()
   try {
     await waitFor(() => {
       try {
-        return execFileSync("/usr/sbin/lsof", ["+D", dir, "-F", "p"], { encoding: "utf8" }).includes(`p${own.pid}`);
+        return execFileSync(LSOF_COMMAND, ["+D", dir, "-F", "p"], { encoding: "utf8" }).includes(`p${own.pid}`);
       } catch {
         return false;
       }
@@ -251,7 +251,7 @@ test("plan 06e: the sweep never signals a process outside the run's process grou
     await waitFor(() => {
       let out = "";
       try {
-        out = execFileSync("/usr/sbin/lsof", ["+D", dir, "-F", "p"], { encoding: "utf8" });
+        out = execFileSync(LSOF_COMMAND, ["+D", dir, "-F", "p"], { encoding: "utf8" });
       } catch (err) {
         out = String((err as { stdout?: string }).stdout ?? "");
       }

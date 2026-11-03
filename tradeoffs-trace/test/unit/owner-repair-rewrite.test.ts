@@ -46,7 +46,8 @@ function driver(state: State, events: Event[], order: string[]) {
     // Model the production effect's durable fact lookup as well as its write.
     if (!facts.has(finding.doneWhen)) {
       order.push(`done_when_base:${finding.doneWhen}`);
-      facts.set(finding.doneWhen, { exitCode: finding.doneWhen === "true" ? 0 : 1, timedOut: false });
+      facts.set(finding.doneWhen, { exitCode: finding.doneWhen === "true" ? 0 : finding.doneWhen === "unavailable" ? 127 : 1,
+        timedOut: finding.doneWhen === "timeout" });
     }
     return facts.get(finding.doneWhen);
   };
@@ -58,7 +59,7 @@ function driver(state: State, events: Event[], order: string[]) {
   return { conductor, send: conductor.test_applyEvent, run: () => conductor.test_runDomainRounds("test") };
 }
 
-for (const original of [undefined, "true"]) test(`UNPROVABLE ${original ?? "missing command"} can be rewritten before MAP, live and replayed`, async () => {
+for (const original of ["unavailable", "timeout"]) test(`UNPROVABLE ${original} can be rewritten before MAP, live and replayed`, async () => {
   const { state: initial, request } = fixture();
   const events: Event[] = [], order: string[] = [];
   const d = driver(initial, events, order);
@@ -171,7 +172,7 @@ test("a later ruling supersedes an unmaterialized repair, only at its binding", 
   assert.equal(ownerRepairPointFor(state.phase, first, { checks: [] }), undefined);
   assert.equal(ownerRepairPointFor(state.phase, ruling, { checks: [] }), undefined);
   ruling.resolvedBinding = { candidateSha: "another", contractVersion: K };
-  assert.ok("reason" in ownerRepairPointFor(state.phase, first, { checks: [] }));
+  assert.ok("finding" in ownerRepairPointFor(state.phase, first, { checks: [] }));
 });
 
 test("a later repair reuses already materialized work rather than raising a duplicate", () => {

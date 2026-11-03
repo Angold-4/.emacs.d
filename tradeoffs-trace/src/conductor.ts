@@ -80,6 +80,8 @@ import {
 import { resolveBinding } from "./core/binding.ts";
 import { next } from "./core/next.ts";
 import { checkCommands, checkTier, diffTouchesWidePath, effectiveChecks, finalCheckOf, parseCheckRecord, type CheckRecord, type CheckRecordCommand, type CheckRecordFact, type CheckTier } from "./core/checks.ts";
+import { runCompatibilityInventory, type CompatibilityRecord } from "./effects/compatibility.ts";
+import { compatibilityTests } from "./core/compatibility.ts";
 // Plan 05i: the pure environment preflight — parse every declared shell
 // command's executable and resolve it in the conductor's own PATH. See the
 // module's header.
@@ -1740,10 +1742,10 @@ export function ownerRepairPointFor(
     for (const verify of parseVerify(citation[0])) if (verify.kind === "test") tests.push(verify);
   }
   if (item) tests.push(...itemTestVerifies(item));
-  const doneWhen = fields.doneWhen ?? finding?.doneWhen ??
+  const doneWhen = fields.doneWhen ??
     (finding?.reproduction?.result === "reproduced" ? finding.reproduction.command : undefined) ??
+    finding?.doneWhen ??
     lostTestsDoneWhen(tests, declared);
-  if (!doneWhen?.trim()) return { reason: `X:UNPROVABLE: owner repair ${request.id} ${tests.length ? "names a test with no declared command" : "has no proving command"}; the lead must rewrite the point with doneWhen` };
   const option = request.resolution.option;
   const label = request.options.find((o) => o.id === option)?.label ?? option;
   return {
@@ -1765,8 +1767,9 @@ export function ownerRepairPointFor(
 }
 
 /** Admission precedes FINDING_RAISED and MAP. The caller establishes and
- * records the command's base result; a green or inconclusive base cannot
- * prove a repair. Replays reuse that recorded fact. */
+ * records the command's base result. A command already green on the base
+ * supplies no repair evidence: the point then requires domain approval.
+ * Replays reuse that recorded fact. */
 export async function admitOwnerRepairPoint(
   phase: PhaseState,
   request: PhaseState["ownerRequests"][number],
@@ -1775,9 +1778,12 @@ export async function admitOwnerRepairPoint(
 ): Promise<ReturnType<typeof ownerRepairPointFor>> {
   const point = ownerRepairPointFor(phase, request, declared);
   if (!point || "reason" in point) return point;
-  if (!point.finding.doneWhen?.trim()) return { reason: `X:UNPROVABLE: owner repair ${request.id} has no doneWhen; the lead must rewrite the point` };
+  if (!point.finding.doneWhen?.trim()) return point;
   const fact = await baseFact(point.finding);
-  if (fact.exitCode === 0 && !fact.timedOut) return { reason: `X:UNPROVABLE: owner repair ${request.id} doneWhen already passes on the base; the lead must rewrite the point` };
+  if (fact.exitCode === 0 && !fact.timedOut) {
+    const { doneWhen: _unproving, ...finding } = point.finding;
+    return { ...point, finding };
+  }
   if (fact.timedOut || fact.exitCode === null || fact.exitCode === 126 || fact.exitCode === 127) {
     return { reason: `X:UNPROVABLE: owner repair ${request.id} has no conclusive failing base result; the lead must rewrite the point` };
   }
@@ -2823,6 +2829,16 @@ export class Conductor {
    * uninterrupted run already produces, so no new core vocabulary was
    * needed for this packet (see the README's "Item 1c" section). */
   async #reconcileInFlight(): Promise<void> {
+    // The inventory belongs to its enclosing round/check effect. Reap its
+    // recorded child groups before resuming that effect after a crash.
+    const { records } = readLog(this.#paths.events);
+    const completed = new Set(records.filter((r) => r.kind === "completion").map((r) => r.actionId));
+    for (const record of records) {
+      if (record.kind !== "intent" || !record.actionId?.startsWith("compatibility-") || completed.has(record.actionId)) continue;
+      const pgid = (record.event as { pgid?: number }).pgid;
+      if (typeof pgid === "number") await this.#killRecordedGroup(pgid, Date.parse(record.ts));
+      this.#log.completion(record.actionId, { interrupted: true, reason: "crash-recovery" });
+    }
     const inFlight = { ...this.#state.phase.inFlight };
     for (const key of Object.keys(inFlight) as InFlightKey[]) {
       const entry = inFlight[key];
@@ -11313,6 +11329,14 @@ export class Conductor {
       // Packet X: each doneWhen that passes here also runs on the round's base
       // (the lane's start), so a command that passes there too repairs
       // nothing.
+      // Inventory the first green lane immediately, even if its reviews
+      // later fail. Only an adopted candidate publishes its findings.
+      // Make the cheap check facts visible to the concurrent seats before a
+      // slow inventory starts; the inventory must not make review blind.
+      this.#laneCheckOutputs.set(candidateSha, combinedOutput);
+      if (this.#itemsEnforced()) {
+        this.#laneCheckResolutions.set(candidateSha, resolveRoundTestVerifies(this.#planItems(), combinedOutput, recordCommands));
+      }
       const facts =
         (this.#state.phase.contract.domains?.length ?? 0) > 0 && !this.#stopRequested
           ? await this.#runDoneWhenFacts(lane, candidateSha, checkoutDir.dir, laneBase ?? this.#baselineBaseSha())
@@ -11342,12 +11366,7 @@ export class Conductor {
       });
       // Plan 07e (A4/E4): a record the disk refused fails the lane's check.
       if (!recordWritten) return { ok: false, note: "disk full" };
-      // The item test-verifies are resolved for the winner only (the hand-off
-      // applies them); a loser's output must not touch the phase's item state.
-      this.#laneCheckOutputs.set(candidateSha, combinedOutput);
-      if (this.#itemsEnforced()) {
-        this.#laneCheckResolutions.set(candidateSha, this.#resolveVerifies(combinedOutput, candidateSha));
-      }
+      if (passed) await this.#collectCompatibilityInventory(candidateSha, checkoutDir.dir);
       return passed ? { ok: true } : { ok: false, note: firstFailure ?? "a check command failed" };
     } finally {
       checkoutDir.dispose();
@@ -12269,6 +12288,8 @@ export class Conductor {
         }
       }
       if (this.#stopRequested || this.#recheckCancelledLaneRound) return;
+      if (check.ok) await this.#inventoryCandidate(candidate);
+      if (this.#stopRequested || this.#recheckCancelledLaneRound) return;
       if (!check.ok) {
         const result = this.#readCheckRecord(candidate);
         const output = result?.output ?? check.note ?? "";
@@ -12892,6 +12913,7 @@ export class Conductor {
     const roundRecord = (this.#state.phase.rounds ?? []).find((r) => r.round === round);
     const candidate = roundRecord?.candidates.find((c) => c.lane === winner.lane);
     const reviews = candidate?.reviews ?? [];
+    const checksPassed = this.#readCheckRecord(winner.sha)?.record.passed === true;
     // The worktree the phase's own worker would have used is set to the
     // winner, so every later stage that reads `paths.worktree` sees the
     // winner's tree (a repair round's lanes are created fresh from its sha).
@@ -12930,6 +12952,14 @@ export class Conductor {
         // The winner's own lane sweep, never a hard-coded false.
         tainted: build?.tainted === true,
       });
+      // An owner may name a red candidate as the repair base. Its recorded
+      // check result still decides the gate; a ruling cannot turn it green.
+      if (!checksPassed) {
+        this.#pendingLaneWinner = undefined;
+        this.#applyEvent({ type: "CHECKS_FAILED" });
+        return;
+      }
+      await this.#inventoryCandidate(winner.sha);
       // Plan 06g2: the winner lane's turn-1 discoveries become the phase's own
       // records, bound to the winner. The reviews' ballots name the ids the
       // lane's turn-2 prompt listed (the lane's worker decisions and these
@@ -13003,6 +13033,7 @@ export class Conductor {
       }
     } finally {
       this.#driveSuspended = false;
+      if (!checksPassed) this.drive();
     }
     // The same bookkeeping #runFreeze does once a candidate exists: carry the
     // messages, raise each decision as a trade-off, note the coverage, sample
@@ -14544,6 +14575,153 @@ export class Conductor {
     }
   }
 
+  /** Compatibility is a round effect, independent of semantic acceptance.
+   * A new checked candidate refreshes the inventory; an identical candidate
+   * reuses its durable record after a restart. No phase state or flag. */
+  async #inventoryCandidate(candidateSha: string): Promise<void> {
+    if (!finalCheckOf(this.#state.phase.contract) || this.#stopRequested) return;
+    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots, this.#runDir);
+    const window = this.#openCheckWindow();
+    let checkout: DisposableCheckout | undefined;
+    try {
+      checkout = disposableCheckout(this.#plan.repo, candidateSha);
+      await this.#inventoryInCheckout(candidateSha, checkout.dir);
+    } catch (err) {
+      const record = this.#inventoryError(candidateSha, err);
+      if (record) this.#applyCompatibilityInventory(record, checkout?.dir ?? "");
+    } finally {
+      checkout?.dispose();
+      window.release();
+      await lock.release();
+    }
+  }
+
+  async #inventoryInCheckout(candidateSha: string, cwd: string): Promise<void> {
+    const record = await this.#collectCompatibilityInventory(candidateSha, cwd);
+    if (record && !this.#stopRequested && !this.#recheckCancelledLaneRound) this.#applyCompatibilityInventory(record, cwd);
+  }
+
+  async #collectCompatibilityInventory(candidateSha: string, cwd: string): Promise<CompatibilityRecord | undefined> {
+    try {
+      const commands = effectiveChecks([], this.#state.phase.contract.finalChecks ?? []).map((c) => this.#withValues(c));
+      if (commands.length === 0 || this.#stopRequested) return;
+      const file = path.join(this.#paths.checks, candidateSha, "compatibility.json");
+      let record = this.#readCompatibilityInventory(candidateSha, commands);
+      if (!record) {
+        this.#log.append("compatibility_inventory_started", { candidateSha, commands });
+        // Wide-path plans may already have executed every final command.
+        // Reuse only raw green command facts, with each command's own log.
+        const checked = this.#readCheckRecord(candidateSha)?.record;
+        const reusable = checked?.tier === "final" && checked.passed &&
+          checked.commands.every((c) => c.exitCode === 0 && !c.timedOut) && commands.every((command) =>
+            checked.commands.some((c) => c.command === command && c.log && fs.existsSync(path.join(this.#paths.checks, candidateSha, c.log))));
+        record = reusable ? { candidateSha, at: new Date().toISOString(), complete: true, commands: commands.map((command) => {
+          const c = checked!.commands.find((c) => c.command === command)!;
+          const output = fs.readFileSync(path.join(this.#paths.checks, candidateSha, c.log!), "utf8");
+          return { command, exitCode: c.exitCode, timedOut: c.timedOut, output, tests: compatibilityTests(output, command, this.#plan.rerun) };
+        }) } : await runCompatibilityInventory({ candidateSha, commands, cwd, env: this.#checkEnv(),
+          deadlineMs: this.#deadlines.finalCheckMs, termGraceMs: this.#deadlines.termGraceMs, rerun: this.#plan.rerun,
+          stopped: () => this.#stopRequested || this.#recheckCancelledLaneRound,
+          onIntent: ({ pgid }) => {
+            this.#onStageShIntent(pgid);
+            this.#log.intent(`compatibility-${candidateSha}-${pgid}`, { pgid, candidateSha });
+          },
+          onExit: (pgid) => {
+            this.#onStageShExit(pgid);
+            this.#log.completion(`compatibility-${candidateSha}-${pgid}`, { candidateSha });
+          },
+        });
+        if (!verifyIntegrity(this.#plan.repo, cwd, candidateSha)) {
+          record.complete = false;
+          this.#applyEvent({ type: "INTEGRITY_VIOLATED", stage: "checks", evidence: `compatibility candidate ${candidateSha}` });
+        }
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(`${file}.tmp`, JSON.stringify(redactRecord(record, this.#secretMaskable), null, 2));
+        fs.renameSync(`${file}.tmp`, file);
+        this.#log.append("compatibility_inventory_finished", { candidateSha, complete: record.complete,
+          tests: record.commands.flatMap((c) => c.tests),
+          failedCommands: record.commands.filter((c) => c.exitCode !== 0 || c.timedOut).map((c) => c.command) });
+      }
+      if (this.#stopRequested || this.#recheckCancelledLaneRound) return;
+      return record;
+    } catch (err) {
+      return this.#inventoryError(candidateSha, err);
+    }
+  }
+
+  #inventoryError(candidateSha: string, error: unknown): CompatibilityRecord | undefined {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOSPC") {
+      this.#noteDiskFull(error, "compatibility inventory");
+      return;
+    }
+    this.#log.append("compatibility_inventory_error", { candidateSha, error: String((error as Error)?.message ?? error) });
+    return { candidateSha, at: new Date().toISOString(), complete: false, commands: [] };
+  }
+
+  #readCompatibilityInventory(candidateSha: string, commands: readonly string[]): CompatibilityRecord | undefined {
+    try {
+      const kept = JSON.parse(fs.readFileSync(path.join(this.#paths.checks, candidateSha, "compatibility.json"), "utf8")) as CompatibilityRecord;
+      if (kept.candidateSha === candidateSha && kept.complete && kept.commands.length === commands.length &&
+        commands.every((command, i) => kept.commands[i].command === redactText(command, this.#secretMaskable) && typeof kept.commands[i].output === "string" &&
+          Array.isArray(kept.commands[i].tests) && kept.commands[i].tests.every((t) => t && typeof t.name === "string" &&
+            typeof t.command === "string" && ["passed", "failed", "skipped"].includes(t.outcome)) && typeof kept.commands[i].timedOut === "boolean" &&
+          (kept.commands[i].exitCode === null || Number.isInteger(kept.commands[i].exitCode)))) return {
+            ...kept, commands: kept.commands.map((c, i) => ({ ...c, command: commands[i],
+              tests: c.tests.map((t) => ({ ...t, command: this.#withValues(t.command) })) })),
+          };
+    } catch { /* No complete inventory to reuse. */ }
+    return undefined;
+  }
+
+  #applyCompatibilityInventory(record: CompatibilityRecord, cwd: string): void {
+    const phase = this.#state.phase;
+    const prefix = `F-${phase.phaseId}-compat-`;
+    const key = (command: string, name: string): string => `${prefix}${createHash("sha256").update(`${command}\n${name}`).digest("hex").slice(0, 16)}-`;
+    const observed = record.commands.flatMap((c) => c.tests.map((t) => ({ ...t, sourceCommand: c.command })));
+    for (const finding of phase.findings) {
+      if (!finding.id.startsWith(prefix) || finding.status !== "open") continue;
+      const passed = observed.some((t) => t.outcome === "passed" && finding.id.startsWith(key(t.sourceCommand, t.name)));
+      const commandPassed = record.commands.some((c) => c.exitCode === 0 && !c.timedOut &&
+        finding.id.startsWith(key(c.command, c.command)));
+      const completed = finding.expected === "Complete compatibility inventory within the final-check bound";
+      if (record.complete && (passed || commandPassed || completed)) this.#applyEvent({ type: "FINDING_DISPROVED", findingId: finding.id,
+        byReviewer: "conductor", evidence: `the failing compatibility test/command passed on ${record.candidateSha}` });
+    }
+    const failures = record.commands.flatMap((c) => {
+      const failedTests = c.tests.filter((t) => t.outcome === "failed");
+      return failedTests.length > 0 ? failedTests.map((t) => ({ name: t.name, sourceCommand: c.command, command: t.command, file: t.file,
+        expected: `Compatibility test "${t.name}" passes`, output: c.output })) :
+        c.exitCode !== 0 || c.timedOut ? [{ name: c.command, sourceCommand: c.command, command: c.command, file: undefined,
+          expected: `Compatibility command passes: ${c.command}`, output: c.output }] : [];
+    });
+    for (const failure of failures) {
+      if (this.#state.phase.findings.some((f) => f.status === "open" && f.id.startsWith(key(failure.sourceCommand, failure.name)))) continue;
+      const output = failure.output.replaceAll(`${cwd}/`, "");
+      const testFile = failure.file?.replace(`${cwd}/`, "");
+      const owner = failingDomainOf(`${testFile ?? ""}\n${output}\n${failure.command}`, phase.contract.domains ?? []);
+      this.#applyEvent({ type: "FINDING_RAISED", finding: {
+        id: `${key(failure.sourceCommand, failure.name)}${record.candidateSha.slice(0, 12)}`,
+        version: 1, phaseId: phase.phaseId, kind: "defect", severity: "blocking", raisedBy: "conductor", status: "open",
+        boundCandidateSha: record.candidateSha, expected: failure.expected,
+        evidence: `Compatibility inventory: ${failure.name}\nFailing command: ${failure.command}\n${output.slice(-12000)}`,
+        doneWhen: failure.command.replaceAll(`${cwd}/`, ""),
+        ...(owner ? { domain: owner.domain, where: `${owner.path}:1` } : testFile ? { where: `${testFile}:1` } : {}),
+      } });
+    }
+    if (!record.complete && !this.#stopRequested) {
+      // A deadline may leave commands unexecuted. Keep that absence explicit;
+      // no green subset can make an incomplete inventory acceptable.
+      const expected = "Complete compatibility inventory within the final-check bound";
+      if (!this.#state.phase.findings.some((f) => f.id.startsWith(prefix) && f.status === "open" && f.expected === expected))
+        this.#applyEvent({ type: "FINDING_RAISED", finding: {
+          id: `${prefix}incomplete-${record.candidateSha.slice(0, 12)}`, version: 1, phaseId: phase.phaseId,
+          kind: "defect", severity: "blocking", raisedBy: "conductor", status: "open", boundCandidateSha: record.candidateSha,
+          expected, evidence: `Compatibility inventory incomplete: final-check bound ${this.#deadlines.finalCheckMs}ms; executed ${record.commands.length} commands`,
+        } });
+      this.#recordBound("final-check", `compatibility:${record.candidateSha}`, this.#deadlines.finalCheckMs, this.#deadlines.finalCheckMs);
+    }
+  }
+
   /** 07g1: a red FINAL check is a point, not just a record. Anchor it to
    * the first failing file the output names and put it in that file's domain.
    * A failure that names no file of a declared domain is not a point: the
@@ -14637,6 +14815,7 @@ export class Conductor {
       widePathTouched,
     });
     const finalCommands = tier === "final" ? (this.#state.phase.contract.finalChecks ?? []).map((c) => this.#withValues(c)) : [];
+    const inventory = tier === "final" ? this.#readCompatibilityInventory(candidateSha, effectiveChecks([], finalCommands)) : undefined;
     const recordCommands: CheckRecordCommand[] = [];
     const recordLoad1 = Math.round(loadavg()[0] * 100) / 100;
     const recordFreeMemMB = Math.round(os.freemem() / (1024 * 1024));
@@ -14701,7 +14880,11 @@ export class Conductor {
           // ODP-3: the check's own process group, tracked live so `stop()`
           // signals it like every other stage's.
           let checkPgid: number | undefined;
-          const running = runCommand({
+          const kept = inventory?.commands.find((c) => c.command === command && c.exitCode === 0 && !c.timedOut &&
+            c.tests.every((t) => t.outcome !== "failed"));
+          if (kept) this.#log.append("compatibility_check_reused", { candidateSha, command });
+          const running = kept ? { result: Promise.resolve({ exitCode: 0, signal: null, timedOut: false,
+            cancelled: false, output: kept.output, signalsSent: [] } as RunCommandResult) } : runCommand({
             command,
             cwd: checkoutDir.dir,
             // 07g2 (A4/R9): a red round check names its failing step.
@@ -14875,6 +15058,7 @@ export class Conductor {
         return;
       }
       if (this.#closed) return;
+      if (passed && tier === "round") await this.#inventoryInCheckout(candidateSha, checkoutDir.dir);
       // design §2.2: a checkout that no longer matches its candidate commit
       // invalidates that gate's result (never counted as passed — `passed`
       // above is already forced `false` by the `!after` check) and marks

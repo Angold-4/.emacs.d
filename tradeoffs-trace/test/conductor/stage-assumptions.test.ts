@@ -90,7 +90,8 @@ for (const mode of ["ballot", "grade-finding", "defect"]) test(`ACCEPT trusts do
     const text = fs.readFileSync(promptLog, "utf8");
     assert.match(text, /Assume every point resolved by an approved domain is resolved/);
     assert.match(text, /integration defects across domains/);
-    assert.match(text, /green fix checks; quality ok/);
+    assert.match(text, /green fix checks; test -f booking-fixed\.txt: holds/);
+    assert.match(text, /the point is fixed on the reviewed commit/);
   } finally {
     await setup.conductor.stop(); cleanupDir(setup.runRoot); cleanupDir(setup.scriptsDir); cleanupDir(prompts);
   }

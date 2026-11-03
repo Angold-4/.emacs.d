@@ -483,9 +483,10 @@ test("plan-items: two of three seats judging R2 unmet raises a blocking finding 
   }
 });
 
-test("plan-items: the evaluator overturns a majority unmet verdict the passing test contradicts, and counts it against the seat", async () => {
+test("plan-items: a passing weak named test preserves negative seat verdicts and ends with an owner request", async () => {
   const setup = await setupConductor({
     items: ITEMS,
+    rounds: 1,
     phaseChecks: [CHECK_OUTPUT],
     stubReviews: false,
     deadlines: FAST,
@@ -497,7 +498,8 @@ test("plan-items: the evaluator overturns a majority unmet verdict the passing t
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
       ],
     }),
-    // R1's own test verify passed, so two unmet verdicts are contradicted by the code.
+    // CHECK_OUTPUT only prints a passing name. It proves no failure clause,
+    // so the two seats' negative verdicts must remain repair work.
     reviewerScriptFor: (reviewer, state) => reviewerScript(
       reviewer,
       state.phase.candidate?.sha,
@@ -508,18 +510,11 @@ test("plan-items: the evaluator overturns a majority unmet verdict the passing t
   try {
     await setup.conductor.start();
     await waitFor(() => ["DONE", "BLOCKED", "AWAITING_OWNER"].includes(setup.conductor.state.phase.phase), 90_000, 50, setup.runDir);
-    assert.equal(setup.conductor.state.phase.phase, "DONE", "the overturned verdict does not block");
+    assert.equal(setup.conductor.state.phase.phase, "AWAITING_OWNER");
     const overturns = setup.conductor.state.phase.overturns ?? [];
-    // Both contradicted seats are overturned and counted (finding M-3).
-    assert.equal(overturns.length, 2);
-    assert.deepEqual(overturns.map((o) => o.id), ["R1", "R1"]);
-    assert.deepEqual(overturns.map((o) => o.seat).sort(), ["A", "M"]);
-    assert.ok(overturns.every((o) => o.effect === "flip"));
-    assert.ok(!setup.conductor.state.phase.findings.some((f) => f.itemId === "R1"), "no finding is raised for the overturned item");
-    // The seat's overturn count shows in `tt summary`'s PR body.
-    const { prSummary } = await import("../../src/view.ts");
-    const md = prSummary(setup.runDir, setup.plan);
-    assert.match(md, /Overturned verdicts \(counted against a seat\): .*\b1\b/);
+    assert.deepEqual(overturns, []);
+    assert.ok(setup.conductor.state.phase.findings.some((f) => f.itemId === "R1" && f.status === "open"));
+    assert.ok(setup.conductor.state.phase.ownerRequests.some((r) => r.status === "open"));
   } finally {
     await teardown(setup);
   }

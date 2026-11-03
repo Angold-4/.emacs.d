@@ -28,6 +28,10 @@ import * as path from "node:path";
 
 import { readLog } from "./log.ts";
 
+/** System lsof lives in sbin on macOS and bin on Linux. Keep an absolute
+ * path so a worker's PATH cannot substitute the sweep's process inventory. */
+export const LSOF_COMMAND = process.platform === "darwin" ? "/usr/sbin/lsof" : "/usr/bin/lsof";
+
 // ---------------------------------------------------------------------------
 // The one owner of the signalling decision (A2/C3)
 // ---------------------------------------------------------------------------
@@ -230,7 +234,7 @@ export function isProtectedCommand(command: string): boolean {
 function lsofUnder(dir: string): Set<number> {
   let out: string;
   try {
-    out = execFileSync("/usr/sbin/lsof", ["+D", dir, "-F", "p"], { encoding: "utf8" });
+    out = execFileSync(LSOF_COMMAND, ["+D", dir, "-F", "p"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   } catch (err) {
     // lsof exits 1 (and prints nothing) when nothing matches. Any stdout
     // captured on the error object is still authoritative; anything else
@@ -253,7 +257,7 @@ function lsofUnder(dir: string): Set<number> {
  * `<unknown>` when the process is already gone or `lsof` cannot say. */
 function cwdFor(pid: number): string {
   try {
-    const out = execFileSync("/usr/sbin/lsof", ["-a", "-p", String(pid), "-d", "cwd", "-F", "n"], { encoding: "utf8" });
+    const out = execFileSync(LSOF_COMMAND, ["-a", "-p", String(pid), "-d", "cwd", "-F", "n"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
     const named = out.split("\n").find((line) => line.startsWith("n"));
     return named ? named.slice(1) : "<unknown>";
   } catch {

@@ -852,12 +852,9 @@ export interface Overturn {
   reason: string;
 }
 
-/** The evaluator's re-verification of a majority `unmet`/`deviates` verdict
- * against the candidate, and of a unanimous `met`/`fits` verdict whose
- * evidence is thin. Pure: `ctx` carries the code facts. A majority `unmet` for
- * an item whose own `test` verify PASSED is contradicted by the code and is
- * overturned; a unanimous `met` whose only anchors are the worker's is
- * overturned. Every overturn is counted against its seat. */
+/** A passing named test does not establish that it exercises the item's
+ * failure clause. Mechanical check success never overturns a seat verdict;
+ * independent review supplies any approval. */
 export function reverify(
   item: FlatItem,
   verdicts: readonly SeatItemVerdict[],
@@ -867,23 +864,6 @@ export function reverify(
    * none is a file that seat read. */
   readsBySeat: Record<string, readonly string[]> = {},
 ): Overturn[] {
-  if (verdicts.length === 0) return [];
-  const contradicted =
-    item.kind === "architecture" ? verdicts.filter((v) => v.verdict === "deviates") : verdicts.filter((v) => v.verdict === "unmet");
-  if (contradicted.length >= 2) {
-    const tests = itemTestVerifies(item);
-    const testPassed = tests.length > 0 && tests.every((t) => ctx.testOutcomes.get(t.name) === "passed");
-    if (testPassed) {
-      // Every contradicted seat is overturned and counted (finding M-3): the
-      // code proves the opposite, so each `unmet`/`deviates` is flipped. A
-      // symbol merely being present does NOT contradict a shape/ownership
-      // judgement, so only a passing test verify overturns (the reviewers
-      // vetoed the broader rule).
-      const reason = `the item's own test verify passed in this check run (${tests.map((t) => `"${t.name}"`).join(", ")})`;
-      return contradicted.map((v) => ({ seat: v.seat, id: item.id, kind: item.kind, verdict: v.verdict, effect: "flip" as const, reason }));
-    }
-    return [];
-  }
   // Plan 06c (R5): a unanimous thin met/fits verdict is NOT withdrawn by
   // code. It is sent to the evaluator as an owed item check
   // (`thinMetItems`); only a `contradicted` check with valid anchors

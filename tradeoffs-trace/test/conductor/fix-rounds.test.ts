@@ -1039,7 +1039,7 @@ test("fixers launch on the worker model, not the consolidator's", async () => {
   }
 });
 
-test("a failing final check that names no declared domain's file records LEAD_CALLED and makes no point", async () => {
+test("a fileless compatibility failure keeps its failing command and calls the lead without guessing a domain", async () => {
   const setup = await setupConductor({
     phase: {
       id: "p1",
@@ -1072,7 +1072,10 @@ test("a failing final check that names no declared domain's file records LEAD_CA
       50,
       setup.runDir,
     );
-    assert.equal((setup.conductor.state.phase.findings ?? []).filter((f) => f.raisedBy === "conductor").length, 0, "no point was made without a file of a declared domain");
+    const failures = (setup.conductor.state.phase.findings ?? []).filter((f) => f.id.includes("-compat-"));
+    assert.equal(failures.length, 1, "the fileless failing command remains visible as repair work");
+    assert.equal(failures[0].domain, undefined, "no domain was guessed");
+    assert.equal(failures[0].doneWhen, "printf 'the final check failed without a path\n'; exit 1");
   } finally {
     await teardown(setup);
   }
@@ -1142,7 +1145,7 @@ function resolveRepair(setup: TestConductorSetup, request: import("../../src/cor
 
 for (const mode of ["named", "missing", "green"]) test(mode === "named"
   ? "an owner reject_and_repair on a failed vote dispatches that domain's fixer"
-  : `an owner repair ${mode === "missing" ? "without a named test" : "with a green base"} calls the lead as UNPROVABLE and accepts a rewrite`, async () => {
+  : `an owner repair ${mode === "missing" ? "without a named test" : "with a green base"} dispatches a review-gated repair`, async () => {
   const namesTest = mode === "named";
   const promptDir = fs.mkdtempSync("/tmp/tt-owner-repair-prompts-");
   const promptLog = path.join(promptDir, "prompts.txt");
@@ -1198,23 +1201,10 @@ for (const mode of ["named", "missing", "green"]) test(mode === "named"
     await waitFor(() => fixerIntents(setup.runDir).length > 0 || setup.conductor.state.phase.phase === "AWAITING_OWNER" ||
       readEvents(setup.runDir).slice(before).some((r) => r.kind === "event" && (r.event as { type?: string }).type === "FREEZE_COMPLETED"),
       90_000, 50, setup.runDir);
-    if (!namesTest) {
-      await waitFor(() => readEvents(setup.runDir).slice(before).some((r) => r.kind === "lead_called" &&
-        /X:UNPROVABLE.*doneWhen/.test((r.event as { reason: string }).reason)), 20_000, 50, setup.runDir);
-      assert.equal(fixerIntents(setup.runDir).length, 0);
-      assert.equal(setup.conductor.state.phase.findings.some((f) => f.id.includes("owner-repair")), false);
-      const failed = request;
-      request = setup.conductor.state.phase.ownerRequests.find((r) => r.status === "open" && r.linkedDecisionId === failed.linkedDecisionId);
-      assert.ok(request, "UNPROVABLE offers a rewrite of the same linked work");
-      const replayed = rebuildState(setup.runDir, setup.plan);
-      assert.deepEqual(JSON.parse(JSON.stringify(replayed.phase.ownerRequests)), JSON.parse(JSON.stringify(setup.conductor.state.phase.ownerRequests)));
-      resolveRepair(setup, request, `doneWhen: ${BOOKING_DONE}`);
-      await waitFor(() => fixerIntents(setup.runDir).length > 0, 20_000, 50, setup.runDir);
-    }
     assert.equal(fixerIntents(setup.runDir).length, 1, "the owner's ruling dispatches a fixer before another review");
     const point = setup.conductor.state.phase.findings.find((f) => f.linkedDecisionId === request.linkedDecisionId && f.domain === "booking");
     assert.ok(point, "the rejected decision became a booking point");
-    assert.equal(point.doneWhen, namesTest ? `test -f booking-fixed.txt # 'rejects unsafe prices'` : BOOKING_DONE,
+    assert.equal(point.doneWhen, namesTest ? `test -f booking-fixed.txt # 'rejects unsafe prices'` : undefined,
       "admission uses the effective resolution's proving command");
     assert.deepEqual(rebuildState(setup.runDir, setup.plan).phase.findings.find((f) => f.id === point.id), point,
       "strict recovery preserves the admitted replacement point");
@@ -1222,13 +1212,13 @@ for (const mode of ["named", "missing", "green"]) test(mode === "named"
     const baseFactIndex = records.findIndex((r) => r.kind === "done_when_base" && (r.event as { findingId?: string }).findingId === point.id);
     const raisedIndex = records.findIndex((r) => r.kind === "event" && (r.event as { type?: string; finding?: { id: string } }).type === "FINDING_RAISED" &&
       (r.event as { finding: { id: string } }).finding.id === point.id);
-    assert.ok(baseFactIndex >= before && baseFactIndex < raisedIndex, "a recorded failing base fact precedes point admission");
-    const baseFact = records[baseFactIndex].event as { baseSha: string; command: string; exitCode: number; timedOut: boolean; output: string };
-    assert.equal(baseFact.baseSha, original);
-    assert.equal(baseFact.command, point.doneWhen);
-    assert.equal(baseFact.exitCode, 1);
-    assert.equal(baseFact.timedOut, false);
-    assert.equal(typeof baseFact.output, "string", "the admission fact records the command output");
+    if (mode !== "missing") {
+      assert.ok(baseFactIndex >= before && baseFactIndex < raisedIndex, "a recorded base fact precedes admission");
+      const baseFact = records[baseFactIndex].event as { baseSha: string; exitCode: number };
+      assert.equal(baseFact.baseSha, original);
+      assert.equal(baseFact.exitCode, namesTest ? 1 : 0);
+    } else assert.equal(baseFactIndex, -1, "a review-only point runs no substitute candidate check");
+    assert.ok(!records.slice(before).some((r) => r.kind === "lead_called" && /UNPROVABLE/.test(JSON.stringify(r.event))));
     assert.match(point.expected ?? "", /reject_and_repair/);
     assert.match(point.expected ?? "", /VETO_REASON/);
     await waitFor(() => fs.existsSync(promptLog) && fs.readFileSync(promptLog, "utf8").includes(point.id), 20_000, 50, setup.runDir);

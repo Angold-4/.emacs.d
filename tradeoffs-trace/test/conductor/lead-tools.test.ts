@@ -117,11 +117,15 @@ test("tt why prints the blockers with commands on a stopped run", async () => {
   } as never);
   try {
     await setup.conductor.start();
-    // The round's own check, the probe and every reviewed item pass; only the
-    // contract's final check is red. That leaves exactly one check blocker on
-    // a stopped run, and no review/evaluation reason to accept.
+    // The compatibility failure now arrives as an early point. Stop after
+    // the cheap checks, probe and reviews finish, before repair can change C.
     await waitFor(
-      () => setup.conductor.state.phase.checks?.tier === "final" && setup.conductor.state.phase.checks.passed === false,
+      () => {
+        const p = setup.conductor.state.phase;
+        return p.findings.some((f) => f.id.includes("-compat-") && f.doneWhen === "false") &&
+          p.checks?.passed === true && p.probe?.passed === true &&
+          Object.values(p.reviews).filter((slot) => slot.review).length === 3;
+      },
       120_000,
       20,
       setup.runDir,
@@ -187,11 +191,10 @@ test("tt why prints the blockers with commands on a stopped run", async () => {
     const text = await runCli(["why", setup.runDir]);
     assert.equal(text.code, 0, text.stdout);
     assert.match(text.stdout, /accepted: no/);
-    assert.match(text.stdout, /\[check\]/);
     assert.match(text.stdout, /\[point\]/);
     assert.match(text.stdout, /\[decision\]/);
     assert.doesNotMatch(text.stdout, /\[item\]/, "the seat's candidate anchor resolves, so R1 does not block");
-    assert.match(text.stdout, /false/, "the red final check's own command is named verbatim");
+    assert.match(text.stdout, /F-p1-compat-/, "the early final-check point is listed");
     assert.match(text.stdout, /tt why/, "the point blocker names the read that shows its fact");
     assert.match(text.stdout, /"type":"ruling"/, "the unsettled trade-off's command is a ruling");
     assert.match(text.stdout, new RegExp(`runner revision: ${revision}`), "the text names the recorded runner");
@@ -211,11 +214,11 @@ test("tt why prints the blockers with commands on a stopped run", async () => {
       bounds: Array<{ kind: string; scope: string; limitMs: number; elapsedMs: number }>;
     };
     assert.equal(parsed.runId, path.basename(setup.runDir));
-    assert.ok(["REPAIRING", "IMPLEMENTING"].includes(parsed.phase), `the stopped run is repairing its red check, got ${parsed.phase}`);
+    assert.notEqual(parsed.phase, "DONE", "the red compatibility point prevents acceptance");
     assert.equal(parsed.accepted, false);
     assert.equal(parsed.blockers.length, 3, `exactly three blockers, got ${JSON.stringify(parsed.blockers, null, 2)}`);
-    assert.deepEqual(parsed.blockers.map((b) => b.kind), ["check", "point", "decision"], "the red check, the open point and the unsettled trade-off");
-    assert.equal(parsed.blockers.find((b) => b.kind === "check")!.command, "false", "the failing final check command, verbatim");
+    assert.deepEqual(parsed.blockers.map((b) => b.kind), ["point", "point", "decision"], "the compatibility point, the open point and the unsettled trade-off");
+    assert.ok(parsed.blockers.some((b) => b.kind === "point" && b.detail.includes("F-p1-compat-")), "the early final-check point is listed in JSON too");
     assert.match(parsed.blockers.find((b) => b.kind === "point")!.command, /tt why/, "the point names its read");
     assert.match(parsed.blockers.find((b) => b.kind === "decision")!.command, /"type":"ruling"/, "the trade-off names its ruling");
     assert.ok(parsed.blockers.every((b) => b.detail.length > 0 && b.command.length > 0), "every blocker carries detail and command");

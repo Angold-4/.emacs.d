@@ -1,4 +1,6 @@
-// Work packet 2a, design §3.3: a diff path matching the phase's BOUNDARIES
+// Path triggers: files allowed by BOUNDARIES need no owner disposition.
+// The outside-scope case retains the ordinary reviewer vote.
+// Historical work packet 2a, design §3.3: a diff path matching the phase's BOUNDARIES
 // globs, with no decision or finding citing it, becomes a conductor-
 // computed `trigger` Decision record — no model involved in detecting it.
 // A trigger starts at class `delegated` (design §3.4: worker proposes,
@@ -14,11 +16,12 @@ import { test } from "node:test";
 
 import { cleanupDir, defaultReviewerHello, defaultWorkerHello, readEvents, setupConductor, waitFor } from "./harness.ts";
 
-test("boundary-trigger: a diff path matching BOUNDARIES with no citing record becomes a trigger decision", async () => {
+for (const inside of [true, false]) test(`boundary-trigger: a diff path ${inside ? "inside BOUNDARIES creates no decision or owner request" : "outside BOUNDARIES needs a disposition"}`, async () => {
   const setup = await setupConductor({
     checks: ["true"],
     stubReviews: false,
-    boundaries: ["config/**"],
+    boundaries: inside ? ["config/**"] : ["src/**"],
+    acceptanceFiles: ["config/settings.json"],
     workerScript: () => ({
       hello: defaultWorkerHello(),
       steps: [
@@ -86,6 +89,12 @@ test("boundary-trigger: a diff path matching BOUNDARIES with no citing record be
     );
 
     const trigger = setup.conductor.state.phase.decisions.find((d) => d.source === "trigger");
+    if (inside) {
+      assert.equal(trigger, undefined, "a permitted file creates no mechanical decision");
+      assert.deepEqual(setup.conductor.state.phase.ownerRequests, []);
+      assert.ok(!readEvents(setup.runDir).some((r) => r.kind === "event" &&
+        (r.event as { type: string }).type === "DECISION_ADDED"));
+    } else {
     assert.ok(trigger, `expected a trigger decision; got ${JSON.stringify(setup.conductor.state.phase.decisions)}`);
     assert.equal(trigger!.class, "delegated");
     assert.ok(trigger!.choice.includes("config/settings.json"), `trigger choice should name the path; got ${trigger!.choice}`);
@@ -103,6 +112,7 @@ test("boundary-trigger: a diff path matching BOUNDARIES with no citing record be
         (r.event as unknown as { ballot: { decisionId: string } }).ballot.decisionId === trigger!.id,
     );
     assert.ok(ballotsOnTrigger.length >= 3, `all three reviewers should have voted on (classified) the trigger at least once; got ${ballotsOnTrigger.length}`);
+    }
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);
