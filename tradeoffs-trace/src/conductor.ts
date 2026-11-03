@@ -167,6 +167,11 @@ import { domainOf, whereKey, type Domain } from "./core/domains.ts";
 // Plan 07c (D4): the fix-round task rule and the fixer's fixed duty text.
 import {
   domainReviewBrief,
+  acceptanceDomainLines,
+  acceptanceReviewAdvisories,
+  domainFailureRequest,
+  domainMetItems,
+  domainResolvedPoints,
   factKeepsOpen,
   DEFAULT_FIXERS,
   DEFAULT_INTEGRATE_MAX,
@@ -244,7 +249,6 @@ import {
   resolveAnchorPath,
   reverify,
   symbolPresent,
-  tallyItems,
   testOutcomeIn,
   testResultLines,
   testVerifyProblems,
@@ -1718,13 +1722,16 @@ export function ownerRepairPointFor(
     correction?.correctionText, message?.context, ...(message?.evidence ?? []),
     request.reason, request.resolution.note,
   ].filter((s): s is string => typeof s === "string" && s.length > 0).join("\n");
-  const owner = failingDomainOf(evidence, phase.contract.domains ?? []);
+  const rewrite = request.resolution.option === "rewrite_plan_point" ? parseOwnerPointFields(request.resolution.note ?? "") : undefined;
+  if (rewrite?.missing.length) return { reason: `owner repair ${request.id}: rewrite the plan point with ${rewrite.missing.join(", ")}` };
+  const owner = failingDomainOf(rewrite?.fields.where ?? evidence, phase.contract.domains ?? []);
   if (!owner) return { reason: `owner repair ${request.id} names no file owned by a declared domain; the lead must rewrite the point` };
+  if (rewrite && rewrite.fields.domain !== owner.domain) return { reason: `owner repair ${request.id}: rewritten domain does not own ${rewrite.fields.where}` };
   const fields = parseOwnerPointFields(evidence).fields;
   const anchor = evidenceFileAnchors(evidence).find((a) => a.path === owner.path);
-  const where = finding?.where && domainOf(whereKey(finding.where).split(" ")[0], phase.contract.domains) === owner.domain
-    ? finding.where : `${owner.path}:${anchor?.start ?? 1}`;
-  const itemId = finding?.itemId ?? finding?.item ?? decision?.itemId ?? fields.item;
+  const where = rewrite?.fields.where ?? (finding?.where && domainOf(whereKey(finding.where).split(" ")[0], phase.contract.domains) === owner.domain
+    ? finding.where : `${owner.path}:${anchor?.start ?? 1}`);
+  const itemId = rewrite?.fields.item ?? finding?.itemId ?? finding?.item ?? decision?.itemId ?? fields.item;
   const item = flatItems(itemsFromPhase(phase.contract)).find((i) => i.id === itemId);
   const tests: TestVerify[] = [];
   for (const citation of evidence.matchAll(/\btest\s+(?:final\s+)?(?:"[^"]+"|[\w./:-]+::[\w.:-]+)/g)) {
@@ -1744,7 +1751,7 @@ export function ownerRepairPointFor(
       domain: owner.domain, where, evidence,
       expected: [
         `Owner ${request.id}: ${option} (${label}). ${request.resolution.note ?? ""}`.trim(),
-        finding?.expected,
+        rewrite?.fields.expected ?? finding?.expected,
         ...ballots.map((b) => `${b.reviewer} rejected: ${b.rationale}`),
       ].filter(Boolean).join("\n"),
       ...(decision ? { linkedDecisionId: decision.id } : {}),
@@ -5803,7 +5810,7 @@ export class Conductor {
           const flat = flatItems(items);
           const valid = (v: { id: string }): boolean => {
             const item = flat.find((i) => i.id === v.id);
-            return item ? verdictIssues(item, v as import("./core/items.ts").ItemVerdict, this.#verdictContext(item, review.reviewer)).length === 0 : true;
+            return domainMetItems(this.#state.phase).has(v.id) || !item || verdictIssues(item, v as import("./core/items.ts").ItemVerdict, this.#verdictContext(item, review.reviewer)).length === 0;
           };
           review = { ...review, items: (review.items ?? []).filter(valid), arch: (review.arch ?? []).filter(valid) };
         }
@@ -6784,7 +6791,8 @@ export class Conductor {
       ...this.#directiveIds(),
       ...this.#state.phase.corrections.map((c) => c.id),
     ].filter((id) => typeof id === "string" && id.length > 0);
-    return { itemIds, regressions: this.#regressionTests(), triage: blockingTriageRecords(this.#state.phase) };
+    return { itemIds, regressions: this.#regressionTests(), triage: blockingTriageRecords(this.#state.phase),
+      domainResolvedItems: [...domainMetItems(this.#state.phase).keys()] };
   }
 
   /** Plan 06g (A6b): the tests that failed in this candidate's checks and
@@ -7033,6 +7041,8 @@ export class Conductor {
       const ground: FindingGround = {
         severity,
         evidence: fd.evidence,
+        ...(domainMode && fd.item ? { itemId: fd.item } : {}),
+        ...(domainMode && fd.where ? { where: fd.where } : {}),
         ...(fd.criterionDispute?.criterion ? { criterionDisputed: fd.criterionDispute.criterion } : {}),
       };
       const gate = this.#acceptanceGate();
@@ -7081,6 +7091,9 @@ export class Conductor {
       const result = await this.#runReproduction(fd.reproduction.command, candidateSha);
       reproduction = { command: fd.reproduction.command, result };
     }
+    // A re-grade downgraded to advisory is an observation, not an open
+    // domain point whose missing fact could block acceptance a second way.
+    const pointFields = domainMode && !(roundDowngrade && fd.item && domainMetItems(this.#state.phase).has(fd.item));
     const finding: Finding = {
       id: `F-${this.#state.phase.phaseId}-${candidateSha.slice(0, 8)}-${reviewer}-${this.#state.phase.findings.length + 1}`,
       version: 1,
@@ -7116,12 +7129,12 @@ export class Conductor {
       // Plan 07a (D2): the domain-mode point fields, recorded verbatim so the
       // open finding keeps its domain, item, where, expected, doneWhen and
       // optional from. Outside domain mode none is set.
-      ...(domainMode && typeof fd.domain === "string" && fd.domain.trim().length > 0 ? { domain: fd.domain.trim() } : {}),
-      ...(domainMode && typeof fd.item === "string" && fd.item.trim().length > 0 ? { item: fd.item.trim() } : {}),
-      ...(domainMode && typeof fd.where === "string" && fd.where.trim().length > 0 ? { where: fd.where.trim() } : {}),
-      ...(domainMode && typeof fd.expected === "string" && fd.expected.trim().length > 0 ? { expected: fd.expected.trim() } : {}),
-      ...(domainMode && typeof fd.doneWhen === "string" && fd.doneWhen.trim().length > 0 ? { doneWhen: fd.doneWhen.trim() } : {}),
-      ...(domainMode && fd.from !== undefined ? { from: fd.from } : {}),
+      ...(pointFields && typeof fd.domain === "string" && fd.domain.trim().length > 0 ? { domain: fd.domain.trim() } : {}),
+      ...(pointFields && typeof fd.item === "string" && fd.item.trim().length > 0 ? { item: fd.item.trim() } : {}),
+      ...(pointFields && typeof fd.where === "string" && fd.where.trim().length > 0 ? { where: fd.where.trim() } : {}),
+      ...(pointFields && typeof fd.expected === "string" && fd.expected.trim().length > 0 ? { expected: fd.expected.trim() } : {}),
+      ...(pointFields && typeof fd.doneWhen === "string" && fd.doneWhen.trim().length > 0 ? { doneWhen: fd.doneWhen.trim() } : {}),
+      ...(pointFields && fd.from !== undefined ? { from: fd.from } : {}),
     };
     const result = validate(FINDING_SCHEMA, finding);
     if (!result.valid) return `raised finding fails schemas/finding.schema.json: ${result.errors.join("; ")}`;
@@ -7508,6 +7521,7 @@ export class Conductor {
     // always raised and always paneled; a stray `sameAs` (the submission
     // schema does not offer one on a blocker) is logged, never honoured.
     const raised: Array<{ fd: FindingDisclosure; asBlocker: boolean }> = [
+      ...acceptanceReviewAdvisories(this.#state.phase, review).map((fd) => ({ fd, asBlocker: false })),
       ...(review.findings ?? []).map((fd) => ({ fd, asBlocker: false })),
       ...(review.blockers ?? []).map((b) => ({
         fd: { ...b, severity: "blocking" as const } as FindingDisclosure,
@@ -8529,26 +8543,23 @@ export class Conductor {
   #reviewItemIssues(review: Review, candidateSha?: string): string[] {
     if (!this.#itemsEnforced()) return [];
     const items = this.#planItems();
-    const issues = reviewItemsIssues({ items: review.items ?? [], arch: review.arch ?? [] }, items);
+    const settled = candidateSha ? new Map<string, string[]>() : domainMetItems(this.#state.phase);
+    const issues = reviewItemsIssues({ items: review.items ?? [], arch: review.arch ?? [] }, items, settled);
     const flat = flatItems(items);
     for (const v of review.items ?? []) {
       const item = flat.find((i) => i.id === v.id);
-      if (item) issues.push(...verdictIssues(item, v, this.#verdictContext(item, review.reviewer, candidateSha)));
+      if (item && !settled.has(v.id)) issues.push(...verdictIssues(item, v, this.#verdictContext(item, review.reviewer, candidateSha)));
     }
     for (const v of review.arch ?? []) {
       const item = flat.find((i) => i.id === v.id);
-      if (item) issues.push(...verdictIssues(item, v, this.#verdictContext(item, review.reviewer, candidateSha)));
+      if (item && !settled.has(v.id)) issues.push(...verdictIssues(item, v, this.#verdictContext(item, review.reviewer, candidateSha)));
     }
     return issues;
   }
 
   /** The per-item majority across the three reviews. */
   #itemOutcomes(): ItemOutcome[] {
-    const reviews = seatsOf(this.#state.phase.contract).map((seat) => {
-      const r = this.#state.phase.reviews[seat]?.review;
-      return { seat, items: r ? { items: r.items ?? [], arch: r.arch ?? [] } : undefined };
-    });
-    const outcomes = tallyItems(this.#planItems(), reviews, this.#state.phase.overturns ?? []);
+    const outcomes = phaseItemOutcomes(this.#state.phase);
     // A symbol the conductor could not find is `deviates` regardless of the
     // seats' own verdicts.
     const symbolDeviations = this.#state.phase.archSymbolDeviations ?? [];
@@ -8637,7 +8648,7 @@ export class Conductor {
     if (messageType !== "finding") return [];
     if (this.#itemsEnforced()) {
       for (const o of phaseItemOutcomes(this.#state.phase)) {
-        if (itemIsSplit(o)) ids.add(o.item.id);
+        if (!domainMetItems(this.#state.phase).has(o.item.id) && itemIsSplit(o)) ids.add(o.item.id);
       }
     }
     // Plan 06i (A3): every open finding owes its impact classification
@@ -8657,6 +8668,7 @@ export class Conductor {
       B: this.#reviewerReadFiles("B"),
     };
     for (const o of outcomes) {
+      if (domainMetItems(this.#state.phase).has(o.item.id)) continue;
       const ctx = this.#verdictContext(o.item, (o.seats[0]?.seat ?? "M") as Reviewer);
       // 07g2 (R7): every seat gave the same verdict — no evaluator re-check may
       // overturn it. It is a disagreement for the lead instead (A3/R7).
@@ -10112,9 +10124,11 @@ export class Conductor {
   #openPointsOn(candidateSha: string): string[] {
     const facts = this.#factsFor(candidateSha);
     const earlierFacts = this.#state.phase.doneWhenFacts ?? [];
+    const approved = domainResolvedPoints(this.#state.phase, candidateSha);
     return this.#state.phase.findings
       .filter((f) => f.status === "open")
       .filter((f) => {
+        if (approved.has(f.id)) return false;
         const fact = facts.find((x) => x.findingId === f.id);
         if (fact === undefined) return this.#approvedItemPointReview(f, candidateSha) === undefined;
         // Its fact fails on this candidate: the point is open whatever closed
@@ -10132,26 +10146,11 @@ export class Conductor {
       .map((f) => f.id);
   }
 
-  /** §7a.3: a conductor point without a command closes by an approved
-   * domain review with green fix checks. Read only replayed checkpoints and
-   * require that the reviewed head actually merged into this candidate. */
+  /** Domain approval closes every point it gated, including review-only
+   * points. The durable merge/base chain binds that evidence to this head. */
   #approvedItemPointReview(finding: Finding, candidateSha: string): string | undefined {
-    if (finding.raisedBy !== "conductor" || finding.doneWhen || candidateSha === finding.boundCandidateSha) return undefined;
-    for (const round of this.#state.phase.rounds ?? []) {
-      for (const pass of round.fixed?.domains ?? []) {
-        if (!pass.sha || !pass.facts?.checkPassed || !pass.review?.quality.ok ||
-          !pass.review.points.some((p) => p.pointId === finding.id && p.fixed) ||
-          !round.fixed?.tasks.some((t) => t.domain === finding.domain && t.findingIds.includes(finding.id)) ||
-          !round.fixed.merges.some((m) => m.sha === pass.sha)) continue;
-        try {
-          execFileSync("git", ["-C", this.#plan.repo, "merge-base", "--is-ancestor", pass.sha, candidateSha], { stdio: "ignore" });
-          return `domain ${finding.domain} approved point ${finding.id} at ${pass.sha} with green fix checks (round ${round.round}, pass ${pass.iteration})`;
-        } catch {
-          // An approval of a head absent from this candidate proves nothing.
-        }
-      }
-    }
-    return undefined;
+    if (candidateSha === finding.boundCandidateSha) return undefined;
+    return domainResolvedPoints(this.#state.phase, candidateSha).get(finding.id);
   }
 
   /** 07g2 (A2/R4): the merged candidate's red check with points still open on
@@ -10724,6 +10723,12 @@ export class Conductor {
       },
     };
     const outcome = await runDomainLoop(task, host);
+    const request = this.#stopRequested || this.#recheckCancelledLaneRound ? undefined : domainFailureRequest(this.#state.phase, task, round, {
+      ...outcome, records: this.#domainLoopHistory(task, round, outcome.records),
+    });
+    if (request && !this.#state.phase.ownerRequests.some((r) => r.id === request.id)) {
+      this.#applyEvent({ type: "OWNER_REQUEST_OPENED", request });
+    }
     const outcomeSha = outcome.sha;
     // Only an approved domain may merge (§5). An unchanged fixer with a red
     // point remains open on its domain branch; it is not an integration vote.
@@ -12289,6 +12294,12 @@ export class Conductor {
       this.#recordIntegratedRegressions(round, candidate);
       for (const fact of this.#factsFor(candidate)) this.#applyEvent({ type: "FINDING_FACT", ...fact });
       const openPoints = this.#openPointsOn(candidate);
+      const failedDomains = this.#state.phase.ownerRequests.filter((r) => r.status === "open" &&
+        r.id.startsWith(`OR-${this.#state.phase.phaseId}-domain-${round}-`));
+      if (failedDomains.length > 0) {
+        this.#parkOpenPoints(round, failedDomains.map((r) => r.reason).join("\n"), openPoints);
+        return;
+      }
       if (check.ok && openPoints.length === 0) {
         this.#log.completion(actionId, { round, base: record.base, candidate });
         await this.#handOffIntegratedCandidate(record, candidate);
@@ -17240,7 +17251,7 @@ export class Conductor {
       // turn 1 too, so a reviewer discovers against the same point shape it
       // will submit in turn 2; empty outside domain mode.
       ...domainPromptLines(phase.contract.domains),
-      ...this.#acceptanceDomainLines(),
+      ...this.#acceptanceDomainLines(phase),
       `Candidate checkout (read-only): ${candidateDir}`,
       ...referenceLines(runReferences(this.#runDir)),
       ...directiveLines(phase.ownerDirectives),
@@ -17276,12 +17287,8 @@ export class Conductor {
 
   /** §5: acceptance seats receive the integrated domains' recorded commits,
    * points, facts and verdicts across the lane-free fix loops. */
-  #acceptanceDomainLines(): string[] {
-    const loops = (this.#state.phase.rounds ?? []).filter((r) => r.lanes.length === 0);
-    if (loops.length === 0) return [];
-    return ["Acceptance review: the integrated domains, their points and verdicts:",
-      ...loops.map((r) => JSON.stringify({ round: r.round, base: r.base, ...r.fixed })),
-      "A fact-closed point stays closed unless its fact fails on this candidate (conceptual integrity §5)."];
+  #acceptanceDomainLines(phase = this.#state.phase): string[] {
+    return acceptanceDomainLines(phase);
   }
 
   /** Turn 2 (design §6.1): every live record on this candidate (the worker's
@@ -17352,6 +17359,7 @@ export class Conductor {
       // Plan 07a (D2): domain mode names the domains and the point fields on
       // turn 2 as well; empty outside domain mode.
       ...domainPromptLines(phase.contract.domains),
+      ...this.#acceptanceDomainLines(phase),
       // Plan 01f: reviewers are told the conductor produces the gate's
       // evidence and shown the record when one exists (the failed gate that
       // sent the phase into this repair round, or a record reused for this
@@ -17375,7 +17383,7 @@ export class Conductor {
             ...checklistLines(this.#planItems()),
             ...coverageLines(phase.coverage, this.#planItems()),
             ...checkResolutionLines(phase.checkResolution ?? []),
-            ...reviewRequestLines(this.#planItems()),
+            ...reviewRequestLines(this.#planItems(), domainMetItems(phase)),
           ]
         : []),
       // Plan 04a: the settled ledger, so a fresh reviewer never re-raises
@@ -18198,6 +18206,7 @@ export function buildReviewerPrompt(
     // domains and the fields. Outside domain mode this is empty, so the
     // prompt is byte-identical to today's.
     ...domainPromptLines(phase.contract.domains),
+    ...acceptanceDomainLines(phase),
     ...directiveLines(directives),
     ...directiveAnswerLines(phase),
     // Plan 01f: the same rule every reviewer prompt carries — the conductor
@@ -18214,7 +18223,7 @@ export function buildReviewerPrompt(
           ...checklistLines(itemsFromPhase(phase.contract)),
           ...coverageLines(phase.coverage, itemsFromPhase(phase.contract)),
           ...checkResolutionLines(phase.checkResolution ?? []),
-          ...reviewRequestLines(itemsFromPhase(phase.contract)),
+          ...reviewRequestLines(itemsFromPhase(phase.contract), domainMetItems(phase)),
         ]
       : []),
     ...((directives ?? []).some((d) => d.status === "in-force") ? ["", DIRECTIVE_BINDING_STATEMENT] : []),

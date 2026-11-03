@@ -12,6 +12,7 @@
 // choosing each one does.
 
 import { addressed, decisionSettled, isLiveDecision, reviewsComplete } from "./predicate.ts";
+import { domainResolvedPoints } from "./fix-rounds.ts";
 import type { OwnerRequest, OwnerRequestOption, PhaseState } from "./types.ts";
 
 function hasOpenRequestLinkedTo(phase: PhaseState, matches: (r: OwnerRequest) => boolean): boolean {
@@ -66,7 +67,7 @@ export function isRepairForcingOption(origin: OwnerRequest["origin"], optionId: 
   return (
     (origin === "failed_vote" && optionId === "reject_and_repair") ||
     (origin === "reserved_decision" && optionId === "reject_and_repair") ||
-    (origin === "open_finding" && optionId === "repair") ||
+    (origin === "open_finding" && (optionId === "repair" || optionId === "rewrite_plan_point")) ||
     (origin === "unaddressed_correction" && optionId === "grant_correction") ||
     // Plan 04b: an escalated blocker's every panel option is a decision the
     // owner makes about the work, so resolving one starts the repair that
@@ -102,8 +103,11 @@ export function openItemOwnerRequestsFor(phase: PhaseState, cause: string): Owne
   };
 
   // one per open blocking finding
+  const integrated = phase.rounds?.at(-1)?.fixed?.candidate;
+  const resolved = domainResolvedPoints(phase, integrated ?? C);
   for (const f of phase.findings) {
     if (f.status !== "open" || f.severity !== "blocking") continue;
+    if (resolved.has(f.id)) continue;
     if (hasOpenRequestLinkedTo(phase, (r) => r.linkedFindingId === f.id)) continue;
     if (created.some((r) => r.linkedFindingId === f.id)) continue;
     created.push({

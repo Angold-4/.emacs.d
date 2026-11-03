@@ -768,7 +768,7 @@ test("a red fixer's fix prompt carries its fix check's output", async () => {
   }
 });
 
-test("an unchanged domain merge chains on the same base with no lane repair", async () => {
+test("an unchanged domain merge preserves the base and asks the owner about its dropped domain", async () => {
   // Packet X: the gates fixer changes nothing; the booking fixer's red commit
   // adds a marker and its fix removes it again, so its green commit — and
   // the merge — has B's own tree.
@@ -798,11 +798,10 @@ test("an unchanged domain merge chains on the same base with no lane repair", as
     assert.equal(record.candidate, undefined, "a merge with the base's tree is no candidate");
     const { records } = readLog(runPaths(setup.runDir).events);
     assert.ok(records.some((r) => r.kind === "fix_merge_unchanged"), "the unchanged merge is logged");
-    await waitFor(() => (setup.conductor.state.phase.rounds?.length ?? 0) >= 3, 120_000, 50, setup.runDir);
-    const next = setup.conductor.state.phase.rounds![2];
-    assert.equal(next.base, record.base, "an unchanged reduction keeps its base");
-    assert.deepEqual(next.lanes, [], "the next loop has no lane");
-    assert.equal(next.picked, undefined);
+    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 30_000, 50, setup.runDir);
+    assert.equal(setup.conductor.state.phase.rounds!.length, 2, "a dropped domain gets no automatic retry");
+    assert.equal(setup.conductor.state.phase.rounds![1].base, record.base, "an unchanged reduction keeps its base");
+    assert.ok(setup.conductor.state.phase.ownerRequests.some((r) => r.status === "open" && /domain gates was not fixed/.test(r.reason)));
   } finally {
     await teardown(setup);
   }

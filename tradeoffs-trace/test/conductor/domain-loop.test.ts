@@ -304,9 +304,9 @@ test("a domain review session has read-only tools and adds no commit", async () 
   }
 });
 
-test("a domain loop at its bound is dropped while the approved domain merges", async () => {
+for (const bound of [1, 3]) test(`a domain dropped after ${bound} reviews requests the owner while the approved domain merges`, async () => {
   const setup = await setupConductor({
-    phase: { ...domainPhase(), domainLoopMax: 1 },
+    phase: { ...domainPhase(), domainLoopMax: bound },
     checks: ["true"],
     phaseChecks: ["true"],
     stubReviews: true,
@@ -337,10 +337,10 @@ test("a domain loop at its bound is dropped while the approved domain merges", a
         ],
       };
     },
-    fixerScriptFor: (domain) => ({
+    fixerScriptFor: (domain, _round, n) => ({
       hello: defaultWorkerHello(),
       steps: [
-        { kind: "call-sh", command: `printf 'fixed\n' > ${domain}-fixed.txt` },
+        { kind: "call-sh", command: `printf 'fixed ${n}\n' > ${domain}-fixed.txt` },
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
       ],
     }),
@@ -361,6 +361,22 @@ test("a domain loop at its bound is dropped while the approved domain merges", a
     const candidateDir = path.join(runPaths(setup.runDir).candidates, record.candidate!);
     assert.ok(fs.existsSync(path.join(candidateDir, "booking-fixed.txt")), "the approved domain's work is in the candidate");
     assert.ok(!fs.existsSync(path.join(candidateDir, "gates-fixed.txt")), "the dropped domain's work never merged");
+    const request = setup.conductor.state.phase.ownerRequests.find((r) => r.id === `OR-p1-domain-2-gates`);
+    assert.ok(request, "the domain raises an owner request without spending another phase round");
+    assert.match(request.reason, new RegExp(`domain gates was not fixed in ${bound} loops`));
+    assert.match(request.reason, /STILL_WRONG/);
+    assert.match(request.reason, /checkPassed.*true/);
+    assert.deepEqual(request.options.map((o) => o.id), ["repair", "rewrite_plan_point"]);
+    const records = readEvents(setup.runDir);
+    const requestIndex = records.findIndex((r) => r.kind === "event" && (r.event as { type?: string; request?: { id: string } }).type === "OWNER_REQUEST_OPENED" &&
+      (r.event as { request: { id: string } }).request.id === request.id);
+    const fixedIndex = records.findIndex((r) => r.kind === "event" && (r.event as { type?: string }).type === "ROUND_FIXED");
+    assert.ok(requestIndex >= 0 && requestIndex < fixedIndex, "the request precedes REDUCE completion");
+    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 30_000, 50, setup.runDir);
+    assert.equal(setup.conductor.state.phase.rounds!.length, 2, "no domain retry consumes a phase round");
+    assert.equal(setup.conductor.state.phase.ownerRequests.filter((r) => r.status === "open" && r.linkedFindingId &&
+      setup.conductor.state.phase.findings.some((f) => f.id === r.linkedFindingId && f.domain === "booking")).length, 0,
+      "the approved domain needs no owner request");
     const gates = (setup.conductor.state.phase.findings ?? []).find((f) => f.domain === "gates" && f.raisedBy === "M");
     assert.equal(gates?.status, "open", "a dropped domain's points stay open");
   } finally {

@@ -21,6 +21,7 @@
 // `isLiveDecision`).
 
 import { evidenceFileAnchors, pathInList } from "./items.ts";
+import { concreteDomainFinding } from "./fix-rounds.ts";
 import { isLiveDecision } from "./predicate.ts";
 import { findingDispositionIsTradeoff, triageFixFor } from "./triage.ts";
 import { DEFAULT_SEATS } from "./seats.ts";
@@ -509,6 +510,8 @@ export interface AcceptanceGate {
   /** Tests (or named behaviours) that failed in this candidate's checks but
    * passed at the round's base — the regressions. */
   regressions: string[];
+  /** Derived from this candidate's merged domain approvals, never stored. */
+  domainResolvedItems?: readonly string[];
   /** Plan 06i: the phase's triage records, keyed by item id. A record the
    * triage dispositioned `fix` blocks in ANY round, so 06g's round-2
    * downgrade never applies to a wrong-output record. */
@@ -561,6 +564,7 @@ export interface FindingGround {
   evidence: string;
   itemId?: string;
   criterionDisputed?: string;
+  where?: string;
 }
 
 export function blocksAcceptance(finding: FindingGround, round: number, gate: AcceptanceGate): boolean {
@@ -573,10 +577,13 @@ export function blocksAcceptance(finding: FindingGround, round: number, gate: Ac
   if (finding.id && triageFixFor(gate.triage, finding.id)) return true;
   if (finding.severity !== "blocking") return false;
   if (round <= 1) return true;
-  const text = [finding.evidence, finding.criterionDisputed ?? ""].filter(Boolean).join("\n");
+  const text = [finding.evidence, finding.where ?? "", finding.criterionDisputed ?? ""].filter(Boolean).join("\n");
+  if (namesRegression(text, gate.regressions)) return true;
+  const resolved = gate.domainResolvedItems ?? [];
+  if ((finding.itemId && resolved.includes(finding.itemId) || namesItem(text, resolved)) &&
+    !concreteDomainFinding({ ...finding, item: finding.itemId })) return false;
   const itemNamed = finding.itemId !== undefined && gate.itemIds.includes(finding.itemId) || namesItem(text, gate.itemIds);
   if (itemNamed && FILE_LINE_RE.test(text)) return true;
-  if (namesRegression(text, gate.regressions)) return true;
   return false;
 }
 
@@ -585,7 +592,9 @@ export function blocksAcceptance(finding: FindingGround, round: number, gate: Ac
  * clause applied. */
 export function advisoryReason(finding: FindingGround, round: number, gate: AcceptanceGate): string {
   if (round <= 1) return "round 1: a blocking finding always blocks";
-  const text = [finding.evidence, finding.criterionDisputed ?? ""].filter(Boolean).join("\n");
+  const text = [finding.evidence, finding.where ?? "", finding.criterionDisputed ?? ""].filter(Boolean).join("\n");
+  if ((finding.itemId && gate.domainResolvedItems?.includes(finding.itemId) || namesItem(text, gate.domainResolvedItems ?? [])) &&
+    !concreteDomainFinding({ ...finding, item: finding.itemId })) return "domain approval already settled this item; re-grading without a concrete new defect is advisory";
   const itemNamed = (finding.itemId !== undefined && gate.itemIds.includes(finding.itemId)) || namesItem(text, gate.itemIds);
   if (itemNamed && !FILE_LINE_RE.test(text)) {
     return "it names a contract item but cites no file:line, so it is an advisory from round 2";

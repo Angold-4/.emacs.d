@@ -8,7 +8,120 @@
 import { domainOf, whereKey, type Domain } from "./domains.ts";
 import { testNames } from "./test-names.ts";
 import type { Disposition } from "./triage.ts";
-import type { Finding, FindingFact, RoundRecord } from "./types.ts";
+import type { Finding, FindingDisclosure, FindingFact, OwnerRequest, PhaseState, Review, RoundRecord } from "./types.ts";
+import type { DomainLoopOutcome } from "../fix-loop.ts";
+
+/** Approval evidence is a projection of the merged checkpoints, never a new
+ * phase flag. Follow the candidate's recorded bases so an unmerged or abandoned
+ * domain head cannot settle anything on a different candidate. */
+export interface DomainEvidenceState {
+  candidate?: { sha: string };
+  rounds?: readonly RoundRecord[];
+  findings?: readonly Finding[];
+  doneWhenFacts?: readonly FindingFact[];
+}
+
+export function domainResolvedPoints(phase: DomainEvidenceState, candidateSha = phase.candidate?.sha): Map<string, string> {
+  const out = new Map<string, string>();
+  let head = candidateSha;
+  for (const round of [...(phase.rounds ?? [])].reverse()) {
+    const fixed = round.fixed;
+    if (round.lanes.length > 0 || !head || !fixed?.candidate || fixed.candidate !== head) continue;
+    for (const task of fixed.tasks) {
+      if (!task.sha || !fixed.merges.some((m) => m.sha === task.sha)) continue;
+      const pass = fixed.domains?.findLast((p) => p.sha === task.sha && p.review);
+      if (!pass?.facts?.checkPassed || !pass.review?.quality.ok || (pass.facts.testRemovals?.length ?? 0) > 0 ||
+        !task.findingIds.every((id) => pass.facts!.points.some((p) => p.id === id && p.onHead) &&
+          pass.review!.points.some((p) => p.pointId === id && p.fixed))) continue;
+      for (const id of task.findingIds) {
+        const fact = phase.doneWhenFacts?.find((f) => f.findingId === id && f.candidateSha === candidateSha);
+        if (fact && (fact.timedOut || fact.exitCode !== 0)) continue;
+        const verdict = pass.review.points.find((p) => p.pointId === id)!;
+        const pointFact = pass.facts.points.find((p) => p.id === id)!;
+        if (!out.has(id)) out.set(id, `domain ${task.domain} approved point ${id} at ${task.sha} (round ${round.round}, pass ${pass.iteration}); ` +
+          `green fix checks; quality ok; ${pointFact.doneWhen ?? "review-only point"}: holds${pointFact.outputTail ? ` — ${pointFact.outputTail}` : ""}; ` +
+          `${verdict.why}${verdict.anchors?.length ? ` (${verdict.anchors.join(", ")})` : ""}`);
+      }
+    }
+    head = fixed.base;
+  }
+  return out;
+}
+
+/** An untouched item still belongs to the seats. Every earlier open point
+ * on a covered item must be approved. A new ACCEPT finding on this candidate
+ * blocks in its own right; it cannot make the other seats re-grade the item. */
+export function domainMetItems(phase: DomainEvidenceState): Map<string, string[]> {
+  const resolved = domainResolvedPoints(phase);
+  const out = new Map<string, string[]>();
+  for (const finding of phase.findings ?? []) {
+    const item = finding.item ?? ("itemId" in finding && typeof finding.itemId === "string" ? finding.itemId : undefined);
+    const evidence = resolved.get(finding.id);
+    if (item && evidence) out.set(item, [...(out.get(item) ?? []), evidence]);
+  }
+  for (const finding of phase.findings ?? []) {
+    const item = finding.item ?? ("itemId" in finding && typeof finding.itemId === "string" ? finding.itemId : undefined);
+    if (item && finding.status === "open" && finding.severity === "blocking" && !resolved.has(finding.id) &&
+      finding.boundCandidateSha !== phase.candidate?.sha) out.delete(item);
+  }
+  return out;
+}
+
+export function acceptanceDomainLines(phase: DomainEvidenceState): string[] {
+  const resolved = domainResolvedPoints(phase);
+  if (resolved.size === 0) return [];
+  return ["Acceptance review: the integrated domains, their points and verdicts:",
+    ...[...resolved].map(([id, evidence]) => `- ${id}: ${evidence}`),
+    `Domain-resolved items: ${[...domainMetItems(phase).keys()].join(", ") || "(none)"}.`,
+    "Assume every point resolved by an approved domain is resolved, with the approving review and facts above as evidence. Do not re-grade those points or the items they close; no further item vote is needed for them.",
+    "Find NEW issues only: integration defects across domains, regressions, scope and conceptual-integrity violations, and items no domain touched (submit the usual item verdicts for those).",
+    "Reopen a resolved point only as a NEW finding citing a concrete defect: path:line and its failing condition, or a failing check. Re-grading the same point (such as 'still partial') is advisory and does not block acceptance."];
+}
+
+/** A negative item ballot is not a new defect. Preserve that observation as
+ * an ordinary advisory unless the seat also filed a concrete new finding. */
+export function acceptanceReviewAdvisories(phase: DomainEvidenceState, review: Review): FindingDisclosure[] {
+  const met = domainMetItems(phase);
+  return [...(review.items ?? []), ...(review.arch ?? [])].filter((v) => met.has(v.id) &&
+    v.verdict !== "met" && v.verdict !== "fits" &&
+    ![...(review.findings ?? []), ...(review.blockers ?? [])].some((f) =>
+      f.item === v.id && concreteDomainFinding(f)))
+    .map((v) => ({ kind: "defect", severity: "advisory",
+      evidence: `${v.id}: ${review.reviewer} marked ${v.verdict}: ${v.evidence ?? ""}. Domain approval settles this item; no concrete new finding accompanied this re-grade.` }));
+}
+
+/** Require a location and a stated failing condition, rather than a grade
+ * repeated in the findings array. Check names can supply the location for
+ * a recorded regression through the ordinary acceptance gate. */
+export function concreteDomainFinding(finding: { evidence: string; where?: string; item?: string }): boolean {
+  const text = `${finding.where ?? ""}\n${finding.evidence}`;
+  if (!/\b[\w./-]+:\d+(?::\d+)?\b/.test(text)) return false;
+  const condition = finding.evidence.replace(/\b[\w./-]+:\d+(?::\d+)?\b/g, "")
+    .replaceAll(finding.item ?? "\0", "").replace(/\b(still|partial|unmet|met|not|resolved|fixed|incomplete|unclear|deviates)\b/gi, "")
+    .replace(/[^A-Za-z0-9]/g, "");
+  return condition.length > 0;
+}
+
+/** A domain's exhausted local judgement is an owner decision now, even if
+ * the phase has spare rounds. Both options use the existing repair route;
+ * rewrite supplies explicit point fields in the owner's resolution note. */
+export function domainFailureRequest(phase: Pick<PhaseState, "phaseId" | "candidate" | "contract">, task: FixTask,
+  round: number, outcome: DomainLoopOutcome): OwnerRequest | undefined {
+  if (outcome.status !== "dropped" && outcome.status !== "open") return undefined;
+  const last = outcome.records.findLast((r) => r.review);
+  const facts = outcome.records.findLast((r) => r.facts)?.facts;
+  return {
+    id: `OR-${phase.phaseId}-domain-${round}-${task.domain}`, version: 1, phaseId: phase.phaseId,
+    reason: [`domain ${task.domain} was not fixed in ${outcome.reviews} loops: ${outcome.reason ?? outcome.status}`,
+      `Points: ${task.findingIds.join(", ")}`,
+      `Last review: ${JSON.stringify(last?.review ?? null)}`, `Facts: ${JSON.stringify(facts ?? null)}`].join("\n"),
+    origin: "open_finding", linkedFindingId: task.findingIds[0],
+    ...(phase.candidate ? { boundCandidateSha: phase.candidate.sha } : {}), boundContractVersion: phase.contract.contractVersion,
+    options: [{ id: "repair", label: "repair the domain (grant 3 rounds)" },
+      { id: "rewrite_plan_point", label: "rewrite the plan point (supply domain, item, where, expected and doneWhen; grant 3 rounds)" }],
+    status: "open",
+  };
+}
 
 /** Plan 07c (D4): the default `#+TT_FIXERS` — the most fixer tasks (one per
  * domain) a fix round may run. */
