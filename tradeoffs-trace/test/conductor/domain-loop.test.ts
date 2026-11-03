@@ -304,7 +304,7 @@ test("a domain review session has read-only tools and adds no commit", async () 
   }
 });
 
-for (const bound of [1, 3]) test(`a domain dropped after ${bound} reviews requests the owner while the approved domain merges`, async () => {
+for (const bound of [1, 3]) test(`a domain ${bound === 1 ? "dropped at its bound" : "stalled after two reviews"} requests the owner while the approved domain merges`, async () => {
   const setup = await setupConductor({
     phase: { ...domainPhase(), domainLoopMax: bound },
     checks: ["true"],
@@ -355,7 +355,7 @@ for (const bound of [1, 3]) test(`a domain dropped after ${bound} reviews reques
     assert.ok(events.some((e) => e.type === "DOMAIN_APPROVED" && e.domain === "booking"), "the booking domain approved");
     const dropped = events.find((e) => e.type === "DOMAIN_DROPPED" && e.domain === "gates") as { reason?: string } | undefined;
     assert.ok(dropped, "the gates domain was dropped at its bound");
-    assert.match(dropped.reason ?? "", /bound/);
+    assert.match(dropped.reason ?? "", bound === 1 ? /bound/ : /stalled/);
     assert.equal(record.merges.length, 1, "only the approved domain merged");
     assert.ok(record.candidate, "the approved domain produced a merged candidate");
     const candidateDir = path.join(runPaths(setup.runDir).candidates, record.candidate!);
@@ -363,7 +363,7 @@ for (const bound of [1, 3]) test(`a domain dropped after ${bound} reviews reques
     assert.ok(!fs.existsSync(path.join(candidateDir, "gates-fixed.txt")), "the dropped domain's work never merged");
     const request = setup.conductor.state.phase.ownerRequests.find((r) => r.id === `OR-p1-domain-2-gates`);
     assert.ok(request, "the domain raises an owner request without spending another phase round");
-    assert.match(request.reason, new RegExp(`domain gates was not fixed in ${bound} loops`));
+    assert.match(request.reason, new RegExp(`domain gates was not fixed in ${Math.min(bound, 2)} loops`));
     assert.match(request.reason, /STILL_WRONG/);
     assert.match(request.reason, /checkPassed.*true/);
     assert.deepEqual(request.options.map((o) => o.id), ["repair", "rewrite_plan_point"]);
@@ -475,7 +475,7 @@ test("a fixer that changed nothing on a red point ends the domain open, never ap
   assert.equal(dropped.status, "dropped");
 });
 
-test("a domain loop at its bound is dropped and the other domains merge", async () => {
+test("a domain loop stalls before another fix and the other domains merge", async () => {
   const good: FixTask = { ...task, domain: "good", findingIds: ["G"], findings: [{ ...task.findings[0], id: "G", domain: "good" }] };
   const bad: FixTask = { ...task, domain: "bad" };
   const goodOutcome = runDomainLoop(good, {
@@ -498,9 +498,9 @@ test("a domain loop at its bound is dropped and the other domains merge", async 
   });
   const [a, b] = await Promise.all([goodOutcome, badOutcome]);
   assert.equal(a.status, "approved");
-  assert.equal(b.status, "dropped", "the bound drops the domain");
+  assert.equal(b.status, "stalled", "a flat review stops the domain");
   assert.equal(badReviews, 2);
-  assert.match(b.reason!, /bound/);
+  assert.match(b.reason!, /stalled/);
 });
 
 test("a resumed domain loop counts the reviews its log already spent against the bound", async () => {
@@ -743,5 +743,90 @@ test("a resumed conductor rebuilds the domain brief from its log and continues t
     await (resumed ?? setup.conductor).stop();
     cleanupDir(setup.runRoot);
     cleanupDir(setup.scriptsDir);
+  }
+});
+
+for (const ending of ["timeout", "stalled", "red"] as const) test(`point progress: ${ending} preserves only reviewed green work through REDUCE`, async () => {
+  let reviewCount = 0;
+  let fixerCount = 0;
+  const setup = await setupConductor({
+    phase: { ...domainPhase(), domainLoopMax: 3, fixChecks: "test ! -f red-head.txt" },
+    checks: ["true"], stubReviews: true,
+    deadlines: { ...FAST, fixerAttemptMs: 6_000 },
+    workerScript: () => laneWorker(1, "a"),
+    laneWorkerScriptFor: (lane, round) => laneWorker(round, lane),
+    laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion,
+      seat === "M" && state.phase.rounds?.length === 1 ? Array.from({ length: 13 }, (_, n) => ({
+        kind: "defect", severity: "blocking", evidence: `booking/a.ts:${n + 1} broken point ${n + 1}`,
+        domain: "booking", item: `R${n + 1}`, where: `booking/a.ts:${n + 1}`, expected: `correct point ${n + 1}`,
+        doneWhen: BOOKING_DONE,
+      })) : []),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1, "a"),
+    domainReviewScriptFor: (domain, round, _iteration, state) => {
+      reviewCount++;
+      const points = state.phase.findings.filter((f) => f.status === "open" && f.domain === domain);
+      return { hello: defaultDomainReviewHello(), steps: [{ kind: "call-submit", tool: "submit_domain_review", args: {
+        points: points.map((p, n) => ({ pointId: p.id, fixed: round > 2 || n < 5,
+          why: `booking/a.ts:1 ${n < 5 ? "verified fixed" : "STUCK still returns duplicates"}` })),
+        quality: round > 2 ? { ok: true } : { ok: false, problems: ["design.md:10 verifier rejects legal overshoot"] },
+      } }] };
+    },
+    fixerScriptFor: (_domain, round, n) => {
+      fixerCount++;
+      return { hello: defaultWorkerHello(), steps: [
+        ...(round === 2 && n > 1 && (ending === "timeout" || (ending === "red" && n > 2))
+          ? [{ kind: "sleep", ms: 20_000 }] : []),
+        { kind: "call-sh", command: `printf 'fixed pass ${n}\\n' > booking-fixed.txt${ending === "red" && n > 1 ? " && touch red-head.txt" : ""}${round > 2 ? " && touch owner-fixed.txt" : ""}` },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ] };
+    },
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 60_000, 25, setup.runDir);
+    const p = setup.conductor.state.phase;
+    const fixed = p.rounds![1].fixed!;
+    assert.ok(fixed.candidate, "the partially approved head merged despite the failed domain");
+    assert.equal(fixed.merges.length, 1);
+    const lastReview = fixed.domains!.findLast((r) => r.review)!;
+    assert.equal(fixed.merges[0].sha, lastReview.sha, "the merge uses the last reviewed head");
+    const dir = path.join(runPaths(setup.runDir).candidates, fixed.candidate);
+    assert.ok(fs.existsSync(path.join(dir, "booking-fixed.txt")));
+    assert.equal(fs.existsSync(path.join(dir, "red-head.txt")), false, "a later red head never merges");
+    const original = p.findings.filter((f) => f.raisedBy === "M" && f.domain === "booking");
+    assert.equal(original.length, 13);
+    assert.equal(original.filter((f) => f.status === "repaired").length, 5);
+    assert.equal(original.filter((f) => f.status === "open").length, 8);
+    assert.ok(p.findings.some((f) => f.status === "open" && /verifier rejects legal overshoot/.test(f.evidence)));
+    const request = p.ownerRequests.find((r) => r.id === "OR-p1-domain-2-booking")!;
+    assert.ok(request);
+    assert.ok(original.slice(5).every((f) => request.reason.includes(f.id)));
+    assert.ok(original.slice(0, 5).every((f) => request.linkedFindingId !== f.id));
+    assert.match(request.reason, /STUCK/);
+    const outcome = readEvents(setup.runDir).find((r) => r.kind === "domain_loop_finished")!.event as { status: string };
+    assert.equal(outcome.status, ending === "stalled" ? "stalled" : "dropped");
+    assert.equal(reviewCount, ending === "stalled" ? 2 : 1);
+    assert.equal(fixerCount, ending === "red" ? 3 : 2);
+    if (ending === "timeout") {
+      // Grant repair via the real inbox and prove the next MAP inherits the
+      // partially merged head while only the eight remaining points recur.
+      for (const open of p.ownerRequests.filter((r) => r.status === "open")) {
+        fs.writeFileSync(path.join(runPaths(setup.runDir).inbox, `repair-progress-${open.id}.json`), JSON.stringify({
+          commandId: `repair-progress-${open.id}`, type: "resolve", recordKind: "request", option: "repair",
+          note: "doneWhen: test -f owner-fixed.txt",
+          binding: { runId: p.runId, phaseId: p.phaseId, candidateSha: p.candidate!.sha, contractVersion: p.contract.contractVersion,
+            recordId: open.id, recordVersion: open.version },
+        }));
+      }
+      await waitFor(() => setup.conductor.state.phase.rounds!.length >= 3, 30_000, 25, setup.runDir);
+      const next = setup.conductor.state.phase.rounds![2];
+      assert.equal(next.base, fixed.candidate, "the next fix round starts from the merged result");
+      assert.equal(execFileSync("git", ["show", `${next.base}:booking-fixed.txt`], { cwd: setup.repo.dir, encoding: "utf8" }), "fixed pass 1\n");
+      await waitFor(() => setup.conductor.state.phase.rounds![2].fixed !== undefined, 30_000, 25, setup.runDir);
+      const nextIds = setup.conductor.state.phase.rounds![2].fixed!.tasks.flatMap((t) => t.findingIds);
+      assert.ok(original.slice(0, 5).every((f) => !nextIds.includes(f.id)), "settled points do not return as fixer work");
+    }
+  } finally {
+    await teardown(setup);
   }
 });

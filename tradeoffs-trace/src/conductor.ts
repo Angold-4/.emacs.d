@@ -172,6 +172,8 @@ import {
   domainFailureRequest,
   domainMetItems,
   domainResolvedPoints,
+  domainUnresolvedPoints,
+  lastDomainProgress,
   factKeepsOpen,
   DEFAULT_FIXERS,
   DEFAULT_INTEGRATE_MAX,
@@ -10125,10 +10127,12 @@ export class Conductor {
     const facts = this.#factsFor(candidateSha);
     const earlierFacts = this.#state.phase.doneWhenFacts ?? [];
     const approved = domainResolvedPoints(this.#state.phase, candidateSha);
+    const unapproved = domainUnresolvedPoints(this.#state.phase, candidateSha);
     return this.#state.phase.findings
       .filter((f) => f.status === "open")
       .filter((f) => {
         if (approved.has(f.id)) return false;
+        if (unapproved.has(f.id)) return true;
         const fact = facts.find((x) => x.findingId === f.id);
         if (fact === undefined) return this.#approvedItemPointReview(f, candidateSha) === undefined;
         // Its fact fails on this candidate: the point is open whatever closed
@@ -10651,7 +10655,7 @@ export class Conductor {
    * verdict goes back to that same session. A fresh stateless domain review
    * judges the points only after every fact is green; a domain that spends its
    * review bound is dropped and never holds another domain. */
-  async #runFixer(task: FixTask, round: number, base: string): Promise<LaneBuild & { ok: boolean; fixes: number; domainRecords?: DomainLoopRecord[] }> {
+  async #runFixer(task: FixTask, round: number, base: string): Promise<LaneBuild & { ok: boolean; fixes: number; status: string; reason?: string; domainRecords?: DomainLoopRecord[] }> {
     const worktree = this.#fixerWorktree(task.domain);
     const sessionDir = path.join(this.#paths.sessions, `fix-${round}-${task.domain}`);
     const lane = `fix-${task.domain}`;
@@ -10698,6 +10702,7 @@ export class Conductor {
       // its stateless brief keeps every earlier pass instead of overwriting
       // iteration 1 with a fresh one.
       startIteration: this.#domainLoopResumeIteration(task, round),
+      startRecords: this.#domainLoopHistory(task, round, []),
       build: () => buildFixer(),
       facts: (sha, iteration) => this.#domainFacts(task, round, base, sha, iteration),
       review: (sha, iteration, facts) => this.#runDomainReview(task, round, base, sha, iteration, facts, records),
@@ -10705,8 +10710,8 @@ export class Conductor {
         const ms = remaining();
         if (ms < Math.min(60_000, this.#deadlines.fixerAttemptMs / 10)) {
           this.#log.append("fixer_fix_skipped", { round, domain: task.domain, sha, reason: "no attempt time left" });
-          // No fix ran: the unchanged head remains open on its domain branch,
-          // never approved for integration merely because its check is green.
+          // No fix ran. The loop retains any earlier reviewed progress;
+          // a green check alone grants no point approval.
           return { lane, unchanged: true, note: "its attempt time is spent" };
         }
         this.#log.append("fixer_fix_started", { round, domain: task.domain, sha, remainingMs: ms });
@@ -10730,9 +10735,11 @@ export class Conductor {
       this.#applyEvent({ type: "OWNER_REQUEST_OPENED", request });
     }
     const outcomeSha = outcome.sha;
-    // Only an approved domain may merge (§5). An unchanged fixer with a red
-    // point remains open on its domain branch; it is not an integration vote.
+    // Approval is the domain's outcome; merge eligibility is per-point
+    // progress on a reviewed green head, even when the domain drops/stalls.
     const approved = outcome.status === "approved";
+    const progress = lastDomainProgress(task, outcome.records);
+    const mergeable = outcome.status !== "stopped" && outcomeSha !== undefined && progress?.sha === outcomeSha;
     // 07g1 (A2): a quality problem already sent the work back to the same
     // fixer, so an approved domain's review is quality-ok. Keep its notes for
     // the next fixer on DOMAIN_APPROVED so the record still carries them.
@@ -10754,10 +10761,9 @@ export class Conductor {
       reviews: outcome.reviews,
       fixes: outcome.fixes,
     });
-    if (approved && outcomeSha) return { lane, ok: true, sha: outcomeSha, fixes: outcome.fixes, status: outcome.status, domainRecords: outcome.records, ...(allDisclosures.length > 0 ? { disclosures: allDisclosures } : {}), ...(allAdded.length > 0 ? { added: allAdded } : {}) };
     return {
       lane,
-      ok: false,
+      ok: mergeable,
       fixes: outcome.fixes,
       status: outcome.status,
       reason: outcome.reason,
@@ -10773,7 +10779,7 @@ export class Conductor {
    * or a review that did not fix every point or reported a quality problem. */
   #fixerFixPrompt(task: FixTask, round: number, sha: string, failure: string, remainingMs: number): string {
     return [
-      `Your fixer commit ${sha.slice(0, 7)} is not accepted in domain ${task.domain}, so it cannot be merged yet.`,
+      `Your fixer commit ${sha.slice(0, 7)} is not accepted in domain ${task.domain}. Fix the remaining work below.`,
       "",
       "Fix exactly what fails, in this worktree (it holds your commit). Change only what your points need; do not delete, skip or #[ignore] a test to make a check pass.",
       "Run every failing command until it passes, then call submit_phase again with all your disclosures: in decisions every trade-off you met beyond your findings (reported, not decided), in assumptions what you assumed, and in deviations anything you changed beyond your findings.",
@@ -11359,9 +11365,11 @@ export class Conductor {
    * passes there too (`passesOnBase`); only one that fails on the base (a
    * non-zero exit or a timeout) and passes on the candidate repairs. */
   async #runDoneWhenFacts(lane: string, candidateSha: string, cwd: string, baseSha: string): Promise<FindingFact[]> {
+    // Checkpoint closures still owe the integrated tree a regression check.
+    const approved = lane === "integrated" ? domainResolvedPoints(this.#state.phase, candidateSha) : new Map<string, string>();
     const open = this.#state.phase.findings.filter(
       (f) =>
-        f.status === "open" &&
+        (f.status === "open" || (f.status === "repaired" && approved.has(f.id))) &&
         // A domain-mode point only: a finding with no domain is never a
         // doneWhen fact (conductor-raised findings carry a domain and no
         // doneWhen; ingestion refuses a domain-mode finding without one).
@@ -12218,7 +12226,7 @@ export class Conductor {
     // Keep the integrated work as the next base and give that point a new MAP.
     if (last.fixed && this.#openPointsOn(last.fixed.candidate ?? last.base)
       .some((id) => !last.fixed!.tasks.some((t) => t.findingIds.includes(id)))) resume = false;
-    let base = last.picked?.sha ?? last.fixed?.candidate ?? last.base;
+    let base = last.fixed?.candidate ?? last.picked?.sha ?? last.base;
     for (;;) {
       const round = resume ? last.round : last.round + 1;
       if (!resume && !repairBudgetRemains(this.#state.phase, round)) {
@@ -12363,7 +12371,8 @@ export class Conductor {
       // FREEZE_COMPLETED historically supersedes conductor item findings.
       // Keep their actual closure evidence so the hand-off records repair,
       // not merely supersession by a new candidate.
-      const openPoints = this.#state.phase.findings.filter((f) => f.status === "open");
+      const openPoints = this.#state.phase.findings.filter((f) => f.status === "open" ||
+        (f.status === "repaired" && f.repairedByCandidateSha === sha));
       this.#applyEvent({ type: "SUBMIT_PHASE", disclosures });
       decisions = this.#assembleDecisions(sha);
       this.#applyEvent({ type: "FREEZE_COMPLETED", candidateSha: sha, decisions, tainted: false });

@@ -33,7 +33,7 @@ import {
 } from "./owner-commands.ts";
 import { isLiveDecision, panelOutcome, panelSeatNumbers, panelSeatSettled, panelSeatsSettled, reviewIngestionIssue, sameVersion } from "./predicate.ts";
 import { repairBudgetRemains, repairRoundsSpent } from "./rounds.ts";
-import { factKeepsOpen } from "./fix-rounds.ts";
+import { domainProgressFindings, domainResolvedPoints, factKeepsOpen } from "./fix-rounds.ts";
 import { seatsOf } from "./seats.ts";
 import { namedCandidate } from "./ruling-picks.ts";
 import { findOwnerRequest } from "./triage.ts";
@@ -720,10 +720,9 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
     }
 
     case "ROUND_FIXED": {
-      // Plan 07c (D4.6): record-only. The round's fix step is marked with its
-      // result; the conductor reads it to start the next round as a
-      // single-lane round on the merged candidate (or, without one, today's
-      // two-lane round), and to never re-run the fixers after it.
+      // Checkpoint the merged result and its head-bound point evidence before
+      // REDUCE can park for the owner. Partial approvals close individually;
+      // quality problems become open findings in the same replayable event.
       const round = (p.rounds ?? []).find((r) => r.round === event.round);
       if (!round) return rejected(state, `ROUND_FIXED for round ${event.round}, which has not started`);
       if (round.lanes.length > 0 && !round.picked) return rejected(state, `ROUND_FIXED for round ${event.round}, which picked no lane`);
@@ -742,7 +741,9 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         ...(event.added && event.added.length > 0 ? { added: event.added } : {}),
         ...(event.domains && event.domains.length > 0 ? { domains: event.domains } : {}),
       };
-      return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, fixed }) } });
+      const updated = { ...round, fixed };
+      const phase = { ...p, rounds: replaceRound(p.rounds, updated) };
+      return ok({ ...state, phase: { ...phase, findings: domainProgressFindings(phase, updated) } });
     }
 
     case "DOMAIN_CHECKED":
@@ -823,9 +824,9 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
 
     case "FINDING_FACT": {
       // Plan 07b (D3): one open domain-mode finding's `doneWhen` result on one
-      // candidate, emitted only for the picked candidate. Record-only and
-      // idempotent: replaying the same fact leaves exactly one entry, so a
-      // resumed round's re-application cannot double-count.
+      // candidate. Replaying the same fact leaves exactly one entry, so a
+      // resumed round's re-application cannot double-count. A failing merged
+      // fact also reopens a point closed by its domain checkpoint.
       const fact = {
         findingId: event.findingId,
         candidateSha: event.candidateSha,
@@ -837,7 +838,12 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const others = (p.doneWhenFacts ?? []).filter(
         (f) => !(f.findingId === fact.findingId && f.candidateSha === fact.candidateSha),
       );
-      return ok({ ...state, phase: { ...p, doneWhenFacts: [...others, fact] } });
+      // A closure proved on a domain head must not hide a regression in the
+      // integrated tree. A failing fact reopens that point for the next MAP.
+      const regressed = (fact.timedOut || fact.exitCode !== 0) && domainResolvedPoints(p, fact.candidateSha).has(fact.findingId);
+      const findings = regressed ? p.findings.map((f) => f.id === fact.findingId && f.status === "repaired"
+        ? { ...f, status: "open" as const, repairedByCandidateSha: undefined } : f) : p.findings;
+      return ok({ ...state, phase: { ...p, findings, doneWhenFacts: [...others, fact] } });
     }
 
     case "FINDING_EVALUATOR_REPAIRED": {

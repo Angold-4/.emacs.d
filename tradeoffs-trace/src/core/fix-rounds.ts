@@ -8,7 +8,7 @@
 import { domainOf, whereKey, type Domain } from "./domains.ts";
 import { testNames } from "./test-names.ts";
 import type { Disposition } from "./triage.ts";
-import type { Finding, FindingDisclosure, FindingFact, OwnerRequest, PhaseState, Review, RoundRecord } from "./types.ts";
+import type { DomainLoopRecord, Finding, FindingDisclosure, FindingFact, OwnerRequest, PhaseState, Review, RoundRecord } from "./types.ts";
 import type { DomainLoopOutcome } from "../fix-loop.ts";
 
 /** Approval evidence is a projection of the merged checkpoints, never a new
@@ -21,31 +21,93 @@ export interface DomainEvidenceState {
   doneWhenFacts?: readonly FindingFact[];
 }
 
-export function domainResolvedPoints(phase: DomainEvidenceState, candidateSha = phase.candidate?.sha): Map<string, string> {
-  const out = new Map<string, string>();
+/** Point approvals belong to this exact reviewed head. Quality is separate
+ * work; it cannot erase an approved point whose machine facts are green. */
+export function domainApprovedPoints(task: Pick<FixTask, "findingIds">, pass: DomainLoopRecord): string[] {
+  if (!pass.sha || !pass.facts?.checkPassed || !pass.review || (pass.facts.testRemovals?.length ?? 0) > 0) return [];
+  return task.findingIds.filter((id) => pass.facts!.points.some((p) => p.id === id && p.onHead) &&
+    pass.review!.points.some((p) => p.pointId === id && p.fixed));
+}
+
+/** The last reviewed, green head with progress, using each head's latest
+ * facts. Later unreviewed or red fixes cannot replace reviewed progress. */
+export function lastDomainProgress(task: Pick<FixTask, "findingIds">, records: readonly DomainLoopRecord[]): DomainLoopRecord | undefined {
+  const facts = new Map<string, NonNullable<DomainLoopRecord["facts"]>>();
+  for (const pass of [...records].reverse()) {
+    if (!pass.sha) continue;
+    if (pass.facts && !facts.has(pass.sha)) facts.set(pass.sha, pass.facts);
+    if (!pass.review || !pass.facts) continue;
+    const checked = { ...pass, facts: facts.get(pass.sha)! };
+    if (domainApprovedPoints(task, checked).length > 0) return checked;
+  }
+  return undefined;
+}
+
+function domainPointReviews(phase: DomainEvidenceState, candidateSha = phase.candidate?.sha): Map<string, string | undefined> {
+  const out = new Map<string, string | undefined>();
   let head = candidateSha;
   for (const round of [...(phase.rounds ?? [])].reverse()) {
     const fixed = round.fixed;
     if (round.lanes.length > 0 || !head || !fixed?.candidate || fixed.candidate !== head) continue;
     for (const task of fixed.tasks) {
       if (!task.sha || !fixed.merges.some((m) => m.sha === task.sha)) continue;
-      const pass = fixed.domains?.findLast((p) => p.sha === task.sha && p.review);
-      if (!pass?.facts?.checkPassed || !pass.review?.quality.ok || (pass.facts.testRemovals?.length ?? 0) > 0 ||
-        !task.findingIds.every((id) => pass.facts!.points.some((p) => p.id === id && p.onHead) &&
-          pass.review!.points.some((p) => p.pointId === id && p.fixed))) continue;
+      const pass = lastDomainProgress(task, (fixed.domains ?? []).filter((p) => p.sha === task.sha));
+      if (!pass) continue;
+      const approved = new Set(domainApprovedPoints(task, pass));
       for (const id of task.findingIds) {
+        if (out.has(id)) continue;
+        // A passing command alone cannot close a point this review rejected.
+        out.set(id, undefined);
+        if (!approved.has(id)) continue;
         const fact = phase.doneWhenFacts?.find((f) => f.findingId === id && f.candidateSha === candidateSha);
         if (fact && (fact.timedOut || fact.exitCode !== 0)) continue;
-        const verdict = pass.review.points.find((p) => p.pointId === id)!;
-        const pointFact = pass.facts.points.find((p) => p.id === id)!;
-        if (!out.has(id)) out.set(id, `domain ${task.domain} approved point ${id} at ${task.sha} (round ${round.round}, pass ${pass.iteration}); ` +
-          `green fix checks; quality ok; ${pointFact.doneWhen ?? "review-only point"}: holds${pointFact.outputTail ? ` — ${pointFact.outputTail}` : ""}; ` +
+        const verdict = pass.review!.points.find((p) => p.pointId === id)!;
+        const pointFact = pass.facts!.points.find((p) => p.id === id)!;
+        out.set(id, `domain ${task.domain} approved point ${id} at ${task.sha} (round ${round.round}, pass ${pass.iteration}); ` +
+          `green fix checks; ${pointFact.doneWhen ?? "review-only point"}: holds${pointFact.outputTail ? ` — ${pointFact.outputTail}` : ""}; ` +
           `${verdict.why}${verdict.anchors?.length ? ` (${verdict.anchors.join(", ")})` : ""}`);
       }
     }
     head = fixed.base;
   }
   return out;
+}
+
+export function domainResolvedPoints(phase: DomainEvidenceState, candidateSha = phase.candidate?.sha): Map<string, string> {
+  return new Map([...domainPointReviews(phase, candidateSha)].filter((entry): entry is [string, string] => entry[1] !== undefined));
+}
+
+export function domainUnresolvedPoints(phase: DomainEvidenceState, candidateSha = phase.candidate?.sha): Set<string> {
+  return new Set([...domainPointReviews(phase, candidateSha)].filter(([, evidence]) => evidence === undefined).map(([id]) => id));
+}
+
+/** Apply the checkpoint's point closures and quality findings together, so
+ * replay and a park before acceptance retain exactly the same progress. The
+ * approving review and facts remain in ROUND_FIXED as the closure evidence. */
+export function domainProgressFindings(phase: PhaseState, round: RoundRecord): Finding[] {
+  const fixed = round.fixed;
+  if (!fixed?.candidate) return phase.findings;
+  const resolved = domainResolvedPoints(phase, fixed.candidate);
+  const findings = phase.findings.map((f) => f.status === "open" && resolved.has(f.id)
+    ? { ...f, status: "repaired" as const, repairedByCandidateSha: fixed.candidate } : f);
+  for (const task of fixed.tasks) {
+    if (!task.sha || !fixed.merges.some((m) => m.sha === task.sha)) continue;
+    const pass = lastDomainProgress(task, (fixed.domains ?? []).filter((p) => p.sha === task.sha));
+    if (!pass?.review || pass.review.quality.ok) continue;
+    const problems = pass.review.quality.problems?.length ? pass.review.quality.problems : ["the domain review reported quality not ok"];
+    for (const [index, problem] of problems.entries()) {
+      const id = `F-${phase.phaseId}-domain-quality-${round.round}-${task.domain}-${index + 1}`;
+      if (findings.some((f) => f.id === id)) continue;
+      const where = [...problem.matchAll(/[\w./-]+:\d+(?::\d+)?/g)].map((m) => m[0])
+        .find((anchor) => domainOf(anchor.split(":")[0], phase.contract.domains ?? []) === task.domain) ??
+        task.findingIds.map((id) => phase.findings.find((f) => f.id === id)?.where).find(Boolean);
+      findings.push({ id, version: 1, phaseId: phase.phaseId, kind: "defect", severity: "blocking",
+        raisedBy: "conductor", status: "open", boundCandidateSha: fixed.candidate, domain: task.domain,
+        ...(where ? { where } : {}), expected: "resolve the domain review's quality problem",
+        evidence: `domain ${task.domain} quality at ${task.sha} (round ${round.round}, pass ${pass.iteration}): ${problem}` });
+    }
+  }
+  return findings;
 }
 
 /** An untouched item still belongs to the seats. Every earlier open point
@@ -107,15 +169,18 @@ export function concreteDomainFinding(finding: { evidence: string; where?: strin
  * rewrite supplies explicit point fields in the owner's resolution note. */
 export function domainFailureRequest(phase: Pick<PhaseState, "phaseId" | "candidate" | "contract">, task: FixTask,
   round: number, outcome: DomainLoopOutcome): OwnerRequest | undefined {
-  if (outcome.status !== "dropped" && outcome.status !== "open") return undefined;
+  if (outcome.status !== "dropped" && outcome.status !== "open" && outcome.status !== "stalled") return undefined;
   const last = outcome.records.findLast((r) => r.review);
   const facts = outcome.records.findLast((r) => r.facts)?.facts;
+  const kept = lastDomainProgress(task, outcome.records);
+  const approved = new Set(kept ? domainApprovedPoints(task, kept) : []);
+  const stuck = task.findingIds.filter((id) => !approved.has(id));
   return {
     id: `OR-${phase.phaseId}-domain-${round}-${task.domain}`, version: 1, phaseId: phase.phaseId,
     reason: [`domain ${task.domain} was not fixed in ${outcome.reviews} loops: ${outcome.reason ?? outcome.status}`,
-      `Points: ${task.findingIds.join(", ")}`,
+      `Points still open: ${stuck.join(", ") || "(quality only)"}`,
       `Last review: ${JSON.stringify(last?.review ?? null)}`, `Facts: ${JSON.stringify(facts ?? null)}`].join("\n"),
-    origin: "open_finding", linkedFindingId: task.findingIds[0],
+    origin: "open_finding", linkedFindingId: stuck[0] ?? `F-${phase.phaseId}-domain-quality-${round}-${task.domain}-1`,
     ...(phase.candidate ? { boundCandidateSha: phase.candidate.sha } : {}), boundContractVersion: phase.contract.contractVersion,
     options: [{ id: "repair", label: "repair the domain (grant 3 rounds)" },
       { id: "rewrite_plan_point", label: "rewrite the plan point (supply domain, item, where, expected and doneWhen; grant 3 rounds)" }],
