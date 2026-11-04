@@ -4,16 +4,17 @@
 // check or a review that does not fix every point (or that reports a quality
 // problem) goes back to the SAME fixer session; a review that fixes them all
 // with quality ok approves the domain. A domain that spends its review bound
-// is dropped, never allowed to hold another domain. 07g1b (A2): a domain whose
-// fixer has nothing left to change with its check green ends `open` — no
-// review approved it, so its head cannot merge and its points stay open.
+// is dropped; a review with no new point closures stalls it. Both retain the
+// last green reviewed head with point progress for integration. A domain whose
+// fixer has nothing left to change with its check green ends `open`. Only
+// earlier reviewed progress can merge; its unapproved points stay open.
 //
 // This module owns only the sequence. Every effect (building the fixer,
 // running the facts, reviewing, fixing, emitting events) is a host callback,
 // so the loop is unit-testable without a conductor, a model or git.
 
 import type { DomainFacts, DomainLoopRecord, DomainReview } from "./core/types.ts";
-import type { FixTask } from "./core/fix-rounds.ts";
+import { domainApprovedPoints, lastDomainProgress, type FixTask } from "./core/fix-rounds.ts";
 import { domainOf } from "./core/domains.ts";
 
 export interface DomainBuild {
@@ -39,6 +40,8 @@ export interface DomainLoopHost {
    * restart continues the same budget instead of handing the domain a fresh
    * one. */
   readonly startReviews?: number;
+  /** Earlier passes from the log: progress and stall detection survive resume. */
+  readonly startRecords?: readonly DomainLoopRecord[];
   /** Start the domain from its base. */
   build(): Promise<DomainBuild>;
   /** Establish the check, doneWhen and test-removal facts on `sha`. */
@@ -55,11 +58,12 @@ export interface DomainLoopHost {
 }
 
 export interface DomainLoopOutcome {
-  /** 07g1b (A2/R14): `open` is a loop that ended because its fixer had nothing
-   * left to change while its fix check was green, with a point still open. It
-   * is NOT an approval — no domain review ran, so its points stay open and
-   * its head remains on the domain branch, never in the integrated candidate. */
-  status: "approved" | "open" | "dropped" | "stopped";
+  /** `open` means the fixer changed nothing with a green check but failing
+   * point facts. It grants no approval; only earlier reviewed progress may
+   * integrate. `stalled` means a review closed none of the previous open set. */
+  status: "approved" | "open" | "dropped" | "stalled" | "stopped";
+  /** On drop/stall, the last green reviewed head with approved points, when
+   * one exists. Merge eligibility must still be established from its records. */
   sha?: string;
   reason?: string;
   reviews: number;
@@ -141,14 +145,18 @@ export function domainReviewFailure(task: FixTask, review: DomainReview, itemIds
 
 /** Run one domain's loop. See the module comment. */
 export async function runDomainLoop(task: FixTask, host: DomainLoopHost): Promise<DomainLoopOutcome> {
-  const records: DomainLoopRecord[] = [];
+  const records: DomainLoopRecord[] = [...(host.startRecords ?? [])];
   const maxReviews = Number.isFinite(host.maxReviews) && host.maxReviews > 0 ? Math.floor(host.maxReviews) : 1;
   let fixes = 0;
   let reviews = Number.isFinite(host.startReviews) && (host.startReviews as number) > 0 ? Math.floor(host.startReviews as number) : 0;
   const stopped = (): boolean => host.stopRequested?.() === true;
   const finish = (outcome: DomainLoopOutcome): DomainLoopOutcome => {
+    if (outcome.status !== "approved" && outcome.status !== "stopped") {
+      const progress = lastDomainProgress(task, records);
+      if (progress) outcome = { ...outcome, sha: progress.sha };
+    }
     if (outcome.status === "approved" && outcome.sha) host.approved?.(outcome.sha, outcome.reviews);
-    if (outcome.status === "dropped") host.dropped?.(outcome.reason ?? "the domain loop ended", outcome.reviews);
+    if (outcome.status === "dropped" || outcome.status === "stalled") host.dropped?.(outcome.reason ?? "the domain loop ended", outcome.reviews);
     return outcome;
   };
   const record = (r: DomainLoopRecord): void => {
@@ -163,8 +171,8 @@ export async function runDomainLoop(task: FixTask, host: DomainLoopHost): Promis
   const notedReview = (review: DomainReview): DomainReview => {
     const extra = qualityNote(review);
     if (review.quality.ok || blockingQualityProblems(review, itemIds).length > 0) return review;
-    // Those remarks have already been judged advisory by the domain gate.
-    // Record its effective quality approval, retaining each remark as a note.
+    // A completed approval keeps the existing advisory-quality rule. Partial
+    // reviews retain their original quality verdict for open findings.
     return { ...review, quality: { ok: true }, notes: [...(review.notes ?? []), ...extra.map((p) => `quality note (no plan item or design line cited): ${p}`)] };
   };
 
@@ -189,6 +197,8 @@ export async function runDomainLoop(task: FixTask, host: DomainLoopHost): Promis
   }
   let sha = build.sha;
   let iteration = firstIteration;
+  const previous = records.findLast((r) => r.review);
+  let previousOpen = previous ? task.findingIds.filter((id) => !domainApprovedPoints(task, previous).includes(id)) : undefined;
 
   for (;;) {
     if (stopped()) return finish({ status: "stopped", sha, reason: "the owner stopped the run", reviews, fixes, records });
@@ -213,7 +223,7 @@ export async function runDomainLoop(task: FixTask, host: DomainLoopHost): Promis
         const note = fixed.note ?? `the fix of ${sha.slice(0, 9)} changed nothing`;
         // An unchanged fixer with a green check and a red point ends open,
         // not approved. No review runs on a red fact, and the conductor may
-        // merge only approved domains; these points wait for the next loop.
+        // merge only reviewed progress; these points wait for the next loop.
         if (fixed.unchanged === true && facts.checkPassed && (facts.testRemovals?.length ?? 0) === 0) {
           const reason = `${note}: the domain ends open, not approved, and its points stay open`;
           record({ iteration, sha, facts, note: reason });
@@ -243,14 +253,21 @@ export async function runDomainLoop(task: FixTask, host: DomainLoopHost): Promis
     }
     reviews += 1;
     const approved = domainReviewApproves(task, review, itemIds);
+    const approvedPoints = new Set(domainApprovedPoints(task, { iteration, sha, facts, review }));
+    const open = task.findingIds.filter((id) => !approvedPoints.has(id));
     record({
       iteration,
       sha,
       facts,
-      review: notedReview(review),
+      review: approved ? notedReview(review) : review,
       note: approved ? "domain review approved" : "domain review sent work back",
     });
     if (reviewApproved(task, review, itemIds)) return finish({ status: "approved", sha, reviews, fixes, records });
+    if (previousOpen && !previousOpen.some((id) => approvedPoints.has(id))) {
+      const reason = `the domain stalled after ${reviews} reviews; stuck points: ${open.join(", ") || "(quality only)"}\n${domainReviewFailure(task, review, itemIds)}`;
+      return finish({ status: "stalled", sha, reason, reviews, fixes, records });
+    }
+    previousOpen = open;
     if (reviews >= maxReviews) {
       const reason = `the domain loop bound was reached after ${reviews} reviews: ${domainReviewFailure(task, review, itemIds).split("\n")[0]}`;
       return finish({ status: "dropped", sha, reason, reviews, fixes, records });
@@ -279,9 +296,9 @@ function reviewApproved(task: FixTask, review: DomainReview, itemIds: readonly s
 }
 
 // ---------------------------------------------------------------------------
-// 07g2 (A1): integration of the approved domains onto the pick
+// 07g2 (A1): integration of reviewed domain progress onto the pick
 // ---------------------------------------------------------------------------
-// git does the merge (`merge --no-ff` of every approved domain commit); a
+// git does the merge (`merge --no-ff` of each eligible domain commit); a
 // conflict is the ONE place another writer runs — the integrate duty — and its
 // resolution may change only the files git left unmerged (C4). The functions
 // below are pure so the conductor's merge step, its fence and its brief are

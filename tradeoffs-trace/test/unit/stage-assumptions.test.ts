@@ -76,7 +76,7 @@ test("stage assumptions: an unsupported partial is advisory; a new path:line def
   assert.equal(accept(p, "C2", CV()), false);
 });
 
-test("stage assumptions: a domain dropped after three reviews requests the owner and leaves approved work mergeable", async () => {
+test("stage assumptions: a domain stalled after two reviews requests the owner and leaves approved work mergeable", async () => {
   const p = phase();
   const task = { domain: "gates", findingIds: ["F2"], findings: [{ ...p.findings[1], status: "open" as const }] };
   let n = 0;
@@ -86,18 +86,18 @@ test("stage assumptions: a domain dropped after three reviews requests the owner
     review: async () => { n++; return { points: [{ pointId: "F2", fixed: false, why: "gates/a.ts:1 still duplicates output" }], quality: { ok: true } }; },
     fix: async () => ({ sha: `g${n + 1}` }),
   });
-  assert.equal(outcome.status, "dropped");
-  assert.equal(outcome.reviews, 3);
+  assert.equal(outcome.status, "stalled");
+  assert.equal(outcome.reviews, 2);
   const request = fixes.domainFailureRequest(p, task, 2, outcome);
   assert.ok(request);
-  assert.match(request.reason, /domain gates was not fixed in 3 loops/);
+  assert.match(request.reason, /domain gates was not fixed in 2 loops/);
   assert.match(request.reason, /still duplicates output/);
   assert.match(request.reason, /fact passed/);
   assert.deepEqual(request.options.map((o) => o.id), ["repair", "rewrite_plan_point"]);
   assert.equal(request.origin, "open_finding");
   assert.equal(request.linkedFindingId, "F2");
-  // The caller integrates only approved outcomes; an owner request is not
-  // an instruction to discard the other domain's approved commit.
+  // A request for a domain with no approved point does not discard the other
+  // domain's approved commit.
   const approved = await runDomainLoop({ domain: "booking", findingIds: ["F1"], findings: [p.findings[0]] }, {
     maxReviews: 3, build: async () => ({ sha: "head-F1" }),
     facts: async () => ({ checkPassed: true, points: [{ id: "F1", onBase: false, onHead: true }] }),
