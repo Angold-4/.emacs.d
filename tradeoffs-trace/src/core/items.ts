@@ -467,11 +467,41 @@ export function stripAnsi(text: string): string {
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
 }
 
+// Nextest 0.9.148: the retry status uses short signal names and failure
+// labels (TMT, LKFAIL, FL+LK); START/SLOW/TRMNTG are progress, not results.
+const nextestLine = /^\s*(?:(TRY\s+\d+)\s+)?([A-Z][A-Z0-9-]*(?:\s+\+\s+LEAK|\s+SIG\s+\d+|\s+\d+\/\d+)?|FL\+LK|SIG\s+\d+)\s+\[[^\]\r\n]*\]\s+(?:\(\s*\d+\s*\/\s*\d+\s*\)\s+)?(\S+)\s+(.+?)\s*$/;
+
+function nextestResult(line: string): { retry: boolean; outcome: TestOutcome; binary: string; name: string } | undefined {
+  const match = nextestLine.exec(line);
+  if (!match) return undefined;
+  const [, retry, status, binary, name] = match;
+  if (/^(?:START|SLOW|TRMNTG|TERMINATING)$/.test(status)) return undefined;
+  const passed = /^(?:PASS|LEAK|TIMEOUT-PASS|TMPASS|FLAKY\s+\d+\/\d+)$/.test(status);
+  const failed = /^(?:FAIL(?:\s+\+\s+LEAK)?|SIG[A-Z0-9]+|ABORT(?:\s+SIG\s+\d+)?|TIMEOUT|LEAK-FAIL|XFAIL|FLKY-FL\s+\d+\/\d+)$/.test(status);
+  if (!passed && !failed && !retry && status !== "SKIP") return undefined;
+  return { retry: !!retry, outcome: passed ? "passed" : status === "SKIP" ? "missing" : "failed", binary, name };
+}
+
+/** Nextest's captured stdout/stderr contains libtest results for individual
+ * attempts. Read the reporter's result instead, including after retention. */
+function testOutputLines(output: string): string[] {
+  let nextest = false;
+  let captured = false;
+  return output.split("\n").filter((line) => {
+    const clean = stripAnsi(line);
+    if (nextestResult(clean)) { nextest = true; captured = false; }
+    else if (/^\s*[-─]{4,}\s*$/.test(clean)) { nextest = false; captured = false; }
+    else if (nextest && /^\s*(?:stdout|stderr)\s+[-─]{3,}\s*$/.test(clean)) captured = true;
+    return !captured;
+  });
+}
+
 /** Whether the check run's combined output names `name` as passing, failing or
  * not at all. The name must be the reporter's own test-name token, not a
  * substring of a longer one (finding M-14): `✔ name (1.2ms)` and TAP's
  * `ok N - name` both match, while `lanes: tally` never matches `lanes: tally
- * extended`. A failure anywhere wins over a pass. Plan 06j (A2): ANSI escapes
+ * extended`. A terminal failure anywhere wins over a pass; nextest retry
+ * attempts resolve to their last result (FLAKY is passed). Plan 06j (A2): ANSI escapes
  * are stripped first, so a coloured reporter cannot hide a name. */
 export function testOutcomeIn(output: string, name: string): TestOutcome {
   if (name.trim().length === 0) return "missing";
@@ -492,12 +522,22 @@ export function testOutcomeIn(output: string, name: string): TestOutcome {
   const qualified = name.trim().includes("::") ? undefined : `(?:[A-Za-z0-9_]+::)+`;
   const cargoPassQ = qualified ? new RegExp(`^\\s*test\\s+${qualified}${escaped}\\s+\\.\\.\\.\\s+ok\\s*$`) : undefined;
   const cargoFailQ = qualified ? new RegExp(`^\\s*test\\s+${qualified}${escaped}\\s+\\.\\.\\.\\s+FAILED\\s*$`) : undefined;
+  const nextestName = new RegExp(`^(?:${qualified ?? ""})?${escaped}$`);
+  const retries = new Map<string, TestOutcome>();
   let passed = false;
-  for (const line of clean.split("\n")) {
+  for (const line of testOutputLines(clean)) {
+    const result = nextestResult(line);
+    if (result && nextestName.test(result.name) && result.outcome !== "missing") {
+      if (result.outcome === "failed" && !result.retry) return "failed";
+      // Keep binaries and full paths separate: a retry passing in one target
+      // cannot hide a failure of the same bare name in another target.
+      retries.set(`${result.binary} ${result.name}`, result.outcome);
+    }
     if (tapFail.test(line) || nodeFail.test(line) || cargoFail.test(line) || cargoFailQ?.test(line)) return "failed";
     if (tapPass.test(line) || nodePass.test(line) || cargoPass.test(line) || cargoPassQ?.test(line)) passed = true;
   }
-  return passed ? "passed" : "missing";
+  if ([...retries.values()].includes("failed")) return "failed";
+  return passed || [...retries.values()].includes("passed") ? "passed" : "missing";
 }
 
 /** The test-result lines of a check run's output, in the shapes
@@ -509,7 +549,7 @@ export function testResultLines(output: string): string[] {
     /^\s*(?:not\s+)?ok\s+\d+\s+-\s+\S/,
     /^\s*test\s+\S.*\s+\.\.\.\s+(?:ok|FAILED|ignored)\s*$/,
   ];
-  return output.split("\n").filter((line) => shapes.some((re) => re.test(line)));
+  return testOutputLines(output).filter((line) => shapes.some((re) => re.test(line)) || nextestResult(stripAnsi(line)) !== undefined);
 }
 
 /** Resolve every `test` verify of every R, C (and A) item against the check
