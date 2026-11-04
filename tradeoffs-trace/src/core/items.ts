@@ -18,6 +18,7 @@
 // `evidence:`) and `C1` from `:RESERVED:`. No existing plan changes meaning.
 
 import { seatsOf } from "./seats.ts";
+import { domainMetItems, type DomainEvidenceState } from "./fix-rounds.ts";
 import type { Reviewer } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -616,7 +617,7 @@ export function isArchVerdictValue(v: unknown): v is ArchVerdictValue {
  * with none, a bad verdict value, or a non-met verdict without evidence.
  * Empty means complete — the existing complete-ballot rule then treats a
  * missing id like a missing ballot. */
-export function reviewItemsIssues(review: ReviewItems | undefined, items: PlanItems): string[] {
+export function reviewItemsIssues(review: ReviewItems | undefined, items: PlanItems, settled: ReadonlyMap<string, readonly string[]> = new Map()): string[] {
   const out: string[] = [];
   if (!review) return ["the review carries no item verdicts"];
   const need = requirementAndConstraintItems(items);
@@ -630,7 +631,7 @@ export function reviewItemsIssues(review: ReviewItems | undefined, items: PlanIt
     seen.add(v.id);
     if (!isItemVerdictValue(v.verdict)) out.push(`item verdict for ${v.id} is not met, unmet or partial`);
   }
-  for (const item of need) if (!seen.has(item.id)) out.push(`the review omits a verdict for ${item.id} (${item.title})`);
+  for (const item of need) if (!settled.has(item.id) && !seen.has(item.id)) out.push(`the review omits a verdict for ${item.id} (${item.title})`);
   const known = new Set(need.map((i) => i.id));
   for (const id of seen) if (!known.has(id)) out.push(`the review names the unknown item ${id}`);
 
@@ -644,7 +645,7 @@ export function reviewItemsIssues(review: ReviewItems | undefined, items: PlanIt
     archSeen.add(v.id);
     if (!isArchVerdictValue(v.verdict)) out.push(`architecture verdict for ${v.id} is not fits, deviates or unclear`);
   }
-  for (const a of items.architecture) if (!archSeen.has(a.id)) out.push(`the review omits a verdict for ${a.id} (${a.title})`);
+  for (const a of items.architecture) if (!settled.has(a.id) && !archSeen.has(a.id)) out.push(`the review omits a verdict for ${a.id} (${a.title})`);
   const archKnown = new Set(items.architecture.map((a) => a.id));
   for (const id of archSeen) if (!archKnown.has(id)) out.push(`the review names the unknown architecture item ${id}`);
   return out;
@@ -1039,7 +1040,7 @@ export function itemCounts(items: PlanItems, outcomes: readonly ItemOutcome[]): 
 
 /** The slice of a phase's state the views need to tally its items. `PhaseState`
  * is structurally assignable. */
-export interface ItemLoopState {
+export interface ItemLoopState extends DomainEvidenceState {
   contract: PhaseItemInput;
   reviews?: Partial<Record<string, { review?: { items?: ItemVerdict[]; arch?: ArchVerdict[] } } | undefined>>;
   coverage?: Coverage;
@@ -1054,7 +1055,15 @@ export function phaseItemOutcomes(phase: ItemLoopState): ItemOutcome[] {
     const r = phase.reviews?.[seat]?.review;
     return { seat, items: r ? { items: r.items ?? [], arch: r.arch ?? [] } : undefined };
   });
-  return tallyItems(itemsFromPhase(phase.contract), reviews, phase.overturns ?? []);
+  const outcomes = tallyItems(itemsFromPhase(phase.contract), reviews, phase.overturns ?? []);
+  const met = domainMetItems(phase);
+  for (const outcome of outcomes) {
+    const evidence = met.get(outcome.item.id);
+    if (!evidence) continue;
+    outcome.outcome = outcome.item.kind === "architecture" ? "fits" : "met";
+    outcome.evidence = evidence;
+  }
+  return outcomes;
 }
 
 /** The counts line's inputs for a phase. */
@@ -1124,6 +1133,7 @@ export function itemEvidenceFiles(phase: ItemLoopState): Array<{ id: string; con
     }
     const o = outcomes.get(item.id);
     lines.push("", `* Verdict: ${o?.outcome ?? "incomplete"}`);
+    if (o) for (const evidence of domainMetItems(phase).get(item.id) ?? []) lines.push(`  - ${evidence}`);
     if (o && o.seats.length > 0) for (const s of o.seats) lines.push(`  - ${s.seat}: ${s.verdict} — ${s.evidence}`);
     else lines.push("  (no item verdict was submitted)");
     return { id: item.id, contents: `${lines.join("\n")}\n` };
@@ -1293,9 +1303,10 @@ export function checkResolutionLines(resolutions: readonly VerifyResolution[]): 
 }
 
 /** The item verdicts a reviewer must submit, rendered as a checklist. */
-export function reviewRequestLines(items: PlanItems): string[] {
+export function reviewRequestLines(items: PlanItems, settled: ReadonlyMap<string, readonly string[]> = new Map()): string[] {
   const lines = ["", "For EVERY item below, submit_review must carry a verdict (missing ids are an incomplete review):"];
   for (const item of flatItems(items)) {
+    if (settled.has(item.id)) continue;
     if (item.kind === "architecture") {
       lines.push(`- ${item.id} (architecture): fits | deviates | unclear, with evidence`);
     } else {

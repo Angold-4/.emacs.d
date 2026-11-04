@@ -258,6 +258,9 @@ export function checkOwnerRequestResolved(phase: PhaseState, event: EvOwnerReque
   if (request.origin === "open_finding" && event.option === "accept_risk" && (!event.note || event.note.trim().length === 0)) {
     return { ok: false, reason: `accepting the risk for finding ${request.linkedFindingId} requires a non-empty scope note` };
   }
+  if (request.origin === "open_finding" && event.option === "rewrite_plan_point" && !event.note?.trim()) {
+    return { ok: false, reason: "rewriting the plan point requires explicit domain, where, expected and doneWhen fields in the resolution note" };
+  }
   return { ok: true };
 }
 

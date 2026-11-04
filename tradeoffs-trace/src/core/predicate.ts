@@ -38,7 +38,7 @@ import type { Domain } from "./domains.ts";
 // its test verifies passed, every A fitting by majority or its deviation
 // accepted by the owner, and every evidence item recorded.
 import { evidenceFileAnchors, evidenceHasAnchor, flatItems, isStructured, itemNeedsEvidence, itemsFromPhase, phaseItemOutcomes, testVerifyProblems, testVerifyBlockedItemIds } from "./items.ts";
-import { factKeepsOpen } from "./fix-rounds.ts";
+import { domainMetItems, domainResolvedPoints, factKeepsOpen } from "./fix-rounds.ts";
 import {
   discoveredDecisions,
   findingDispositionIsTradeoff,
@@ -205,7 +205,8 @@ export function typesNeedingEvaluation(phase: PhaseState): MessageType[] {
  * agreement with evaluationExceptions, so a unanimous unmet item cannot
  * leave EVALUATING waiting forever for a session that must never start. */
 export function itemsNeedingEvaluatorReverify(phase: PhaseState): boolean {
-  return isStructured(phase.contract) && phaseItemOutcomes(phase).some(itemIsSplit);
+  const settled = domainMetItems(phase);
+  return isStructured(phase.contract) && phaseItemOutcomes(phase).some((o) => !settled.has(o.item.id) && itemIsSplit(o));
 }
 
 /** True when the seats do not give an item the verdict the plan requires by
@@ -927,11 +928,13 @@ function acceptanceBlockersFor(
     // majority; a `contradicted` entry is applied earlier, as an overturn.
     const needed = Math.floor(seatsOf(phase.contract).length / 2) + 1;
     const outcomes = phaseItemOutcomes(phase);
+    const domainMet = domainMetItems(phase);
     const blocked = testVerifyBlockedItemIds(phase.checkResolution ?? []);
     for (const item of flatItems(items!)) {
       if (blocked.has(item.id)) continue;
       if (item.kind === "architecture" && acceptedDeviations!.has(item.id)) continue;
       if (itemNeedsEvidence(item) && !evidenceRecorded!.includes(item.id)) continue;
+      if (domainMet.has(item.id)) continue;
       const outcome = outcomes.find((o) => o.item.id === item.id);
       const required = item.kind === "architecture" ? "fits" : "met";
       const resolving = outcome
@@ -959,8 +962,10 @@ function acceptanceBlockersFor(
   const open = openFindings(phase);
   const pointIds = new Set<string>();
   const pointsByDomain = new Map<string, string[]>();
+  const resolvedByDomain = domainResolvedPoints(phase);
   for (const finding of open) {
     if (!finding.domain && !finding.doneWhen) continue;
+    if (resolvedByDomain.has(finding.id)) continue;
     const proves = pointHasProvingFact(phase, finding);
     // Plan 07f (F0/A1): a point is closed by a proving fact (or a domain
     // review that the conductor records as a closed finding). An evaluator's
@@ -990,6 +995,7 @@ function acceptanceBlockersFor(
   const covered = new Set(pointIds);
   for (const finding of open) {
     if (finding.severity !== "blocking" || covered.has(finding.id)) continue;
+    if (resolvedByDomain.has(finding.id)) continue;
     // The failed check already names this same cause and the command to
     // rerun. It is not a second blocker asking for an owner ruling.
     if (finding.raisedBy === "conductor" && blockers.some((b) => b.kind === "check" && b.detail === finding.evidence)) continue;

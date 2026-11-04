@@ -162,8 +162,10 @@ export async function runDomainLoop(task: FixTask, host: DomainLoopHost): Promis
     (review.quality.ok ? [] : (review.quality.problems ?? []).filter((p) => !qualityProblemCites(p, itemIds)));
   const notedReview = (review: DomainReview): DomainReview => {
     const extra = qualityNote(review);
-    if (extra.length === 0) return review;
-    return { ...review, notes: [...(review.notes ?? []), ...extra.map((p) => `quality note (no plan item or design line cited): ${p}`)] };
+    if (review.quality.ok || blockingQualityProblems(review, itemIds).length > 0) return review;
+    // Those remarks have already been judged advisory by the domain gate.
+    // Record its effective quality approval, retaining each remark as a note.
+    return { ...review, quality: { ok: true }, notes: [...(review.notes ?? []), ...extra.map((p) => `quality note (no plan item or design line cited): ${p}`)] };
   };
 
   let build: DomainBuild;
