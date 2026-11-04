@@ -195,6 +195,63 @@ test("plan-items: a requirement whose test verify is missing from the check outp
   }
 });
 
+test("plan-items: a failed guard creates one check finding for 25 unreached named tests", async () => {
+  const requirements = Array.from({ length: 25 }, (_, n) => ({
+    id: `P${n + 1}`, title: "named test", text: "named test", arch: [], verify: [`test \"tt07_p1_p${n + 1}\"`],
+  }));
+  const check = "printf 'CMake 3.30 or higher is required\\n' >&2; exit 1";
+  const setup = await setupConductor({
+    items: { architecture: [], requirements, constraints: [] },
+    checks: [check], phaseChecks: [check], deadlines: FAST,
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [
+      { kind: "call-sh", command: "echo candidate > change.txt" },
+      { kind: "call-submit", tool: "submit_coverage", args: {
+        arch: [], items: requirements.map((r) => ({ id: r.id, status: "done", where: ["change.txt:1"], tests: [`tt07_p1_p${r.id.slice(1)}`] })),
+      } },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+    ] }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => (setup.conductor.state.phase.checkResolution ?? []).length === 25, 90_000, 50, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    assert.ok(phase.checkResolution!.every((r) => r.blockedBy?.command === check));
+    const findings = phase.findings.filter((f) => f.raisedBy === "conductor");
+    assert.equal(findings.length, 1, JSON.stringify(findings));
+    assert.match(findings[0].evidence, /failed before its named tests ran/);
+    assert.match(findings[0].evidence, /CMake 3.30 or higher is required/);
+    assert.equal(phase.checks?.passed, false);
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan-items: a grouped check finding closes when a repaired candidate passes that check", async () => {
+  const check = "test -f fixed.txt || { echo 'toolchain guard failed'; exit 1; }; printf 'ok 1 - R1 proves it\\n'";
+  const worker = (attempt: number) => ({ hello: defaultWorkerHello(), steps: [
+    { kind: "call-sh" as const, command: WRITE_ROUNDS + (attempt > 1 ? " && touch fixed.txt" : "") },
+    { kind: "call-submit" as const, tool: "submit_coverage", args: coverage() },
+    { kind: "call-submit" as const, tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+  ] });
+  const setup = await setupConductor({
+    items: ITEMS, checks: [check], phaseChecks: [check], deadlines: FAST,
+    workerScript: () => worker(1), workerScriptForAttempt: (attempt) => worker(attempt),
+    stubReviews: false,
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({})),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 50, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    const grouped = phase.findings.filter((f) => f.id.includes("-named-check-"));
+    assert.equal(grouped.length, 1);
+    assert.notEqual(grouped[0].status, "open");
+    assert.ok(readEvents(setup.runDir).some((r) => r.kind === "event" && (r.event as any).type === "FINDING_DISPROVED" && (r.event as any).findingId === grouped[0].id));
+  } finally {
+    await teardown(setup);
+  }
+});
+
 /** R1's test runs only in the final checks (`:VERIFY: test final`). */
 const FINAL_ONLY_ITEMS = {
   ...ITEMS,

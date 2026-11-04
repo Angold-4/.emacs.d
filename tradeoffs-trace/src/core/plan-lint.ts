@@ -241,6 +241,7 @@ export interface LintPhaseInput {
 }
 
 export interface LintPlanInput {
+  preflight?: string[];
   /** The Org file this JSON came from, when known. */
   sourceFile?: string;
   /** tt 09-1: the plan's global round checks (`#+TT_CHECKS:`), which every

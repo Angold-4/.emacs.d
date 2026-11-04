@@ -750,6 +750,7 @@ because `domainOf' takes the first match."
          (fix-rounds (+tt--keyword "TT_FIX_ROUNDS"))
          (fixers (+tt--keyword "TT_FIXERS"))
          (fix-checks (+tt--keyword "TT_FIX_CHECKS"))
+         (test-removals (+tt--keyword "TT_TEST_REMOVALS"))
          ;; Plan 01f: the conductor's own expensive, live proof. `:GATE:` is
          ;; the command it runs once per candidate the reviewers accepted,
          ;; before acceptance; `:GATE_CLEANUP:` releases what the gate took,
@@ -827,6 +828,8 @@ because `domainOf' takes the first match."
                 `((fixers . ,(+tt--count-value fixers))))
             ,@(when fix-checks
                 `((fixChecks . ,(string-trim fix-checks))))
+            ,@(when test-removals
+                `((testRemovals . ,(vconcat (split-string test-removals ";" t "[ \t\n]+")))))
             (boundaries . ,(vconcat (and boundaries (split-string boundaries))))
             (reserved . ,(vconcat reserved-list))
             (provisional . ,(if provisional t :false))
@@ -1118,6 +1121,8 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                   (repo . ,(or repo ""))
                   (integrationBranch . ,(or branch ""))
                   (checks . ,(vconcat (and global-checks (list global-checks))))
+                  ,@(let ((p (+tt--keyword "TT_PREFLIGHT")))
+                      (and p `((preflight . ,(vector p)))))
                   (phases . ,(vconcat (nreverse phases)))
                   ,@(when rerun
                       `((rerun . ,(car rerun))
@@ -1170,6 +1175,9 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                   ,@(let ((f (+tt--keyword-at "TT_FIX_CHECKS")))
                       (and f (list (cons 'fixChecks (string-trim (car f)))
                                    (cons 'fixChecksLine (cdr f)))))
+                  ,@(let ((r (+tt--keyword-at "TT_TEST_REMOVALS")))
+                      (and r (list (cons 'testRemovals (vconcat (split-string (car r) ";" t "[ \t\n]+")))
+                                   (cons 'testRemovalsLine (cdr r)))))
                   ,@(let ((d (+tt--plan-deadlines)))
                       (and d `((deadlines . ,d))))
                   ;; Plan 07e (E3): raw bound values and lines for `tt lint'.

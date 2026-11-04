@@ -51,6 +51,7 @@ import { DEFAULT_SEATS, seatsOf } from "./core/seats.ts";
 import { computeSeatTable, mergeSeatTables, renderSeatTable } from "./core/seat-table.ts";
 import { distinctModelGroups, modelsCheckRefused, planModelTargets, type ModelsCheck } from "./core/models-check.ts";
 import { runModelsCheck } from "./effects/models-check.ts";
+import { recordCheckEnvironment, runPlanPreflight, type CheckEnvironmentRecord } from "./effects/check-env.ts";
 import { CHANGED_TEST_BUDGET_MS, checkTestFiles, effectiveChecks, testFilesImporting } from "./core/checks.ts";
 // Plan 05i: the program commands preflight every node they will start, before
 // any run is created, so a missing toolchain refuses visibly instead of
@@ -854,10 +855,23 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
       if (admitPlanOrRefuse(entry.plan, `start the program (node ${entry.id})`)) return;
     }
     if (refuseMissingSecretsForPlans(program.entries.map((e) => e.plan), "start the program", resolvedEnvFile)) return;
+    const checkEnvs: Record<string, CheckEnvironmentRecord> = {};
+    for (const entry of program.entries) {
+      if (!entry.plan.preflight?.length) continue;
+      const env = recordCheckEnvironment(entry.plan);
+      const failure = await runPlanPreflight(entry.plan, program.base ?? entry.plan.integrationBranch ?? "HEAD", env);
+      if (failure) {
+        const { maskable } = resolveSecrets(secretNames(entry.plan.secrets), process.env, entry.plan.envFile);
+        refuseAdmit("X:ENV_FAULT", redactText(failure, maskable), `start the program (node ${entry.id})`);
+        return;
+      }
+      checkEnvs[entry.id] = env;
+    }
     // Plan 05i: every node's declared commands must resolve in THIS caller's
     // PATH before the program (or any of its runs) exists.
     if (refuseMissingTools(program.entries.map((e) => e.plan), "start the program")) return;
     const dir = createProgram(root, program);
+    if (Object.keys(checkEnvs).length > 0) writeFileSync(path.join(dir, "check-env.json"), JSON.stringify(checkEnvs, null, 2));
     // Plan 03c: the Org program file the program was started from (Emacs
     // passes it), shown in the program buffer's header.
     if (source) recordProgramSource(dir, source);
@@ -1144,10 +1158,20 @@ async function cmdStart(planPath: string, root: string, skipModelsCheck = false,
   // one on this shell's PATH.
   if (admitPlanOrRefuse(plan, "start the run")) return;
   if (refuseMissingSecrets(plan.secrets, "start the run", plan.envFile)) return;
+  const checkEnv = plan.preflight?.length ? recordCheckEnvironment(plan) : undefined;
+  if (checkEnv) {
+    const failure = await runPlanPreflight(plan, plan.integrationBranch ?? "HEAD", checkEnv);
+    if (failure) {
+      const { maskable } = resolveSecrets(secretNames(plan.secrets), process.env, plan.envFile);
+      refuseAdmit("X:ENV_FAULT", redactText(failure, maskable), "start the run");
+      return;
+    }
+  }
   // 06a finding #24: create the run, probe its distinct configured models,
   // record the result in the run directory, and refuse to launch when one is
   // refused (unless --skip-models-check).
   const runDir = createRun(root, plan);
+  if (checkEnv) writeFileSync(path.join(runDir, "check-env.json"), JSON.stringify(checkEnv, null, 2));
   const check = await runPlanModelsCheck(plan);
   writeModelsCheck(runDir, check);
   if (!skipModelsCheck && refuseRefusedModels(check, "start the run")) return;

@@ -85,6 +85,12 @@ const STRUCTURED = `#+TITLE: structured
     The public API does not change.
 `;
 
+test("org-plan: plan-wide preflight shell commands survive parsing for lint", () => {
+  const command = "cargo --version && cmake --version";
+  const plan = parseOrgPlan(`#+TT_PREFLIGHT: ${command}\n${STRUCTURED}`, "/x/PLAN.org");
+  assert.deepEqual(plan.preflight, [command]);
+});
+
 test("org-plan: a structured fixture parses to the goal, 3 architecture, 4 requirements, 2 constraints", () => {
   const plan = parseOrgPlan(STRUCTURED, "/x/PLAN.org");
   const phase = plan.phases![0];

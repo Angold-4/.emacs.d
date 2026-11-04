@@ -90,6 +90,7 @@ export class AdmitRefusal extends Error {
  * commands. Structural, so a plan file, a program entry's plan and a run's
  * plan snapshot all pass unchanged. */
 export interface AdmitPlanShape {
+  preflight?: string[];
   checks?: string[];
   phases?: Array<{ checks?: string[]; finalChecks?: string[]; gate?: string; gateCleanup?: string }>;
 }
@@ -106,6 +107,7 @@ export function admitCommands(plan: AdmitPlanShape): string[] {
     seen.add(command);
     out.push(command);
   };
+  for (const command of plan.preflight ?? []) add(command);
   for (const command of plan.checks ?? []) add(command);
   for (const phase of plan.phases ?? []) {
     for (const command of phase.checks ?? []) add(command);

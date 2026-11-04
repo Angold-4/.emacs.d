@@ -30,6 +30,7 @@ test("roles: launchArgs never uses --exclude-tools, always an explicit --tools a
     assert.equal(args[args.indexOf("--extension") + 1], "/tmp/ext.ts");
     assert.ok(args.includes("--no-extensions"), "must isolate from the owner's own user extensions");
     assert.ok(args.includes("--no-skills"), "must isolate from the owner's own user skills");
+    assert.ok(args.includes("--no-context-files"), "must load no AGENTS.md/CLAUDE.md, global or from the worktree");
   }
 });
 

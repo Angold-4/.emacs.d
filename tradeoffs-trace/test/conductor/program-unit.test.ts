@@ -169,6 +169,7 @@ test("ADMIT parses every declared command: the checks, the final checks and the 
   // gate command with a syntax error is as fatal as a check with one.
   assert.deepEqual(
     admitCommands({
+      preflight: ["toolchain-guard"],
       checks: ["plan-check"],
       phases: [
         { checks: ["phase-check"], finalChecks: ["final-check"], gate: "gate-cmd", gateCleanup: "cleanup-cmd" },
@@ -176,8 +177,57 @@ test("ADMIT parses every declared command: the checks, the final checks and the 
         { checks: ["phase-check"] },
       ],
     }),
-    ["plan-check", "phase-check", "final-check", "gate-cmd", "cleanup-cmd"],
+    ["toolchain-guard", "plan-check", "phase-check", "final-check", "gate-cmd", "cleanup-cmd"],
   );
+});
+
+test("a failed plan preflight refuses both starts with ENV_FAULT before any run or model probe", () => {
+  const repo = makeRepo();
+  const work = shortTmp("tt-preflight-start");
+  const env = cliEnv(work);
+  try {
+    const paths = writePlanAndProgram(work, repo.dir, ["true"]);
+    const plan = JSON.parse(fs.readFileSync(paths.plan, "utf8"));
+    plan.preflight = ["printf 'CMake 3.30 or higher is required\\n' >&2; exit 7"];
+    // A model that must never be probed: the preflight refuses first.
+    plan.models = { worker: { provider: "never-call", model: "never-call" } };
+    fs.writeFileSync(paths.plan, JSON.stringify(plan));
+    fs.writeFileSync(paths.program, JSON.stringify({ title: "preflight", maxParallel: 1, entries: [{ id: "a", after: [], plan }] }));
+    for (const [kind, args] of [["run", ["start", paths.plan]], ["program (node a)", ["program", "start", paths.program]]] as const) {
+      const root = path.join(work, kind === "run" ? "runs" : "programs");
+      fs.mkdirSync(root);
+      const result = runCli([...args, "--root", root], env);
+      assert.notEqual(result.code, 0);
+      assert.ok(result.stderr.includes(`refusing to start the ${kind}: X:ENV_FAULT: preflight`), result.stderr);
+      assert.match(result.stderr, /exited 7: CMake 3.30 or higher is required/);
+      assert.deepEqual(fs.readdirSync(root), [], "no run, program or model probe record");
+    }
+  } finally {
+    cleanupDir(work);
+    cleanupDir(repo.dir);
+  }
+});
+
+test("a program node keeps the environment used by its plan preflight after a scheduler restart", () => {
+  const repo = makeRepo();
+  const root = shortTmp("tt-preflight-node-env");
+  const plan: RunPlanFile = {
+    title: "recorded env", repo: repo.dir, integrationBranch: "main", checks: ["true"],
+    preflight: ["true"], envVars: ["TOOLCHAIN", "ABSENT"],
+    phases: [{ id: "p1", goal: "g", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [] }],
+  };
+  try {
+    const dir = createProgram(root, { title: "env program", maxParallel: 1, entries: [{ id: "a", after: [], plan }] });
+    const recorded = { PATH: "/recorded/toolchain:/usr/bin:/bin", TOOLCHAIN: "original", ABSENT: null };
+    fs.writeFileSync(path.join(dir, "check-env.json"), JSON.stringify({ a: recorded }));
+    const runs: string[] = [];
+    schedulerTick(dir, { runRoot: root, launch: (runDir) => runs.push(runDir), runner: () => "test-runner" });
+    assert.equal(runs.length, 1);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(runs[0], "check-env.json"), "utf8")), recorded);
+  } finally {
+    cleanupDir(root);
+    cleanupDir(repo.dir);
+  }
 });
 
 /** 07h3 (H2/R6): `#+TT_BASE: B` on a program is the branch EVERY root node is

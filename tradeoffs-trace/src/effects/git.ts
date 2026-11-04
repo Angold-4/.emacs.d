@@ -375,7 +375,9 @@ export function disposableCheckout(repo: string, sha: string): DisposableCheckou
  *   (design §2.2), not containment against a deliberate adversary who can
  *   already write anywhere the owning OS account can write. */
 export function treeHashOf(repo: string, dir: string, sha: string): string {
-  const objectsDir = path.join(git(["-C", repo, "rev-parse", "--absolute-git-dir"]), "objects");
+  // The object store lives in the common git dir: for a linked worktree
+  // `--absolute-git-dir` is `.git/worktrees/<name>`, which has no objects.
+  const objectsDir = path.join(git(["-C", repo, "rev-parse", "--path-format=absolute", "--git-common-dir"]), "objects");
   const scratchGitDir = fs.mkdtempSync(path.join(os.tmpdir(), "tt-treehash-"));
   try {
     git(["init", "-q", "--bare", scratchGitDir]);

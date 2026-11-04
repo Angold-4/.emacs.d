@@ -9,6 +9,11 @@
   "properties": {
     "title": { "type": "string", "minLength": 1 },
     "checks": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "preflight": {
+      "description": "#+TT_PREFLIGHT: shell commands run once before start at the program base, in the recorded check environment.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
     "phases": {
       "type": "array",
       "minItems": 1,

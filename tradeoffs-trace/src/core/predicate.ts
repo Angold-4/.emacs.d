@@ -37,7 +37,7 @@ import type { Domain } from "./domains.ts";
 // Plan 06b: the per-item acceptance half — every R and C met by majority with
 // its test verifies passed, every A fitting by majority or its deviation
 // accepted by the owner, and every evidence item recorded.
-import { evidenceFileAnchors, evidenceHasAnchor, flatItems, isStructured, itemNeedsEvidence, itemsFromPhase, phaseItemOutcomes, testVerifyProblems } from "./items.ts";
+import { evidenceFileAnchors, evidenceHasAnchor, flatItems, isStructured, itemNeedsEvidence, itemsFromPhase, phaseItemOutcomes, testVerifyProblems, testVerifyBlockedItemIds } from "./items.ts";
 import { factKeepsOpen } from "./fix-rounds.ts";
 import {
   discoveredDecisions,
@@ -802,7 +802,21 @@ function acceptanceBlockersFor(
     // Plan 07f1b (A1): one blocker per command that FAILED, so every blocker
     // names the failing check command itself — never a command that passed and
     // never a synthesized `a && b` (see `failingCheckCommands`).
-    for (const command of failingCheckCommands(phase, failedCommands, target)) blockers.push({ kind: "check", detail, command });
+    const stopped = (phase.checkResolution ?? []).filter((r) => r.blockedBy);
+    if (stopped.length > 0) {
+      const seen = new Set<string>();
+      for (const resolution of stopped) {
+        const command = resolution.blockedBy!.command;
+        if (seen.has(command)) continue;
+        seen.add(command);
+        blockers.push({ kind: "check", detail: testVerifyProblems([resolution])[0], command });
+      }
+      for (const command of failedCommands ?? []) {
+        if (!stopped.some((r) => r.blockedBy!.command === command)) blockers.push({ kind: "check", detail, command });
+      }
+    } else {
+      for (const command of failingCheckCommands(phase, failedCommands, target)) blockers.push({ kind: "check", detail, command });
+    }
   }
   // The probe must be onto the CURRENT integration head: a head moved by a
   // stale publish (design §6.4 step 3) must not let a stale probe count.
@@ -834,7 +848,9 @@ function acceptanceBlockersFor(
   let acceptedDeviations: Set<string> | undefined;
   let evidenceRecorded: string[] | undefined;
   if (itemsEnforced) {
-    for (const problem of testVerifyProblems(phase.checkResolution ?? [])) {
+    for (const problem of testVerifyProblems((phase.checkResolution ?? []).filter((r) =>
+      !r.blockedBy || !blockers.some((b) => b.kind === "check" && b.command === r.blockedBy!.command),
+    ))) {
       blockers.push({
         kind: "test-verify",
         detail: `named test verify ${problem}`,
@@ -911,7 +927,9 @@ function acceptanceBlockersFor(
     // majority; a `contradicted` entry is applied earlier, as an overturn.
     const needed = Math.floor(seatsOf(phase.contract).length / 2) + 1;
     const outcomes = phaseItemOutcomes(phase);
+    const blocked = testVerifyBlockedItemIds(phase.checkResolution ?? []);
     for (const item of flatItems(items!)) {
+      if (blocked.has(item.id)) continue;
       if (item.kind === "architecture" && acceptedDeviations!.has(item.id)) continue;
       if (itemNeedsEvidence(item) && !evidenceRecorded!.includes(item.id)) continue;
       const outcome = outcomes.find((o) => o.item.id === item.id);
@@ -972,6 +990,9 @@ function acceptanceBlockersFor(
   const covered = new Set(pointIds);
   for (const finding of open) {
     if (finding.severity !== "blocking" || covered.has(finding.id)) continue;
+    // The failed check already names this same cause and the command to
+    // rerun. It is not a second blocker asking for an owner ruling.
+    if (finding.raisedBy === "conductor" && blockers.some((b) => b.kind === "check" && b.detail === finding.evidence)) continue;
     // Plan 07f (A2): a disposition `tradeoff` settles the finding; its old
     // blocking label no longer blocks acceptance. An untriaged finding still
     // blocks (fail safe).

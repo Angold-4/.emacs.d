@@ -42,6 +42,8 @@ test("an installed runner carries its own Emacs exporter", async (t) => {
 #+TT_REPO: ${repo}
 #+TT_BRANCH: main
 #+TT_CHECKS: true
+#+TT_PREFLIGHT: cargo --version && cmake --version
+#+TT_TEST_REMOVALS: test/old.test.ts::old case; test/deleted.test.ts
 * Phase
   :PROPERTIES:
   :ID: p1
@@ -61,6 +63,9 @@ test("an installed runner carries its own Emacs exporter", async (t) => {
       assert.equal(program.title, "tiny program");
       assert.equal(program.entries[0].id, "node");
       assert.equal(program.entries[0].plan.phases[0].id, "p1");
+      assert.deepEqual(program.entries[0].plan.preflight, ["cargo --version && cmake --version"]);
+      assert.deepEqual(program.entries[0].plan.testRemovals, ["test/old.test.ts::old case", "test/deleted.test.ts"]);
+      assert.deepEqual(program.entries[0].plan.phases[0].testRemovals, program.entries[0].plan.testRemovals);
     });
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

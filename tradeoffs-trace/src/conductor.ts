@@ -248,6 +248,7 @@ import {
   testOutcomeIn,
   testResultLines,
   testVerifyProblems,
+  testVerifyBlockedItemIds,
   verdictIssues,
   type Coverage,
   type FlatItem,
@@ -265,6 +266,7 @@ import { EventLog, readLog, type LogRecord } from "./effects/log.ts";
 import { acquireCheckSlot, acquireLock, acquireWaitingLock, DEFAULT_CHECK_SLOTS, openCheckWindow, otherCheckWindowOwner, PausableTimer, type Lock } from "./effects/lock.ts";
 import { resumeKeptWorktree } from "./effects/kept-worktree.ts";
 import { childEnv, runCommand, shBoundFor, type CommandStep, type RunCommandResult } from "./effects/shell.ts";
+import { checkEnvironment, recordCheckEnvironment } from "./effects/check-env.ts";
 // 07 design A1: ADMIT — the one gate start, resume and a program node's own
 // start run before any event.
 import { admitOrRefuse } from "./effects/admit.ts";
@@ -548,6 +550,8 @@ export interface RunPlanPhase {
  * this packet's single-phase conductor. */
 export interface RunPlanFile {
   title: string;
+  /** Plan-wide toolchain guards, run once at start in the check environment. */
+  preflight?: string[];
   /** Plan 06m (A5): the labels `tt deliver` applies to each PR
    * (`#+TT_LABELS:`). Absent means none. */
   labels?: string[];
@@ -8328,7 +8332,9 @@ export class Conductor {
     const findingLine = (f: Finding) =>
       `${f.id} (${f.kind}, raised by ${f.raisedBy}${f.alsoRaisedBy?.length ? ` and ${f.alsoRaisedBy.join(", ")}` : ""}): ${clip(f.evidence)}`;
     const open = phase.findings.filter((f) => f.status === "open");
-    const blocking = open.filter((f) => f.severity === "blocking").map(findingLine);
+    const blocking = open.filter((f) => f.severity === "blocking").map((f) =>
+      f.id.startsWith(`F-${phase.phaseId}-named-check-`) ? f.evidence : findingLine(f),
+    );
     if (checksFailed) {
       blocking.unshift("The phase checks failed on the candidate (see the check output in your worktree by rerunning the failing test).");
       // Plan 05d: name each failing test's own label, so the worker repairs a
@@ -8357,7 +8363,11 @@ export class Conductor {
     // Plan 06b: list only the items a majority did not meet (or fit), with
     // the reviewers' evidence, so the repair addresses exactly those points.
     if (this.#structured()) {
-      blocking.push(...repairItemLines(this.#itemOutcomes(), phase.overturns ?? []));
+      const blocked = testVerifyBlockedItemIds(phase.checkResolution ?? []);
+      for (const reason of testVerifyProblems((phase.checkResolution ?? []).filter((r) => r.blockedBy))) {
+        if (!blocking.includes(reason)) blocking.push(reason);
+      }
+      blocking.push(...repairItemLines(this.#itemOutcomes().filter((o) => !blocked.has(o.item.id)), phase.overturns ?? []));
     }
     // Plan 06n (A7/R9c): a candidate that regressed is not the next base; the
     // items it lost come FIRST, with its sha for reference only.
@@ -8974,7 +8984,9 @@ export class Conductor {
     // blocks nor raises a finding.
     const outcomes = this.#itemOutcomes();
     const overturned = new Set(overturns.map((o) => o.id));
+    const blocked = testVerifyBlockedItemIds(this.#state.phase.checkResolution ?? []);
     for (const o of outcomes) {
+      if (blocked.has(o.item.id)) continue;
       if (o.item.kind === "architecture") {
         const accepted = (this.#state.phase.acceptedDeviations ?? []).includes(o.item.id);
         if (o.outcome === "fits" || accepted) continue;
@@ -9038,8 +9050,9 @@ export class Conductor {
    * runs that test only in #+TT_FINAL_CHECKS (exex 01b2), which resolve it,
    * so it neither raises a finding nor holds acceptance before they run.
    * Every other missing test, and every failed test, is kept. */
-  #resolveVerifies(output: string): VerifyResolution[] {
-    return resolveRoundTestVerifies(this.#planItems(), output);
+  #resolveVerifies(output: string, sha = this.#state.phase.candidate?.sha): VerifyResolution[] {
+    const commands = sha ? this.#readCheckRecord(sha)?.record.commands ?? [] : [];
+    return resolveRoundTestVerifies(this.#planItems(), output, commands);
   }
 
   /** A `test` verify that is missing from or failed in the candidate's check
@@ -9047,12 +9060,29 @@ export class Conductor {
   #applyTestVerifyFindings(C: string): void {
     if (!this.#itemsEnforced()) return;
     const resolutions = this.#state.phase.checkResolution ?? [];
+    const prefix = `F-${this.#state.phase.phaseId}-named-check-`;
+    const commands = this.#readCheckRecord(C)?.record.commands ?? [];
+    for (const finding of this.#state.phase.findings) {
+      if (finding.status !== "open" || finding.raisedBy !== "conductor" || !finding.id.startsWith(prefix)) continue;
+      const passed = commands.find((c) => c.passed && finding.evidence.startsWith(`check \`${c.command}\` failed before its named tests ran:`));
+      if (passed) this.#applyEvent({ type: "FINDING_DISPROVED", findingId: finding.id, byReviewer: "conductor", evidence: `check \`${passed.command}\` passed on candidate ${C}` });
+    }
     const problems = testVerifyProblems(resolutions);
     if (problems.length === 0) return;
-    for (const id of new Set(resolutions.filter((r) => r.outcome !== "passed").map((r) => r.id))) {
+    // A stopped check is one finding. Keep its absent names out of the
+    // per-item loop below, so they cannot become independent defects.
+    for (const reason of testVerifyProblems(resolutions.filter((r) => r.blockedBy))) {
+      if (this.#state.phase.findings.some((f) => f.status === "open" && f.evidence === reason)) continue;
+      this.#applyEvent({ type: "FINDING_RAISED", finding: {
+        id: `${prefix}${this.#state.phase.findings.length + 1}`,
+        version: 1, phaseId: this.#state.phase.phaseId, kind: "defect", severity: "blocking",
+        evidence: reason, raisedBy: "conductor", status: "open", boundCandidateSha: C,
+      } });
+    }
+    for (const id of new Set(resolutions.filter((r) => r.outcome !== "passed" && !r.blockedBy).map((r) => r.id))) {
       if (this.#state.phase.findings.some((f) => f.status === "open" && f.severity === "blocking" && f.itemId === id)) continue;
       const item = flatItems(this.#planItems()).find((i) => i.id === id);
-      const lines = resolutions.filter((r) => r.id === id && r.outcome !== "passed").map((r) => `test "${r.name}" ${r.outcome}`);
+      const lines = resolutions.filter((r) => r.id === id && r.outcome !== "passed" && !r.blockedBy).map((r) => `test "${r.name}" ${r.outcome}`);
       const finding: Finding = {
         id: `F-${this.#state.phase.phaseId}-test-${id}-${this.#state.phase.findings.length + 1}`,
         version: 1,
@@ -11088,7 +11118,7 @@ export class Conductor {
     const recorded = this.#readCheckRecord(sha);
     if (recorded !== undefined) {
       this.#laneCheckOutputs.set(sha, recorded.output);
-      if (this.#itemsEnforced()) this.#laneCheckResolutions.set(sha, this.#resolveVerifies(recorded.output));
+      if (this.#itemsEnforced()) this.#laneCheckResolutions.set(sha, this.#resolveVerifies(recorded.output, sha));
       // Plan 07b (D3): the doneWhen facts the pre-stop check ran are read
       // back, so the resumed hand-off records them without running again.
       if (recorded.record.facts) this.#laneFacts.set(sha, recorded.record.facts.map((f) => ({ ...f, candidateSha: sha })));
@@ -11305,7 +11335,7 @@ export class Conductor {
       // applies them); a loser's output must not touch the phase's item state.
       this.#laneCheckOutputs.set(candidateSha, combinedOutput);
       if (this.#itemsEnforced()) {
-        this.#laneCheckResolutions.set(candidateSha, this.#resolveVerifies(combinedOutput));
+        this.#laneCheckResolutions.set(candidateSha, this.#resolveVerifies(combinedOutput, candidateSha));
       }
       return passed ? { ok: true } : { ok: false, note: firstFailure ?? "a check command failed" };
     } finally {
@@ -12340,7 +12370,7 @@ export class Conductor {
         if (finding && proven) this.#applyEvent({ type: "FINDING_CONFIRMED_REPAIRED", findingId: finding.id, byReviewer: finding.raisedBy, candidateSha: sha });
       }
       if (this.#itemsEnforced()) {
-        this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: this.#resolveVerifies(this.#checkOutputFor(sha)) });
+        this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: this.#resolveVerifies(this.#checkOutputFor(sha), sha) });
         this.#applyTestVerifyFindings(sha);
       }
     } finally {
@@ -12941,7 +12971,7 @@ export class Conductor {
       }
       if (this.#itemsEnforced()) {
         const output = this.#laneCheckOutputs.get(winner.sha) ?? "";
-        this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: this.#resolveVerifies(output) });
+        this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: this.#resolveVerifies(output, winner.sha) });
         this.#applyTestVerifyFindings(winner.sha);
         if (build?.coverage) {
           this.#applyEvent({
@@ -14864,10 +14894,12 @@ export class Conductor {
       // failed in this output fails the final checks, by name; when all
       // passed they resolve as passed.
       const finalVerifies =
-        tier === "final" && this.#itemsEnforced() ? resolveFinalTestVerifies(this.#planItems(), combinedOutput) : [];
-      const finalVerifyLines = finalVerifies
-        .filter((r) => r.outcome !== "passed")
-        .map((r) => `${r.id} test final "${r.name}" ${r.outcome === "missing" ? "is missing from the final check output" : "failed"}`);
+        tier === "final" && this.#itemsEnforced() ? resolveFinalTestVerifies(this.#planItems(), combinedOutput, recordCommands) : [];
+      const finalVerifyLines = [
+        ...testVerifyProblems(finalVerifies.filter((r) => r.blockedBy)),
+        ...finalVerifies.filter((r) => r.outcome !== "passed" && !r.blockedBy)
+          .map((r) => `${r.id} test final "${r.name}" ${r.outcome === "missing" ? "is missing from the final check output" : "failed"}`),
+      ];
       if (tier === "final") {
         if (passed && finalVerifyLines.length === 0) {
           if (finalVerifies.length > 0) {
@@ -15186,12 +15218,7 @@ export class Conductor {
    * environment this run recorded at start. The recorded values win, so a
    * resume from a shell that lost JAVA_HOME or PATH still checks with them. */
   #checkEnv(): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...childEnv() };
-    for (const [name, value] of Object.entries(this.#recordedEnv)) {
-      if (value === null) delete env[name];
-      else env[name] = value;
-    }
-    return env;
+    return checkEnvironment(this.#recordedEnv);
   }
 
   /** Plan 06k1 (A6): record, once, the environment this run's checks need —
@@ -15228,25 +15255,14 @@ export class Conductor {
         // fall through and re-record from this process's environment
       }
     }
-    const names = new Set<string>(["PATH", ...(this.#plan.envVars ?? [])]);
-    const commands = [
-      ...this.#plan.checks,
-      ...this.#plan.phases.flatMap((p) => [...p.checks, ...(p.finalChecks ?? []), ...(p.gate ? [p.gate] : [])]),
-    ];
-    for (const command of commands) {
-      for (const m of command.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g)) names.add(m[1]);
-    }
     // Finding A-12: record a DECLARED name even when it was unset, as an
     // explicit null, so a resume shell supplying it cannot change the check
     // environment.
     // Plan 01a: a declared secret is never recorded — its value would sit in
     // a file under the run directory. A check that references it still gets
     // it from this process's environment (`childEnv`), as before 06k1.
-    for (const name of this.#secretNames) names.delete(name);
-    const env: Record<string, string | null> = {};
-    for (const name of names) {
-      env[name] = name === "PATH" && admitPath !== undefined ? admitPath : (process.env[name] ?? null);
-    }
+    const env = recordCheckEnvironment({ ...this.#plan, secrets: this.#secretNames });
+    if (admitPath !== undefined && Object.hasOwn(env, "PATH")) env.PATH = admitPath;
     this.#recordedEnv = env;
     try {
       fs.writeFileSync(file, `${JSON.stringify(env, null, 2)}\n`);
