@@ -1783,3 +1783,59 @@ test("07g1b R13: a test-verified item the seats rate met on the pick still regre
     await teardown(setup);
   }
 });
+
+test("exex 07f1: a check slower than the attempt still leaves the red lane its fix, and the fix sees the named failure", async () => {
+  const promptLog = fs.mkdtempSync(path.join(fs.realpathSync(path.dirname(fileURLToPath(import.meta.url))), ".lane-fix-budget-"));
+  const launches: Record<string, number> = {};
+  // The red candidate's check outlasts the whole attempt and names its failure
+  // only as a TAP fact with a nextest FAIL line, as a plan's own checker does.
+  const check = "if [ -f red.txt ]; then sleep 9; echo 'not ok 1 - tt07 affected nextest'; echo '#         FAIL [   0.1s] pkg::tests a_named_failure'; exit 1; fi";
+  const setup = await setupConductor({
+    phase: lanePhase({ checks: [check] }),
+    checks: [check],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: { ...FAST, workerAttemptMs: 8_000, checkMs: 30_000 },
+    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: path.join(promptLog, "prompts.txt") },
+    workerScript: () => laneWorker("a"),
+    laneWorkerScriptFor: (lane) => {
+      // Both lanes are red first, so a green sibling never ends the round
+      // before the other lane's fix (07g1b R11).
+      launches[lane] = (launches[lane] ?? 0) + 1;
+      return launches[lane] === 1
+        ? {
+            hello: defaultWorkerHello(),
+            steps: [
+              { kind: "call-sh", command: `printf 'lane ${lane}\\n' > lane-${lane}.txt && printf 'broken\\n' > red.txt` },
+              { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+            ],
+          }
+        : {
+            hello: defaultWorkerHello(),
+            steps: [
+              { kind: "call-sh", command: "rm red.txt" },
+              { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+            ],
+          };
+    },
+    laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", `${seat} prefers a`),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
+    const { records } = readLog(runPaths(setup.runDir).events);
+    assert.equal(records.filter((r) => r.kind === "lane_fix_skipped").length, 0, "the check's wait is not the worker's time");
+    assert.equal(launches.a, 2, "lane a's worker was launched once to build and once to fix");
+    assert.ok(records.some((r) => r.kind === "lane_fix_started" && (r.event as { lane: string }).lane === "a"), "lane a's fix ran");
+    const a = setup.conductor.state.phase.rounds![0].candidates.find((c) => c.lane === "a")!;
+    assert.equal(a.ok, true, "the fixed candidate passed its check");
+    const prompts = fs.readFileSync(path.join(promptLog, "prompts.txt"), "utf8");
+    assert.match(prompts, /not ok 1 - tt07 affected nextest/, "the check's own failed fact reaches the fix");
+    assert.match(prompts, /FAIL \[ {3}0\.1s\] pkg::tests a_named_failure/, "and so does the failing test it names");
+    assert.equal(records.filter((r) => r.kind === "lane_check_unnamed").length, 0);
+  } finally {
+    await teardown(setup);
+    cleanupDir(promptLog);
+  }
+});

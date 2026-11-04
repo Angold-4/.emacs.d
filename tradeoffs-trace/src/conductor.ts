@@ -2025,6 +2025,11 @@ export class Conductor {
   /** exex 01a2: when each lane's worker started this round (`round-lane`), so
    * a fix after a red check gets only the attempt time that is left. */
   #laneStartedAt = new Map<string, number>();
+  /** exex 07f1: the time a lane's worker has worked in a round (its build
+   * plus its fixes), without the time its candidate waited on checks. A fix
+   * gets the attempt's work time that is left, so a long final check never
+   * leaves a red candidate without a fix. */
+  #laneWorkMs = new Map<string, number>();
   /** Plan 06k3 (A2, findings A-13/T-29): lanes whose unsubmitted-work ref
    * could not be written. Their dirty worktree is retained (never removed)
    * so the work is not lost, and the next attempt continues in it. */
@@ -9773,7 +9778,11 @@ export class Conductor {
    * time left keeps its red candidate for this round. */
   async #fixLane(lane: string, round: number, sha: string, failure: string): Promise<LaneBuild> {
     const started = this.#laneStartedAt.get(`${round}-${lane}`) ?? Date.now();
-    const remainingMs = this.#deadlines.workerAttemptMs - (Date.now() - started);
+    // exex 07f1: only the worker's own time counts; the time its candidate
+    // waited on checks does not (a resumed conductor without the record falls
+    // back to the wall clock since the lane started).
+    const worked = this.#laneWorkMs.get(`${round}-${lane}`) ?? Date.now() - started;
+    const remainingMs = this.#deadlines.workerAttemptMs - worked;
     // Under a minute (or a tenth of a short attempt) is too little to fix
     // anything: the red candidate stays this round's record.
     if (remainingMs < Math.min(60_000, this.#deadlines.workerAttemptMs / 10)) {
@@ -9781,6 +9790,9 @@ export class Conductor {
       return { lane, note: `the lane's candidate ${sha.slice(0, 7)} is red and its attempt time is spent` };
     }
     const digest = this.#laneCheckFailureDigest(sha);
+    // exex 07f1: a check that names no failing test or error leaves the fix
+    // blind; it is recorded, so the plan's check is fixed, and the worker is told.
+    if (!digest) this.#log.append("lane_check_unnamed", { lane, round, sha });
     this.#log.append("lane_fix_started", { lane, round, sha, remainingMs });
     const prompt = [
       `Your round-${round} candidate ${sha.slice(0, 7)} FAILED the round checks, so its reviews were cancelled. A lane never hands in a red tree: a candidate's reviews count only once its checks pass.`,
@@ -9790,9 +9802,13 @@ export class Conductor {
       `You have about ${Math.max(1, Math.floor(remainingMs / 60_000))} minutes of this attempt left.`,
       "",
       `The failure: ${failure}`,
-      ...(digest ? ["", "Its output (errors first):", "```", digest, "```"] : []),
+      ...(digest
+        ? ["", "Its output (errors first):", "```", digest, "```"]
+        : ["", "The check output names no failing test or error. Run the failing command above yourself, find each failure in its output, and fix those."]),
     ].join("\n");
+    const fixStarted = Date.now();
     const fixed = await this.#buildLane(lane, round, sha, prompt, { of: sha, timeoutMs: remainingMs });
+    this.#laneWorkMs.set(`${round}-${lane}`, worked + (Date.now() - fixStarted));
     // A "fix" whose tree is the red candidate's own tree changed nothing:
     // checking it again would only repeat the failure, so the loop ends.
     if (fixed.sha && treeOf(this.#plan.repo, fixed.sha) === treeOf(this.#plan.repo, sha)) {
@@ -9817,13 +9833,17 @@ export class Conductor {
     const keep: string[] = [];
     for (let i = 0; i < lines.length && keep.length < limit; i++) {
       const line = lines[i];
-      if (/^error(\[E\d+\])?:/.test(line) || /^warning: unused/.test(line)) {
+      if (/^not ok \d+ /.test(line)) {
+        // exex 07f1: a TAP check's own failed fact and the detail it names
+        keep.push(line);
+        for (let j = i + 1; j < lines.length && /^# /.test(lines[j]) && keep.length < limit; j++) keep.push(lines[j]);
+      } else if (/^error(\[E\d+\])?:/.test(line) || /^warning: unused/.test(line)) {
         // the message and its location/snippet lines
         for (let j = i; j < Math.min(lines.length, i + 8) && keep.length < limit; j++) {
           if (j > i && /^(error|warning)/.test(lines[j])) break;
           keep.push(lines[j]);
         }
-      } else if (/^test .* FAILED$/.test(line) || /panicked at/.test(line) || /^Diff in /.test(line) || /^---- .* stdout ----$/.test(line)) {
+      } else if (/^test .* FAILED$/.test(line) || /^\s*(FAIL|TIMEOUT|SIGSEGV|SIGABRT|SIGKILL) \[/.test(line) || /panicked at/.test(line) || /^Diff in /.test(line) || /^---- .* stdout ----$/.test(line)) {
         keep.push(line);
         if (/panicked at/.test(line) && i + 1 < lines.length) keep.push(lines[i + 1]);
       }
@@ -12521,7 +12541,9 @@ export class Conductor {
         },
         lanePrompt: (r, at) => this.#laneWorkerPrompt(r, at),
         buildLane: async (lane, r, at, prompt) => {
+          const workStarted = Date.now();
           const built = await this.#buildLane(lane, r, at, prompt);
+          this.#laneWorkMs.set(`${r}-${lane}`, Date.now() - workStarted);
           // Kept for the lane review prompts, which need the lane's own
           // disclosures before the winner's hand-off assembles them.
           this.#laneBuilds.set(`${r}-${lane}`, built);
