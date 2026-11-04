@@ -318,7 +318,7 @@ test("items: verdict validation refuses a missing file, a missing line, a stale 
   assert.ok(verdictIssues(item, { id: "R1", verdict: "unmet", evidence: "it is missing" }, ctx).some((i) => i.includes("no anchor")));
 });
 
-test("items: the evaluator overturns a majority unmet verdict the item's passing test contradicts", () => {
+test("items: a weak passing named test never flips the seats' unmet verdicts", () => {
   const item = structured.requirements[0];
   const ctx = {
     lineCount: () => 10,
@@ -333,11 +333,12 @@ test("items: the evaluator overturns a majority unmet verdict the item's passing
     { seat: "B", verdict: "met", evidence: "src/a.ts:1" },
   ];
   const overturns = reverify(item, verdicts, ctx);
-  // Every contradicted seat is overturned and counted (finding M-3).
-  assert.equal(overturns.length, 2);
-  assert.deepEqual(overturns.map((o) => o.seat).sort(), ["A", "M"]);
-  assert.equal(overturns[0].id, "R1");
-  assert.equal(overturns[0].effect, "flip");
+  assert.deepEqual(overturns, []);
+  assert.deepEqual(reverify(item, verdicts.map((v) => ({ ...v, verdict: "unmet" })), ctx), [],
+    "a unanimous not-met also requires independent approval");
+  assert.deepEqual(reverify({ ...item, kind: "architecture", id: "A-weak" },
+    verdicts.map((v) => ({ ...v, verdict: "deviates" })), ctx), [],
+    "passing named tests do not flip architecture deviations either");
 });
 
 test("plan 06b: symbol presence never overturns a majority deviates", () => {

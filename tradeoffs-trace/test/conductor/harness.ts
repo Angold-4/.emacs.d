@@ -70,6 +70,36 @@ export function cleanupDir(dir: string): void {
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
+/** Exercise the real owner inbox when a domain's local loop has parked.
+ * The owner's repair choice is required before another phase round starts. */
+export async function repairDroppedDomain(setup: TestConductorSetup, domain: string): Promise<void> {
+  await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER" &&
+    setup.conductor.state.phase.ownerRequests.some((r) => r.status === "open" && r.id.endsWith(`-${domain}`)),
+    90_000, 25, setup.runDir);
+  const phase = setup.conductor.state.phase;
+  const request = phase.ownerRequests.find((r) => r.status === "open" && r.id.endsWith(`-${domain}`))!;
+  const commandId = `repair-domain-${request.id}`;
+  fs.writeFileSync(path.join(runPaths(setup.runDir).inbox, `${commandId}.json`), JSON.stringify({
+    commandId, type: "resolve", recordKind: "request", option: "repair",
+    binding: { runId: phase.runId, phaseId: phase.phaseId, candidateSha: phase.candidate!.sha,
+      contractVersion: phase.contract.contractVersion, recordId: request.id, recordVersion: request.version },
+  }));
+  await waitFor(() => setup.conductor.state.phase.ownerRequests.find((r) => r.id === request.id)?.status === "resolved",
+    20_000, 25, setup.runDir);
+  // Some older phase fixtures also expose the generic budget gate beside
+  // the domain request. Resolve that real request through the inbox too.
+  for (const gate of setup.conductor.state.phase.ownerRequests.filter((r) => r.status === "open" && r.origin === "repair_budget_exhausted")) {
+    const commandId = `grant-${gate.id}`;
+    fs.writeFileSync(path.join(runPaths(setup.runDir).inbox, `${commandId}.json`), JSON.stringify({
+      commandId, type: "resolve", recordKind: "request", option: "grant",
+      binding: { runId: phase.runId, phaseId: phase.phaseId, candidateSha: phase.candidate!.sha,
+        contractVersion: phase.contract.contractVersion, recordId: gate.id, recordVersion: gate.version },
+    }));
+    await waitFor(() => setup.conductor.state.phase.ownerRequests.find((r) => r.id === gate.id)?.status === "resolved",
+      20_000, 25, setup.runDir);
+  }
+}
+
 export interface FakePiStep {
   kind: string;
   [key: string]: unknown;

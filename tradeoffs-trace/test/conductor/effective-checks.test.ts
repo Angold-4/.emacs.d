@@ -424,7 +424,7 @@ function passingReviewer() {
   });
 }
 
-test("plan 06c: an org phase with TT_FINAL_CHECKS parsed by the real Emacs parser runs the final check only on the candidate about to be accepted", async () => {
+test("an org phase inventories FINAL_CHECKS after candidate checks pass and reuses that result at acceptance", async () => {
   const finalMarker = `/tmp/tt-final-${randomUUID().slice(0, 8)}`;
   const checkMarker = `/tmp/tt-final-round-${randomUUID().slice(0, 8)}`;
   fs.rmSync(finalMarker, { force: true });
@@ -485,7 +485,7 @@ test("plan 06c: an org phase with TT_FINAL_CHECKS parsed by the real Emacs parse
   }
 });
 
-test("plan 06c: a failing final check sends the phase to repair and the next accepted candidate runs it again", async () => {
+test("an early final-check failure sends the phase to repair as a finding and the repaired candidate refreshes it", async () => {
   const finalMarker = `/tmp/tt-final-fail-${randomUUID().slice(0, 8)}`;
   fs.rmSync(finalMarker, { force: true });
   // The final command fails the first time it runs (naming a test) and passes
@@ -543,9 +543,11 @@ test("plan 06c: a failing final check sends the phase to repair and the next acc
   try {
     await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
     assert.equal(fs.readFileSync(finalMarker, "utf8").trim(), "2", "the final check ran again for the next accepted candidate");
-    const failed = readEvents(setup.runDir).find((r) => r.kind === "event" && (r.event as { type: string }).type === "FINAL_CHECKS_FAILED");
-    assert.ok(failed, "a failing final check was recorded");
-    assert.match((failed!.event as { evidence: string }).evidence, /final gate test/, "the failing final test is named");
+    const failed = readEvents(setup.runDir).find((r) => r.kind === "event" &&
+      (r.event as { type: string; finding?: { id: string } }).type === "FINDING_RAISED" &&
+      (r.event as { finding: { id: string } }).finding.id.includes("-compat-"));
+    assert.ok(failed, "a failing compatibility test was recorded before acceptance");
+    assert.match((failed!.event as { finding: { evidence: string } }).finding.evidence, /final gate test/, "the failing final test is named");
     // The repair prompt names the failing final test.
     const prompts = fs.readFileSync(promptLog, "utf8");
     assert.match(prompts, /REPAIR/);
@@ -694,8 +696,10 @@ test("plan 06n: a candidate touching a TT_WIDE_PATHS glob runs the final checks 
     assert.ok(recordA.commands.some((c) => c.command === finalCommand), "lane a ran the final command");
     const recordB = checkRecord(setup.runDir, shaB);
     assert.equal(recordB.tier, "round", "lane b touches only src/ so it runs the round checks");
-    assert.deepEqual(recordB.finalCommands, [], "lane b ran no final command");
-    assert.equal(fs.readFileSync(finalMarker, "utf8").trim().split("\n").length, 1, "the final command ran once, for lane a");
+    assert.deepEqual(recordB.finalCommands, [], "lane b's candidate checks keep their ordinary tier");
+    assert.equal(fs.readFileSync(finalMarker, "utf8").trim().split("\n").length, 2,
+      "both green lanes get a final inventory; lane a reuses its already-executed final command");
+    assert.ok(JSON.parse(fs.readFileSync(path.join(setup.runDir, "checks", shaB, "compatibility.json"), "utf8")).complete);
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);

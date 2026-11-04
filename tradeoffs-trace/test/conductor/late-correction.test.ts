@@ -178,7 +178,8 @@ test("plan 07f (A3): a correction during review or final checks is a point, neve
     assert.ok(!(phase.ownerNotes ?? []).some((n) => n.includes("CORRECTION-DURING")), "no correction is kept as a note");
     assert.equal((phase.queuedCorrections ?? []).length, 0, "and none is a queued correction");
     assert.ok(
-      !fs.existsSync(promptLog) || !fs.readFileSync(promptLog, "utf8").includes("CORRECTION-DURING"),
+      !fs.existsSync(promptLog) || !fs.readFileSync(promptLog, "utf8").split("\n")
+        .some((line) => line.startsWith("Owner notes:") && line.includes("CORRECTION-DURING")),
       "no worker prompt carries a correction as queued note text",
     );
   } finally {

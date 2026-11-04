@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { domainReviewBrief, factKeepsOpen, fixTasks, repairProducedNoChange, testRemovalViolations, FIXER_DUTY, type FixFinding, type FixTask } from "../../src/core/fix-rounds.ts";
+import { domainProgressFindings, domainResolvedPoints, domainReviewBrief, factKeepsOpen, fixTasks, repairProducedNoChange, testRemovalViolations, FIXER_DUTY, type FixFinding, type FixTask } from "../../src/core/fix-rounds.ts";
 import { ownerRepairPointFor } from "../../src/conductor.ts";
 import * as conductor from "../../src/conductor.ts";
 import { domainFactFailure } from "../../src/fix-loop.ts";
@@ -474,21 +474,22 @@ function ownerRepairFixture() {
   return { phase, request };
 }
 
-test("an owner repair without a proving command is refused as UNPROVABLE before MAP", async () => {
+test("an owner repair without a failing command is admitted for domain review", async () => {
   const { phase, request } = ownerRepairFixture();
   const projected = ownerRepairPointFor(phase, request, { checks: ["true"] });
-  assert.ok(projected && "reason" in projected, "missing doneWhen is refused at projection, before any fact or point");
+  assert.ok(projected && "finding" in projected);
   let ran = false;
   const point = await conductor.admitOwnerRepairPoint(phase, request, { checks: ["true"] }, async () => {
     ran = true; return { exitCode: 1, timedOut: false };
   });
-  assert.ok(point && "reason" in point);
-  assert.match(point.reason, /X:UNPROVABLE.*doneWhen/);
+  assert.ok(point && "finding" in point);
+  assert.equal(point.finding.doneWhen, undefined);
+  assert.deepEqual(fixTasks([{ ...point.finding, disposition: FIX }], DOMAINS, 4).map((t) => t.domain), ["booking"]);
   assert.equal(ran, false);
   assert.deepEqual(phase.findings, []);
 });
 
-for (const exitCode of [0, 1]) test(`owner repair admission requires a failing base fact (base exit ${exitCode})`, async () => {
+for (const exitCode of [0, 1]) test(`owner repair uses only a failing base command, otherwise domain review (base exit ${exitCode})`, async () => {
   const { phase, request } = ownerRepairFixture();
   request.resolution!.note = "doneWhen: test -f booking-fixed.txt";
   const commands: string[] = [];
@@ -499,8 +500,8 @@ for (const exitCode of [0, 1]) test(`owner repair admission requires a failing b
   assert.deepEqual(commands, ["test -f booking-fixed.txt"]);
   assert.ok(point);
   if (exitCode === 0) {
-    assert.ok("reason" in point);
-    assert.match(point.reason, /X:UNPROVABLE.*already passes on the base/);
+    assert.ok("finding" in point);
+    assert.equal(point.finding.doneWhen, undefined, "an already-green candidate gate cannot masquerade as repair evidence");
   } else {
     assert.ok("finding" in point);
     assert.equal(point.finding.domain, "booking");
@@ -510,6 +511,37 @@ for (const exitCode of [0, 1]) test(`owner repair admission requires a failing b
     assert.deepEqual(tasks.map((t) => t.domain), ["booking"]);
   }
   assert.deepEqual(phase.findings, [], "admission precedes event application");
+});
+
+test("repair of a dropped domain with an already-green candidate gate closes only by merged domain approval", async () => {
+  const { phase, request } = ownerRepairFixture();
+  const original = finding("F-dropped", "booking");
+  original.doneWhen = "true";
+  phase.findings = [original];
+  request.origin = "open_finding";
+  request.linkedDecisionId = undefined;
+  request.linkedFindingId = original.id;
+  request.resolution = { option: "repair" };
+  const point = await conductor.admitOwnerRepairPoint(phase, request, { checks: ["true"] }, async () => ({ exitCode: 0, timedOut: false }));
+  assert.ok(point && "finding" in point);
+  assert.equal(point.finding.doneWhen, undefined);
+  phase.findings = [point.finding];
+  phase.candidate!.sha = "C2";
+  const round = { round: 2, base: "C1", lanes: [], candidates: [], votes: [], fixed: {
+    base: "C1", candidate: "C2", tasks: [{ domain: "booking", findingIds: [point.finding.id], sha: "domain-head" }],
+    merges: [{ sha: "domain-head" }], domains: [{ iteration: 1, sha: "domain-head",
+      facts: { checkPassed: true, points: [{ id: point.finding.id, onBase: false, onHead: true }] },
+      review: { points: [{ pointId: point.finding.id, fixed: false, why: "booking/a.ts:1 still wrong" }], quality: { ok: true } },
+    }],
+  } };
+  phase.rounds = [round];
+  assert.equal(domainResolvedPoints(phase).has(point.finding.id), false, "green checks alone do not approve the repair");
+  assert.equal(domainProgressFindings(phase, round)[0].status, "open");
+  round.fixed.domains[0].review.points[0].fixed = true;
+  assert.equal(domainResolvedPoints(phase).has(point.finding.id), true);
+  assert.equal(domainProgressFindings(phase, round)[0].status, "repaired");
+  round.fixed.merges = [];
+  assert.equal(domainResolvedPoints(phase).has(point.finding.id), false, "an abandoned domain head supplies no closure");
 });
 
 test("a repair ruling takes a named test's doneWhen from the declared rerun", () => {
@@ -561,12 +593,12 @@ test("an acceptance ruling creates no fixer work", () => {
   assert.equal(ownerRepairPointFor(phase, request, { checks: ["true"] }), undefined);
 });
 
-test("a repair naming a test with no command is an exception", () => {
+test("a repair naming a test with no command requires domain approval", () => {
   const { phase, request } = ownerRepairFixture();
   request.relatedBallots![0].rationale += '; test "rejects unsafe prices"';
   const point = ownerRepairPointFor(phase, request, { checks: [] });
-  assert.ok(point && "reason" in point);
-  assert.match(point.reason, /test with no declared command/);
+  assert.ok(point && "finding" in point);
+  assert.equal(point.finding.doneWhen, undefined);
 });
 
 

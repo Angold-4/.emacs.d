@@ -18,6 +18,7 @@
 // file's happy-path run to DONE.
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -218,9 +219,15 @@ test("review-protocol: two-turn ordering, reviewer-discovered records, unreferen
 test("plan 06c: the silent-review re-prompt names missing tools from the preflight", async () => {
   const originalPath = process.env.PATH;
   const dir = fs.mkdtempSync("/tmp/tt-06c-reprompt-");
-  // A PATH without rg: the agent-tool line names it, including on the silent
-  // reviewer's re-prompt (which goes through the shared #agentPrompt helper).
-  process.env.PATH = "/usr/bin:/bin";
+  // Linux installs rg in /usr/bin: give the fixture only the tools it needs.
+  const bin = path.join(dir, "bin");
+  fs.mkdirSync(bin);
+  for (const name of ["git", "sh", "bash", "env", "ps", "perl", "chmod"]) {
+    const resolved = execFileSync("/bin/sh", ["-c", 'command -v "$1"', "tt-test", name], { encoding: "utf8" }).trim();
+    fs.symlinkSync(resolved, path.join(bin, name));
+  }
+  fs.symlinkSync(process.execPath, path.join(bin, "node"));
+  process.env.PATH = bin;
   const bLog = path.join(dir, `B-${randomUUID().slice(0, 8)}.log`);
   let setup: Awaited<ReturnType<typeof setupConductor>> | undefined;
   try {

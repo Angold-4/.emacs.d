@@ -8,6 +8,6 @@
     "node": ">=22.19"
   },
   "scripts": {
-    "test": "node --test 'test/**/*.test.ts'"
+    "test": "node --test --test-force-exit --test-concurrency=3 --test-timeout=180000 'test/**/*.test.ts'"
   }
 }

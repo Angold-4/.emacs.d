@@ -73,8 +73,9 @@ export function isBoundaryRelevant(p: string, boundaries: string[], acceptanceFi
   return false;
 }
 
-/** design §3.3: a boundary-relevant path with no record citing it becomes a
- * `trigger` the reviewer must classify. "Citing" is deliberately coarse for
+/** Only an out-of-scope path with no citing record needs a path trigger.
+ * BOUNDARIES grants permission to change its matching paths, including
+ * manifests and acceptance files. "Citing" is deliberately coarse for
  * this work packet (design §12 notes precision here is measured later): a
  * path counts as cited if it appears, as a plain substring, in any of the
  * given citation texts (decision choice/whyItMatters/alternative text,
@@ -86,6 +87,7 @@ export function computeBoundaryTriggerPaths(
   citationTexts: string[],
 ): string[] {
   return diffPaths.filter((p) => {
+    if (boundaries.some((g) => matchesGlob(g, p))) return false;
     if (!isBoundaryRelevant(p, boundaries, acceptanceFiles)) return false;
     return !citationTexts.some((text) => text.includes(p));
   });

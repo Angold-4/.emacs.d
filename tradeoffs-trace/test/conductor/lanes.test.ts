@@ -579,8 +579,8 @@ test("plan 06g: one lane crashing leaves the other candidate checked, reviewed a
 });
 
 // exex 01a2 (replaces plan 06g's "repeats from the same base"): both lanes'
-test("plan 06k2: a two-lane winner's boundary-trigger decisions are balloted by its lane reviews and settle", async () => {
-  // Scenario 1: the winner touches an uncited boundary path.
+test("a two-lane winner's permitted paths create no trigger decisions or owner requests", async () => {
+  // Scenario 1: the winner touches an uncited path allowed by BOUNDARIES.
   const setup = await setupConductor({
     phase: { id: "p1", goal: "build two candidates", acceptance: ["it works"], checks: ["true"], boundaries: ["src/**"], reserved: [], workers: 2, rounds: 10 },
     checks: ["true"],
@@ -614,11 +614,9 @@ test("plan 06k2: a two-lane winner's boundary-trigger decisions are balloted by 
     const phase = setup.conductor.state.phase;
     const winner = phase.rounds![0].picked!;
     const trigger = phase.decisions.find((d) => d.source === "trigger" && d.boundCandidateSha === winner.sha);
-    assert.ok(trigger, "the winner's boundary trigger was created");
-    const ballots = phase.ballots.filter((b) => b.decisionId === trigger!.id && b.boundCandidateSha === winner.sha);
-    assert.equal(ballots.length, 3, "the winner's lane reviews balloted the trigger");
-    assert.ok(ballots.every((b) => b.vote === "approve"));
-    assert.equal(phase.phase, "DONE", "the balloted trigger settles and the phase reaches DONE");
+    assert.equal(trigger, undefined, "a permitted path needs no mechanical decision");
+    assert.deepEqual(phase.ownerRequests, []);
+    assert.equal(phase.phase, "DONE");
   } finally {
     await teardown(setup);
   }
@@ -1499,13 +1497,15 @@ test("a lead ruling makes the next repair build on the named candidate (SHA in t
   }
 });
 
-test("a lead ruling makes the next repair build on the named candidate", async () => {
+for (const beforePick of [false, true]) test(`a lead ruling makes the next repair build on the named candidate${beforePick ? " before the pick" : ""}`, async () => {
+  const syncDir = fs.mkdtempSync("/tmp/tt-ruling-check-");
+  const release = path.join(syncDir, "release");
   const setup = await setupConductor({
     phase: lanePhase({ checks: ["test ! -f red.txt"] }),
     checks: ["test ! -f red.txt"],
     phaseChecks: ["true"],
     stubReviews: true,
-    deadlines: { ...FAST, inboxPollMs: 40 },
+    deadlines: { ...FAST, inboxPollMs: 40, ...(beforePick ? { workerAttemptMs: 60_000 } : {}) },
     workerScript: () => laneWorker("a"),
     laneWorkerScriptFor: (lane) =>
       lane === "a"
@@ -1518,7 +1518,10 @@ test("a lead ruling makes the next repair build on the named candidate", async (
               { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
             ],
           }
-        : laneWorker("b"),
+        : { ...laneWorker("b"), steps: [
+            ...(beforePick ? [{ kind: "call-sh" as const, command: `remaining=900; while test ! -f '${release}' && test "$remaining" -gt 0; do sleep 0.05; remaining=$((remaining - 1)); done; test -f '${release}'` }] : []),
+            ...laneWorker("b").steps,
+          ] },
     // M raises a blocking point on the pick (lane b), so the phase does not
     // accept it and a repair round follows.
     laneReviewerScriptFor: (seat, _candidate, state, lane) =>
@@ -1528,12 +1531,24 @@ test("a lead ruling makes the next repair build on the named candidate", async (
           })
         : laneReview(seat as Reviewer, state.phase.contract.contractVersion),
     pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "b", `${seat} picks the green lane`),
+    // A ruling can replace the pick while its reviews are being promoted.
+    // Review the newly named candidate too; otherwise fake-pi has no script
+    // and this fixture tests a missing reviewer instead of the repair base.
+    reviewerScriptFor: (seat, state) => {
+      const script = laneReview(seat, state.phase.contract.contractVersion, {
+        findings: seat === "M" ? [{ kind: "defect", severity: "blocking", evidence: "lane-a.txt:1 red.txt must be removed", doneWhen: "test ! -f red.txt" }] : [],
+      });
+      // stubReviews uses one turn: skip lane discovery and its barrier wait.
+      return { ...script, steps: script.steps.slice(2) };
+    },
   });
   try {
     await setup.conductor.start();
-    await waitFor(() => setup.conductor.state.phase.rounds?.[0]?.picked !== undefined, 120_000, 50, setup.runDir);
+    await waitFor(() => beforePick
+      ? setup.conductor.state.phase.rounds?.[0]?.candidates.some((c) => c.lane === "a" && c.ok === false) === true
+      : setup.conductor.state.phase.rounds?.[0]?.picked !== undefined, 120_000, 50, setup.runDir);
     const redSha = setup.conductor.state.phase.rounds![0].candidates.find((c) => c.lane === "a")!.sha!;
-    assert.equal(setup.conductor.state.phase.rounds![0].picked?.lane, "b", "the vote picked lane b");
+    if (!beforePick) assert.equal(setup.conductor.state.phase.rounds![0].picked?.lane, "b", "the vote picked lane b");
     const phase = setup.conductor.state.phase;
     fs.writeFileSync(
       path.join(runPaths(setup.runDir).inbox, `test-ruling-${Date.now()}.json`),
@@ -1546,6 +1561,7 @@ test("a lead ruling makes the next repair build on the named candidate", async (
       }),
     );
     await waitFor(() => (setup.conductor.state.phase.rulings ?? []).length === 1, 60_000, 40, setup.runDir);
+    fs.writeFileSync(release, "go");
     const ruled = setup.conductor.state.phase.rounds![0].picked!;
     assert.equal(ruled.lane, "a", "the ruling replaced the round's pick");
     assert.equal(ruled.sha, redSha, "with the named candidate");
@@ -1556,8 +1572,17 @@ test("a lead ruling makes the next repair build on the named candidate", async (
     await waitFor(() => (setup.conductor.state.phase.rounds?.length ?? 0) >= 2, 120_000, 50, setup.runDir);
     const repair = setup.conductor.state.phase.rounds![1];
     assert.equal(repair.base, redSha, "the next repair starts from the named candidate");
+    const events = readEvents(setup.runDir).filter((r) => r.kind === "event").map((r) => r.event as any);
+    const handoff = events.findIndex((e) => e.type === "FREEZE_COMPLETED" && e.candidateSha === redSha);
+    if (beforePick) assert.ok(handoff >= 0, "the pre-pick ruling deterministically hands off the red candidate");
+    if (handoff >= 0) {
+      const gate = events.slice(handoff + 1).find((e) => ["CHECKS_PASSED", "CHECKS_FAILED"].includes(e.type));
+      assert.equal(gate?.type, "CHECKS_FAILED", "the owner's red candidate keeps its own failing check fact");
+    }
   } finally {
+    fs.writeFileSync(release, "go");
     await teardown(setup);
+    cleanupDir(syncDir);
   }
 });
 
@@ -1647,7 +1672,7 @@ function regressionSetup(r1Round2: "met" | "unmet"): Promise<TestConductorSetup>
           ? {}
           : {
               findings: [{ kind: "defect", severity: "blocking", evidence: `${read}:1 it works is unmet`,
-                domain: "booking", item: "C2", where: "booking/a.ts:1", expected: "fix the declared point", doneWhen: "test -f booking-fixed.txt" }],
+                domain: "booking", item: r1Round2 === "unmet" ? "R1" : "C2", where: "booking/a.ts:1", expected: "fix the declared point", doneWhen: "test -f booking-fixed.txt" }],
               ...(open.length > 0
                 ? { findingStatements: open.map((f) => ({ findingId: f.id, status: "withdraw", evidence: "fixed" })) }
                 : {}),
@@ -1756,5 +1781,61 @@ test("07g1b R13: a test-verified item the seats rate met on the pick still regre
     assert.equal(rounds[2].base, rounds[1].fixed!.candidate, "no restart: the next loop still builds on the integrated candidate");
   } finally {
     await teardown(setup);
+  }
+});
+
+test("exex 07f1: a check slower than the attempt still leaves the red lane its fix, and the fix sees the named failure", async () => {
+  const promptLog = fs.mkdtempSync(path.join(fs.realpathSync(path.dirname(fileURLToPath(import.meta.url))), ".lane-fix-budget-"));
+  const launches: Record<string, number> = {};
+  // The red candidate's check outlasts the whole attempt and names its failure
+  // only as a TAP fact with a nextest FAIL line, as a plan's own checker does.
+  const check = "if [ -f red.txt ]; then sleep 9; echo 'not ok 1 - tt07 affected nextest'; echo '#         FAIL [   0.1s] pkg::tests a_named_failure'; exit 1; fi";
+  const setup = await setupConductor({
+    phase: lanePhase({ checks: [check] }),
+    checks: [check],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: { ...FAST, workerAttemptMs: 8_000, checkMs: 30_000 },
+    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: path.join(promptLog, "prompts.txt") },
+    workerScript: () => laneWorker("a"),
+    laneWorkerScriptFor: (lane) => {
+      // Both lanes are red first, so a green sibling never ends the round
+      // before the other lane's fix (07g1b R11).
+      launches[lane] = (launches[lane] ?? 0) + 1;
+      return launches[lane] === 1
+        ? {
+            hello: defaultWorkerHello(),
+            steps: [
+              { kind: "call-sh", command: `printf 'lane ${lane}\\n' > lane-${lane}.txt && printf 'broken\\n' > red.txt` },
+              { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+            ],
+          }
+        : {
+            hello: defaultWorkerHello(),
+            steps: [
+              { kind: "call-sh", command: "rm red.txt" },
+              { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+            ],
+          };
+    },
+    laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", `${seat} prefers a`),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
+    const { records } = readLog(runPaths(setup.runDir).events);
+    assert.equal(records.filter((r) => r.kind === "lane_fix_skipped").length, 0, "the check's wait is not the worker's time");
+    assert.equal(launches.a, 2, "lane a's worker was launched once to build and once to fix");
+    assert.ok(records.some((r) => r.kind === "lane_fix_started" && (r.event as { lane: string }).lane === "a"), "lane a's fix ran");
+    const a = setup.conductor.state.phase.rounds![0].candidates.find((c) => c.lane === "a")!;
+    assert.equal(a.ok, true, "the fixed candidate passed its check");
+    const prompts = fs.readFileSync(path.join(promptLog, "prompts.txt"), "utf8");
+    assert.match(prompts, /not ok 1 - tt07 affected nextest/, "the check's own failed fact reaches the fix");
+    assert.match(prompts, /FAIL \[ {3}0\.1s\] pkg::tests a_named_failure/, "and so does the failing test it names");
+    assert.equal(records.filter((r) => r.kind === "lane_check_unnamed").length, 0);
+  } finally {
+    await teardown(setup);
+    cleanupDir(promptLog);
   }
 });

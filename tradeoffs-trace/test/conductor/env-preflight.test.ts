@@ -543,9 +543,16 @@ test("env-preflight: tt program retry refuses a blocked node whose entry names a
 test("plan 06c: the worker prompt names missing tools from the preflight", async () => {
   const originalPath = process.env.PATH;
   const dir = fs.mkdtempSync("/tmp/tt-06c-tools-");
-  // A PATH with git and sh but without rg/gtimeout/docker/cargo: the agent
-  // preflight reports them missing, and the worker prompt names them.
-  process.env.PATH = "/usr/bin:/bin";
+  // A minimal PATH makes the missing-tool condition portable: Linux often
+  // installs rg in /usr/bin, unlike the original macOS fixture.
+  const bin = path.join(dir, "bin");
+  fs.mkdirSync(bin);
+  for (const name of ["git", "sh", "bash", "env", "ps", "perl", "chmod"]) {
+    const resolved = execFileSync("/bin/sh", ["-c", 'command -v "$1"', "tt-test", name], { encoding: "utf8" }).trim();
+    fs.symlinkSync(resolved, path.join(bin, name));
+  }
+  fs.symlinkSync(process.execPath, path.join(bin, "node"));
+  process.env.PATH = bin;
   const promptLog = path.join(dir, "worker.prompts.log");
   let setup: Awaited<ReturnType<typeof setupConductor>> | undefined;
   try {

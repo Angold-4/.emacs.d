@@ -233,7 +233,8 @@ test("after a passing check a finding whose doneWhen exits 0 on the picked candi
   try {
     await setup.conductor.start();
     await waitFor(
-      () => setup.conductor.state.phase.findings.some((f) => f.doneWhen === doneWhen && f.status === "repaired"),
+      () => setup.conductor.state.phase.findings.some((f) => f.doneWhen === doneWhen && f.status === "repaired" &&
+        coreEvents(setup.runDir).some((e) => e.type === "FINDING_FACT" && e.findingId === f.id)),
       150_000,
       50,
       setup.runDir,
@@ -271,7 +272,8 @@ test("a doneWhen that fails on the round's base and passes on the candidate repa
   try {
     await setup.conductor.start();
     await waitFor(
-      () => setup.conductor.state.phase.findings.some((f) => f.doneWhen === doneWhen && f.status === "repaired"),
+      () => setup.conductor.state.phase.findings.some((f) => f.doneWhen === doneWhen && f.status === "repaired" &&
+        coreEvents(setup.runDir).some((e) => e.type === "FINDING_FACT" && e.findingId === f.id)),
       150_000,
       50,
       setup.runDir,
@@ -304,6 +306,14 @@ test("a doneWhen that already passes on the round's base records a flagged fact 
     workerScript: () => laneWorker(1, "a"),
     laneWorkerScriptFor: (lane, round) => (lane === "b" ? crashedLane() : laneWorker(round, lane)),
     laneReviewerScriptFor: (seat, candidate, state) => reviewerWithPoint(doneWhen)(seat, candidate, state),
+    domainReviewScriptFor: (domain, _round, _iteration, state) => ({
+      hello: { role: "domain-review", tools: ROLE_TOOLS["domain-review"] },
+      steps: [{ kind: "call-submit", tool: "submit_domain_review", args: {
+        points: state.phase.findings.filter((f) => f.status === "open" && f.domain === domain)
+          .map((f) => ({ pointId: f.id, fixed: false, why: "src/a.ts:1 no independent approval; the command also passes on the base" })),
+        quality: { ok: true },
+      } }],
+    }),
   });
   try {
     await setup.conductor.start();
@@ -427,7 +437,8 @@ test("a doneWhen runs in the checked checkout with the check environment", async
   try {
     await setup.conductor.start();
     await waitFor(
-      () => setup.conductor.state.phase.findings.some((f) => f.doneWhen === doneWhen && f.status === "repaired"),
+      () => setup.conductor.state.phase.findings.some((f) => f.doneWhen === doneWhen && f.status === "repaired" &&
+        coreEvents(setup.runDir).some((e) => e.type === "FINDING_FACT" && e.findingId === f.id)),
       150_000,
       50,
       setup.runDir,
@@ -538,7 +549,8 @@ test("the evaluator prompt lists the picked candidate's done-when facts", async 
   try {
     await setup.conductor.start();
     await waitFor(
-      () => setup.conductor.state.phase.findings.some((f) => f.doneWhen === doneWhen && f.status === "repaired"),
+      () => setup.conductor.state.phase.findings.some((f) => f.doneWhen === doneWhen && f.status === "repaired" &&
+        coreEvents(setup.runDir).some((e) => e.type === "FINDING_FACT" && e.findingId === f.id)),
       150_000,
       50,
       setup.runDir,

@@ -18,6 +18,7 @@ import { runPaths } from "../../src/conductor.ts";
 import { readLog } from "../../src/effects/log.ts";
 import {
   cleanupDir,
+  repairDroppedDomain,
   defaultReviewerHello,
   defaultWorkerHello,
   readEvents,
@@ -444,7 +445,7 @@ test("the integrate duty is fenced by files even when its edit is staged", async
   }
 });
 
-test("open points chain domain loops on the integrated candidate and park at the third loop", async () => {
+test("a dropped domain parks immediately and preserves another domain's approved progress", async () => {
   // R4: while points stay open the loop re-enters the owning domain and no
   // reviewer agent starts. Each loop starts on the candidate the round before
   // it picked — never on the older pick that candidate was based on — and the
@@ -495,29 +496,20 @@ test("open points chain domain loops on the integrated candidate and park at the
     await setup.conductor.start();
     await waitFor(() => events().some((e) => e.type === "LOOP_BOUND_REACHED"), 180_000, 50, setup.runDir);
     const rounds = setup.conductor.state.phase.rounds ?? [];
-    const [first, second, third] = [rounds[0], rounds[1], rounds[2]];
-    assert.ok(first?.picked && second?.fixed && third?.fixed, "BUILD picked once; domain loops record their own reductions");
-    assert.ok(second.fixed.candidate, "the first domain loop merged a candidate");
-    assert.equal(second.fixed.merges.length, 1, "only the approved domain merges; an open head is not an approval");
-    assert.equal(second.base, first.picked.sha, "the first domain loop starts on the pick");
-    assert.equal(third.base, second.fixed.candidate, "the later loop chains on the integrated candidate");
-    assert.notEqual(third.base, first.picked.sha, "the chain never falls back to the original pick");
-    for (const round of [second, third]) {
-      assert.deepEqual(round.lanes, [], "a fix loop contains no lanes");
-      assert.equal(round.picked, undefined, "a fix loop picks no candidate");
-      assert.equal(round.votes.length, 0, `loop round ${round.round} takes no pick vote`);
-      assert.equal(round.candidates.length, 0, `loop round ${round.round} starts no lane review`);
-    }
-    assert.deepEqual(
-      readEvents(setup.runDir)
-        .filter((r) => r.kind === "fix_loop_chained")
-        .map((r) => (r.event as { round?: number }).round),
-      [2, 3],
-      "both open-point rounds are recorded as chained loops",
-    );
-    const bound = events().find((e) => e.type === "LOOP_BOUND_REACHED");
-    assert.equal(bound?.round, 3, "the third loop with a point still open is the bound's last");
-    assert.ok(events().some((e) => e.type === "LEAD_CALLED"), "the bound parks the phase for the lead");
+    const [first, second] = rounds;
+    assert.ok(first?.picked && second?.fixed, "BUILD and the domain reduction are recorded");
+    assert.equal(rounds.length, 2, "a dropped domain waits for its owner before another round");
+    assert.ok(second.fixed.candidate);
+    assert.equal(second.fixed.merges.length, 1, "only the approved domain merges");
+    assert.equal(second.base, first.picked.sha);
+    assert.deepEqual(second.lanes, []);
+    assert.equal(second.picked, undefined);
+    assert.equal(second.votes.length, 0);
+    assert.ok(setup.conductor.state.phase.ownerRequests.some((r) => r.status === "open" && r.id === "OR-p1-domain-2-gates"));
+    assert.ok(setup.conductor.state.phase.findings.some((f) => f.domain === "booking" && f.status === "repaired"),
+      "the approved booking point survives the gates park");
+    assert.ok(!readEvents(setup.runDir).some((r) => r.kind === "fix_loop_chained"));
+    assert.ok(events().some((e) => e.type === "LEAD_CALLED"));
     const intents = readEvents(setup.runDir)
       .filter((r) => r.kind === "intent")
       .map((r) => r.event as { agentId?: string; round?: number });
@@ -617,7 +609,8 @@ test("a red merged check that names no declared domain parks for the lead with n
     );
     assert.equal(setup.conductor.state.phase.phase, "AWAITING_OWNER", "the phase parks for the lead");
     assert.ok(events().some((e) => e.type === "LOOP_BOUND_REACHED" && String(e.reason).includes("names no file")), "the parking transition carries the ownerless-check reason");
-    assert.ok(!events().some((e) => e.type === "BOUND_REACHED"), "an ownerless check is not a reached bound");
+    assert.ok(!events().some((e) => e.type === "BOUND_REACHED" && e.kind !== "rounds"),
+      "an ownerless check is not a command timeout; the phase's generic owner boundary may still be recorded");
     assert.ok(
       !events().some((e) => e.type === "fix_loop_chained"),
       "no loop chains on a red merge with no owning domain",
@@ -698,18 +691,20 @@ test("a point proven by an earlier loop does not keep the seats from reviewing o
         .filter((r) => r.kind === "intent")
         .map((r) => String((r.event as { agentId?: string }).agentId ?? ""));
     await setup.conductor.start();
+    await repairDroppedDomain(setup, "gates");
+    const resumedEventsStart = events().length;
     await waitFor(() => intents().filter((id) => id.startsWith("reviewer-")).length === 3, 120_000, 20, setup.runDir);
     assert.ok(
-      !events().some((e) => e.type === "LEAD_CALLED"),
+      !events().slice(resumedEventsStart).some((e) => e.type === "LEAD_CALLED"),
       "a point closed on an earlier candidate never parks the phase",
     );
-    assert.ok(!events().some((e) => e.type === "LOOP_BOUND_REACHED"), "no loop bound is reached on a closed set");
+    assert.ok(!events().slice(resumedEventsStart).some((e) => e.type === "LOOP_BOUND_REACHED"), "no new loop bound is reached on a closed set");
     assert.deepEqual(
       readEvents(setup.runDir)
         .filter((r) => r.kind === "fix_loop_chained")
         .map((r) => (r.event as { round?: number }).round),
-      [2],
-      "only the first loop with a point still open chains",
+      [],
+      "the dropped domain resumed through the owner's repair choice, without an automatic chained round",
     );
     assert.ok(
       intents().filter((id) => id.startsWith("reviewer-")).length === 3,

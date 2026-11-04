@@ -18,6 +18,7 @@ import type { Reviewer, State } from "../../src/core/types.ts";
 import { basePhase } from "../unit/helpers.ts";
 import {
   cleanupDir,
+  repairDroppedDomain,
   defaultReviewerHello,
   defaultWorkerHello,
   readEvents,
@@ -180,7 +181,7 @@ test("a decision a fixer discloses in a fix loop is balloted by the acceptance s
     extraReviewerEnv: () => ({ FAKE_PI_PROMPT_LOG: promptLog }),
     workerScript: () => laneWorker("a"),
     laneWorkerScriptFor: (lane) => ({ hello: defaultWorkerHello(), steps: [
-      { kind: "call-sh", command: `mkdir -p booking; echo '${lane}' > booking/a.txt` },
+      { kind: "call-sh", command: `mkdir -p booking gates; echo '${lane}' > booking/a.txt; echo '${lane}' > gates/a.txt` },
       { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
     ] }),
     laneReviewerScriptFor: (seat, _candidate, state) => {
@@ -188,10 +189,11 @@ test("a decision a fixer discloses in a fix loop is balloted by the acceptance s
         kind: "defect", severity: "blocking", evidence: "booking/a.txt:1 needs the domain fix",
         domain: "booking", item: "R1", where: "booking/a.txt:1", expected: "the booking fix is present", doneWhen: "test -f booking/fixed.txt",
       }, {
-        kind: "defect", severity: "blocking", evidence: "booking/a.txt:1 needs the gates fix too",
-        domain: "gates", item: "R1", where: "booking/a.txt:1", expected: "the gates fix is present", doneWhen: "test -f gates/fixed.txt",
+        kind: "defect", severity: "blocking", evidence: "gates/a.txt:1 needs the gates fix too",
+        domain: "gates", item: "R1", where: "gates/a.txt:1", expected: "the gates fix is present", doneWhen: "test -f gates/fixed.txt",
       }] : [] });
       script.steps.splice(2, 0, { kind: "call-tool", tool: "read", args: { path: "booking/a.txt" } });
+      script.steps.splice(3, 0, { kind: "call-tool", tool: "read", args: { path: "gates/a.txt" } });
       return script;
     },
     pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", { yes: false, anchors: [] }),
@@ -223,6 +225,7 @@ test("a decision a fixer discloses in a fix loop is balloted by the acceptance s
   });
   try {
     await setup.conductor.start();
+    await repairDroppedDomain(setup, "gates");
     await waitFor(() => readEvents(setup.runDir).some((r) => r.kind === "intent" &&
       (r.event as { agentId?: string }).agentId?.startsWith("reviewer-")), 60_000, 25, setup.runDir);
     const decision = setup.conductor.state.phase.decisions.find((d) => d.choice === choice)!;

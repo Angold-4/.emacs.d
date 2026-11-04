@@ -122,6 +122,9 @@ export class PiAgent {
     // to that write's callback and fails its request; without a listener the
     // stream's 'error' event would crash the conductor instead.
     child.stdin.on("error", () => undefined);
+    // A failed spawn (missing binary or cwd) is thrown below as "no pid"; its
+    // asynchronous 'error' event must not crash the conductor afterwards.
+    child.on("error", () => undefined);
     if (!child.pid) throw new Error("failed to spawn pi agent: no pid");
     this.pgid = child.pid;
 

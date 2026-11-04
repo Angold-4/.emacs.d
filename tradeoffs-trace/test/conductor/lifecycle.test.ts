@@ -98,7 +98,7 @@ test("a resume re-resolves the pinned pi and refuses a wrong one with X:ENV_FAUL
   const binWrong = shortTmp("tt-07h1-pi-wrong");
   const shellPath = process.env.PATH ?? "";
   const rightPi = writePiShim(binRight, ADMIT_PINNED_PI);
-  const wrongPi = writePiShim(binWrong, "1.4.0");
+  const wrongPi = writePiShim(binWrong, "99.99.99");
 
   const plan: RunPlanFile = {
     title: "admit lifecycle",
@@ -198,7 +198,7 @@ test("a resume re-resolves the pinned pi and refuses a wrong one with X:ENV_FAUL
         assert.ok(err instanceof AdmitRefusal, `expected an AdmitRefusal, got ${String(err)}`);
         assert.equal(err.kind, "X:ENV_FAULT", "a wrong pi is an environment fault, not a plan defect");
         assert.match(err.message, /X:ENV_FAULT/);
-        assert.match(err.reason, /1\.4\.0/, "the reason names the version the shell's pi reports");
+        assert.match(err.reason, /99\.99\.99/, "the reason names the version the shell's pi reports");
         assert.match(err.reason, new RegExp(wrongPi.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "the reason names the pi it resolved");
         assert.match(err.reason, new RegExp(binWrong.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "the reason names the PATH it resolved on");
         return true;

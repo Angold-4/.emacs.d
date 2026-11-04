@@ -746,13 +746,20 @@ test("a resumed conductor rebuilds the domain brief from its log and continues t
   }
 });
 
+/** The fixer budget for the sleep endings: small enough that the budget, and
+ * not the wall clock, ends a fix that never submits. */
+const SLEEP_FIXER_BUDGET_MS = 6_000;
+/** The red ending needs room for a third fix after the loop's own work (the
+ * build, two fact passes and a review), so its budget must not race it. */
+const RED_FIXER_BUDGET_MS = 120_000;
+
 for (const ending of ["timeout", "stalled", "red"] as const) test(`point progress: ${ending} preserves only reviewed green work through REDUCE`, async () => {
   let reviewCount = 0;
   let fixerCount = 0;
   const setup = await setupConductor({
     phase: { ...domainPhase(), domainLoopMax: 3, fixChecks: "test ! -f red-head.txt" },
     checks: ["true"], stubReviews: true,
-    deadlines: { ...FAST, fixerAttemptMs: 6_000 },
+    deadlines: { ...FAST, fixerAttemptMs: ending === "red" ? RED_FIXER_BUDGET_MS : SLEEP_FIXER_BUDGET_MS },
     workerScript: () => laneWorker(1, "a"),
     laneWorkerScriptFor: (lane, round) => laneWorker(round, lane),
     laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion,
@@ -773,8 +780,15 @@ for (const ending of ["timeout", "stalled", "red"] as const) test(`point progres
     },
     fixerScriptFor: (_domain, round, n) => {
       fixerCount++;
+      // The red ending's third fix changes nothing, so the loop ends on it
+      // instead of spending a wall-clock budget to stop.
+      if (ending === "red" && n > 2) {
+        return { hello: defaultWorkerHello(), steps: [
+          { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+        ] };
+      }
       return { hello: defaultWorkerHello(), steps: [
-        ...(round === 2 && n > 1 && (ending === "timeout" || (ending === "red" && n > 2))
+        ...(round === 2 && n > 1 && ending === "timeout"
           ? [{ kind: "sleep", ms: 20_000 }] : []),
         { kind: "call-sh", command: `printf 'fixed pass ${n}\\n' > booking-fixed.txt${ending === "red" && n > 1 ? " && touch red-head.txt" : ""}${round > 2 ? " && touch owner-fixed.txt" : ""}` },
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
