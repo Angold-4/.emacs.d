@@ -7941,8 +7941,11 @@ export class Conductor {
   }
 
   #candidateDir(): string {
-    const sha = this.#state.phase.candidate?.sha ?? "unknown";
-    return path.join(this.#paths.candidates, sha);
+    // A phase parked with no candidate (every lane red) has no candidate
+    // checkout; agents then read the base worktree instead of a missing dir.
+    const sha = this.#state.phase.candidate?.sha;
+    const dir = sha ? path.join(this.#paths.candidates, sha) : undefined;
+    return dir && fs.existsSync(dir) ? dir : this.#paths.worktree;
   }
 
   /** Resolves once `agentId`'s tracked token total (see `#trackRunTokens`)

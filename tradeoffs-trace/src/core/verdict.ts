@@ -67,7 +67,15 @@ export function reviewerOutcomes(phase: PhaseState): ReviewerOutcome[] {
  * happened are listed; a gate still running is not a reason. The status
  * view reads `acceptanceBlockers` itself so each line carries its command. */
 export function notAcceptedReasons(phase: PhaseState): string[] {
-  if (!phase.candidate?.sha) return [];
+  if (!phase.candidate?.sha) {
+    // No candidate was picked: the reasons are the last round's red lanes, so
+    // a parked phase never reaches the owner with an empty reason list.
+    const last = (phase.rounds ?? []).at(-1);
+    if (!last) return [];
+    const red = last.candidates.filter((c) => c.ok === false);
+    if (red.length === 0) return [`round ${last.round}: no lane submitted a checked candidate`];
+    return red.map((c) => `round ${last.round} lane ${c.lane} candidate ${(c.sha ?? "").slice(0, 10)} failed its checks: ${c.note ?? "no note"}`);
+  }
   // Plan 07f (C3/F1): the SAME list `accept` reads. There is no second
   // derivation of "why not accepted" here or in the status view.
   return acceptanceBlockers(phase).map((b) => b.detail);
