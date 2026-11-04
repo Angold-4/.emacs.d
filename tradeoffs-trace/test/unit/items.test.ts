@@ -514,6 +514,108 @@ test("items: a Rust test verify keeps its module path and resolves from cargo te
   assert.equal(testOutcomeIn(output, "mark_s11_04_long_name"), "missing");
 });
 
+test("items: nextest resolves unit-module and integration-target lines from the S1 and D1 checks", () => {
+  const lines = [
+    // d1-check-299f7512-round3.log and s1-check-c6e4d83.log, respectively.
+    "        PASS [   0.071s] ( 601/1242) protocol-stf core::tests::delist::tt07_d1_delist_command_applies_once",
+    "        PASS [   0.067s] (  55/1662) finalizer-application::tt07_s1 tt07_s1_finalizer_mirrors_counter_and_queue",
+  ];
+  const output = lines.join("\n");
+  assert.equal(testOutcomeIn(output, "tt07_d1_delist_command_applies_once"), "passed");
+  assert.equal(testOutcomeIn(output, "core::tests::delist::tt07_d1_delist_command_applies_once"), "passed");
+  assert.equal(testOutcomeIn(output, "tt07_s1_finalizer_mirrors_counter_and_queue"), "passed");
+  assert.equal(testOutcomeIn(output, "delist_command_applies_once"), "missing");
+  assert.equal(testOutcomeIn(output, "tests::delist::tt07_d1_delist_command_applies_once"), "missing");
+  assert.equal(testOutcomeIn(output, "tt07_d1_delist_command_applies"), "missing");
+  assert.equal(testOutcomeIn(output, "tt07_s1"), "missing", "the binary id is not a test path");
+  assert.equal(testOutcomeIn(output, "never_ran"), "missing");
+  assert.equal(testOutcomeIn("PASS [0.001s] crate tests::case_extended", "case"), "missing");
+  assert.equal(testOutcomeIn("PASS [0.001s] crate::bin tests::case", "case"), "passed");
+  assert.equal(testOutcomeIn("\u001b[32mPASS\u001b[0m [0.001s] crate tests::case", "case"), "passed");
+  assert.deepEqual(testResultLines(output), lines);
+  const items = { ...structured, architecture: [], constraints: [], requirements: [
+    { ...structured.requirements[0], verify: ['test "tt07_d1_delist_command_applies_once"'] },
+    { ...structured.requirements[1], verify: ['test "tt07_s1_finalizer_mirrors_counter_and_queue"'] },
+  ] };
+  const resolutions = resolveRoundTestVerifies(items, testResultLines(output).join("\n"));
+  assert.deepEqual(resolutions.map((r) => r.outcome), ["passed", "passed"]);
+  assert.deepEqual(testVerifyProblems(resolutions), []);
+});
+
+test("items: nextest terminal failures win over passes, and skips stay missing", () => {
+  const pass = "PASS [0.001s] crate tests::case";
+  for (const status of ["FAIL", "TIMEOUT", "SIGSEGV", "SIGABRT", "SIGKILL", "SIGILL", "ABORT", "ABORT SIG 99", "LEAK-FAIL", "FAIL + LEAK", "XFAIL", "FLKY-FL 2/3"]) {
+    const fail = `${status} [0.001s] ( 1/2) crate tests::case`;
+    assert.equal(testOutcomeIn(`${pass}\n${fail}`, "case"), "failed", status);
+    assert.equal(testOutcomeIn(`${fail}\n${pass}`, "case"), "failed", status);
+    assert.equal(testOutcomeIn(fail, "tests::case"), "failed", status);
+    assert.equal(testOutcomeIn(fail, "ase"), "missing", status);
+    assert.deepEqual(testResultLines(fail), [fail]);
+  }
+  for (const status of ["LEAK", "TIMEOUT-PASS"]) {
+    assert.equal(testOutcomeIn(`${status} [0.001s] crate tests::case`, "case"), "passed", status);
+  }
+  const skip = "SKIP [         ] crate tests::case";
+  assert.equal(testOutcomeIn(skip, "case"), "missing");
+  assert.deepEqual(testResultLines(skip), [skip]);
+  for (const status of ["START", "SLOW", "TERMINATING", "TRY 2 START", "TRY 2 SLOW", "TRY 2 TRMNTG"]) {
+    const line = `${status} [0.001s] crate tests::case`;
+    assert.equal(testOutcomeIn(line, "case"), "missing", status);
+    assert.deepEqual(testResultLines(line), [], status);
+  }
+});
+
+test("items: nextest retries pass when recovered and retain failures in other binaries or paths", () => {
+  const retry = "TRY 1 FAIL [0.001s] crate tests::case";
+  const pass = "TRY 2 PASS [0.001s] crate tests::case";
+  const flaky = "FLAKY 2/3 [0.001s] crate tests::case";
+  assert.equal(testOutcomeIn(retry, "case"), "failed");
+  assert.equal(testOutcomeIn(`${retry}\n${pass}`, "case"), "passed");
+  assert.equal(testOutcomeIn(`${retry}\n${flaky}`, "case"), "passed");
+  assert.equal(testOutcomeIn(`${retry}\nTRY 2 FAIL [0.001s] crate tests::case`, "case"), "failed");
+  assert.equal(testOutcomeIn(`${retry}\nTRY 2 PASS [0.001s] crate::integration tests::case`, "case"), "failed");
+  assert.equal(testOutcomeIn(`${retry}\nTRY 2 PASS [0.001s] crate other::case`, "case"), "failed");
+  for (const status of ["FAIL", "TMT", "LKFAIL", "FL+LK", "XFAIL", "SEGV", "ABRT", "KILL", "SIG 99"]) {
+    const failed = `TRY 2 ${status} [0.001s] crate tests::case`;
+    assert.equal(testOutcomeIn(`${pass}\n${failed}`, "case"), "failed", status);
+    assert.equal(testOutcomeIn(`${failed}\nTRY 3 PASS [0.001s] crate tests::case`, "case"), "passed", status);
+    assert.deepEqual(testResultLines(failed), [failed]);
+  }
+  const output = [retry, pass, flaky, "Summary [0.003s] 1 test run: 1 passed (1 flaky), 0 skipped"].join("\n");
+  assert.deepEqual(testResultLines(output), [retry, pass, flaky]);
+  assert.equal(testOutcomeIn(testResultLines(output).join("\n"), "case"), "passed");
+});
+
+test("items: nextest captured libtest failures describe attempts, not the successful retry's outcome", () => {
+  const retry = "TRY 1 FAIL [0.003s] fixture-project::basic test_flaky_mod_2";
+  const pass = "TRY 2 PASS [0.002s] fixture-project::basic test_flaky_mod_2";
+  const flaky = "FLAKY 2/3 [0.002s] fixture-project::basic test_flaky_mod_2";
+  const output = [
+    retry, "stdout ---", "    running 1 test", "    test test_flaky_mod_2 ... FAILED",
+    "    test result: FAILED. 0 passed; 1 failed; 0 ignored", "stderr ---", "    panic: attempt 1 failed",
+    pass, "────────────", "Summary [0.021s] 1 test run: 1 passed (1 flaky), 25 skipped", flaky,
+  ].join("\n");
+  assert.equal(testOutcomeIn(output, "test_flaky_mod_2"), "passed");
+  assert.deepEqual(testResultLines(output), [retry, pass, flaky]);
+  assert.equal(testOutcomeIn(testResultLines(output).join("\n"), "test_flaky_mod_2"), "passed");
+  assert.equal(testOutcomeIn(`${output}\ntest test_flaky_mod_2 ... FAILED`, "test_flaky_mod_2"), "failed");
+});
+
+test("items: libtest, TAP and node outcomes still resolve alongside nextest", () => {
+  for (const [pass, fail] of [
+    ["test tests::case ... ok", "test tests::case ... FAILED"],
+    ["ok 1 - case", "not ok 1 - case"],
+    ["✔ case (1ms)", "✖ case (1ms)"],
+  ]) {
+    const nextest = "PASS [0.001s] crate tests::case";
+    assert.equal(testOutcomeIn(pass, "case"), "passed");
+    assert.equal(testOutcomeIn(`${pass}\n${fail}`, "case"), "failed");
+    assert.equal(testOutcomeIn(`${nextest}\n${fail}`, "case"), "failed");
+    assert.equal(testOutcomeIn(`${fail}\n${nextest}`, "case"), "failed");
+    assert.deepEqual(testResultLines(`${pass}\n${fail}\n${nextest}`), [pass, fail, nextest]);
+  }
+});
+
 test("plan 06h: an item needs a strict majority of the configured seats, not a fixed two", () => {
   const item = { id: "R1", kind: "requirement" as const, title: "R1", text: "R1", verify: [] };
   const v = (seat: string, verdict: "met" | "unmet"): SeatItemVerdict => ({ seat, verdict, evidence: "src/a.ts:1" });
