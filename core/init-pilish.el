@@ -588,8 +588,12 @@ TAB folds a tool/thinking block."
 
 ;;;; Pilish
 
+;; Explicit recipes also work with older Straight recipe snapshots.
+(use-package md-ts-mode
+  :straight (md-ts-mode :type git :host github :repo "dnouri/md-ts-mode"))
+
 (use-package pilish
-  :straight t
+  :straight (pilish :type git :host github :repo "dnouri/pilish")
   :commands (pilish
              pilish-session-browser
              pilish-select-model)
