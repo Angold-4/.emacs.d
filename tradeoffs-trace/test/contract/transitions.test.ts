@@ -1704,6 +1704,12 @@ test("plan 06j: a recheck from IMPLEMENTING clears the stopped attempt's dispatc
   assert.deepEqual(next(result.state), [{ type: "run_checks", candidateSha: "C1" }]);
 });
 
+for (const from of ["IMPLEMENTING", "FREEZING", "CHECKING", "FINAL_CHECKING", "PROBING", "REVIEWING", "EVALUATING", "RESOLVING", "REPAIRING", "GATING", "ACCEPTED", "PUBLISHING"] as PhaseStateName[]) {
+  BUILD[`stuck-from-${from.toLowerCase()}`] = {
+    state: baseState({ phase: from }), event: { type: "PHASE_STUCK", reason: "stuck: R1 unchanged for 3 rounds" },
+  };
+}
+
 test("transition table: every row in transitions.ts has a covering fixture", () => {
   const missing = TRANSITIONS.filter((r) => !BUILD[r.id]).map((r) => r.id);
   assert.deepEqual(missing, [], `rows with no test fixture: ${missing.join(", ")}`);

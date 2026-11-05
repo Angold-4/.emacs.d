@@ -15,6 +15,7 @@ phase states:
   | IMPLEMENTING   |  entered 2x - 41m00s  -  worker - model opus
   +----------------+
       +- SUBMIT_PHASE              -> FREEZING        [submit-phase]
+      +- PHASE_STUCK               -> AWAITING_OWNER  [stuck-from-implementing]
       +- ATTEMPT_TIMED_OUT (budgetRemains) -> REPAIRING       [attempt-timed-out-to-repairing]
       +- ATTEMPT_TIMED_OUT (budgetExhausted) -> AWAITING_OWNER  [attempt-timed-out-budget-exhausted]
       +- ATTEMPT_NO_SUBMISSION (budgetRemains) -> REPAIRING       [attempt-no-submission-to-repairing]
@@ -28,12 +29,14 @@ phase states:
   +----------------+
   | REPAIRING      |  entered 1x - 10s
   +----------------+
+      +- PHASE_STUCK               -> AWAITING_OWNER  [stuck-from-repairing]
       +- REPAIR_ATTEMPT_STARTED    -> IMPLEMENTING    [repair-attempt-started]
       +- REPAIR_BUDGET_EXHAUSTED   -> AWAITING_OWNER  [repairing-budget-exhausted]
 
   +----------------+
   | FREEZING       |  entered 2x - 20s
   +----------------+
+      +- PHASE_STUCK               -> AWAITING_OWNER  [stuck-from-freezing]
       +- FREEZE_COMPLETED          -> CHECKING        [freeze-completed]
       +- FREEZE_TIMED_OUT (budgetRemains) -> REPAIRING       [freeze-timed-out-to-repairing]
       +- FREEZE_TIMED_OUT (budgetExhausted) -> AWAITING_OWNER  [freeze-timed-out-budget-exhausted]
@@ -42,6 +45,7 @@ phase states:
   +----------------+
   | CHECKING       |  entered 2x - 8m00s
   +----------------+
+      +- PHASE_STUCK               -> AWAITING_OWNER  [stuck-from-checking]
       +- CHECKS_PASSED             -> PROBING         [checks-passed]
       +- CHECKS_FAILED (budgetRemains) -> REPAIRING       [checks-failed-to-repairing]
       +- CHECKS_FAILED (budgetExhausted) -> AWAITING_OWNER  [checks-failed-budget-exhausted]
@@ -52,6 +56,7 @@ phase states:
   +----------------+
   | PROBING        |  entered 2x - 12m00s
   +----------------+
+      +- PHASE_STUCK               -> AWAITING_OWNER  [stuck-from-probing]
       +- PROBE_PASSED (reviewsIncomplete) -> REVIEWING       [probe-passed-needs-review]
       +- PROBE_PASSED (reviewsAlreadyComplete) -> EVALUATING      [probe-passed-reviews-already-valid]
       +- PROBE_FAILED (budgetRemains) -> REPAIRING       [probe-failed-to-repairing]
@@ -63,6 +68,7 @@ phase states:
   +----------------+
   | REVIEWING      |  entered 2x - 30m00s  -  M, A, B - model sonnet
   +----------------+
+      +- PHASE_STUCK               -> AWAITING_OWNER  [stuck-from-reviewing]
       +- REVIEW_SUBMITTED (reviewIncomplete) -> REVIEWING       [review-submitted-incomplete]
       +- REVIEW_SUBMITTED (reviewComplete) -> EVALUATING      [review-submitted-complete]
       +- REVIEW_TIMED_OUT (firstTimeout) -> REVIEWING       [review-timed-out-first]
@@ -74,6 +80,7 @@ phase states:
   +----------------+
   | RESOLVING      |  entered 2x - 20s
   +----------------+
+      +- PHASE_STUCK               -> AWAITING_OWNER  [stuck-from-resolving]
       +- CRITERION_AMENDED         -> IMPLEMENTING    [resolving-criterion-amended]
       +- ACCEPTED                  -> ACCEPTED        [resolving-accept-holds]
       +- GATE_REQUIRED             -> GATING          [resolving-gate-required]
@@ -88,6 +95,7 @@ phase states:
   +----------------+
   | GATING         |  entered 2x - 30m00s
   +----------------+
+      +- PHASE_STUCK               -> AWAITING_OWNER  [stuck-from-gating]
       +- ACCEPTED                  -> ACCEPTED        [gate-accepted]
       +- GATE_FAILED (budgetRemains) -> REPAIRING       [gate-failed-to-repairing]
       +- GATE_FAILED (budgetExhausted) -> AWAITING_OWNER  [gate-failed-budget-exhausted]
@@ -98,6 +106,7 @@ phase states:
   +----------------+
   | ACCEPTED       |  entered 1x - 10s
   +----------------+
+      +- PHASE_STUCK               -> AWAITING_OWNER  [stuck-from-accepted]
       +- PUBLISH_INTENT            -> PUBLISHING      [accepted-publish-intent]
       +- AMEND                     -> CHECKING        [amend-from-accepted]
       +- CRITERION_REVERTED        -> CHECKING        [criterion-reverted-from-accepted]
@@ -106,6 +115,7 @@ phase states:
   +----------------+
   | PUBLISHING     |  entered 1x - 10s
   +----------------+
+      +- PHASE_STUCK               -> AWAITING_OWNER  [stuck-from-publishing]
       +- PUBLISH_COMPLETED         -> DONE            [publish-completed]
       +- PUBLISH_STALE             -> PROBING         [publish-stale]
       +- CRITERION_REVERTED        -> CHECKING        [criterion-reverted-from-publishing]
@@ -160,6 +170,7 @@ phase states:
   +----------------+
   | FINAL_CHECKING |  not entered
   +----------------+
+      +- PHASE_STUCK               -> AWAITING_OWNER  [stuck-from-final_checking]
       +- FINAL_CHECKS_PASSED (acceptHoldsAndNoGate) -> ACCEPTED        [final-checks-passed-accepted]
       +- FINAL_CHECKS_PASSED (acceptHoldsAndGateDeclared) -> GATING          [final-checks-passed-gated]
       +- FINAL_CHECKS_PASSED (acceptDoesNotHoldOnFinalPassAndBudgetRemains) -> REPAIRING       [final-checks-passed-not-accepted]
@@ -170,6 +181,7 @@ phase states:
   +----------------+
   | EVALUATING     |  not entered  -  evaluator, panel - model default
   +----------------+
+      +- PHASE_STUCK               -> AWAITING_OWNER  [stuck-from-evaluating]
       +- EVALUATION_COMPLETED (evaluationSettledAndPanelEscalated) -> AWAITING_OWNER  [panel-escalate]
       +- EVALUATION_COMPLETED (evaluationSettledAndPanelDowngraded) -> REPAIRING       [panel-downgrade]
       +- EVALUATION_COMPLETED (evaluationSettledAndPanelIncomplete) -> RESOLVING       [panel-incomplete]

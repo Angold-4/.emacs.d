@@ -212,6 +212,8 @@ export async function setupConductor(opts: {
   /** Plan 05e: the default round-panel vote for every item. */
   defaultRoundPanelVote?: "keep" | "drop" | "downgrade";
   deadlines?: ConductorOptions["deadlines"];
+  /** Deadline fixtures run on a quiet simulated host unless testing load. */
+  infrastructureLoad1?: ConductorOptions["infrastructureLoad1"];
   /** Plan 07e: `#+TT_ROUNDS` (the rounds bound). */
   rounds?: number;
   /** Plan 07e (E4): the plan's `#+TT_CHECK_WINDOW` opt-in. */
@@ -480,6 +482,7 @@ export async function setupConductor(opts: {
     providerModelFor: planModelSelector(plan, plan.seats),
     extraEnv: opts.extraEnv,
     deadlines: opts.deadlines,
+    infrastructureLoad1: opts.infrastructureLoad1 ?? (() => 0),
     stubReviews: opts.stubReviews ?? true,
     briefs: opts.briefs ?? false,
     probeReuse: opts.probeReuse,

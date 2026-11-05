@@ -28,6 +28,10 @@
       "type": "integer",
       "minimum": 2
     },
+    "roundCeiling": {
+      "description": "Hard ceiling on total phase rounds, including owner grants. Default 6; configured by TT_ROUND_CEILING.",
+      "type": "integer", "minimum": 1
+    },
     "roundsAllowed": {
       "description": "Plan 06g: #+TT_ROUNDS frozen into the contract — how many rounds the phase may spend. Absent means the default of 3 (core/rounds.ts's roundBudget).",
       "type": "integer",

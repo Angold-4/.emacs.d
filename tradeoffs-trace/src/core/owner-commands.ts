@@ -9,6 +9,7 @@ import { applyMessageEvent } from "./messages.ts";
 import { isBudgetGateRequest, isRepairForcingOption } from "./owner-requests.ts";
 import { budgetGateIsMoot } from "./predicate.ts";
 import { namedCandidate } from "./ruling-picks.ts";
+import { roundCeilingReason } from "./rounds.ts";
 import { findOwnerRequest, ownerRequestIsStale } from "./triage.ts";
 import type { BindingTuple, ContractVersion, Decision, Event, Message, PhaseState, RuledDecision } from "./types.ts";
 
@@ -254,6 +255,10 @@ export function checkOwnerRequestResolved(phase: PhaseState, event: EvOwnerReque
       ok: false,
       reason: `'${event.option}' is not an option owner request ${event.requestId} offers (offered: ${request.options.map((o) => o.id).join(", ")})`,
     };
+  }
+  if ((isBudgetGateRequest(request) && event.option === "grant") || isRepairForcingOption(request.origin, event.option)) {
+    const ceiling = roundCeilingReason(phase);
+    if (ceiling) return { ok: false, reason: `${ceiling}; '${event.option}' cannot authorize another round; correct tt or the plan before restarting` };
   }
   if (request.origin === "open_finding" && event.option === "accept_risk" && (!event.note || event.note.trim().length === 0)) {
     return { ok: false, reason: `accepting the risk for finding ${request.linkedFindingId} requires a non-empty scope note` };

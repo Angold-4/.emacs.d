@@ -864,7 +864,7 @@ and an unknown id is refused by that command."
           (with-temp-file plan-a (insert +tt-test--valid-plan))
           (with-temp-file plan-b (insert (replace-regexp-in-string "p1" "q1" +tt-test--valid-plan)))
           (with-temp-buffer
-            (insert "#+TITLE: plan 13\n#+TT_PROGRAM: 4\n#+TT_CHECK_MINUTES: 40\n#+TT_SECRETS: VENDOR_KEY OTHER_KEY\n\n* 13a\n  :PROPERTIES:\n  :PLAN: a.org\n  :END:\n* 13c\n  :PROPERTIES:\n  :PLAN: b.org\n  :AFTER: 13a\n  :END:\n")
+            (insert "#+TITLE: plan 13\n#+TT_PROGRAM: 4\n#+TT_ROUND_CEILING: 7\n#+TT_CHECK_MINUTES: 40\n#+TT_SECRETS: VENDOR_KEY OTHER_KEY\n\n* 13a\n  :PROPERTIES:\n  :PLAN: a.org\n  :END:\n* 13c\n  :PROPERTIES:\n  :PLAN: b.org\n  :AFTER: 13a\n  :END:\n")
             (setq buffer-file-name (expand-file-name "program.org" dir) default-directory dir)
             (org-mode)
             (let* ((parsed (+tt-parse-program))
@@ -873,6 +873,7 @@ and an unknown id is refused by that command."
               (set-buffer-modified-p nil) (setq buffer-file-name nil)
               (should (null (plist-get parsed :errors)))
               (should (= (alist-get 'maxParallel program) 4))
+              (should (= (alist-get 'roundCeiling program) 7))
               (should (equal (alist-get 'branches program) "stack"))
               (should (equal (mapcar (lambda (e) (alist-get 'id e)) entries) '("13a" "13c")))
               (should (equal (alist-get 'after (aref entries 1)) ["13a"]))
@@ -3895,3 +3896,10 @@ reviews (M/A/B on both lanes), not only the winner's."
       (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
       (when-let* ((b (get-file-buffer (expand-file-name "views/review.org" dir)))) (kill-buffer b))
       (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-round-ceiling-export ()
+  "The plan ceiling survives export and keeps invalid input for lint."
+  (dolist (value '("6" "0" "wrong"))
+    (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_ROUND_CEILING: " value "\n" +tt-test--valid-plan)) :plan))
+           (n (alist-get 'roundCeiling plan)))
+      (should (equal n (if (equal value "wrong") "wrong" (string-to-number value)))))))

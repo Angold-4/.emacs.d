@@ -23,6 +23,7 @@ import { accept, isLiveDecision, resolvedCorrectionIdsFor } from "../../src/core
 import { next } from "../../src/core/next.ts";
 import { isBudgetGateRequest, isRepairForcingOption } from "../../src/core/owner-requests.ts";
 import { reduce } from "../../src/core/reduce.ts";
+import { roundCeilingReason } from "../../src/core/rounds.ts";
 import type {
   Ballot,
   ContractVersion,
@@ -184,7 +185,9 @@ function driveOnce(rng: () => number): RunResult {
             throw new Error(`item ${key} was settled but a request (${r.id}) was regenerated for it`);
           }
         }
-        if (ownerInterventions >= MAX_OWNER_INTERVENTIONS || !state.phase.candidate) {
+        // The hard ceiling is an owner park the simulated owner cannot lift
+        // with another grant. This is now a terminal outcome of the driver.
+        if (ownerInterventions >= MAX_OWNER_INTERVENTIONS || !state.phase.candidate || roundCeilingReason(state.phase)) {
           return { terminal: "AWAITING_OWNER", steps: i, finalState: state, acceptRecords };
         }
         ownerInterventions += 1;

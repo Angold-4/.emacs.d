@@ -468,6 +468,7 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
     ...parseSeats(first("TT_REVIEWERS")),
     ...(rerun ? { rerun: rerun.value, rerunLine: rerun.line } : {}),
     ...(workersValue !== undefined ? { workers: workersValue, workersLine: workers!.line } : {}),
+    ...(first("TT_ROUND_CEILING") ? { roundCeiling: parseCount(first("TT_ROUND_CEILING")), roundCeilingLine: first("TT_ROUND_CEILING")!.line } : {}),
     ...(roundsValue !== undefined ? { rounds: roundsValue, roundsLine: rounds!.line } : {}),
     ...(variantLimitValue !== undefined ? { variantLimit: variantLimitValue, variantLimitLine: variantLimit!.line } : {}),
     ...(golden && golden.value.trim().length > 0 ? { golden: golden.value.trim(), goldenLine: golden.line } : {}),

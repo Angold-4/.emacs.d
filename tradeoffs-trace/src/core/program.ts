@@ -27,6 +27,8 @@ export interface ProgramPlanEntry {
 export interface ProgramFile {
   title: string;
   maxParallel: number;
+  /** #+TT_ROUND_CEILING: hard total-round limit for every phase (default 6). */
+  roundCeiling?: number;
   entries: ProgramPlanEntry[];
   /** "stack" (default): each node publishes to its own branch, based on its
    * dependencies' branches, so every phase becomes its own (stacked) PR.
@@ -385,6 +387,7 @@ export function nodePlan(
       : base;
   return {
     ...entry.plan,
+    ...(program.roundCeiling !== undefined ? { roundCeiling: program.roundCeiling } : {}),
     title: `${entry.plan.title} [${node.id}]`,
     integrationBranch: nodeBranch(program, node),
     phases: [phase],

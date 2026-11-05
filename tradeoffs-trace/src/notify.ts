@@ -124,11 +124,12 @@ export function oneLine(text: string, max = 300): string {
  * the run, the phase, the why and the answer from one place. */
 export function answeringCommand(
   runId: string,
-  phase: { ownerRequests: ReadonlyArray<{ status: string; origin?: string; linkedMessageId?: string; linkedFindingId?: string; linkedDecisionId?: string }> },
+  phase: { ownerRequests: ReadonlyArray<{ status: string; reason?: string; origin?: string; linkedMessageId?: string; linkedFindingId?: string; linkedDecisionId?: string }> },
 ): string | undefined {
   const open = phase.ownerRequests.filter((r) => r.status === "open");
   if (open.length === 0) return undefined;
   const r = open[open.length - 1];
+  if (r.reason?.startsWith("stuck:")) return `tt stop ${runId}; correct tt or the plan before restarting`;
   if (r.linkedMessageId) return `tt verdict ${runId} ${r.linkedMessageId} accept|refuse`;
   if (r.origin === "repair_budget_exhausted" || r.origin === "failed_vote" || r.origin === "reserved_decision") {
     return `tt carry ${runId} ${r.linkedFindingId ?? r.linkedDecisionId ?? "<item>"} --to <next-phase>  (or tt verdict ${runId} <messageId> accept|refuse)`;

@@ -155,9 +155,14 @@ test("plan-models: a plan's models launch every role with its own --provider/--m
   });
   try {
     await setup.conductor.start();
-    // The panel is the last role to launch (the blocker is published and then
-    // voted), so once its argv is recorded all four have run.
-    await waitFor(() => argvFor(setup, "panel", argvDir).length > 0, 90_000, 25, setup.runDir);
+    // As in the no-model case below, wait for EVERY role's argv: evaluator
+    // and panel children can start and write their files in either order.
+    await waitFor(
+      () => (["worker", "reviewer", "evaluator", "panel"] as Role[]).every((r) => argvFor(setup, r, argvDir).length > 0),
+      90_000,
+      25,
+      setup.runDir,
+    );
     assertRoleFlags(setup, "worker", argvDir, { provider: "p-w", model: "m-w" });
     assertRoleFlags(setup, "reviewer", argvDir, { provider: "p-r", model: "m-r" });
     assertRoleFlags(setup, "evaluator", argvDir, { provider: "p-e", model: "m-e" });
