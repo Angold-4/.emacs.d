@@ -5,7 +5,9 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { normalizeDecisionViewCommand } from "../../src/core/owner-inbox.ts";
 import { accept, acceptanceBlockers } from "../../src/core/predicate.ts";
+import { reduce } from "../../src/core/reduce.ts";
 import { CV, basePhase, makeDecision } from "./helpers.ts";
 import { resolveRoundTestVerifies } from "../../src/core/items.ts";
 
@@ -44,6 +46,29 @@ const POINT = (id: string) => ({
   boundCandidateSha: C,
   domain: "booking",
   doneWhen: "test -f done",
+});
+
+test("the tt why accept_risk suggestion includes the scope note needed to resolve an open_finding request", () => {
+  const phase = basePhase({
+    phase: "AWAITING_OWNER",
+    candidate: { sha: C, contractVersion: K },
+    findings: [POINT("F-1")],
+    ownerRequests: [{
+      id: "OR-1", version: 1, phaseId: "p1", reason: "F-1 open", origin: "open_finding", linkedFindingId: "F-1",
+      options: [{ id: "accept_risk", label: "accept the risk" }], status: "open",
+    }],
+  });
+  const command = acceptanceBlockers(phase).find((b) => b.kind === "owner-request")!.command;
+  const payload = JSON.parse(command.match(/^printf %s '(.*)' \| tt input /)![1]);
+  assert.equal(payload.option, "accept_risk");
+  assert.equal(payload.note, "<scope>");
+  const normalized = normalizeDecisionViewCommand(payload, "cmd-why");
+  assert.equal(normalized.ok, true);
+  if (!normalized.ok) return;
+  const result = reduce({ run: "RUN_ACTIVE", phase }, normalized.event);
+  assert.equal(result.ok, true, !result.ok ? result.reason : "");
+  assert.equal(result.state.phase.ownerRequests[0].status, "resolved");
+  assert.equal(result.state.phase.findings[0].acceptedScope, "<scope>");
 });
 
 test("a guard that stops before 25 named tests is one check blocker and cannot be accepted", () => {

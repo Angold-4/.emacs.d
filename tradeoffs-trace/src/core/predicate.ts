@@ -696,6 +696,7 @@ function resolveCommand(phase: PhaseState, C: string, K: ContractVersion, reques
   return inputCommand(phase, {
     type: "resolve",
     option,
+    ...(request.origin === "open_finding" && option === "accept_risk" ? { note: "<scope>" } : {}),
     binding: recordBinding(phase, C, K, request.id, request.version),
   }, target);
 }

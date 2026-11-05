@@ -23,11 +23,13 @@ import {
   applyItemCarried,
   applyOverrideCast,
   applyOwnerRequestResolved,
+  applyRulingRecorded,
   autoResolveLinkedRequest,
   checkFindingAcceptedByOwner,
   checkItemCarried,
   checkOverrideCast,
   checkOwnerRequestResolved,
+  checkRulingRecorded,
   clearRulings,
   recordRulings,
 } from "./owner-commands.ts";
@@ -35,7 +37,6 @@ import { isLiveDecision, panelOutcome, panelSeatNumbers, panelSeatSettled, panel
 import { repairBudgetRemains, repairRoundsSpent } from "./rounds.ts";
 import { domainProgressFindings, domainResolvedPoints, factKeepsOpen } from "./fix-rounds.ts";
 import { seatsOf } from "./seats.ts";
-import { namedCandidate } from "./ruling-picks.ts";
 import { findOwnerRequest } from "./triage.ts";
 import { rowsFor } from "./transitions.ts";
 import type {
@@ -1008,66 +1009,9 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
     }
 
     case "RULING_RECORDED": {
-      // Plan 07f (A3/§3.2/§3.3, OD-1.3): a ruling is final when recorded. It
-      // settles EVERY record it names at once — a decision by id and unchanged
-      // choice, a trade-off finding by acceptance, and a point (a finding with
-      // `domain` and/or `doneWhen`) too: the owner's ruling is the authority
-      // that closes it, so the point is never left open waiting for a fact it
-      // may never get, and the ruling never queues a correction. It also
-      // answers the open owner requests about those records. It is
-      // record-only: no loop, no queue, no repair round.
-      const ruling = (event as Extract<Event, { type: "RULING_RECORDED" }>).ruling;
-      if (!ruling || typeof ruling.text !== "string" || ruling.text.trim().length === 0) {
-        return rejected(state, "a ruling needs non-empty text");
-      }
-      if (!Array.isArray(ruling.recordIds) || ruling.recordIds.length === 0) {
-        return rejected(state, "a ruling must name at least one record id");
-      }
-      const unknown = ruling.recordIds.filter(
-        (id) =>
-          !p.decisions.some((d) => d.id === id) &&
-          !p.findings.some((f) => f.id === id) &&
-          !namedCandidate(p, id),
-      );
-      if (unknown.length > 0) return rejected(state, `a ruling names unknown record(s): ${unknown.join(", ")}`);
-      // 07g1b (R12): a named candidate must be one this phase recorded.
-      if (ruling.candidate !== undefined && !namedCandidate(p, ruling.candidate)) {
-        return rejected(state, `a ruling's candidate ${ruling.candidate} names no candidate of this phase`);
-      }
-      // Plan 07f (A3, OD-1.3): everything the ruling names is settled at once,
-      // points included — a named point is closed by the ruling itself, never
-      // silently left open.
-      const settledIds = ruling.recordIds;
-      const decided = new Map(p.decisions.map((d) => [d.id, d]));
-      const rulings = [...(p.rulings ?? [])];
-      if (!rulings.some((r) => r.id === ruling.id)) rulings.push(ruling);
-      const ruledDecisions = [...(p.ruledDecisions ?? [])];
-      for (const id of settledIds) {
-        const decision = decided.get(id);
-        if (!decision) continue;
-        const kept = ruledDecisions.filter((r) => r.id !== id);
-        ruledDecisions.length = 0;
-        ruledDecisions.push(...kept, { id, choice: decision.choice, by: ruling.id });
-      }
-      const findings = p.findings.map((f) =>
-        settledIds.includes(f.id) && f.status === "open"
-          ? {
-              ...f,
-              status: "accepted" as const,
-              // Plan 07f1a (A1): a point the ruling names is closed by the
-              // ruling itself, and its reason is the ruling's id. A trade-off
-              // keeps the ruling text as its accepted scope (the owner's
-              // reasoning), exactly as before.
-              acceptedScope: f.domain !== undefined || f.doneWhen !== undefined ? ruling.id : ruling.text,
-              version: f.version + 1,
-            }
-          : f,
-      );
-      let next: PhaseState = { ...p, rulings, ruledDecisions, findings };
-      for (const id of settledIds) {
-        next = autoResolveLinkedRequest(next, id, "ruled", p.candidate?.sha ?? "", p.contract.contractVersion);
-      }
-      return ok({ ...state, phase: next });
+      const check = checkRulingRecorded(p, event);
+      if (!check.ok) return rejected(state, check.reason!);
+      return ok({ ...state, phase: applyRulingRecorded(p, event) });
     }
 
     case "DECISION_CLOSED": {

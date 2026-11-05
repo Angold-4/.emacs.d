@@ -6,10 +6,13 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { next } from "../../src/core/next.ts";
 import { awaitingOwnerTarget } from "../../src/core/owner-commands.ts";
+import { accept, acceptanceBlockers } from "../../src/core/predicate.ts";
 import { reduce } from "../../src/core/reduce.ts";
-import type { Event, State } from "../../src/core/types.ts";
-import { CV, baseState, makeDecision } from "./helpers.ts";
+import { notAcceptedReasons } from "../../src/core/verdict.ts";
+import type { Event, PhaseState, State } from "../../src/core/types.ts";
+import { CV, approvingReview, baseState, makeDecision } from "./helpers.ts";
 
 const K = CV();
 
@@ -18,6 +21,103 @@ function step(state: State, event: Event): State {
   assert.equal(result.ok, true, !result.ok ? result.reason : "");
   return result.state;
 }
+
+function awaitingRuling(overrides: Partial<PhaseState> = {}): State {
+  return baseState({
+    phase: "AWAITING_OWNER",
+    candidate: { sha: "C1", contractVersion: K },
+    checks: { candidateSha: "C1", passed: true },
+    probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+    reviews: Object.fromEntries(["M", "A", "B"].map((seat) => [seat, { review: approvingReview(seat, "C1", K) }])),
+    findings: [{
+      id: "F-point", version: 1, phaseId: "p1", kind: "defect", severity: "blocking",
+      evidence: "the owner's correction is still open", raisedBy: "owner", status: "open",
+      boundCandidateSha: "C1", domain: "booking", doneWhen: "test -f done",
+    }],
+    ownerRequests: [{
+      id: "OR-finding-1", version: 1, phaseId: "p1", reason: "F-point open", origin: "open_finding",
+      linkedFindingId: "F-point", options: [{ id: "accept_risk", label: "accept the risk" }], status: "open",
+    }],
+    ...overrides,
+  });
+}
+
+const pointRuling: Event = {
+  type: "RULING_RECORDED",
+  ruling: { id: "RUL-1", text: "accept F-point", recordIds: ["F-point"], by: "owner" },
+};
+
+test("awaiting-owner-exits: a ruling settling the last point and linked request resumes the accept path", () => {
+  const state = awaitingRuling();
+  assert.deepEqual(acceptanceBlockers(state.phase).map((b) => b.kind), ["point", "owner-request"]);
+  const ruled = step(state, pointRuling);
+  assert.equal(ruled.phase.findings[0].status, "accepted");
+  assert.equal(ruled.phase.findings[0].acceptedScope, "RUL-1");
+  assert.equal(ruled.phase.ownerRequests.find((r) => r.id === "OR-finding-1")!.status, "resolved");
+  assert.deepEqual(acceptanceBlockers(ruled.phase), [], "tt why has no acceptance blocker");
+  assert.deepEqual(notAcceptedReasons(ruled.phase), []);
+  assert.equal(accept(ruled.phase, "C1", K), true);
+  assert.equal(ruled.phase.phase, "RESOLVING");
+  assert.deepEqual(next(ruled), [{ type: "accept", resolvedCorrectionIds: [] }]);
+  assert.equal(step(ruled, { type: "ACCEPTED", resolvedCorrectionIds: [] }).phase.phase, "ACCEPTED");
+});
+
+test("awaiting-owner-exits: a ruling leaving another item open stays parked", () => {
+  const state = awaitingRuling();
+  state.phase.findings.push({ ...state.phase.findings[0], id: "F-other" });
+  state.phase.ownerRequests.push({ ...state.phase.ownerRequests[0], id: "OR-other", linkedFindingId: "F-other" });
+  const ruled = step(state, pointRuling);
+  assert.equal(ruled.phase.findings[0].status, "accepted");
+  assert.equal(ruled.phase.ownerRequests.find((r) => r.id === "OR-finding-1")!.status, "resolved");
+  assert.equal(ruled.phase.findings[1].status, "open");
+  assert.equal(ruled.phase.ownerRequests.find((r) => r.id === "OR-other")!.status, "open");
+  assert.equal(ruled.phase.phase, "AWAITING_OWNER");
+  assert.equal(accept(ruled.phase, "C1", K), false);
+  assert.deepEqual(next(ruled), []);
+});
+
+test("awaiting-owner-exits: a ruling clearing the request resumes an outstanding correction in REPAIRING", () => {
+  const state = awaitingRuling({ corrections: [{
+    id: "C-1", version: 1, phaseId: "p1", targetRecordId: "D-other", correctionText: "repair the other choice",
+    contractChange: false, status: "open", boundContractVersion: K, grantedRounds: 3,
+  }] });
+  const ruled = step(state, pointRuling);
+  assert.equal(ruled.phase.ownerRequests[0].status, "resolved");
+  assert.equal(ruled.phase.phase, "REPAIRING");
+  assert.equal(ruled.phase.repairRoundsGranted, state.phase.repairRoundsGranted);
+  assert.deepEqual(next(ruled), [{ type: "repair_attempt_started" }]);
+});
+
+test("awaiting-owner-exits: a ruling in IMPLEMENTING stays record-only", () => {
+  const state = awaitingRuling({ phase: "IMPLEMENTING", inFlight: { dispatch_worker: { actionId: "worker-1" } } });
+  const ruled = step(state, pointRuling);
+  assert.equal(ruled.phase.findings[0].status, "accepted");
+  assert.equal(ruled.phase.ownerRequests[0].status, "resolved");
+  assert.deepEqual(ruled.phase.rulings, [pointRuling.ruling]);
+  assert.equal(ruled.phase.phase, "IMPLEMENTING");
+  assert.deepEqual(ruled.phase.inFlight, state.phase.inFlight);
+  assert.deepEqual(ruled.phase.corrections, state.phase.corrections);
+  assert.equal(ruled.phase.repairRoundsGranted, state.phase.repairRoundsGranted);
+});
+
+test("awaiting-owner-exits: malformed rulings are rejected before settling records or moving the phase", () => {
+  const cases = [
+    { ruling: { ...pointRuling.ruling, text: " " }, reason: /non-empty text/ },
+    { ruling: { ...pointRuling.ruling, recordIds: [] }, reason: /at least one record id/ },
+    { ruling: { ...pointRuling.ruling, recordIds: ["F-point", "F-missing"] }, reason: /unknown record\(s\): F-missing/ },
+    { ruling: { ...pointRuling.ruling, candidate: "C9-z" }, reason: /names no candidate of this phase/ },
+  ];
+  for (const phase of ["AWAITING_OWNER", "IMPLEMENTING"] as const) {
+    for (const { ruling, reason } of cases) {
+      const state = awaitingRuling({ phase });
+      const result = reduce(state, { type: "RULING_RECORDED", ruling });
+      assert.equal(result.ok, false);
+      if (result.ok) continue;
+      assert.match(result.reason, reason);
+      assert.deepEqual(result.state, state);
+    }
+  }
+});
 
 test("awaiting-owner-exits: resolving two independent open findings, one at a time, only leaves AWAITING_OWNER after the second", () => {
   let state = baseState({
