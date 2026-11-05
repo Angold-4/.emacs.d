@@ -1,7 +1,6 @@
-// Shared, single-source-of-truth logic for the three owner commands that
-// close a record-level open item — OWNER_REQUEST_RESOLVED,
-// FINDING_ACCEPTED_BY_OWNER and OVERRIDE_CAST — used both by reduce.ts's
-// ordinary (phase-unchanged) handling and by transitions.ts's AWAITING_OWNER
+// Shared, single-source-of-truth logic for owner commands that close a
+// record-level open item, used both by reduce.ts's ordinary (phase-unchanged)
+// handling and by transitions.ts's AWAITING_OWNER
 // rows (design §6.1: "AWAITING_OWNER ... leaves only through an owner
 // command"), so the binding check and the mutation are never duplicated.
 
@@ -9,6 +8,7 @@ import { checkBinding, checkTupleBinding } from "./binding.ts";
 import { applyMessageEvent } from "./messages.ts";
 import { isBudgetGateRequest, isRepairForcingOption } from "./owner-requests.ts";
 import { budgetGateIsMoot } from "./predicate.ts";
+import { namedCandidate } from "./ruling-picks.ts";
 import { findOwnerRequest, ownerRequestIsStale } from "./triage.ts";
 import type { BindingTuple, ContractVersion, Decision, Event, Message, PhaseState, RuledDecision } from "./types.ts";
 
@@ -403,6 +403,73 @@ export function applyFindingAcceptedByOwner(phase: PhaseState, event: EvFindingA
   return autoResolveLinkedRequest(withFinding, event.findingId, "accepted", event.boundCandidateSha, event.boundContractVersion);
 }
 
+// --- RULING_RECORDED -----------------------------------------------------
+
+type EvRulingRecorded = Extract<Event, { type: "RULING_RECORDED" }>;
+
+export function checkRulingRecorded(phase: PhaseState, event: EvRulingRecorded): CommandCheck {
+  const ruling = event.ruling;
+  if (!ruling || typeof ruling.text !== "string" || ruling.text.trim().length === 0) {
+    return { ok: false, reason: "a ruling needs non-empty text" };
+  }
+  if (!Array.isArray(ruling.recordIds) || ruling.recordIds.length === 0) {
+    return { ok: false, reason: "a ruling must name at least one record id" };
+  }
+  const unknown = ruling.recordIds.filter(
+    (id) =>
+      !phase.decisions.some((d) => d.id === id) &&
+      !phase.findings.some((f) => f.id === id) &&
+      !namedCandidate(phase, id),
+  );
+  if (unknown.length > 0) return { ok: false, reason: `a ruling names unknown record(s): ${unknown.join(", ")}` };
+  // 07g1b (R12): a named candidate must be one this phase recorded.
+  if (ruling.candidate !== undefined && !namedCandidate(phase, ruling.candidate)) {
+    return { ok: false, reason: `a ruling's candidate ${ruling.candidate} names no candidate of this phase` };
+  }
+  return { ok: true };
+}
+
+/** A ruling settles every named record and its linked requests at once.
+ * Applying it is record-only; the state table routes AWAITING_OWNER after
+ * settlement, using the same target as the other owner commands. */
+export function applyRulingRecorded(phase: PhaseState, event: EvRulingRecorded): PhaseState {
+  const ruling = event.ruling;
+  // Plan 07f (A3, OD-1.3): everything the ruling names is settled at once,
+  // points included — a named point is closed by the ruling itself, never
+  // silently left open.
+  const settledIds = ruling.recordIds;
+  const decided = new Map(phase.decisions.map((d) => [d.id, d]));
+  const rulings = [...(phase.rulings ?? [])];
+  if (!rulings.some((r) => r.id === ruling.id)) rulings.push(ruling);
+  const ruledDecisions = [...(phase.ruledDecisions ?? [])];
+  for (const id of settledIds) {
+    const decision = decided.get(id);
+    if (!decision) continue;
+    const kept = ruledDecisions.filter((r) => r.id !== id);
+    ruledDecisions.length = 0;
+    ruledDecisions.push(...kept, { id, choice: decision.choice, by: ruling.id });
+  }
+  const findings = phase.findings.map((f) =>
+    settledIds.includes(f.id) && f.status === "open"
+      ? {
+          ...f,
+          status: "accepted" as const,
+          // Plan 07f1a (A1): a point the ruling names is closed by the
+          // ruling itself, and its reason is the ruling's id. A trade-off
+          // keeps the ruling text as its accepted scope (the owner's
+          // reasoning), exactly as before.
+          acceptedScope: f.domain !== undefined || f.doneWhen !== undefined ? ruling.id : ruling.text,
+          version: f.version + 1,
+        }
+      : f,
+  );
+  let next: PhaseState = { ...phase, rulings, ruledDecisions, findings };
+  for (const id of settledIds) {
+    next = autoResolveLinkedRequest(next, id, "ruled", phase.candidate?.sha ?? "", phase.contract.contractVersion);
+  }
+  return next;
+}
+
 // --- ITEM_CARRIED --------------------------------------------------------
 //
 // Plan 06g (A5): the owner's `tt carry <run> <id> --to <phase-id>`. It takes
@@ -579,8 +646,7 @@ export function applyOverrideCast(phase: PhaseState, event: EvOverrideCast): Pha
  * RESOLVING if the candidate's checks/probe/reviews are already valid
  * (guaranteed once a candidate exists, since AWAITING_OWNER's record-level
  * requests only ever arise from RESOLVING), or AWAITING_OWNER defensively
- * if there is no candidate at all (should not happen for these three
- * commands, which all require a record that itself requires a candidate). */
+ * if there is no candidate at all. */
 export type AwaitingOwnerTarget = "AWAITING_OWNER" | "REPAIRING" | "RESOLVING";
 
 /** True once no owner request still parks the phase. */

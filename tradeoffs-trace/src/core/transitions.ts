@@ -21,6 +21,7 @@ import {
   applyItemCarried,
   applyOverrideCast,
   applyOwnerRequestResolved,
+  applyRulingRecorded,
   autoResolveLinkedRequest,
   mapOwnerRequestsInResolutionOrder,
   awaitingOwnerTarget,
@@ -29,6 +30,7 @@ import {
   checkItemCarried,
   checkOverrideCast,
   checkOwnerRequestResolved,
+  checkRulingRecorded,
   clearRulings,
   recordRulings,
 } from "./owner-commands.ts";
@@ -1877,10 +1879,9 @@ addRow({
   apply: applyOwnerCorrection,
 });
 
-// --- AWAITING_OWNER: OWNER_REQUEST_RESOLVED, FINDING_ACCEPTED_BY_OWNER and
-// OVERRIDE_CAST move the phase, but only once no owner request remains open
-// after applying them (item 2, round 2). Otherwise the command is still
-// recorded and the phase stays parked. ------------------------------------
+// --- AWAITING_OWNER: record-level owner commands move the phase, but only
+// once no owner request remains open after applying them (item 2, round 2).
+// Otherwise the command is still recorded and the phase stays parked. ------
 
 function checkAndApply<E extends Event>(
   check: (phase: PhaseState, ev: E) => { ok: boolean },
@@ -1894,6 +1895,7 @@ function checkAndApply<E extends Event>(
 
 const ownerRequestResolved = checkAndApply(checkOwnerRequestResolved, applyOwnerRequestResolved);
 const findingAcceptedByOwner = checkAndApply(checkFindingAcceptedByOwner, applyFindingAcceptedByOwner);
+const rulingRecorded = checkAndApply(checkRulingRecorded, applyRulingRecorded);
 const overrideCast = checkAndApply(checkOverrideCast, applyOverrideCast);
 const itemCarried = checkAndApply(checkItemCarried, applyItemCarried);
 
@@ -1980,10 +1982,11 @@ addRow({
 });
 
 /** Builds the generic "clears / stays" three rows shared by
- * OWNER_REQUEST_RESOLVED (non-budget-gate), FINDING_ACCEPTED_BY_OWNER and
- * OVERRIDE_CAST: once applied, either an open item is still there (stays),
- * or none remain and the phase resumes into REPAIRING (an open correction
- * still needs a round) or RESOLVING (checks/probe/reviews already valid —
+ * OWNER_REQUEST_RESOLVED (non-budget-gate), FINDING_ACCEPTED_BY_OWNER,
+ * RULING_RECORDED, OVERRIDE_CAST and ITEM_CARRIED: once applied, either an
+ * open item is still there (stays), or none remain and the phase resumes
+ * into REPAIRING (an open correction still needs a round) or RESOLVING
+ * (checks/probe/reviews already valid —
  * next() re-evaluates accept()). */
 function addAwaitingOwnerRecordCommandRows(
   idPrefix: string,
@@ -2088,6 +2091,8 @@ addAwaitingOwnerRecordCommandRows(
 );
 
 addAwaitingOwnerRecordCommandRows("awaiting-owner-finding-accepted", "FINDING_ACCEPTED_BY_OWNER", () => true, findingAcceptedByOwner);
+
+addAwaitingOwnerRecordCommandRows("awaiting-owner-ruling-recorded", "RULING_RECORDED", () => true, rulingRecorded);
 
 addAwaitingOwnerRecordCommandRows("awaiting-owner-override", "OVERRIDE_CAST", () => true, overrideCast);
 

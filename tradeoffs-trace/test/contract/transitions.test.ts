@@ -1288,6 +1288,15 @@ BUILD["awaiting-owner-finding-accepted-stays"] = {
   },
 };
 
+// Rulings share the same three routing outcomes as direct finding acceptance.
+for (const outcome of ["clears-to-resolving", "clears-to-repairing", "stays"]) {
+  const fixture = BUILD[`awaiting-owner-finding-accepted-${outcome}`];
+  BUILD[`awaiting-owner-ruling-recorded-${outcome}`] = {
+    state: fixture.state,
+    event: { type: "RULING_RECORDED", ruling: { id: "RUL-1", text: "accept F1", recordIds: ["F1"], by: "owner" } },
+  };
+}
+
 // Plan 06g (A5): `tt carry <run> <id> --to <phase-id>`. Carrying the only
 // blocking item resolves the request about it and accepts the candidate
 // (`acceptedWithCarried`), so the phase resumes to RESOLVING.
