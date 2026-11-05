@@ -12,7 +12,7 @@
 // distinguishes rows that share a trigger, and `apply` computes the new
 // state. `actions` is what `next()` of the resulting state must equal.
 
-import { carryBallotsForward, carryDecisionsForward, repairBudgetRemains, hasDomainRounds } from "./rounds.ts";
+import { carryBallotsForward, carryDecisionsForward, repairBudgetRemains, hasDomainRounds, roundCeilingReason } from "./rounds.ts";
 import { leaderOf, seatsOf } from "./seats.ts";
 import { finalCheckOf } from "./checks.ts";
 import { gateCommandOf } from "./gate.ts";
@@ -319,8 +319,34 @@ addRow({
  * gate that failed, for the fallback request when nothing record-level
  * caused it (e.g. every worker attempt just kept timing out). */
 function enterAwaitingOwner(s: State, cause: string): State {
+  const stuck = roundCeilingReason(s.phase);
+  if (stuck) return enterStuck(s, stuck);
   const requests = openItemOwnerRequestsFor(s.phase, cause);
   return withPhase(s, { phase: "AWAITING_OWNER", ownerRequests: [...s.phase.ownerRequests, ...requests] });
+}
+
+function enterStuck(s: State, reason: string): State {
+  // Keep each item's existing dispositions (accept risk, repair, etc.). A
+  // separate stop-only request would both hide those choices and keep the
+  // phase parked after the owner had settled the underlying item.
+  const requests = openItemOwnerRequestsFor(s.phase, reason);
+  const alreadyOpen = s.phase.ownerRequests.some((r) => r.status === "open");
+  const added = alreadyOpen ? requests.filter((r) => !isBudgetGateRequest(r)) : requests;
+  return withPhase(s, {
+    phase: "AWAITING_OWNER",
+    inFlight: {},
+    ownerRequests: [...s.phase.ownerRequests, ...added].map((r) => r.status === "open"
+      ? { ...r, reason: r.reason === reason ? reason : `${reason}\n${r.reason}` }
+      : r),
+  });
+}
+
+for (const from of ["IMPLEMENTING", "FREEZING", "CHECKING", "FINAL_CHECKING", "PROBING", "REVIEWING", "EVALUATING", "RESOLVING", "REPAIRING", "GATING", "ACCEPTED", "PUBLISHING"] as PhaseStateName[]) {
+  addRow({
+    id: `stuck-from-${from.toLowerCase()}`, axis: "phase", from, trigger: "PHASE_STUCK",
+    guardName: "always", guard: () => true, to: "AWAITING_OWNER", actions: [],
+    apply: (s, ev) => enterStuck(s, (ev as Extract<Event, { type: "PHASE_STUCK" }>).reason),
+  });
 }
 
 function failureRows(

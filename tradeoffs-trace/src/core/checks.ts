@@ -263,9 +263,9 @@ export interface CheckRecordCommand {
    * distinct from an ordinary red check. `silent` exited non-zero with no
    * output; `interrupted` was cut off by the owner's stop; `disk-full` could
    * not record its output. */
-  failureClass?: "silent" | "interrupted" | "disk-full";
+  failureClass?: "silent" | "interrupted" | "disk-full" | "infrastructure-stall";
   /** 07e (A4): how the command ended, including a silent or interrupted check. */
-  class?: "passed" | "failed" | "silent" | "interrupted" | "disk-full";
+  class?: "passed" | "failed" | "silent" | "interrupted" | "disk-full" | "infrastructure-stall";
   /** 07e (A4): the one-line reason, e.g. `check exited 3 with no output`. */
   note?: string;
   /** 07g2 (A4/R9): the simple command the shell ran last before the non-zero
@@ -340,10 +340,10 @@ export function parseCheckRecord(value: unknown): CheckRecord | undefined {
       timedOut: e.timedOut,
       durationMs: e.durationMs,
       passed: e.passed,
-      ...(e.failureClass === "silent" || e.failureClass === "interrupted" || e.failureClass === "disk-full"
+      ...(e.failureClass === "silent" || e.failureClass === "interrupted" || e.failureClass === "disk-full" || e.failureClass === "infrastructure-stall"
         ? { failureClass: e.failureClass }
         : {}),
-      ...(e.class === "passed" || e.class === "failed" || e.class === "silent" || e.class === "interrupted" || e.class === "disk-full" ? { class: e.class } : {}),
+      ...(e.class === "passed" || e.class === "failed" || e.class === "silent" || e.class === "interrupted" || e.class === "disk-full" || e.class === "infrastructure-stall" ? { class: e.class } : {}),
       ...(typeof e.note === "string" ? { note: e.note } : {}),
       ...(typeof e.failingStep === "string" ? { failingStep: e.failingStep } : {}),
       ...(typeof e.failingStepOutput === "string" ? { failingStepOutput: e.failingStepOutput } : {}),

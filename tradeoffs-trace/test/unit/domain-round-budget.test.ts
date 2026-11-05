@@ -81,7 +81,7 @@ test("a recorded repair grant after the last original round dispatches round fou
   assert.equal(d.conductor.test_state.phase.repairRoundsUsed, 3);
 });
 
-test("a second recorded repair grant lifts the same driver allowance again", async () => {
+test("a second recorded repair grant cannot exceed the default hard ceiling", async () => {
   let state = grant(initial(), "OR1");
   for (let round = 4; round <= 6; round++) {
     const d = driver(state); await d.run();
@@ -89,9 +89,10 @@ test("a second recorded repair grant lifts the same driver allowance again", asy
     state = finish(d.conductor.test_state);
   }
   const d = driver(grant(state, "OR2")); await d.run();
-  assert.deepEqual(d.dispatches, [7]);
+  assert.deepEqual(d.dispatches, []);
+  assert.match(d.parks[0], /stuck:.*6 total rounds/);
   assert.equal(d.conductor.test_state.phase.repairRoundsGranted, 8);
-  assert.equal(d.conductor.test_state.phase.repairRoundsUsed, 6);
+  assert.equal(d.conductor.test_state.phase.repairRoundsUsed, 5);
 });
 
 test("exhaustion of an owner grant agrees with the state-table guard", async () => {
@@ -103,7 +104,7 @@ test("exhaustion of an owner grant agrees with the state-table guard", async () 
   }
   const d = driver(state); await d.run();
   assert.deepEqual(d.dispatches, []);
-  assert.match(d.parks[0], /round bound/);
+  assert.match(d.parks[0], /stuck:.*6 total rounds/);
   assert.equal(applied({ ...state, phase: { ...state.phase, phase: "REPAIRING" } }, { type: "REPAIR_BUDGET_EXHAUSTED" }).phase.phase, "AWAITING_OWNER");
   assert.equal(reduce({ ...state, phase: { ...state.phase, phase: "REPAIRING" } }, { type: "REPAIR_ATTEMPT_STARTED" }).ok, false);
 });

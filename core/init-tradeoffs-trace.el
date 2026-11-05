@@ -1133,6 +1133,9 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                   ,@(let ((w (+tt--keyword-at "TT_WORKERS")))
                       (and w (list (cons 'workers (+tt--count-value (car w)))
                                    (cons 'workersLine (cdr w)))))
+                  ,@(let ((r (+tt--keyword-at "TT_ROUND_CEILING")))
+                      (and r (list (cons 'roundCeiling (+tt--count-value (car r)))
+                                   (cons 'roundCeilingLine (cdr r)))))
                   ,@(let ((r (+tt--keyword-at "TT_ROUNDS")))
                       (and r (list (cons 'rounds (+tt--count-value (car r)))
                                    (cons 'roundsLine (cdr r)))))
@@ -1518,6 +1521,8 @@ several phases runs them in order."
                                  (and b (list (cons 'base (string-trim b)))))
                              ,@(let ((f (+tt--keyword "TT_PROGRAM_FINAL_CHECKS")))
                                  (and f (list (cons 'programFinalChecks (string-trim f)))))
+                             ,@(let ((r (+tt--keyword "TT_ROUND_CEILING")))
+                                 (and r (list (cons 'roundCeiling (+tt--count-value r)))))
                              (entries . ,(vconcat (nreverse entries))))
                            ;; The program file's own #+TT_MODELS, for `tt lint'
                            ;; (the entries already carry the merged form).

@@ -99,6 +99,10 @@
       "description": "Lint-only: the 1-based line of #+TT_WORKERS in the source Org file.",
       "type": "integer"
     },
+    "roundCeiling": {
+      "description": "Hard ceiling on total phase rounds, including owner grants. Default 6; configured by TT_ROUND_CEILING.",
+      "type": "integer", "minimum": 1
+    },
     "rounds": {
       "description": "Plan 06g: #+TT_ROUNDS — how many rounds a phase may spend before it parks on the owner (1 to 5). Absent means the default of 3. A value that is not a whole number is passed through as written so `tt lint` can name it.",
       "type": ["integer", "string"]

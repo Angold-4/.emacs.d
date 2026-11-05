@@ -279,6 +279,8 @@ export interface LintPlanInput {
   rounds?: number;
   /** Lint-only: the 1-based line of `#+TT_ROUNDS:` in the source Org file. */
   roundsLine?: number;
+  roundCeiling?: number;
+  roundCeilingLine?: number;
   /** Plan 06m (A5): the labels `tt deliver` applies to each PR
    * (`#+TT_LABELS:`). */
   labels?: string[];
@@ -375,6 +377,8 @@ export interface LintProgramInput {
   workersLine?: number;
   rounds?: number;
   roundsLine?: number;
+  roundCeiling?: number;
+  roundCeilingLine?: number;
   /** Plan 06h (A1/A4): a program file may also declare `#+TT_REVIEWERS:` and
    * `#+TT_LEADER:`; the same rules apply. */
   seats?: string[];
@@ -894,6 +898,7 @@ export function lintPhaseSeats(phase: LintPhaseInput, plan: LintPlanInput): Lint
  * its #+TT_MODELS and its #+TT_RERUN). Pure. */
 export function lintPlan(plan: LintPlanInput): LintFinding[] {
   const out: LintFinding[] = [
+    ...lintRoundCeiling(plan),
     ...lintModels(plan),
     ...lintRerun(plan),
     ...lintVerifyCommands(plan),
@@ -982,7 +987,7 @@ export function lintPlan(plan: LintPlanInput): LintFinding[] {
 /** Lint every entry's plan in a program file; phase ids are prefixed with the
  * entry id so two entries with the same phase id stay tellable apart. */
 export function lintProgram(program: LintProgramInput): LintFinding[] {
-  const out: LintFinding[] = [...lintModels(program), ...lintWorkers(program), ...lintWorkerPrompt(program)];
+  const out: LintFinding[] = [...lintRoundCeiling(program), ...lintModels(program), ...lintWorkers(program), ...lintWorkerPrompt(program)];
   for (const entry of program.entries ?? []) {
     for (const finding of lintPlan(entry.plan ?? { phases: [] })) {
       out.push({ ...finding, phaseId: entry.id ? `${entry.id}/${finding.phaseId}` : finding.phaseId });
@@ -1828,4 +1833,14 @@ export function formatFinding(finding: LintFinding, fallbackFile = "<plan>"): st
 
 export function formatFindings(findings: readonly LintFinding[], fallbackFile = "<plan>"): string {
   return findings.map((f) => formatFinding(f, fallbackFile)).join("\n");
+}
+
+/** A program ceiling must be explicit and finite, never silently disabled. */
+function lintRoundCeiling(input: { roundCeiling?: number; roundCeilingLine?: number; sourceFile?: string }): LintFinding[] {
+  const n = input.roundCeiling;
+  if (n === undefined || (Number.isInteger(n) && n >= 1)) return [];
+  return [{ severity: "error", rule: "worker-count", phaseId: "?", item: "#+TT_ROUND_CEILING",
+    line: input.roundCeilingLine, sourceFile: input.sourceFile,
+    problem: `TT_ROUND_CEILING must be a positive whole number, got ${String(n)}`,
+    fix: "write #+TT_ROUND_CEILING: 6" }];
 }

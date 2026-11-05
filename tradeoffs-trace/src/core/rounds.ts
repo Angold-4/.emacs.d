@@ -146,10 +146,22 @@ export function carryBallotsForward(
 // With no `#+TT_WORKERS` (or 1) none of this runs: no round event is
 // recorded and the phase behaves exactly as it did before this plan.
 
-/** The default number of rounds one phase may spend (owner, 2026-10-07:
+/** The initial number of rounds one phase may spend (owner, 2026-10-07:
  * "we cannot afford the loop becomes infinity … likely most of the loop
  * should finish within 3 rounds"). `#+TT_ROUNDS` overrides it. */
 export const DEFAULT_ROUND_BUDGET = 3;
+/** Total phase rounds, including the initial candidate. Grants cannot raise it. */
+export const DEFAULT_ROUND_CEILING = 6;
+
+export function roundCeiling(contract: { roundCeiling?: number } | undefined): number {
+  const n = contract?.roundCeiling;
+  return typeof n === "number" && Number.isInteger(n) && n >= 1 ? n : DEFAULT_ROUND_CEILING;
+}
+
+export function roundCeilingReason(phase: PhaseState): string | undefined {
+  const limit = roundCeiling(phase.contract);
+  return repairRoundsSpent(phase) + 1 >= limit ? `stuck: phase reached hard ceiling of ${limit} total rounds` : undefined;
+}
 
 /** The lane ids of a K-lane round: `a`, `b`, `c`, … Lane 0 is `a`, so a
  * one-lane round's single candidate is `C<round>-a`. */
@@ -163,8 +175,8 @@ export function candidateLabel(round: number, lane: string): string {
   return `C${round}-${lane}`;
 }
 
-/** `roundBudget(contract)` is the ONLY place that decides how many rounds a
- * phase may spend. It reads the contract's frozen `#+TT_ROUNDS` and falls
+/** `roundBudget(contract)` decides the initial round allowance, before owner
+ * grants and the independent hard ceiling. It reads the contract's frozen `#+TT_ROUNDS` and falls
  * back to the default of 3. Both the one-lane and the two-lane loop ask this
  * function, never a constant of their own. */
 export function roundBudget(contract: Pick<PhaseContract, "roundsAllowed"> | undefined): number {
@@ -181,8 +193,8 @@ export function repairRoundsSpent(phase: PhaseState): number {
 }
 
 export function repairBudgetRemains(phase: PhaseState, nextRound = repairRoundsSpent(phase) + 2): boolean {
-  // The absolute ceiling is one initial round plus all recorded grants.
-  return Math.max(repairRoundsSpent(phase) + 1, nextRound - 1) <= phase.repairRoundsGranted;
+  return nextRound <= roundCeiling(phase.contract) &&
+    Math.max(repairRoundsSpent(phase) + 1, nextRound - 1) <= phase.repairRoundsGranted;
 }
 
 /** After the first pick, ROUND_STARTED owns the charge. The phase entry

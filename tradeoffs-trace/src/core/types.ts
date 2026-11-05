@@ -145,6 +145,8 @@ export interface PhaseContract {
   /** Plan 06g: `#+TT_ROUNDS:` frozen into the contract, or undefined for the
    * default (3). `roundBudget()` reads this; nothing else decides the budget. */
   roundsAllowed?: number;
+  /** Hard ceiling on total phase rounds, including all owner grants. Default 6. */
+  roundCeiling?: number;
   /** Plan 06k1 (A3): `#+TT_VARIANT_LIMIT:` frozen into the contract, or
    * undefined for the default (3). `variantLimitOf()` reads this. */
   variantLimit?: number;
@@ -1766,6 +1768,12 @@ export interface EvLoopBoundReached {
   reason: string;
 }
 
+/** The round loop cannot make progress. Uses the ordinary owner/notify path. */
+export interface EvPhaseStuck {
+  type: "PHASE_STUCK";
+  reason: string;
+}
+
 /** Plan 04a: one message type's evaluator state inside EVALUATING. */
 export interface EvaluatorOutcome {
   settled?: boolean;
@@ -3080,6 +3088,7 @@ export type Event =
   | EvBoundReached
   | EvLeadCalled
   | EvLoopBoundReached
+  | EvPhaseStuck
   | EvAttemptNoSubmission
   | EvAttemptInterrupted
   | EvWorkerResumed

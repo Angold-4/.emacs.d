@@ -34,7 +34,7 @@ import {
   recordRulings,
 } from "./owner-commands.ts";
 import { isLiveDecision, panelOutcome, panelSeatNumbers, panelSeatSettled, panelSeatsSettled, reviewIngestionIssue, sameVersion } from "./predicate.ts";
-import { repairBudgetRemains, repairRoundsSpent } from "./rounds.ts";
+import { repairBudgetRemains, repairRoundsSpent, roundCeiling } from "./rounds.ts";
 import { domainProgressFindings, domainResolvedPoints, factKeepsOpen } from "./fix-rounds.ts";
 import { seatsOf } from "./seats.ts";
 import { findOwnerRequest } from "./triage.ts";
@@ -119,6 +119,7 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "REPAIR_ATTEMPT_STARTED",
   "REPAIR_BUDGET_EXHAUSTED",
   "LOOP_BOUND_REACHED",
+  "PHASE_STUCK",
   "RESOLVING_INCOMPLETE",
   "GATE_REQUIRED",
   "GATE_FAILED",
@@ -546,6 +547,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       if (event.round < 1) {
         return rejected(state, "ROUND_STARTED needs a positive round number");
       }
+      if (event.round > roundCeiling(p.contract)) return rejected(state, "ROUND_STARTED exceeds the hard phase round ceiling");
       const prior = (p.rounds ?? []).find((r) => r.round === event.round);
       if (event.lanes.length === 0 && prior) {
         if (prior.lanes.length !== 0 || prior.base !== event.base) return rejected(state, "ROUND_STARTED cannot replace a different checkpoint");

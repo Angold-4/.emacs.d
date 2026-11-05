@@ -36,6 +36,9 @@ import { namedCandidate } from "./core/ruling-picks.ts";
 // and `roundBudget` (architecture A3 and A6). Nothing in this file decides a
 // winner or whether a finding blocks by itself.
 import { advisoryReason, bestCandidate, blocksAcceptance, candidateLabel, carryBallotsForward, carryDecisionsForward, laneMetItems, losingLanes, loserAnchors, roundBudget, repairBudgetRemains, type AcceptanceGate, type FindingGround, type PickGuard } from "./core/rounds.ts";
+import { roundCeiling, roundCeilingReason, repairRoundsSpent } from "./core/rounds.ts";
+import { repeatedItemStall } from "./core/stuck.ts";
+import { runCheckWithInfrastructureRetry, type InfrastructureCheckResult, type InfrastructureRetry } from "./effects/check-retry.ts";
 // Plan 06g2 (A1): `runRound` is the round's only orchestrator. The conductor
 // implements its `LaneHost` with the worktree, agent, check, review and vote
 // machinery below and calls it; it decides nothing about lanes itself.
@@ -487,6 +490,8 @@ export interface RunPlanPhase {
   /** Plan 06g: `#+TT_ROUNDS:` — how many rounds one phase may spend before
    * it parks on the owner. Absent means the default of 3. */
   rounds?: number;
+  /** Hard ceiling on total phase rounds; grants cannot raise it (default 6). */
+  roundCeiling?: number;
   /** Plan 06h (A1): `#+TT_REVIEWERS:` (or the phase's own `:REVIEWERS:`).
    * Absent means `M A B`. */
   seats?: string[];
@@ -574,6 +579,8 @@ export interface RunPlanFile {
   /** Plan 06g: the plan's `#+TT_ROUNDS:` — how many rounds one phase may
    * spend. Absent means the default of 3. */
   rounds?: number;
+  /** Hard ceiling on total phase rounds; grants cannot raise it (default 6). */
+  roundCeiling?: number;
   /** Plan 06h (A1): the plan's `#+TT_REVIEWERS:`. Absent means `M A B`. */
   seats?: string[];
   /** Plan 06h (A1): the plan's `#+TT_LEADER:`. Absent means the first seat. */
@@ -684,6 +691,9 @@ export interface ConductorOptions {
   runDir: string;
   plan: RunPlanFile;
   deadlines?: Partial<Deadlines>;
+  /** Host load used to classify check timeouts. Defaults to the real load1;
+   * injectable so deadline tests do not depend on unrelated host work. */
+  infrastructureLoad1?: () => number;
   /** The `pi` binary, or an injected stand-in (fake-pi) for tests — e.g.
    * `"node"` with `piArgsPrefix: ["test/fake-pi/fake-pi.ts"]`. */
   piCommand?: string;
@@ -1032,6 +1042,7 @@ export function buildContract(phase: RunPlanPhase): PhaseContract {
     // Plan 06g: the lane count and the round budget are frozen into the
     // contract, so the FSM, the prompts and the views all read one value.
     ...(workersOf(phase) > 1 ? { workers: workersOf(phase) } : {}),
+    ...(phase.roundCeiling !== undefined ? { roundCeiling: phase.roundCeiling } : {}),
     ...(typeof phase.rounds === "number" && phase.rounds > 0 ? { roundsAllowed: Math.floor(phase.rounds) } : {}),
     ...(typeof phase.variantLimit === "number" && phase.variantLimit > 0 ? { variantLimit: Math.floor(phase.variantLimit) } : {}),
     // Plan 06h (A2): the seats and the leader are frozen too, so every
@@ -1061,10 +1072,11 @@ export function initialState(
    * plan's own seats, and `M A B` when it declares none. */
   initSeats?: Seats,
   /** 07g1: plan-level defaults for the phase-level domain-loop fields. */
-  planDefaults?: Pick<RunPlanFile, "domainLoopMax" | "integrateMax" | "forbidden" | "testRemovals">,
+  planDefaults?: Pick<RunPlanFile, "domainLoopMax" | "integrateMax" | "forbidden" | "testRemovals" | "roundCeiling">,
 ): State {
   const effectivePhase: RunPlanPhase = {
     ...phase,
+    ...(planDefaults?.roundCeiling !== undefined ? { roundCeiling: planDefaults.roundCeiling } : {}),
     ...(phase.domainLoopMax === undefined && planDefaults?.domainLoopMax !== undefined ? { domainLoopMax: planDefaults.domainLoopMax } : {}),
     ...(phase.integrateMax === undefined && planDefaults?.integrateMax !== undefined ? { integrateMax: planDefaults.integrateMax } : {}),
     ...(phase.forbidden === undefined && planDefaults?.forbidden !== undefined ? { forbidden: planDefaults.forbidden } : {}),
@@ -1095,7 +1107,7 @@ export function initialState(
     inFlight: {},
     repairRoundsUsed: 0,
     // Plan 06g (A4, owner-verified): `roundBudget(contract)` is the only place
-    // that decides how many ROUNDS a phase may spend — `#+TT_ROUNDS` when the
+    // that decides the INITIAL round allowance — `#+TT_ROUNDS` when the
     // plan names it, the default of 3 otherwise. One round is one candidate
     // reviewed, so the repair allowance the FSM compares against is
     // `roundBudget - 1`: the first candidate is round 1 and each later round
@@ -1344,12 +1356,15 @@ function timelineFromRecords(records: readonly LogRecord[], plan: RunPlanFile): 
   installRecordedSeatAnchorRule();
   const init = records.find((r) => r.kind === "init")?.event as { runId: string; integrationHead: string; seats?: Seats } | undefined;
   let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "", plan.ownerDirectives ?? [], init?.seats, plan);
+  const ceiling = state.phase.contract.roundCeiling;
+  state = withReplayCeiling(state, initialReplayCeiling(records));
   const phases: Timeline["phases"] = [];
   const rounds: Timeline["rounds"] = [];
   const accepted = [...acceptedReplayRecords(records)];
   const restarts = restartInstants(accepted);
   const stops = accepted.filter((r) => r.kind === "stop").map((r) => r.ts);
   for (const record of accepted) {
+    if (record.kind === "round_ceiling") state = withReplayCeiling(state, roundCeiling(record.event as { roundCeiling?: number }));
     if (record.kind !== "event") continue;
     const before = state;
     const result = reduce(state, record.event);
@@ -1377,7 +1392,19 @@ function timelineFromRecords(records: readonly LogRecord[], plan: RunPlanFile): 
       phases.push({ phase: state.phase.phase, at: record.ts });
     }
   }
-  return { state, phases, rounds, restarts, stops };
+  return { state: withReplayCeiling(state, ceiling), phases, rounds, restarts, stops };
+}
+
+function withReplayCeiling(state: State, roundCeiling: number | undefined): State {
+  const { roundCeiling: _previous, ...contract } = state.phase.contract;
+  return { ...state, phase: { ...state.phase, contract: { ...contract, ...(roundCeiling !== undefined ? { roundCeiling } : {}) } } };
+}
+
+/** Old logs had unlimited grants. Replay their historical policy until
+ * the adoption record, then enforce the frozen ceiling on all future work. */
+function initialReplayCeiling(records: readonly LogRecord[]): number {
+  const init = records.find((r) => r.kind === "init")?.event as { roundCeiling?: number } | undefined;
+  return init?.roundCeiling ?? Number.MAX_SAFE_INTEGER;
 }
 
 export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
@@ -1400,8 +1427,10 @@ export function rebuildTimelineWithEvents(runDir: string, plan: RunPlanFile): { 
  * to paper over. */
 function foldEvents(base: State, records: readonly LogRecord[], lenient = false): State {
   installRecordedSeatAnchorRule();
-  let state = base;
+  const ceiling = base.phase.contract.roundCeiling;
+  let state = withReplayCeiling(base, initialReplayCeiling(records));
   for (const record of acceptedReplayRecords(records)) {
+    if (record.kind === "round_ceiling") state = withReplayCeiling(state, roundCeiling(record.event as { roundCeiling?: number }));
     if (record.kind !== "event") continue;
     const result = reduce(state, record.event);
     if (!result.ok && lenient) {
@@ -1415,7 +1444,7 @@ function foldEvents(base: State, records: readonly LogRecord[], lenient = false)
     }
     state = result.state;
   }
-  return state;
+  return withReplayCeiling(state, ceiling);
 }
 
 /** Per-file `git diff --numstat` totals of a worktree against its HEAD,
@@ -1900,6 +1929,7 @@ export class Conductor {
   #curatorInFlight = new Set<string>();
   #plan: RunPlanFile;
   #deadlines: Deadlines;
+  #infrastructureLoad1: () => number;
   #piCommand: string | undefined;
   #piArgsPrefix: string[];
   #piCommandFor: ((role: Role) => string | undefined) | undefined;
@@ -2216,6 +2246,7 @@ export class Conductor {
     this.#piEnvFor = opts.piEnvFor;
     this.#providerModelFor = opts.providerModelFor;
     this.#stubReviews = opts.stubReviews ?? false;
+    this.#infrastructureLoad1 = opts.infrastructureLoad1 ?? (() => Math.round(loadavg()[0] * 100) / 100);
     this.#briefsEnabled = opts.briefs ?? false;
     this.#probeReuse = opts.probeReuse ?? true;
     // Plan 07h2 (A3/R4): the promise the run's own process waits on.
@@ -2385,11 +2416,15 @@ export class Conductor {
         integrationHead: head,
         runnerRevision: runnerRevision(),
         seats: effectiveSeats,
+        roundCeiling: roundCeiling({ roundCeiling: this.#plan.roundCeiling ?? phase0.roundCeiling }),
         ...(this.#workerPrompts ? { workerPrompts: this.#workerPrompts } : {}),
       });
       this.#state = initialState(runId, phase0, head, this.#plan.ownerDirectives ?? [], effectiveSeats, this.#plan);
     }
     this.#state = foldEvents(this.#state, records);
+    if (initRecord && !(initRecord.event as { roundCeiling?: number }).roundCeiling && !records.some((r) => r.kind === "round_ceiling")) {
+      this.#log.append("round_ceiling", { roundCeiling: roundCeiling(this.#state.phase.contract) });
+    }
     // Plan 06c (A5/OD-3): a conductor that starts on an existing, non-terminal
     // run records a real RUN_RESUMED event once at start-up (drive-suspended,
     // so nothing dispatches before start() is ready). The stage clock treats it
@@ -2837,6 +2872,18 @@ export class Conductor {
     // The inventory belongs to its enclosing round/check effect. Reap its
     // recorded child groups before resuming that effect after a crash.
     const { records } = readLog(this.#paths.events);
+    if (repairRoundsSpent(this.#state.phase) + 1 > roundCeiling(this.#state.phase.contract) &&
+      !["AWAITING_OWNER", "DONE", "BLOCKED"].includes(this.#state.phase.phase)) {
+      // An older runner may have left several effects in flight above the
+      // ceiling. Reap its own groups, then park once; do not reconcile each
+      // review into a new effect after the phase has already parked.
+      for (const record of records) {
+        const pgid = (record.event as { pgid?: number }).pgid;
+        if (record.kind === "intent" && typeof pgid === "number") await this.#killRecordedGroup(pgid, Date.parse(record.ts));
+      }
+      this.#applyEvent({ type: "PHASE_STUCK", reason: roundCeilingReason(this.#state.phase)! });
+      return;
+    }
     const completed = new Set(records.filter((r) => r.kind === "completion").map((r) => r.actionId));
     for (const record of records) {
       if (record.kind !== "intent" || !record.actionId?.startsWith("compatibility-") || completed.has(record.actionId)) continue;
@@ -3342,11 +3389,12 @@ export class Conductor {
     // is not.
     if (before !== "AWAITING_OWNER" && this.#state.phase.phase === "AWAITING_OWNER") {
       this.#awaitingEpisode += 1;
+      if (logged.type === "PHASE_STUCK") this.#applyEvent({ type: "LEAD_CALLED", reasons: [logged.reason] });
       // Plan 07e (E2/A3): a failure transition guarded by `budgetExhausted`
       // parks directly, without ever emitting the `repair_budget_exhausted`
       // action. The open budget request is the FSM's own marker of that park.
       if (
-        this.#state.phase.ownerRequests.some(
+        logged.type !== "PHASE_STUCK" && this.#state.phase.ownerRequests.some(
           (r) => r.status === "open" && r.origin === "repair_budget_exhausted",
         )
       ) {
@@ -3395,8 +3443,8 @@ export class Conductor {
     const key = `${phase.phaseId}:${phase.repairRoundsUsed}`;
     if (this.#roundsBoundReported === key) return;
     this.#roundsBoundReported = key;
-    const limit = phase.contract.roundsAllowed ?? this.#plan.rounds ?? boundDefinition("rounds").defaultValue;
-    this.#recordBound("rounds", phase.phaseId, limit, phase.repairRoundsUsed);
+    const limit = roundCeilingReason(phase) ? roundCeiling(phase.contract) : phase.contract.roundsAllowed ?? this.#plan.rounds ?? boundDefinition("rounds").defaultValue;
+    this.#recordBound("rounds", phase.phaseId, limit, roundCeilingReason(phase) ? repairRoundsSpent(phase) + 1 : phase.repairRoundsUsed);
     this.#applyEvent({ type: "LEAD_CALLED", reasons: notAcceptedReasons(phase) });
   }
 
@@ -5149,6 +5197,22 @@ export class Conductor {
   }
 
   #dispatch(action: Action): void {
+    if (this.#state.phase.phase === "AWAITING_OWNER") return;
+    // An old runner may already have exceeded the new ceiling. Preserve its
+    // history, but resume directly into the owner path before any new effect.
+    if (repairRoundsSpent(this.#state.phase) + 1 > roundCeiling(this.#state.phase.contract)) {
+      this.#applyEvent({ type: "PHASE_STUCK", reason: roundCeilingReason(this.#state.phase)! });
+      return;
+    }
+    if (["resolving_incomplete", "repair_attempt_started", "dispatch_worker"].includes(action.type)) {
+      const events = [...acceptedReplayRecords(readLog(this.#paths.events).records)]
+        .filter((r) => r.kind === "event").map((r) => r.event as Event);
+      const reason = repeatedItemStall(this.#state.phase, events);
+      if (reason) {
+        this.#applyEvent({ type: "PHASE_STUCK", reason });
+        return;
+      }
+    }
     const kind =
       action.type === "dispatch_review"
         ? `dispatch_review_${action.reviewer}`
@@ -10200,9 +10264,10 @@ export class Conductor {
    * it parks the phase for the lead: no seat review starts on it. */
   #parkOpenPoints(round: number, reason: string, points: readonly string[]): void {
     this.#log.append("lead_called", { round, reason, points });
-    this.#applyEvent({ type: "BOUND_REACHED", kind: "rounds", scope: `round ${round} fix loop`, limitMs: 0, elapsedMs: 0, action: "the phase parks for the lead" });
+    const ceiling = roundCeilingReason(this.#state.phase) ? roundCeiling(this.#state.phase.contract) : undefined;
+    this.#applyEvent({ type: "BOUND_REACHED", kind: "rounds", scope: `round ${round} fix loop`, limitMs: ceiling ?? 0, elapsedMs: ceiling ? repairRoundsSpent(this.#state.phase) + 1 : 0, action: "the phase parks for the lead" });
     this.#applyEvent({ type: "LEAD_CALLED", reasons: [reason] });
-    this.#applyEvent({ type: "LOOP_BOUND_REACHED", round, loops: this.#state.phase.contract.domainLoopMax ?? 3, reason });
+    this.#applyEvent({ type: "LOOP_BOUND_REACHED", round, loops: ceiling ?? this.#state.phase.contract.domainLoopMax ?? 3, reason });
   }
 
   /** 07g2 (A2/R3): a red merged candidate whose failing file no domain loop
@@ -10698,29 +10763,38 @@ export class Conductor {
     const worktree = this.#fixerWorktree(task.domain);
     const sessionDir = path.join(this.#paths.sessions, `fix-${round}-${task.domain}`);
     const lane = `fix-${task.domain}`;
-    const startedAt = Date.now();
+    // One shared allowance for the sticky fixer's active attempts. Facts and
+    // stateless reviews have their own bounds; charging their wall time here
+    // can skip the next fix entirely and turn a flat review into a drop.
+    let fixerElapsedMs = 0;
     const records: DomainLoopRecord[] = [];
     const allDisclosures: DecisionDisclosure[] = [];
     const allAdded: string[] = [];
-    const remaining = (): number => this.#deadlines.fixerAttemptMs - (Date.now() - startedAt);
+    const remaining = (): number => this.#deadlines.fixerAttemptMs - fixerElapsedMs;
     const buildFixer = async (fix?: { of: string; feedback: string }): Promise<LaneBuild> => {
       const prompt = fix
         ? this.#fixerFixPrompt(task, round, fix.of, fix.feedback, remaining())
         : this.#fixerPrompt(task, round, base);
-      const built = await this.#buildFixerAgent({
-        round,
-        worktree,
-        base,
-        prompt,
-        sessionDir,
-        actionKind: "fixer",
-        agentIdPrefix: `fix-${round}-${task.domain}`,
-        lane,
-        logPrefix: "fixer",
-        roleWord: `fixer ${task.domain}`,
-        fixer: true,
-        ...(fix ? { fix: { of: fix.of, timeoutMs: Math.max(1, remaining()) } } : {}),
-      });
+      const attemptStartedAt = Date.now();
+      let built: LaneBuild;
+      try {
+        built = await this.#buildFixerAgent({
+          round,
+          worktree,
+          base,
+          prompt,
+          sessionDir,
+          actionKind: "fixer",
+          agentIdPrefix: `fix-${round}-${task.domain}`,
+          lane,
+          logPrefix: "fixer",
+          roleWord: `fixer ${task.domain}`,
+          fixer: true,
+          ...(fix ? { fix: { of: fix.of, timeoutMs: Math.max(1, remaining()) } } : {}),
+        });
+      } finally {
+        fixerElapsedMs += Date.now() - attemptStartedAt;
+      }
       if (built.sha && fix && treeOf(this.#plan.repo, built.sha) === treeOf(this.#plan.repo, fix.of)) {
         this.#log.append("fixer_fix_unchanged", { round, domain: task.domain, sha: fix.of, fixedSha: built.sha });
         return { lane, unchanged: true, note: `its fix of ${fix.of.slice(0, 7)} changed nothing`, ...(built.disclosures ? { disclosures: built.disclosures } : {}) };
@@ -11225,6 +11299,7 @@ export class Conductor {
     let passed = true;
     let combinedOutput = "";
     let firstFailure: string | undefined;
+    let infrastructureStall: string | undefined;
     try {
       // Plan 07e (A4/E4): creating the check directory is part of the check, so
       // a full disk here is `disk full`, never an uncaught ENOSPC.
@@ -11251,7 +11326,7 @@ export class Conductor {
         // Plan 06l (A4): a re-run alone must finish inside this same
         // per-command deadline.
         const deadlineAt = startedAt + checkLimitMs;
-        const result = await runCommand({
+        const result = await this.#checkWithInfrastructureRetry(candidateSha, command, tier, outDir, checkLimitMs, () => runCommand({
           command,
           cwd: checkoutDir.dir,
           env: this.#checkEnv(),
@@ -11264,12 +11339,17 @@ export class Conductor {
             this.#onStageShIntent(pgid);
             this.#log.intent(`lane-check-sh-${lane}-${pgid}`, { pgid });
           },
-        }).result;
+        }).result);
         combinedOutput += `${result.output}\n`;
         // Plan 07e (E2): every timed-out check names its bound.
         if (result.timedOut) this.#recordBound(tier === "final" ? "final-check" : "check", `${lane}:${candidateSha}`, checkLimitMs, Date.now() - startedAt);
         const recordFailure = this.#recordCheck(outDir, command, result);
         recordCommands.push(this.#checkRecordCommand(command, result, startedAt, recordFailure));
+        if (result.infrastructureStall) {
+          infrastructureStall = result.infrastructureStall;
+          passed = false;
+          break;
+        }
         // Plan 07e (A4/E4): a check whose own log the disk refused fails with
         // `disk full`, never as a pass.
         if (recordFailure === "disk-full") {
@@ -11361,7 +11441,7 @@ export class Conductor {
         this.#laneCheckResolutions.set(candidateSha, resolveRoundTestVerifies(this.#planItems(), combinedOutput, recordCommands));
       }
       const facts =
-        (this.#state.phase.contract.domains?.length ?? 0) > 0 && !this.#stopRequested
+        (this.#state.phase.contract.domains?.length ?? 0) > 0 && !this.#stopRequested && !infrastructureStall
           ? await this.#runDoneWhenFacts(lane, candidateSha, checkoutDir.dir, laneBase ?? this.#baselineBaseSha())
           : [];
       this.#laneFacts.set(candidateSha, facts);
@@ -11389,6 +11469,10 @@ export class Conductor {
       });
       // Plan 07e (A4/E4): a record the disk refused fails the lane's check.
       if (!recordWritten) return { ok: false, note: "disk full" };
+      if (infrastructureStall && !this.#stopRequested) {
+        this.#applyEvent({ type: "PHASE_STUCK", reason: infrastructureStall });
+        return { ok: false, note: infrastructureStall };
+      }
       if (passed) await this.#collectCompatibilityInventory(candidateSha, checkoutDir.dir);
       return passed ? { ok: true } : { ok: false, note: firstFailure ?? "a check command failed" };
     } finally {
@@ -12272,7 +12356,7 @@ export class Conductor {
     for (;;) {
       const round = resume ? last.round : last.round + 1;
       if (!resume && !repairBudgetRemains(this.#state.phase, round)) {
-        this.#parkOpenPoints(last.round, "the fix loop's round bound was reached", this.#openPointsOn(base));
+        this.#parkOpenPoints(last.round, roundCeilingReason(this.#state.phase) ?? "the fix loop's round bound was reached", this.#openPointsOn(base));
         return;
       }
       if (!resume) this.#applyEvent({ type: "ROUND_STARTED", round, base, lanes: [] });
@@ -12310,7 +12394,7 @@ export class Conductor {
           await lock.release();
         }
       }
-      if (this.#stopRequested || this.#recheckCancelledLaneRound) return;
+      if (this.#stopRequested || this.#recheckCancelledLaneRound || this.#state.phase.phase === "AWAITING_OWNER") return;
       if (check.ok) await this.#inventoryCandidate(candidate);
       if (this.#stopRequested || this.#recheckCancelledLaneRound) return;
       if (!check.ok) {
@@ -12363,7 +12447,7 @@ export class Conductor {
       }
       this.#log.append("fix_loop_chained", { round, candidate, openPoints });
       if (!repairBudgetRemains(this.#state.phase)) {
-        this.#parkOpenPoints(round, `the fix loop's bound was reached with points still open: ${openPoints.join(", ")}`, openPoints);
+        this.#parkOpenPoints(round, roundCeilingReason(this.#state.phase) ?? `the fix loop's bound was reached with points still open: ${openPoints.join(", ")}`, openPoints);
         return;
       }
       base = candidate;
@@ -12479,6 +12563,10 @@ export class Conductor {
             return !c || (typeof c.sha === "string" && c.sha.length > 0 && c.ok === undefined);
           }));
       const round = unfinished ? last!.round : (last?.round ?? 0) + 1;
+      if (round > roundCeiling(this.#state.phase.contract)) {
+        this.#applyEvent({ type: "PHASE_STUCK", reason: `stuck: phase reached hard ceiling of ${roundCeiling(this.#state.phase.contract)} total rounds` });
+        return;
+      }
       // Plan 06n (A7): before a new round starts, the last round's evaluated
       // pick is adopted as the base or, when it lost a met item in code it
       // changed, recorded as a regression (ITEMS_REGRESSED).
@@ -12569,9 +12657,13 @@ export class Conductor {
         // the round itself never waits out a red lane's fix.
         stopLane: (r, lane) => this.#stopLane(r, lane),
         // Plan 06n (A3): the round records nothing after a requested stop.
-        stopRequested: () => this.#stopRequested,
+        stopRequested: () => this.#stopRequested || this.#state.phase.phase === "AWAITING_OWNER",
       };
       const outcome = await runRound(host, { round, base, lanes, ...(laneBases ? { laneBases } : {}) });
+      if (this.#state.phase.phase === "AWAITING_OWNER") {
+        this.#clearLaneRound(round);
+        return;
+      }
       // Plan 06n (A3): a clean stop left the round in place; the next start
       // resumes it. Nothing further is recorded here.
       if (outcome.stopped) {
@@ -13648,6 +13740,25 @@ export class Conductor {
 
   // -- checks ---------------------------------------------------------------
 
+  async #checkWithInfrastructureRetry(candidateSha: string, command: string, tier: CheckTier,
+    outDir: string, limitMs: number, run: () => Promise<RunCommandResult>): Promise<InfrastructureCheckResult> {
+    const key = `${this.#state.phase.phaseId}:${candidateSha}:${tier}:${command}`;
+    const records = readLog(this.#paths.events).records;
+    const prior = records.findLast((r) => r.kind === "check_infrastructure_retried" && (r.event as { key?: string }).key === key) ??
+      records.findLast((r) => r.kind === "check_infrastructure_retry" && (r.event as { key?: string }).key === key);
+    return runCheckWithInfrastructureRetry({
+      command, run, load: this.#infrastructureLoad1,
+      stopped: () => this.#stopRequested || this.#closed,
+      ...(prior ? { prior: (prior.event as { retry: InfrastructureRetry }).retry } : {}),
+      onRetry: (retry) => {
+        this.#recordBound(tier === "final" ? "final-check" : "check", `check \`${command}\` infrastructure retry`, limitMs, limitMs);
+        this.#recordCheck(outDir, `${command} [infrastructure attempt 1]`, retry.first);
+        this.#log.append("check_infrastructure_retry", { key, candidateSha, command, retry });
+      },
+      onRetried: (retry) => this.#log.append("check_infrastructure_retried", { key, candidateSha, command, retry }),
+    });
+  }
+
   /** Records one gate command's evidence: its command string, the identity
    * it ran against (the enclosing directory name) and its outcome, in the
    * same `<checks>/<sha>/<sanitized command>.log` shape the C path has
@@ -13684,16 +13795,16 @@ export class Conductor {
    * disk-full classification and failureClass readers. 07g2 (A4/R9): a failed
    * traced check also records the simple command the shell ran last before the
    * non-zero exit, and that step's own output. */
-  #checkRecordCommand(command: string, result: RunCommandResult, startedAt: number, recordFailure?: "disk-full"): CheckRecordCommand {
-    const failureClass = recordFailure ?? this.#checkFailureClass(result);
+  #checkRecordCommand(command: string, result: InfrastructureCheckResult, startedAt: number, recordFailure?: "disk-full"): CheckRecordCommand {
+    const failureClass = result.infrastructureStall ? "infrastructure-stall" : recordFailure ?? this.#checkFailureClass(result);
     const passed = !failureClass && result.exitCode === 0 && !result.timedOut;
-    const note = failureClass === "interrupted"
+    const note = result.infrastructureStall ?? (failureClass === "interrupted"
       ? this.#interruptedNote()
       : failureClass === "silent"
         ? `check exited ${result.exitCode} with no output`
         : failureClass === "disk-full"
           ? "disk full"
-          : undefined;
+          : undefined);
     const step = !passed ? lastStep(result) : undefined;
     return {
       command,
@@ -14810,11 +14921,20 @@ export class Conductor {
   }
 
   async #runChecks(actionId: string, candidateSha: string): Promise<void> {
+    if (this.#stopRequested || this.#closed) return;
     // Plan 06k1 (A4): every check run on the host — phase or final tier —
     // holds one of the machine-wide check slots (at most `#checkSlots` checks
     // at once) and the host-wide check window, so every other run's workers
     // pause while this one runs.
     const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots, this.#runDir);
+    // Recovery may redispatch just before start() returns, and the owner can
+    // stop while this check is still acquiring its slot. Teardown has closed
+    // the log by then: logging the intent would throw before the cleanup
+    // below and leak the slot's live lock helper. Release without dispatching.
+    if (this.#stopRequested || this.#closed) {
+      await lock.release();
+      return;
+    }
     const window = this.#openCheckWindow();
     this.#log.intent(actionId, { candidateSha });
     crashAt("before_run_checks");
@@ -14863,6 +14983,7 @@ export class Conductor {
       let passed = before;
       let integrityViolated = !before;
       let timedOut = false;
+      let infrastructureStall: string | undefined;
       /** Plan 01e: the names this candidate's checks failed on that the base
        * did not — recorded with the check's completion so a repair round (and
        * the owner) can see exactly what is new. Plan 05d narrows this to the
@@ -14908,7 +15029,7 @@ export class Conductor {
           const kept = inventory?.commands.find((c) => c.command === command && c.exitCode === 0 && !c.timedOut &&
             c.tests.every((t) => t.outcome !== "failed"));
           if (kept) this.#log.append("compatibility_check_reused", { candidateSha, command });
-          const running = kept ? { result: Promise.resolve({ exitCode: 0, signal: null, timedOut: false,
+          const execute = () => kept ? { result: Promise.resolve({ exitCode: 0, signal: null, timedOut: false,
             cancelled: false, output: kept.output, signalsSent: [] } as RunCommandResult) } : runCommand({
             command,
             cwd: checkoutDir.dir,
@@ -14930,7 +15051,7 @@ export class Conductor {
               this.#log.intent(`check-sh-${actionId}-${pgid}`, { pgid });
             },
           });
-          const result = await running.result;
+          const result = await this.#checkWithInfrastructureRetry(candidateSha, command, tier, outDir, checkLimitMs, () => execute().result);
           if (checkPgid !== undefined) this.#onStageShExit(checkPgid);
           combinedOutput += `${result.output}\n`;
           // Plan 05d: the machine's load average at the failing run is part
@@ -14959,6 +15080,11 @@ export class Conductor {
             this.#log.append("disk_full", { stage: "checks", command, exitCode: result.exitCode, action: "ordinary failure" });
           }
           recordCommands.push(this.#checkRecordCommand(command, result, startedAt, recordFailure ?? (diskFullOutput ? "disk-full" : undefined)));
+          if (result.infrastructureStall) {
+            infrastructureStall = result.infrastructureStall;
+            passed = false;
+            break;
+          }
           // Plan 07e (A4/E4): a check whose own log the disk refused fails its
           // action with `disk full`, never as a pass (`#noteDiskFull` stops the
           // run cleanly, exactly as for a command that reported ENOSPC).
@@ -15083,6 +15209,11 @@ export class Conductor {
         return;
       }
       if (this.#closed) return;
+      if (infrastructureStall) {
+        this.#log.completion(actionId, { candidateSha, passed: false, reason: infrastructureStall });
+        this.#applyEvent({ type: "PHASE_STUCK", reason: infrastructureStall });
+        return;
+      }
       if (passed && tier === "round") await this.#inventoryInCheckout(candidateSha, checkoutDir.dir);
       // design §2.2: a checkout that no longer matches its candidate commit
       // invalidates that gate's result (never counted as passed — `passed`

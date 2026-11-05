@@ -937,6 +937,29 @@ from 1 to 5. One round is **one pass of the repair budget**, so
 allowance is `roundBudget - 1`. A round costs one attempt of the repair
 budget, whatever the number of lanes.
 
+All grants remain subject to a hard ceiling of **6 total phase rounds**,
+including the initial round. Set `#+TT_ROUND_CEILING: 8` in a program (or a
+standalone plan) to choose a different positive whole number. Corrections,
+steers and individual repair resolutions cannot raise this ceiling. Reaching
+it parks the phase in `AWAITING_OWNER` with a `stuck:` reason and notifies the
+owner. Existing item resolutions remain available, including accepting risk;
+grants that would start another round at the ceiling are refused with the
+ceiling reason. Correct tt or the plan before restarting further repairs.
+
+The phase also parks when an unmet item has the same evaluated verdict, or
+the same open finding dropped as a duplicate, in **3 consecutive reviewed
+rounds**. Its reason lists the item ids, reviewed candidates and repeated
+findings. Failed-check rounds do not count as reviews; rechecking the same
+candidate does not add a review round. Evaluator overturns count.
+
+A candidate check (lane, round or final tier) that times out while still compiling, or
+under host load `load1 > 8`, gets **one infrastructure retry on the same
+checkout**. This spends no repair round. A second timeout parks and notifies
+as an infrastructure stall, naming the check and measured loads. The retry
+and both results are logged; a restart cannot add retries. Ordinary completed
+check failures retain their candidate-failure behavior. Probe and review
+timeouts keep their own existing failure and retry policies.
+
 From round 2, a finding blocks acceptance only when it either
 
 - names an item of the contract (or of an owner correction) that is unmet on
