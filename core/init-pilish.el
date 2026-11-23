@@ -131,18 +131,22 @@ remember.  Set to nil to let Pi choose."
                  string)
   :group 'tools)
 
-(defcustom +pilish-model nil
+(defcustom +pilish-model "deepseek/deepseek-v4.1-flash-1017"
   "Model passed to the `pi' CLI as `--model'.
-Nil (the default) lets Pi apply the model remembered in its settings."
+The default is DeepSeek V4.1 Flash 1017 through `+pilish-provider'.
+Nil lets Pi apply the model remembered in its settings instead, which is
+what `+pilish-remember-model' writes on every `C-c m a' pick; set it nil
+to let that remembered model win over this pin."
   :type '(choice (const :tag "Use remembered model" nil) string)
   :group 'tools)
 
-(defcustom +pilish-thinking nil
+(defcustom +pilish-thinking "high"
   "Thinking level passed to the `pi' CLI as `--thinking'.
-Nil (the default) lets Pi apply the level its settings remember, which
-is the `defaultThinkingLevel' key Pi's own TUI writes.  Pi does not
-persist a level set over RPC, so without this every session starts on
-the remembered one again."
+The default is `high', one below the `xhigh' and `max' levels DeepSeek
+V4.1 Flash 1017 does not map.  Nil lets Pi apply the level its settings
+remember, which is the `defaultThinkingLevel' key Pi's own TUI writes
+(`medium' when unset).  Pi does not persist a level set over RPC, so
+without this every session starts on the remembered one again."
   :type '(choice (const :tag "Use remembered level" nil)
                  (const :tag "Off" "off")
                  (const :tag "Minimal" "minimal")
